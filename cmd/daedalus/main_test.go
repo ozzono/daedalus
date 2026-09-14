@@ -2,12 +2,15 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"daedalus/internal/version"
 )
 
 // TestParseFlagsDetach covers both spellings and that -d never consumes a
@@ -71,8 +74,10 @@ func TestParseFlagsAppend(t *testing.T) {
 // TestPruneOldLogs pins the retention rule: logs untouched for over a week
 // are removed, recent ones and non-log files stay.
 func TestPruneOldLogs(t *testing.T) {
-	old := t.TempDir()
-	t.Cleanup(func() { daemonDir = old })
+	// daemonDir is global; restore it to a throwaway dir rather than its
+	// original value, so no later test can touch the real daemon dir.
+	reset := t.TempDir()
+	t.Cleanup(func() { daemonDir = reset })
 	daemonDir = t.TempDir()
 
 	fresh := filepath.Join(daemonDir, "worker-daedalus.log")
@@ -120,6 +125,31 @@ func TestReadLivePid(t *testing.T) {
 	}
 	if _, ok := readLivePid(pidFile); ok {
 		t.Error("readLivePid should reject a malformed pid file")
+	}
+}
+
+// TestVersionFlag covers both spellings of the version flag: the CLI prints
+// the embedded version and exits cleanly, without needing a config.
+func TestVersionFlag(t *testing.T) {
+	for _, flag := range []string{"-v", "--version"} {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		stdout, args := os.Stdout, os.Args
+		os.Stdout, os.Args = w, []string{"daedalus", flag}
+		main()
+		w.Close()
+		os.Stdout, os.Args = stdout, args
+
+		out, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := version.String() + "\n"; string(out) != want {
+			t.Errorf("daedalus %s printed %q, want %q", flag, out, want)
+		}
 	}
 }
 

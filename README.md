@@ -1,5 +1,10 @@
 # Daedalus
 
+[![CI](https://github.com/ozzono/daedalus/actions/workflows/ci.yml/badge.svg)](https://github.com/ozzono/daedalus/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ozzono/daedalus/badges/coverage.json)](https://github.com/ozzono/daedalus/actions/workflows/ci.yml)
+[![version](https://img.shields.io/github/v/tag/ozzono/daedalus)](https://github.com/ozzono/daedalus/tags)
+[![Go](https://img.shields.io/badge/go-1.26-00ADD8)](https://go.dev)
+
 A local, sandboxed AI developer agent control plane, written in Go and
 orchestrated via [Temporal](https://temporal.io).
 
@@ -191,3 +196,8 @@ Tests are hermetic: subprocess-backed activities are exercised against stub
 `git`/`go`/`ai-jail` executables installed on a temporary `PATH`, and the
 workflow is tested in Temporal's in-process `TestWorkflowEnvironment` with
 mocked activities — no server, network, or API key needed.
+
+The CLI's version lives in `internal/version/VERSION` (`daedalus --version`
+prints it). CI runs the suite on every PR and master push; after a green
+master push it tags the tested code with the current version, bumps the file
+to the next patch, and refreshes the coverage badge — no other release tooling.

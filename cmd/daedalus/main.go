@@ -24,6 +24,7 @@ import (
 
 	"daedalus/internal/activities"
 	"daedalus/internal/config"
+	"daedalus/internal/version"
 	"daedalus/internal/workflows"
 )
 
@@ -48,6 +49,7 @@ var workflowRegistry = map[string]any{
 var usage = `Daedalus — a local, sandboxed AI developer agent control plane.
 
 Usage:
+  daedalus -v, --version        Print the version and exit.
   daedalus [-c config.yaml] worker [start|stop|status|restart|foreground]
       Run the Temporal worker hosting the pipelines. The default action,
       start, runs it as a detached daemon: logs append to
@@ -121,6 +123,8 @@ func main() {
 	switch args[0] {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
+	case "-v", "--version":
+		fmt.Println(version.String())
 	case "list":
 		// daedalus list [max] — the most recent sessions, newest first.
 		max := 10
