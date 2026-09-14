@@ -1,4 +1,12 @@
-# Daedalus configuration. Copy to config.yaml and edit; every field is
+// Package config loads Daedalus runtime configuration from a YAML file.
+package config
+
+// ExampleYAML is the fully-commented example configuration, every field at
+// its default value. `daedalus init` writes it as config-example.yaml in the
+// working directory. It is kept in lockstep with the repository's own
+// config-example.yaml by TestExampleYAMLMatchesRepoFile, and TestExampleYAML
+// pins that loading it yields exactly the default configuration.
+const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; every field is
 # optional. Provider values that are unset are simply not exported — the
 # jailed agent then inherits whatever the worker's environment provides.
 
@@ -39,3 +47,4 @@ openai:
   url: ""
   key: ""
   model: ""
+`
