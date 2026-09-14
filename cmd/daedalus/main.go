@@ -50,6 +50,9 @@ var usage = `Daedalus — a local, sandboxed AI developer agent control plane.
 
 Usage:
   daedalus -v, --version        Print the version and exit.
+  daedalus init
+      Write config-example.yaml in the current directory: every field with
+      its default value, fully commented. Copy it to config.yaml and edit.
   daedalus [-c config.yaml] worker [start|stop|status|restart|foreground]
       Run the Temporal worker hosting the pipelines. The default action,
       start, runs it as a detached daemon: logs append to
@@ -125,6 +128,11 @@ func main() {
 		fmt.Print(usage)
 	case "-v", "--version":
 		fmt.Println(version.String())
+	case "init":
+		if err := writeExampleConfig("."); err != nil {
+			fmt.Fprintf(os.Stderr, "init failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "list":
 		// daedalus list [max] — the most recent sessions, newest first.
 		max := 10
@@ -652,6 +660,21 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		return nil
 	}
 	return awaitPipeline(run)
+}
+
+// writeExampleConfig writes the fully-commented example configuration —
+// every field at its default — as config-example.yaml in dir, refusing to
+// overwrite an existing file.
+func writeExampleConfig(dir string) error {
+	path := filepath.Join(dir, "config-example.yaml")
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%s already exists — remove it first to regenerate", path)
+	}
+	if err := os.WriteFile(path, []byte(config.ExampleYAML), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	fmt.Printf("wrote %s — copy to config.yaml and edit\n", path)
+	return nil
 }
 
 // listPipelines prints the most recent sessions on this task queue, newest
