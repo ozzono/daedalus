@@ -2,6 +2,10 @@
 # optional. Provider values that are unset are simply not exported — the
 # jailed agent then inherits whatever the worker's environment provides.
 
+# Which jailed agent CLI runs the implementing and reviewer agents:
+# claude (Claude Code, the default) or opencode.
+agent: claude
+
 temporal:
   # Temporal frontend address. 7233 is Temporal's own default, so a plain
   # `temporal server start-dev` matches.

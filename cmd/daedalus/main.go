@@ -93,6 +93,7 @@ Usage:
 
 Configuration is read from config.yaml (-c/--config to override the path);
 see config-example.yaml for all fields and their defaults:
+  agent                Jailed agent CLI: claude or opencode (default claude)
   temporal.host        Temporal frontend address   (default 127.0.0.1:7233)
   temporal.ui_port     Temporal UI port, shown at worker startup (default 8233)
   temporal.task_queue  routing key; distinct projects or flows sharing one
@@ -568,6 +569,11 @@ func runWorker(cfg config.Config) error {
 				return fmt.Errorf("set %s: %w", key, err)
 			}
 		}
+	}
+	// The jailed agent selection travels the same channel: activities read
+	// DAEDALUS_AGENT when building the ai-jail command line.
+	if err := os.Setenv("DAEDALUS_AGENT", cfg.Agent); err != nil {
+		return fmt.Errorf("set DAEDALUS_AGENT: %w", err)
 	}
 
 	if err := activities.PreflightWorktreeRoot(cfg.Temporal.TaskQueue); err != nil {
