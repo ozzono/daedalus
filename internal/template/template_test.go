@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+// TestContinue pins the resumed-run opener: continuation framing, the prior
+// feedback section only when feedback exists, and the no-test-code rule.
+func TestContinue(t *testing.T) {
+	got, err := Continue("finish the feature", "finding 1\nfinding 2")
+	if err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	for _, want := range []string{
+		"finish the feature",
+		"continuing a previous attempt",
+		"finding 1\nfinding 2",
+		"Do not write, modify, or delete test code",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Continue = %q, want it to contain %q", got, want)
+		}
+	}
+
+	got, err = Continue("finish the feature", "")
+	if err != nil {
+		t.Fatalf("Continue (no feedback): %v", err)
+	}
+	if strings.Contains(got, "last review feedback") {
+		t.Errorf("Continue = %q, feedback section should be omitted when empty", got)
+	}
+}
+
 func TestImplement(t *testing.T) {
 	got, err := Implement("add the feature")
 	if err != nil {

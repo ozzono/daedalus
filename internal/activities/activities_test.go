@@ -2,6 +2,7 @@ package activities
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -214,14 +215,49 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 5 {
-		t.Fatalf("git called %d times, want 5 (remove, prune, branch -D, branch --list, add)", len(calls))
+	if len(calls) != 9 {
+		t.Fatalf("git called %d times, want 9 (preserve list, add, commit, drop aborted, rename, remove, prune, stale sweep, worktree add)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "pre-clean remove")
-	assertArgs(t, calls[1].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
-	assertArgs(t, calls[2].Args, []string{"-C", "/repo", "branch", "-D", "feat/issue-42-123"}, "pre-clean branch delete")
-	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "pre-clean stale branch sweep")
-	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123"}, "worktree add")
+	// A stale worktree from a crashed run is preserved, not discarded: its
+	// contents are committed and its branch renamed to aborted/issue-42.
+	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "daedalus/issue-42-*", "--format=%(refname:short)"}, "finalized check")
+	assertArgs(t, calls[1].Args, []string{"-C", worktreePath, "add", "-A"}, "preserve stage")
+	assertArgs(t, calls[2].Args, []string{"-C", worktreePath,
+		"-c", "user.name=daedalus", "-c", "user.email=daedalus@local",
+		"commit", "-m", "daedalus: run closed without approval, work preserved for continue"}, "preserve commit")
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
+	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	assertArgs(t, calls[5].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "pre-clean remove")
+	assertArgs(t, calls[6].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
+	assertArgs(t, calls[7].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "pre-clean stale branch sweep")
+	assertArgs(t, calls[8].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123"}, "worktree add")
+}
+
+// TestCreateWorktreeFromAbortedBase pins the continued-run path: the new
+// worktree branches from the preserved aborted/ branch, which is then
+// deleted — its commits live on the new in-flight branch.
+func TestCreateWorktreeFromAbortedBase(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	stubBin(t, "git", "exit 0")
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+
+	if _, err := CreateWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:   "/repo",
+		TaskQueue:  "daedalus",
+		IssueID:    "42",
+		BranchName: "feat/issue-42-123",
+		BaseBranch: "aborted/issue-42",
+	}); err != nil {
+		t.Fatalf("CreateWorktreeActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 6 {
+		t.Fatalf("git called %d times, want 6 (preserve list, remove, prune, stale sweep, add, drop base)", len(calls))
+	}
+	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123", "aborted/issue-42"}, "worktree add from base")
+	assertArgs(t, calls[5].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop consumed base")
 }
 
 func TestCreateWorktreeActivityHealsStaleRegistration(t *testing.T) {
@@ -251,8 +287,8 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 5 {
-		t.Fatalf("git called %d times, want 5", len(calls))
+	if len(calls) != 9 {
+		t.Fatalf("git called %d times, want 9", len(calls))
 	}
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Errorf("stale directory should be removed even when git remove failed (stat err = %v)", err)
@@ -280,14 +316,15 @@ exit 0`)
 }
 
 // cleanWorktreeSweepOutput shows what deleteStaleBranches does with listed
-// stale branches: each is deleted, in addition to the run's own branch.
+// stale branches: each is deleted. The daedalus/ finalized check lists empty
+// and the worktree is absent, so nothing is preserved.
 func TestCleanupWorktreeActivitySweepsStaleBranches(t *testing.T) {
 	fakeHome(t)
 	log := newStubLog(t)
-	// branch --list reports two stale in-flight branches from crashed runs.
-	stubBin(t, "git", `case "$4" in
-  remove) exit 0 ;;
-  --list) printf 'feat/issue-42-111\nfeat/issue-42-222\n'; exit 0 ;;
+	// branch --list reports two stale in-flight branches from crashed runs;
+	// argv here is: -C repo branch --list <pattern> — the pattern is $5.
+	stubBin(t, "git", `case "$5" in
+  feat/*) printf 'feat/issue-42-111\nfeat/issue-42-222\n'; exit 0 ;;
 esac
 exit 0`)
 
@@ -302,13 +339,72 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	// remove, prune, branch -D, list, -D, -D
+	// finalized check, remove, prune, list, -D, -D
 	if len(calls) != 6 {
-		t.Fatalf("git called %d times, want 6 (remove, prune, branch -D, list, 2 stale deletes)", len(calls))
+		t.Fatalf("git called %d times, want 6 (finalized check, remove, prune, list, 2 stale deletes)", len(calls))
 	}
-	assertArgs(t, calls[2].Args, []string{"-C", "/repo", "branch", "-D", "feat/issue-42-7"}, "branch delete")
+	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "daedalus/issue-42-*", "--format=%(refname:short)"}, "finalized check")
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "stale branch sweep")
 	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "branch", "-D", "feat/issue-42-111"}, "stale branch delete 1")
 	assertArgs(t, calls[5].Args, []string{"-C", "/repo", "branch", "-D", "feat/issue-42-222"}, "stale branch delete 2")
+}
+
+// TestCleanupPreservesAbortedWork pins the preservation contract: without a
+// finalized daedalus/ branch, the worktree's contents are committed and the
+// in-flight branch renamed to aborted/issue-42 for `daedalus continue`.
+func TestCleanupPreservesAbortedWork(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	stubBin(t, "git", "exit 0")
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:   "/repo",
+		TaskQueue:  "daedalus",
+		IssueID:    "42",
+		BranchName: "feat/issue-42-7",
+	}); err != nil {
+		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 8 {
+		t.Fatalf("git called %d times, want 8 (list, add, commit, drop aborted, rename, remove, prune, sweep)", len(calls))
+	}
+	assertArgs(t, calls[1].Args, []string{"-C", worktreePath, "add", "-A"}, "preserve stage")
+	if !contains(calls[2].Args, "work preserved for continue") {
+		t.Errorf("commit %v should carry the preservation message", calls[2].Args)
+	}
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
+	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Errorf("worktree dir should be removed after preservation (stat err = %v)", err)
+	}
+}
+
+// TestRunJailedAPIExhaustion pins the halt labeling: when the agent CLI
+// fails with quota/rate-limit output, the error names ErrAPIExhausted so the
+// failure reads as "resume later" rather than a code bug.
+func TestRunJailedAPIExhaustion(t *testing.T) {
+	newStubLog(t)
+	stubBin(t, "ai-jail", "echo 'credit balance too low' >&2; exit 1")
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if err == nil {
+		t.Fatal("want error when the agent api is exhausted")
+	}
+	if !errors.Is(err, ErrAPIExhausted) {
+		t.Errorf("error %v should wrap ErrAPIExhausted", err)
+	}
+	if !strings.Contains(err.Error(), "credit balance too low") {
+		t.Errorf("error %q should keep the provider's message", err)
+	}
 }
 
 func TestRunJailedClaudeActivity(t *testing.T) {
@@ -333,15 +429,16 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
-	// The prompt must travel via stdin, not argv; the agent runs with
-	// stream-json output so thinking and text come back structured.
+	// The prompt must travel via stdin, not argv; the agent runs with json
+	// output so its text comes back structured (stream-json needs
+	// --verbose, which ai-jail's flag guard rejects).
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
+		"--",
 		"claude",
 		"--output-format",
-		"stream-json",
-		"--verbose",
+		"json",
 		"-p",
 		"--dangerously-skip-permissions",
 	}, "ai-jail")
@@ -417,6 +514,18 @@ func TestRunJailedClaudeActivityStreamJSON(t *testing.T) {
 	}
 	if result.Text != "did the change" {
 		t.Errorf("result.Text = %q, want %q", result.Text, "did the change")
+	}
+}
+
+// TestParseAgentStreamJSONFormat pins the --output-format json path: the
+// single result object's Result field becomes the text.
+func TestParseAgentStreamJSONFormat(t *testing.T) {
+	thinking, text := parseAgentStream(`{"type":"result","subtype":"success","result":"did the change"}`)
+	if thinking != "" {
+		t.Errorf("thinking = %q, want empty", thinking)
+	}
+	if text != "did the change" {
+		t.Errorf("text = %q, want %q", text, "did the change")
 	}
 }
 
@@ -714,12 +823,14 @@ func TestCleanupWorktreeActivity(t *testing.T) {
 
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
 	calls := readCalls(t, log)
+	// No worktree dir and no finalized branch: nothing to preserve, so the
+	// flow is finalized check, remove, prune, stale sweep.
 	if len(calls) != 4 {
-		t.Fatalf("git called %d times, want 4 (remove, prune, branch -D, stale sweep)", len(calls))
+		t.Fatalf("git called %d times, want 4 (finalized check, remove, prune, stale sweep)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "remove")
-	assertArgs(t, calls[1].Args, []string{"-C", "/repo", "worktree", "prune"}, "prune")
-	assertArgs(t, calls[2].Args, []string{"-C", "/repo", "branch", "-D", "feat/issue-42-7"}, "branch delete")
+	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "daedalus/issue-42-*", "--format=%(refname:short)"}, "finalized check")
+	assertArgs(t, calls[1].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "remove")
+	assertArgs(t, calls[2].Args, []string{"-C", "/repo", "worktree", "prune"}, "prune")
 	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "stale branch sweep")
 }
 
@@ -742,9 +853,9 @@ exit 0`)
 
 	calls := readCalls(t, log)
 	if len(calls) != 4 {
-		t.Fatalf("git called %d times, want 4 (remove attempted, prune and branch still run)", len(calls))
+		t.Fatalf("git called %d times, want 4 (finalized check, remove attempted, prune and sweep still run)", len(calls))
 	}
-	assertArgs(t, calls[1].Args, []string{"-C", "/repo", "worktree", "prune"}, "prune after failed remove")
+	assertArgs(t, calls[2].Args, []string{"-C", "/repo", "worktree", "prune"}, "prune after failed remove")
 }
 
 func TestCleanupWorktreeActivityPruneFailure(t *testing.T) {

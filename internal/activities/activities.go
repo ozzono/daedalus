@@ -36,6 +36,10 @@ type WorktreeInput struct {
 	TaskQueue  string
 	IssueID    string
 	BranchName string
+	// BaseBranch, when set, is the ref the new worktree's branch starts
+	// from instead of HEAD — the aborted/<issue> branch a continued run
+	// resumes (see ContinueWorktreeFrom / `daedalus continue`).
+	BaseBranch string
 }
 
 // WorktreeOutput reports the location of a created worktree.
@@ -94,11 +98,24 @@ type ReviewResult struct {
 
 // Branch name prefixes: feat/ marks in-flight runs (always cleaned up, along
 // with any stale feat/ branches from crashed runs); daedalus/ marks approved
-// work committed by FinalizeWorktreeActivity, which is preserved.
+// work committed by FinalizeWorktreeActivity, which is preserved. aborted/
+// carries a run that closed without approval — committed and kept so
+// `daedalus continue` can resume it; each abort replaces the previous
+// snapshot.
 const (
 	inFlightPrefix  = "feat/"
 	preservedPrefix = "daedalus/"
+	abortedPrefix   = "aborted/"
 )
+
+// AbortedBranchName returns the per-issue branch carrying an aborted run's
+// preserved work — the base ref a continued run starts from.
+func AbortedBranchName(issueID string) (string, error) {
+	if err := validatePathSegment(issueID); err != nil {
+		return "", fmt.Errorf("issue id: %w", err)
+	}
+	return abortedPrefix + "issue-" + issueID, nil
+}
 
 // maxTestLogs bounds the test output carried in the activity result (and
 // hence Temporal history). The tail is kept — it usually holds the failures.
@@ -193,6 +210,10 @@ func setProcessGroup(cmd *exec.Cmd) {
 // one — while prune failures and an undeletable directory are surfaced as
 // errors. Preserved daedalus/ branches are never touched.
 func cleanWorktree(ctx context.Context, repoPath, worktreePath, branchName, issueID string) error {
+	if err := preserveAbortedWork(ctx, repoPath, worktreePath, branchName, issueID); err != nil {
+		return err
+	}
+
 	// Best-effort: fall through to prune and the RemoveAll fallback below.
 	_, _ = runGit(ctx, "-C", repoPath, "worktree", "remove", worktreePath, "--force")
 
@@ -200,9 +221,6 @@ func cleanWorktree(ctx context.Context, repoPath, worktreePath, branchName, issu
 		return fmt.Errorf("git worktree prune: %w: %s", err, out)
 	}
 
-	if branchName != "" {
-		_, _ = runGit(ctx, "-C", repoPath, "branch", "-D", branchName)
-	}
 	deleteStaleBranches(ctx, repoPath, issueID)
 
 	if _, err := os.Stat(worktreePath); err == nil {
@@ -210,6 +228,41 @@ func cleanWorktree(ctx context.Context, repoPath, worktreePath, branchName, issu
 			return fmt.Errorf("remove stale worktree %s: %w", worktreePath, err)
 		}
 	}
+	return nil
+}
+
+// preserveAbortedWork keeps a run that closed without approval resumable:
+// the worktree's contents are committed and the in-flight branch renamed to
+// the per-issue aborted/ branch that `daedalus continue` builds on. A
+// finalized run (its daedalus/ deliverable exists) deletes the in-flight
+// branch instead — the deliverable already carries the work. Best-effort
+// throughout: any git hiccup still lets cleanup proceed, and stale state
+// from a crashed run is preserved too (the worktree may hold its work).
+func preserveAbortedWork(ctx context.Context, repoPath, worktreePath, branchName, issueID string) error {
+	if branchName == "" {
+		return nil
+	}
+	preserved, _ := runGit(ctx, "-C", repoPath, "branch", "--list",
+		preservedPrefix+"issue-"+issueID+"-*", "--format=%(refname:short)")
+	if strings.TrimSpace(preserved) != "" {
+		_, _ = runGit(ctx, "-C", repoPath, "branch", "-D", branchName)
+		return nil
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		// No worktree — nothing to preserve; the stale-branch sweep below
+		// still runs.
+		return nil
+	}
+	aborted, err := AbortedBranchName(issueID)
+	if err != nil {
+		return err
+	}
+	_, _ = runGit(ctx, "-C", worktreePath, "add", "-A")
+	_, _ = runGit(ctx, "-C", worktreePath,
+		"-c", "user.name=daedalus", "-c", "user.email=daedalus@local",
+		"commit", "-m", "daedalus: run closed without approval, work preserved for continue")
+	_, _ = runGit(ctx, "-C", repoPath, "branch", "-D", aborted)
+	_, _ = runGit(ctx, "-C", worktreePath, "branch", "-m", aborted)
 	return nil
 }
 
@@ -242,8 +295,18 @@ func CreateWorktreeActivity(ctx context.Context, input WorktreeInput) (WorktreeO
 		return WorktreeOutput{}, fmt.Errorf("clean stale worktree state: %w", err)
 	}
 
-	if out, err := runGit(ctx, "-C", input.RepoPath, "worktree", "add", worktreePath, "-b", input.BranchName); err != nil {
+	addArgs := []string{"-C", input.RepoPath, "worktree", "add", worktreePath, "-b", input.BranchName}
+	if input.BaseBranch != "" {
+		// A continued run resumes the aborted attempt's branch.
+		addArgs = append(addArgs, input.BaseBranch)
+	}
+	if out, err := runGit(ctx, addArgs...); err != nil {
 		return WorktreeOutput{}, fmt.Errorf("git worktree add %s: %w: %s", worktreePath, err, out)
+	}
+	if strings.HasPrefix(input.BaseBranch, abortedPrefix) {
+		// The aborted snapshot served its purpose: its commits now live on
+		// this run's in-flight branch.
+		_, _ = runGit(ctx, "-C", input.RepoPath, "branch", "-D", input.BaseBranch)
 	}
 
 	return WorktreeOutput{WorktreePath: worktreePath}, nil
@@ -263,7 +326,11 @@ type jailResult struct {
 // visible in `ps` and per-argument size limits would make large review
 // prompts (which embed the full diff) fail the run.
 func runJailed(ctx context.Context, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
-	args := []string{"--worktree", "--network", "claude"}
+	// "--" ends ai-jail's own flags: everything after it is the jailed
+	// command, verbatim — otherwise ai-jail rejects child flags that
+	// resemble its own (e.g. claude's --verbose) as misplaced.
+	args := []string{"--worktree", "--network", "--"}
+	args = append(args, "claude")
 	args = append(args, agentArgs...)
 	args = append(args, "-p", "--dangerously-skip-permissions")
 	cmd := exec.CommandContext(ctx, "ai-jail", args...)
@@ -280,9 +347,35 @@ func runJailed(ctx context.Context, worktreePath, prompt string, agentArgs ...st
 	err := cmd.Run()
 	res := jailResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
+		if out := res.Stdout + res.Stderr; matchesAny(out, apiExhaustionMarkers) {
+			return res, fmt.Errorf("%w: %w: %s", ErrAPIExhausted, err, truncateTail(out, 1024))
+		}
 		return res, fmt.Errorf("ai-jail claude run: %w: %s", err, res.Stdout+res.Stderr)
 	}
 	return res, nil
+}
+
+// apiExhaustionMarkers are the phrases provider APIs (and their CLIs) emit
+// when the account is out of quota, rate-limited, or the service is
+// overloaded. Matching them labels the halt so operators can tell "resume
+// with `daedalus continue` later" apart from a code failure.
+var apiExhaustionMarkers = []string{
+	"rate limit", "rate_limit", "quota", "credit balance", "insufficient", "usage limit", "402", "429", "overloaded",
+}
+
+// ErrAPIExhausted marks an agent or reviewer run that failed because the
+// provider API is out of quota or unavailable. Activities do not retry, so
+// the workflow halts immediately; the work is preserved on the aborted/
+// branch and the run is resumable via `daedalus continue` once the API is
+// available again.
+var ErrAPIExhausted = errors.New("agent api exhausted or unavailable")
+
+// matchesAny reports whether s contains any marker, case-insensitively.
+func matchesAny(s string, markers []string) bool {
+	s = strings.ToLower(s)
+	return slices.ContainsFunc(markers, func(m string) bool {
+		return strings.Contains(s, m)
+	})
 }
 
 // activityLogger returns the activity-scoped logger, falling back to a
@@ -298,21 +391,22 @@ func activityLogger(ctx context.Context) (l log.Logger) {
 }
 
 // RunJailedClaudeActivity runs Claude Code inside an ai-jail sandbox rooted at
-// the worktree. The agent runs with stream-json output so its chain of
-// thought and visible text come back as structured messages; both are
-// returned tail-bounded in the activity result (serialized into Temporal
-// history, visible in the UI per round), while the worker log keeps the full
-// untruncated stream.
+// the worktree. The agent runs with json output so its visible text comes
+// back structured and lands tail-bounded in the activity result (serialized
+// into Temporal history, visible in the UI per round), while the worker log
+// keeps the full untruncated output. stream-json (which also carries the
+// chain of thought via --verbose) is blocked for now: ai-jail's flag guard
+// rejects --verbose after the command by prefix match, even behind --.
 func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
 	res, err := runJailed(ctx, input.WorktreePath, input.Prompt,
-		"--output-format", "stream-json", "--verbose")
+		"--output-format", "json")
 	if err != nil {
 		return AgentRunResult{}, err
 	}
 	thinking, text := parseAgentStream(res.Stdout)
 	if text == "" {
-		// Not stream-json (a CLI without the flag, or a parse miss): keep
-		// whatever the agent did print rather than an empty result.
+		// Not json/stream-json (a CLI without the flag, or a parse miss):
+		// keep whatever the agent did print rather than an empty result.
 		text = res.Stdout
 	}
 	logger := activityLogger(ctx)
@@ -326,11 +420,13 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 	}, nil
 }
 
-// streamMessage is one line of claude --output-format stream-json output:
-// assistant messages carry the content blocks (thinking, text); other lines
-// (system, stream_event, result) are not needed here.
+// streamMessage is one line of claude --output-format json/stream-json
+// output: the json format emits a single result object (carrying the final
+// text in Result); stream-json additionally emits assistant messages with
+// content blocks (thinking, text).
 type streamMessage struct {
 	Type    string `json:"type"`
+	Result  string `json:"result"`
 	Message struct {
 		Content []struct {
 			Type     string `json:"type"`
@@ -341,20 +437,30 @@ type streamMessage struct {
 }
 
 // parseAgentStream extracts the agent's chain of thought and visible text
-// from stream-json output. Non-JSON or uninteresting lines are skipped —
-// the stream also carries system/init and delta events.
+// from json or stream-json output. Non-JSON or uninteresting lines are
+// skipped — the stream also carries system/init and delta events.
 func parseAgentStream(stdout string) (thinking, text string) {
 	for line := range strings.SplitSeq(stdout, "\n") {
 		var m streamMessage
-		if json.Unmarshal([]byte(line), &m) != nil || m.Type != "assistant" {
+		if json.Unmarshal([]byte(line), &m) != nil {
 			continue
 		}
-		for _, block := range m.Message.Content {
-			switch block.Type {
-			case "thinking":
-				thinking += block.Thinking
-			case "text":
-				text += block.Text
+		switch m.Type {
+		case "assistant":
+			for _, block := range m.Message.Content {
+				switch block.Type {
+				case "thinking":
+					thinking += block.Thinking
+				case "text":
+					text += block.Text
+				}
+			}
+		case "result":
+			// The json format's single object; also the terminal event of
+			// a stream-json run, where it restates the final assistant
+			// text — overwrite rather than append to avoid duplication.
+			if m.Result != "" {
+				text = m.Result
 			}
 		}
 	}

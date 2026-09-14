@@ -36,6 +36,16 @@ func Implement(task string) (string, error) {
 	return render("implement", struct{ Task string }{task})
 }
 
+// Continue builds the phase-1 opener for a resumed run: the new task, the
+// framing that the worktree already contains an aborted attempt's work, and
+// that attempt's last review feedback when available.
+func Continue(task, priorFeedback string) (string, error) {
+	return render("continue", struct {
+		Task          string
+		PriorFeedback string
+	}{task, priorFeedback})
+}
+
 // ImplementFix feeds code-review comments back to the implementing agent
 // inside the phase-1 (implementation ↔ code review) loop.
 func ImplementFix(comments string) (string, error) {

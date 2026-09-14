@@ -7,12 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
+	"text/tabwriter"
 	"time"
 
 	enums "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
 
 	"daedalus/internal/activities"
@@ -41,10 +48,20 @@ var workflowRegistry = map[string]any{
 var usage = `Daedalus — a local, sandboxed AI developer agent control plane.
 
 Usage:
-  daedalus [-c config.yaml] worker
-      Start a Temporal worker hosting the pipelines.
+  daedalus [-c config.yaml] worker [start|stop|status|restart|foreground]
+      Run the Temporal worker hosting the pipelines. The default action,
+      start, runs it as a detached daemon: logs append to
+      /tmp/daedalus/worker-<queue>.log (pruned to the past week), the pid
+      lives in /tmp/daedalus/worker-<queue>.pid, one daemon per task queue.
+      stop drains it gracefully (SIGTERM); restart is stop + start; status
+      reports pid and log path. foreground runs attached to this terminal.
       anthropic.key is optional — if unset, the jailed agent authenticates
       through the worker's inherited environment or its own login.
+  daedalus [-c config.yaml] list [max]
+      List past and current sessions (pipeline runs) on this task queue,
+      newest first: session id, status, last interaction datetime (close
+      time once closed, start time while running). Defaults to the 10 most
+      recent; pass a larger max to list more.
   daedalus [-c config.yaml] [-w workflow] run [-d] <repo-path> <issue-id> "<prompt>"
       Start a pipeline for an issue. -w selects the workflow
       (default: feature-dev; available: ` + workflowNames() + `).
@@ -62,6 +79,12 @@ Usage:
       Send operator guidance to a running pipeline: the message is folded
       into the agent's next fix prompt, steering a stuck review loop
       without restarting the run.
+  daedalus [-c config.yaml] continue <workflow-id> "<prompt>"
+      Resume a closed session (canceled or failed — including a halt on
+      agent API exhaustion) under a new prompt: the aborted attempt's work,
+      preserved on its aborted/ branch, becomes the new run's starting
+      point, and that attempt's last review feedback is folded into the
+      opening prompt. -d works here too.
   daedalus [-c config.yaml] attach <workflow-id>
       Reattach to a running (or already finished) pipeline, block until it
       finishes, and report the outcome — the other half of "run -d".
@@ -97,18 +120,88 @@ func main() {
 	switch args[0] {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
-	case "worker", "run":
+	case "list":
+		// daedalus list [max] — the most recent sessions, newest first.
+		max := 10
+		if len(args) == 2 {
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n <= 0 {
+				fmt.Fprintf(os.Stderr, "list takes an optional maximum number of sessions (got %q)\n\n%s", args[1], usage)
+				os.Exit(1)
+			}
+			max = n
+		} else if len(args) > 2 {
+			fmt.Fprintf(os.Stderr, "list takes at most one argument\n\n%s", usage)
+			os.Exit(1)
+		}
 		cfg, err := config.Load(configPath.configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 			os.Exit(1)
 		}
-		if args[0] == "worker" {
+		if err := listPipelines(cfg, max); err != nil {
+			fmt.Fprintf(os.Stderr, "list failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "worker":
+		// daedalus worker [start|stop|status|restart|foreground] — default
+		// start runs the worker as a detached daemon.
+		action := "start"
+		if len(args) == 2 {
+			action = args[1]
+		} else if len(args) > 2 {
+			fmt.Fprintf(os.Stderr, "worker takes at most one action\n\n%s", usage)
+			os.Exit(1)
+		}
+		cfg, err := config.Load(configPath.configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		switch action {
+		case "start":
+			if err := workerStart(cfg, configPath.configPath); err != nil {
+				fmt.Fprintf(os.Stderr, "worker start failed: %v\n", err)
+				os.Exit(1)
+			}
+		case "stop":
+			if err := workerStop(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "worker stop failed: %v\n", err)
+				os.Exit(1)
+			}
+		case "status":
+			workerStatus(cfg)
+		case "restart":
+			if err := workerStop(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "worker stop failed: %v\n", err)
+				os.Exit(1)
+			}
+			if err := workerStart(cfg, configPath.configPath); err != nil {
+				fmt.Fprintf(os.Stderr, "worker start failed: %v\n", err)
+				os.Exit(1)
+			}
+		case "foreground":
+			// Run attached to this terminal — the daemon child's mode, and
+			// the way to debug a worker that will not start.
 			if err := runWorker(cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "worker failed: %v\n", err)
 				os.Exit(1)
 			}
-		} else if configPath.appendID != "" {
+			if os.Getenv(daemonEnv) == "1" {
+				pidFile, _ := daemonPaths(cfg.Temporal.TaskQueue)
+				os.Remove(pidFile)
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "unknown worker action %q (start, stop, status, restart, foreground)\n\n%s", action, usage)
+			os.Exit(1)
+		}
+	case "run":
+		cfg, err := config.Load(configPath.configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		if configPath.appendID != "" {
 			// Append mode: no repo path or issue id — just a prompt (or
 			// -f file) for the pipeline that is already running.
 			var prompt string
@@ -154,6 +247,20 @@ func main() {
 		}
 		if err := guidePipeline(cfg, args[1], args[2]); err != nil {
 			fmt.Fprintf(os.Stderr, "guide failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "continue":
+		if len(args) != 3 {
+			fmt.Fprintf(os.Stderr, "continue takes <workflow-id> \"<prompt>\"\n\n%s", usage)
+			os.Exit(1)
+		}
+		cfg, err := config.Load(configPath.configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := continuePipeline(cfg, args[1], args[2], configPath.detach); err != nil {
+			fmt.Fprintf(os.Stderr, "continue failed: %v\n", err)
 			os.Exit(1)
 		}
 	case "attach":
@@ -300,6 +407,154 @@ func newClient(cfg config.Config) (client.Client, error) {
 	return c, nil
 }
 
+// daemonDir hosts the worker daemon's runtime files: its pid file and
+// appended logs. Overridable in tests.
+var daemonDir = "/tmp/daedalus"
+
+// daemonEnv marks the re-exec'd background worker process so the child
+// knows to clear the pid file on exit.
+const daemonEnv = "DAEDALUS_WORKER_DAEMON"
+
+// logRetention bounds how long daemon logs are kept.
+const logRetention = 7 * 24 * time.Hour
+
+// daemonPaths returns the per-task-queue pid and log file paths. One daemon
+// per queue: a second `worker start` on a live queue refuses rather than
+// doubles up.
+func daemonPaths(queue string) (pidFile, logFile string) {
+	return filepath.Join(daemonDir, "worker-"+queue+".pid"),
+		filepath.Join(daemonDir, "worker-"+queue+".log")
+}
+
+// workerStart launches the worker as a detached daemon: it re-executes
+// itself with `worker foreground`, redirected into the per-queue log, in
+// its own session so the terminal is released immediately.
+func workerStart(cfg config.Config, configPath string) error {
+	pidFile, logFile := daemonPaths(cfg.Temporal.TaskQueue)
+	if pid, ok := readLivePid(pidFile); ok {
+		return fmt.Errorf("already running (pid %d) — use 'daedalus worker restart' or 'stop'", pid)
+	}
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", daemonDir, err)
+	}
+	pruneOldLogs()
+
+	log, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open log %s: %w", logFile, err)
+	}
+	defer log.Close()
+
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+	childArgs := []string{"worker", "foreground"}
+	if configPath != defaultConfigPath {
+		childArgs = append(childArgs, "-c", configPath)
+	}
+	cmd := exec.Command(self, childArgs...)
+	cmd.Env = append(os.Environ(), daemonEnv+"=1")
+	cmd.Stdout = log
+	cmd.Stderr = log
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from the terminal
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start daemon: %w", err)
+	}
+	pid := cmd.Process.Pid
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		return fmt.Errorf("write pid file %s: %w", pidFile, err)
+	}
+	cmd.Process.Release() // the daemon outlives this process
+
+	fmt.Printf("worker started (pid %d)\n", pid)
+	fmt.Printf("  log:    %s\n", logFile)
+	fmt.Printf("  stop:   daedalus worker stop\n")
+	return nil
+}
+
+// workerStop gracefully terminates the daemon: SIGTERM lets Temporal's
+// worker drain, then the pid file is cleared once the process is gone.
+func workerStop(cfg config.Config) error {
+	pidFile, logFile := daemonPaths(cfg.Temporal.TaskQueue)
+	pid, ok := readLivePid(pidFile)
+	if !ok {
+		os.Remove(pidFile)
+		fmt.Println("worker not running")
+		return nil
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("signal pid %d: %w", pid, err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := readLivePid(pidFile); !ok {
+			break
+		}
+		if !pidAlive(pid) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if pidAlive(pid) {
+		os.Remove(pidFile)
+		return fmt.Errorf("pid %d still alive after 30s — it may need SIGKILL; log: %s", pid, logFile)
+	}
+	os.Remove(pidFile)
+	fmt.Printf("worker stopped (pid %d)\n", pid)
+	return nil
+}
+
+// workerStatus reports whether the daemon is running and where it logs.
+func workerStatus(cfg config.Config) {
+	pidFile, logFile := daemonPaths(cfg.Temporal.TaskQueue)
+	if pid, ok := readLivePid(pidFile); ok {
+		fmt.Printf("worker running (pid %d)\n  log: %s\n", pid, logFile)
+		return
+	}
+	fmt.Println("worker not running")
+	fmt.Printf("  log: %s\n", logFile)
+}
+
+// readLivePid returns the pid recorded in the pid file when the file exists
+// and that process is still alive; stale files are ignored.
+func readLivePid(pidFile string) (int, bool) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 || !pidAlive(pid) {
+		return 0, false
+	}
+	return pid, true
+}
+
+// pidAlive reports whether the process exists (signal 0 probes without
+// delivering anything).
+func pidAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
+// pruneOldLogs removes daemon logs untouched for longer than the retention
+// window. Best-effort: a failed prune never blocks the daemon.
+func pruneOldLogs() {
+	entries, err := os.ReadDir(daemonDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-logRetention)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(daemonDir, e.Name()))
+		}
+	}
+}
+
 // runWorker registers the workflows and all activities and blocks running the worker.
 func runWorker(cfg config.Config) error {
 	// Export provider settings into the worker's environment — but only the
@@ -387,6 +642,159 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		return nil
 	}
 	return awaitPipeline(run)
+}
+
+// listPipelines prints the most recent sessions on this task queue, newest
+// first: workflow ID (= daedalus session id), status, and the last
+// interaction datetime (close time when the session has ended, start time
+// while it is running).
+func listPipelines(cfg config.Config, max int) error {
+	c, err := newClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	resp, err := c.ListWorkflow(context.Background(), &workflowservice.ListWorkflowExecutionsRequest{
+		Namespace: "default",
+		PageSize:  int32(max),
+		Query:     fmt.Sprintf("TaskQueue = '%s'", cfg.Temporal.TaskQueue),
+	})
+	if err != nil {
+		return fmt.Errorf("list workflows: %w", err)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "SESSION ID\tSTATUS\tLAST INTERACTION")
+	for _, info := range resp.GetExecutions() {
+		when := info.GetCloseTime()
+		note := ""
+		if !when.IsValid() {
+			when = info.GetStartTime()
+			note = " (started)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s%s\n",
+			info.GetExecution().GetWorkflowId(),
+			info.GetStatus(),
+			when.AsTime().Local().Format("2006-01-02 15:04:05"),
+			note)
+	}
+	return w.Flush()
+}
+
+// continuePipeline resumes a closed pipeline (canceled, failed — including
+// an API-exhaustion halt) under a new prompt: the aborted attempt's
+// preserved aborted/<issue> branch becomes the new run's starting point,
+// and the previous run's last review feedback is folded into the opening
+// prompt.
+func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool) error {
+	c, err := newClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	prev, lastReview, err := readPriorRun(c, workflowID)
+	if err != nil {
+		return err
+	}
+	if prev.IssueID == "" {
+		return fmt.Errorf("workflow %s history carries no daedalus pipeline input", workflowID)
+	}
+	base, err := activities.AbortedBranchName(prev.IssueID)
+	if err != nil {
+		return err
+	}
+	if err := verifyBranch(prev.RepoPath, base); err != nil {
+		return fmt.Errorf("nothing to continue for issue %s (%v) — start a fresh run instead", prev.IssueID, err)
+	}
+
+	run, err := c.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
+		ID:                    workflowID,
+		TaskQueue:             cfg.Temporal.TaskQueue,
+		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+	}, workflows.FeatureDevWorkflow, workflows.PipelineInput{
+		RepoPath:      prev.RepoPath,
+		TaskQueue:     cfg.Temporal.TaskQueue,
+		IssueID:       prev.IssueID,
+		Prompt:        prompt,
+		BaseBranch:    base,
+		PriorFeedback: tail(lastReview.Comments, maxPriorFeedback),
+	})
+	if err != nil {
+		return fmt.Errorf("start workflow: %w", err)
+	}
+	fmt.Printf("Continued workflow:\n")
+	fmt.Printf("  Workflow ID: %s\n", run.GetID())
+	fmt.Printf("  Run ID:      %s\n", run.GetRunID())
+	fmt.Printf("  Base branch: %s\n", base)
+
+	if detach {
+		fmt.Printf("Detached — reattach with: daedalus attach %s\n", run.GetID())
+		return nil
+	}
+	return awaitPipeline(run)
+}
+
+// maxPriorFeedback bounds the previous run's last review feedback carried
+// into the continued run's opening prompt.
+const maxPriorFeedback = 16 * 1024
+
+// readPriorRun walks the workflow's history for the original pipeline input
+// and the last reviewer verdict.
+func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineInput, lastReview activities.ReviewResult, err error) {
+	dc := converter.GetDefaultDataConverter()
+	scheduled := map[int64]string{}
+	iter := c.GetWorkflowHistory(context.Background(), workflowID, "",
+		false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	for iter.HasNext() {
+		ev, err := iter.Next()
+		if err != nil {
+			return prev, lastReview, fmt.Errorf("read history of %s: %w", workflowID, err)
+		}
+		switch {
+		case ev.GetWorkflowExecutionStartedEventAttributes() != nil:
+			ps := ev.GetWorkflowExecutionStartedEventAttributes().GetInput().GetPayloads()
+			if len(ps) > 0 {
+				if err := dc.FromPayload(ps[0], &prev); err != nil {
+					return prev, lastReview, fmt.Errorf("decode pipeline input: %w", err)
+				}
+			}
+		case ev.GetActivityTaskScheduledEventAttributes() != nil:
+			a := ev.GetActivityTaskScheduledEventAttributes()
+			scheduled[ev.GetEventId()] = a.GetActivityType().GetName()
+		case ev.GetActivityTaskCompletedEventAttributes() != nil:
+			a := ev.GetActivityTaskCompletedEventAttributes()
+			if scheduled[a.GetScheduledEventId()] != "RunJailedReviewerActivity" {
+				continue
+			}
+			ps := a.GetResult().GetPayloads()
+			if len(ps) == 0 {
+				continue
+			}
+			var r activities.ReviewResult
+			if err := dc.FromPayload(ps[0], &r); err == nil {
+				lastReview = r
+			}
+		}
+	}
+	return prev, lastReview, nil
+}
+
+// verifyBranch fails unless ref resolves in the repository.
+func verifyBranch(repoPath, ref string) error {
+	if out, err := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "--quiet", ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("branch %s not found in %s: %s", ref, repoPath, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// tail keeps the last max bytes of s with a truncation marker.
+func tail(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return "[... earlier feedback truncated ...]" + s[len(s)-max:]
 }
 
 // guidePipeline sends operator guidance to a running pipeline: the message

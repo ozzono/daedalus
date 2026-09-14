@@ -6,3 +6,5 @@ config.yaml
 .gocache/
 .gomodcache/
 backlog/
+
+coverage.out

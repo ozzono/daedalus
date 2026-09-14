@@ -243,6 +243,56 @@ func TestFeatureDevWorkflowGuidanceSignal(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowContinued pins the resume plumbing: a run with
+// BaseBranch hands it to CreateWorktreeActivity and opens on the continue
+// prompt — continuation framing plus the prior review feedback.
+func TestFeatureDevWorkflowContinued(t *testing.T) {
+	env := newTestEnv(t)
+
+	var created activities.WorktreeInput
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.WorktreeInput); ok {
+					created = in
+				}
+			}
+		}).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Return(activities.ReviewResult{Approved: true}, nil)
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-2", nil)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil)
+
+	in := baseInput()
+	in.BaseBranch = "aborted/issue-42"
+	in.PriorFeedback = "finding 1"
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if created.BaseBranch != "aborted/issue-42" {
+		t.Errorf("CreateWorktreeActivity BaseBranch = %q, want aborted/issue-42", created.BaseBranch)
+	}
+	if len(rec.inputs) == 0 {
+		t.Fatal("agent never ran")
+	}
+	first := rec.inputs[0].Prompt
+	if !strings.Contains(first, "continuing a previous attempt") ||
+		!strings.Contains(first, "finding 1") ||
+		!strings.Contains(first, "implement the feature") {
+		t.Errorf("opening prompt lacks continuation context: %q", first)
+	}
+	env.AssertExpectations(t)
+}
+
 func TestFeatureDevWorkflowCodeReviewLoop(t *testing.T) {
 	env := newTestEnv(t)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).

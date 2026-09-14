@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestParseFlagsDetach covers both spellings and that -d never consumes a
@@ -63,6 +65,61 @@ func TestParseFlagsAppend(t *testing.T) {
 
 	if _, _, err := parseFlags([]string{"run", "-a"}); err == nil {
 		t.Error("-a without a value should error")
+	}
+}
+
+// TestPruneOldLogs pins the retention rule: logs untouched for over a week
+// are removed, recent ones and non-log files stay.
+func TestPruneOldLogs(t *testing.T) {
+	old := t.TempDir()
+	t.Cleanup(func() { daemonDir = old })
+	daemonDir = t.TempDir()
+
+	fresh := filepath.Join(daemonDir, "worker-daedalus.log")
+	stale := filepath.Join(daemonDir, "worker-old.log")
+	other := filepath.Join(daemonDir, "worker-daedalus.pid")
+	for _, f := range []string{fresh, stale, other} {
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lastWeek := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(stale, lastWeek, lastWeek); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneOldLogs()
+
+	for _, keep := range []string{fresh, other} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("%s should survive the prune: %v", filepath.Base(keep), err)
+		}
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale log should be pruned (stat err = %v)", err)
+	}
+}
+
+// TestReadLivePid pins the pid-file contract: a live pid reads back, a stale
+// file (dead pid or garbage) does not.
+func TestReadLivePid(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "worker-daedalus.pid")
+
+	if err := os.WriteFile(pidFile, fmt.Appendf(nil, "%d", os.Getpid()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pid, ok := readLivePid(pidFile); !ok || pid != os.Getpid() {
+		t.Errorf("readLivePid = (%d, %v), want (%d, true)", pid, ok, os.Getpid())
+	}
+
+	// A pid that cannot exist (pid 1 on this machine is alive, so use a
+	// garbage file instead) must read as not-live.
+	if err := os.WriteFile(pidFile, []byte("not a pid"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readLivePid(pidFile); ok {
+		t.Error("readLivePid should reject a malformed pid file")
 	}
 }
 

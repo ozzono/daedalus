@@ -23,6 +23,12 @@ type PipelineInput struct {
 	TaskQueue string
 	IssueID   string
 	Prompt    string
+	// BaseBranch, when set, starts the worktree from an aborted attempt's
+	// preserved branch instead of HEAD — a continued run (`daedalus
+	// continue`). PriorFeedback is that attempt's last review feedback,
+	// folded into the opening prompt.
+	BaseBranch    string
+	PriorFeedback string
 }
 
 // FeatureDevWorkflow drives a full issue-development cycle in two
@@ -50,6 +56,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		TaskQueue:  input.TaskQueue,
 		IssueID:    input.IssueID,
 		BranchName: branchName,
+		BaseBranch: input.BaseBranch,
 	}
 
 	// Guarantee the workspace is cleaned up on every exit path. The defer is
@@ -129,7 +136,14 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	}
 
 	// Phase 1: implementation ↔ code review, until the reviewer approves.
-	initialPrompt, err := template.Implement(input.Prompt)
+	// A continued run opens on the aborted attempt's preserved work.
+	var initialPrompt string
+	var err error
+	if input.BaseBranch != "" {
+		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
+	} else {
+		initialPrompt, err = template.Implement(input.Prompt)
+	}
 	if err != nil {
 		return "", fmt.Errorf("build implement prompt: %w", err)
 	}
