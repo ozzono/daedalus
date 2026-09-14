@@ -4,6 +4,7 @@ package workflows
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -77,24 +78,52 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 
 	// runAgent executes one autonomous implementation round; review asks the
 	// reviewer for a verdict on the worktree's current state. The agent's
-	// output is logged inside the activity, not returned — activity results
-	// are serialized into Temporal history.
+	// text and chain of thought come back tail-bounded in the activity
+	// result — serialized into Temporal history — while the worker log keeps
+	// the full stream.
+	//
+	// guideCh carries operator guidance sent while the pipeline runs (see
+	// `daedalus guide`): each fix prompt is prefixed with whatever arrived
+	// since the last round, so a human can steer a stuck review loop without
+	// restarting the run. Draining a signal channel is not a workflow
+	// command — adding it mid-run is replay-safe.
+	guideCh := workflow.GetSignalChannel(ctx, "guide")
+	drainGuidance := func() string {
+		var parts []string
+		for {
+			var g string
+			if !guideCh.ReceiveAsync(&g) {
+				break
+			}
+			if g != "" {
+				parts = append(parts, g)
+			}
+		}
+		if len(parts) == 0 {
+			return ""
+		}
+		return "OPERATOR GUIDANCE (sent while this pipeline was running — treat as direct instructions from the operator, taking precedence over earlier plan assumptions):\n- " +
+			strings.Join(parts, "\n- ")
+	}
 	runAgent := func(prompt string, stage string) error {
+		var result activities.AgentRunResult
 		err := workflow.ExecuteActivity(ctx, activities.RunJailedClaudeActivity, activities.AgentRunInput{
 			WorktreePath: worktree.WorktreePath,
 			Prompt:       prompt,
-		}).Get(ctx, nil)
+		}).Get(ctx, &result)
 		if err == nil {
-			logger.Info("Agent run completed", "Stage", stage)
+			logger.Info("Agent run completed", "Stage", stage,
+				"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
 		}
 		return err
 	}
-	review := func(focus, testLogs string) (activities.ReviewResult, error) {
+	review := func(focus, testLogs string, testsInScope bool) (activities.ReviewResult, error) {
 		var result activities.ReviewResult
 		err := workflow.ExecuteActivity(ctx, activities.RunJailedReviewerActivity, activities.ReviewInput{
 			WorktreePath: worktree.WorktreePath,
 			Focus:        focus,
 			TestLogs:     testLogs,
+			TestsInScope: testsInScope,
 		}).Get(ctx, &result)
 		return result, err
 	}
@@ -108,7 +137,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return "", fmt.Errorf("initial agent run: %w", err)
 	}
 	for {
-		verdict, err := review("the implementation", "")
+		verdict, err := review("the implementation", "", false)
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
 		}
@@ -120,6 +149,10 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		fixPrompt, err := template.ImplementFix(verdict.Comments)
 		if err != nil {
 			return "", fmt.Errorf("build implement-fix prompt: %w", err)
+		}
+		if g := drainGuidance(); g != "" {
+			logger.Info("Operator guidance received, folding into fix prompt")
+			fixPrompt = g + "\n\n" + fixPrompt
 		}
 		if err := runAgent(fixPrompt, "implement-fix"); err != nil {
 			return "", fmt.Errorf("agent run after code review: %w", err)
@@ -140,7 +173,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		if err := workflow.ExecuteActivity(ctx, activities.RunNativeTestsActivity, worktree.WorktreePath).Get(ctx, &result); err != nil {
 			return "", fmt.Errorf("run tests: %w", err)
 		}
-		verdict, err := review("the test suite", result.Logs)
+		verdict, err := review("the test suite", result.Logs, true)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
@@ -153,7 +186,12 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			logger.Info("Approved work committed", "Branch", preservedBranch)
 			return preservedBranch, nil
 		}
-		if err := runAgent(testFixPrompt(result, verdict), "tests-fix"); err != nil {
+		testFix := testFixPrompt(result, verdict)
+		if g := drainGuidance(); g != "" {
+			logger.Info("Operator guidance received, folding into fix prompt")
+			testFix = g + "\n\n" + testFix
+		}
+		if err := runAgent(testFix, "tests-fix"); err != nil {
 			return "", fmt.Errorf("test-fix agent run: %w", err)
 		}
 	}

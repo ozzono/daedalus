@@ -155,6 +155,32 @@ func TestWorktreePathForRejectsBadSegments(t *testing.T) {
 	}
 }
 
+// TestPreflightWorktreeRoot verifies the worker-startup probe creates the
+// worktree root and leaves no probe file behind.
+func TestPreflightWorktreeRoot(t *testing.T) {
+	home := fakeHome(t)
+
+	if err := PreflightWorktreeRoot("daedalus"); err != nil {
+		t.Fatalf("PreflightWorktreeRoot: %v", err)
+	}
+	root := filepath.Join(home, ".daedalus", "worktrees", "daedalus")
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		t.Errorf("worktree root %s missing after preflight (err=%v)", root, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".write-probe")); err == nil {
+		t.Errorf("probe file left behind in %s", root)
+	}
+}
+
+// TestPreflightWorktreeRootRejectsBadQueue mirrors the path-traversal guard
+// on task queue segments.
+func TestPreflightWorktreeRootRejectsBadQueue(t *testing.T) {
+	fakeHome(t)
+	if err := PreflightWorktreeRoot(".."); err == nil {
+		t.Error("task queue .. should be rejected")
+	}
+}
+
 func TestCreateWorktreeActivity(t *testing.T) {
 	home := fakeHome(t)
 	log := newStubLog(t)
@@ -291,22 +317,31 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-test")
 
 	worktree := t.TempDir()
-	if err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	result, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
 		WorktreePath: worktree,
 		Prompt:       "fix the bug",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+	// Plain (non stream-json) output falls back to the raw stdout.
+	if result.Text != "AGENT-OUTPUT\n" {
+		t.Errorf("result.Text = %q, want the raw fallback output", result.Text)
 	}
 
 	calls := readCalls(t, log)
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
-	// The prompt must travel via stdin, not argv.
+	// The prompt must travel via stdin, not argv; the agent runs with
+	// stream-json output so thinking and text come back structured.
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
 		"claude",
+		"--output-format",
+		"stream-json",
+		"--verbose",
 		"-p",
 		"--dangerously-skip-permissions",
 	}, "ai-jail")
@@ -334,7 +369,7 @@ func TestRunJailedClaudeActivityWithoutKey(t *testing.T) {
 	stubBin(t, "ai-jail", "exit 0")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 
-	if err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
 		WorktreePath: t.TempDir(),
 		Prompt:       "do things",
 	}); err != nil {
@@ -346,7 +381,7 @@ func TestRunJailedClaudeActivityFailure(t *testing.T) {
 	newStubLog(t)
 	stubBin(t, "ai-jail", "echo 'jail rejected' >&2; exit 1")
 
-	err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
 		WorktreePath: t.TempDir(),
 		Prompt:       "do things",
 	})
@@ -355,6 +390,48 @@ func TestRunJailedClaudeActivityFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "jail rejected") {
 		t.Errorf("error %q should contain stderr on failure", err)
+	}
+}
+
+// TestRunJailedClaudeActivityStreamJSON pins the stream-json path: thinking
+// and text blocks from assistant messages land in the activity result, other
+// stream lines are ignored.
+func TestRunJailedClaudeActivityStreamJSON(t *testing.T) {
+	newStubLog(t)
+	script := `printf '%s\n' ` +
+		`'{"type":"system","subtype":"init"}' ` +
+		`'{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"plan the change"}]}}' ` +
+		`'{"type":"assistant","message":{"content":[{"type":"text","text":"did the change"}]}}' ` +
+		`'{"type":"result","subtype":"success","result":"did the change"}'; exit 0`
+	stubBin(t, "ai-jail", script)
+
+	result, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "fix the bug",
+	})
+	if err != nil {
+		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+	if result.Thinking != "plan the change" {
+		t.Errorf("result.Thinking = %q, want %q", result.Thinking, "plan the change")
+	}
+	if result.Text != "did the change" {
+		t.Errorf("result.Text = %q, want %q", result.Text, "did the change")
+	}
+}
+
+// TestParseAgentStreamNoise pins tolerance: non-JSON lines and non-assistant
+// events are skipped rather than fatal.
+func TestParseAgentStreamNoise(t *testing.T) {
+	stdout := "not json at all\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta"}}` + "\n" +
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}` + "\n"
+	thinking, text := parseAgentStream(stdout)
+	if thinking != "" {
+		t.Errorf("thinking = %q, want empty", thinking)
+	}
+	if text != "ok" {
+		t.Errorf("text = %q, want %q", text, "ok")
 	}
 }
 

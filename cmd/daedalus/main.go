@@ -45,12 +45,28 @@ Usage:
       Start a Temporal worker hosting the pipelines.
       anthropic.key is optional — if unset, the jailed agent authenticates
       through the worker's inherited environment or its own login.
-  daedalus [-c config.yaml] [-w workflow] run <repo-path> <issue-id> "<prompt>"
+  daedalus [-c config.yaml] [-w workflow] run [-d] <repo-path> <issue-id> "<prompt>"
       Start a pipeline for an issue. -w selects the workflow
       (default: feature-dev; available: ` + workflowNames() + `).
       The "<prompt>" argument is the full task description; pass
       -f/--file <path> to read it from a file instead — either the
       argument or the file, never both.
+      -d/--detach starts the pipeline and returns immediately instead of
+      blocking until it finishes; "daedalus attach" reconnects later.
+  daedalus [-c config.yaml] run -a <workflow-id> "<prompt>"
+      Append instructions to a pipeline that is already running instead of
+      starting a new run: the prompt is folded into the agent's next fix
+      round (same as "daedalus guide"); -f/--file works here too.
+      -d has no effect in append mode.
+  daedalus [-c config.yaml] guide <workflow-id> "<message>"
+      Send operator guidance to a running pipeline: the message is folded
+      into the agent's next fix prompt, steering a stuck review loop
+      without restarting the run.
+  daedalus [-c config.yaml] attach <workflow-id>
+      Reattach to a running (or already finished) pipeline, block until it
+      finishes, and report the outcome — the other half of "run -d".
+      <workflow-id> is the identifier printed by "run" (also visible in
+      "temporal workflow list").
 
 Configuration is read from config.yaml (-c/--config to override the path);
 see config-example.yaml for all fields and their defaults:
@@ -92,17 +108,67 @@ func main() {
 				fmt.Fprintf(os.Stderr, "worker failed: %v\n", err)
 				os.Exit(1)
 			}
+		} else if configPath.appendID != "" {
+			// Append mode: no repo path or issue id — just a prompt (or
+			// -f file) for the pipeline that is already running.
+			var prompt string
+			switch {
+			case configPath.taskFile != "" && len(args) == 1:
+				data, err := os.ReadFile(configPath.taskFile)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "read task file: %v\n", err)
+					os.Exit(1)
+				}
+				prompt = string(data)
+			case configPath.taskFile == "" && len(args) == 2:
+				prompt = args[1]
+			default:
+				fmt.Fprintf(os.Stderr, "run -a/--append takes <workflow-id> \"<prompt>\" (or -f <file>)\n\n%s", usage)
+				os.Exit(1)
+			}
+			if err := guidePipeline(cfg, configPath.appendID, prompt); err != nil {
+				fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
+				os.Exit(1)
+			}
 		} else {
 			prompt, err := runPrompt(configPath.taskFile, args[1:])
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
 				os.Exit(1)
 			}
-			err = startPipeline(cfg, configPath.workflow, args[1], args[2], prompt)
+			err = startPipeline(cfg, configPath.workflow, args[1], args[2], prompt, configPath.detach)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
 				os.Exit(1)
 			}
+		}
+	case "guide":
+		if len(args) != 3 {
+			fmt.Fprintf(os.Stderr, "guide takes <workflow-id> \"<message>\"\n\n%s", usage)
+			os.Exit(1)
+		}
+		cfg, err := config.Load(configPath.configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := guidePipeline(cfg, args[1], args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "guide failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "attach":
+		if len(args) != 2 {
+			fmt.Fprintf(os.Stderr, "attach takes <workflow-id>\n\n%s", usage)
+			os.Exit(1)
+		}
+		cfg, err := config.Load(configPath.configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := attachPipeline(cfg, args[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "attach failed: %v\n", err)
+			os.Exit(1)
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n%s", args[0], usage)
@@ -116,6 +182,10 @@ type flags struct {
 	configPath string
 	workflow   string
 	taskFile   string
+	detach     bool
+	// appendID, set via -a/--append on `run`, targets an already-running
+	// pipeline instead of starting a new one.
+	appendID string
 }
 
 // parseFlags extracts -c/--config and -w/--workflow (which may appear
@@ -129,6 +199,8 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 			f.configPath = value
 		case "file":
 			f.taskFile = value
+		case "append":
+			f.appendID = value
 		case "workflow":
 			if _, ok := workflowRegistry[value]; !ok {
 				return fmt.Errorf("unknown workflow %q (available: %s)", value, workflowNames())
@@ -148,7 +220,7 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 		var name string
 		var value string
 		switch {
-		case a == "-c" || a == "--config" || a == "-w" || a == "--workflow" || a == "-f" || a == "--file":
+		case a == "-c" || a == "--config" || a == "-w" || a == "--workflow" || a == "-f" || a == "--file" || a == "-a" || a == "--append":
 			if i+1 >= len(args) {
 				return f, nil, fmt.Errorf("%s requires a value", a)
 			}
@@ -158,6 +230,8 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 				name = "config"
 			case "-f", "--file":
 				name = "file"
+			case "-a", "--append":
+				name = "append"
 			default:
 				name = "workflow"
 			}
@@ -166,6 +240,11 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 			name, value = "config", strings.TrimPrefix(a, "--config=")
 		case strings.HasPrefix(a, "--file="):
 			name, value = "file", strings.TrimPrefix(a, "--file=")
+		case strings.HasPrefix(a, "--append="):
+			name, value = "append", strings.TrimPrefix(a, "--append=")
+		case a == "-d" || a == "--detach":
+			f.detach = true
+			continue
 		case strings.HasPrefix(a, "--workflow="):
 			name, value = "workflow", strings.TrimPrefix(a, "--workflow=")
 		default:
@@ -236,6 +315,10 @@ func runWorker(cfg config.Config) error {
 		}
 	}
 
+	if err := activities.PreflightWorktreeRoot(cfg.Temporal.TaskQueue); err != nil {
+		return fmt.Errorf("worktree preflight: %w", err)
+	}
+
 	c, err := newClient(cfg)
 	if err != nil {
 		return err
@@ -259,8 +342,9 @@ func runWorker(cfg config.Config) error {
 }
 
 // startPipeline triggers the named workflow for the given issue on the
-// configured task queue.
-func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt string) error {
+// configured task queue. Unless detach is set, it then blocks until the
+// pipeline finishes.
+func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt string, detach bool) error {
 	workflowFn, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
@@ -298,6 +382,56 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 	fmt.Printf("  Workflow ID: %s\n", run.GetID())
 	fmt.Printf("  Run ID:      %s\n", run.GetRunID())
 
+	if detach {
+		fmt.Printf("Detached — reattach with: daedalus attach %s\n", run.GetID())
+		return nil
+	}
+	return awaitPipeline(run)
+}
+
+// guidePipeline sends operator guidance to a running pipeline: the message
+// travels as a "guide" signal and is folded into the pipeline's next agent
+// fix prompt. The empty run ID addresses the latest execution.
+func guidePipeline(cfg config.Config, workflowID, message string) error {
+	c, err := newClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if err := c.SignalWorkflow(context.Background(), workflowID, "", "guide", message); err != nil {
+		return fmt.Errorf("signal workflow %s: %w", workflowID, err)
+	}
+	fmt.Printf("Guidance sent to %s — it lands in the next agent round.\n", workflowID)
+	return nil
+}
+
+// attachPipeline reconnects to an already-started pipeline and blocks until
+// it finishes — the other half of `run -d`. The empty run ID makes Temporal
+// resolve the latest execution of the workflow ID, so reattaching after a
+// finished or failed run reports that run's outcome.
+func attachPipeline(cfg config.Config, workflowID string) error {
+	c, err := newClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	resp, err := c.DescribeWorkflowExecution(context.Background(), workflowID, "")
+	if err != nil {
+		return fmt.Errorf("workflow %s: %w", workflowID, err)
+	}
+	exec := resp.GetWorkflowExecutionInfo().GetExecution()
+	fmt.Printf("Attaching to workflow %s (run %s, %s)\n",
+		workflowID, exec.GetRunId(), resp.GetWorkflowExecutionInfo().GetStatus())
+
+	return awaitPipeline(c.GetWorkflow(context.Background(), workflowID, exec.GetRunId()))
+}
+
+// awaitPipeline blocks until the run finishes (bounded by runWaitTimeout) and
+// reports the outcome: the preserved branch on success, the execution error
+// otherwise.
+func awaitPipeline(run client.WorkflowRun) error {
 	waitCtx, cancel := context.WithTimeout(context.Background(), runWaitTimeout)
 	defer cancel()
 	var preservedBranch string

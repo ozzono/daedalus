@@ -53,8 +53,8 @@ func (r *agentRecorder) record() {
 				}
 			}
 		}).
-		Return(func(ctx context.Context, in activities.AgentRunInput) error {
-			return r.stubErr
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			return activities.AgentRunResult{Text: "stub agent output"}, r.stubErr
 		})
 }
 
@@ -174,6 +174,71 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	}
 	if cleanupCount != 1 {
 		t.Errorf("cleanup ran %d times, want 1", cleanupCount)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowGuidanceSignal pins the guide path: a "guide" signal
+// sent mid-run is folded into the next agent fix prompt, ahead of the review
+// comments.
+func TestFeatureDevWorkflowGuidanceSignal(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	// Code review rejects once — the operator steers mid-run right then —
+	// and approves on the second look; test review approves.
+	var reviewCalls int
+	var revInputs []activities.ReviewInput
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			reviewCalls++
+			for _, a := range args {
+				if in, ok := a.(activities.ReviewInput); ok {
+					revInputs = append(revInputs, in)
+				}
+			}
+			if reviewCalls == 1 {
+				// Mid-run guidance: buffered by the workflow's signal
+				// channel until the next fix prompt drains it.
+				env.SignalWorkflow("guide", "write the missing tests first")
+			}
+		}).
+		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			if reviewCalls == 1 {
+				return activities.ReviewResult{Approved: false, Comments: "rename foo to bar"}, nil
+			}
+			return activities.ReviewResult{Approved: true}, nil
+		})
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-2", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement, review-fix, tests)", len(rec.inputs))
+	}
+	fixPrompt := rec.inputs[1].Prompt
+	if !strings.Contains(fixPrompt, "OPERATOR GUIDANCE") ||
+		!strings.Contains(fixPrompt, "write the missing tests first") {
+		t.Errorf("fix prompt lacks guidance: %q", fixPrompt)
+	}
+	if !strings.Contains(fixPrompt, "rename foo to bar") {
+		t.Errorf("fix prompt lacks review comments: %q", fixPrompt)
+	}
+	// Guidance must not leak into rounds it was not sent for.
+	if strings.Contains(rec.inputs[2].Prompt, "OPERATOR GUIDANCE") {
+		t.Errorf("guidance leaked into the tests prompt: %q", rec.inputs[2].Prompt)
 	}
 	env.AssertExpectations(t)
 }
@@ -322,7 +387,7 @@ func TestFeatureDevWorkflowCreateFailure(t *testing.T) {
 	var agentCalls int
 	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { agentCalls++ }).
-		Return("", nil).Maybe()
+		Return(activities.AgentRunResult{}, nil).Maybe()
 	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
 		Return(activities.ReviewResult{}, nil).Maybe()
 
@@ -389,7 +454,7 @@ func TestFeatureDevWorkflowCleanupOnCancellation(t *testing.T) {
 	// The workflow exits at the create step once cancelled, so the agent and
 	// reviewer may never run — their mocks must not require calls.
 	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
-		Return("", nil).Maybe()
+		Return(activities.AgentRunResult{}, nil).Maybe()
 	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
 		Return(activities.ReviewResult{}, nil).Maybe()
 

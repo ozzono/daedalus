@@ -74,7 +74,13 @@ func TestsFix(testLogs, comments string) (string, error) {
 // the end of the template is the contract parseReviewVerdict in
 // internal/activities relies on: the reviewer's final non-empty line must be
 // exactly APPROVED or CHANGES_REQUESTED. testLogs is optional; when empty the
-// test-output section is left out entirely.
-func Review(focus, diff, testLogs string) (string, error) {
-	return render("review", struct{ Focus, Diff, TestLogs string }{focus, diff, testLogs})
+// test-output section is left out entirely. testsInScope switches the
+// template's phase: the code reviewer (phase 1) is told test coverage is out
+// of scope — tests get their own reviewed phase — while the test reviewer
+// (phase 2) judges the suite itself.
+func Review(focus, diff, testLogs string, testsInScope bool) (string, error) {
+	return render("review", struct {
+		Focus, Diff, TestLogs string
+		TestsInScope          bool
+	}{focus, diff, testLogs, testsInScope})
 }

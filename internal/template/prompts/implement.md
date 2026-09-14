@@ -1,6 +1,6 @@
 {{.Task}}
 
-Implement the change. Do not write or modify tests yet — the test suite is handled in a separate phase.
+Implement the change. Do not write, modify, or delete test code — the test suite is handled in a separate phase; leave every existing test file untouched.
 
 Work style — the laziest solution that actually works:
 

@@ -6,6 +6,7 @@ package activities
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -48,6 +49,19 @@ type AgentRunInput struct {
 	Prompt       string
 }
 
+// maxAgentOutput bounds the agent text and chain-of-thought each carried in
+// the activity result (see maxTestLogs for why results stay small). The
+// worker log still records the full untruncated stream.
+const maxAgentOutput = 16 * 1024
+
+// AgentRunResult carries the agent's visible text and chain of thought into
+// Temporal history, tail-bounded, so the UI and `temporal workflow show`
+// expose both per round without reading worker logs.
+type AgentRunResult struct {
+	Text     string
+	Thinking string
+}
+
 // TestResult reports the outcome of a native test run. A failing suite is
 // reported via Passed=false (not a system error) so the workflow can feed the
 // logs back to the agent. Logs are tail-truncated (see maxTestLogs) because
@@ -65,6 +79,10 @@ type ReviewInput struct {
 	WorktreePath string
 	Focus        string
 	TestLogs     string
+	// TestsInScope tells the reviewer prompt whether tests are part of
+	// this review: false in phase 1 (code review — coverage is a later
+	// phase's concern), true in phase 2 (the test-suite review).
+	TestsInScope bool
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -91,17 +109,47 @@ const maxTestLogs = 16 * 1024
 // worker never collide: ~/.daedalus/worktrees/<taskQueue>/issue-<IssueID>.
 // Both segments are validated — they become filesystem path components.
 func WorktreePathFor(taskQueue, issueID string) (string, error) {
-	if err := validatePathSegment(taskQueue); err != nil {
-		return "", fmt.Errorf("task queue: %w", err)
+	root, err := worktreeRootFor(taskQueue)
+	if err != nil {
+		return "", err
 	}
 	if err := validatePathSegment(issueID); err != nil {
 		return "", fmt.Errorf("issue id: %w", err)
+	}
+	return filepath.Join(root, "issue-"+issueID), nil
+}
+
+// worktreeRootFor returns this task queue's worktree root,
+// ~/.daedalus/worktrees/<taskQueue>.
+func worktreeRootFor(taskQueue string) (string, error) {
+	if err := validatePathSegment(taskQueue); err != nil {
+		return "", fmt.Errorf("task queue: %w", err)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
-	return filepath.Join(home, ".daedalus", "worktrees", taskQueue, "issue-"+issueID), nil
+	return filepath.Join(home, ".daedalus", "worktrees", taskQueue), nil
+}
+
+// PreflightWorktreeRoot verifies up front that this process can create and
+// write worktrees under the task queue's root. A worker without that access
+// still starts and polls — then fails every pipeline it picks up inside
+// CreateWorktreeActivity with an opaque git error, so the check belongs at
+// worker startup, not per activity.
+func PreflightWorktreeRoot(taskQueue string) error {
+	root, err := worktreeRootFor(taskQueue)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return fmt.Errorf("create worktree root %s: %w", root, err)
+	}
+	probe := filepath.Join(root, ".write-probe")
+	if err := os.WriteFile(probe, nil, 0o644); err != nil {
+		return fmt.Errorf("worktree root %s is not writable: %w", root, err)
+	}
+	return os.Remove(probe)
 }
 
 // validatePathSegment rejects values that would escape the worktree root
@@ -210,17 +258,15 @@ type jailResult struct {
 }
 
 // runJailed runs one autonomous Claude Code invocation inside an ai-jail
-// sandbox rooted at the worktree. The prompt travels via stdin, not argv:
-// argv is visible in `ps` and per-argument size limits would make large
-// review prompts (which embed the full diff) fail the run.
-func runJailed(ctx context.Context, worktreePath, prompt string) (jailResult, error) {
-	cmd := exec.CommandContext(ctx, "ai-jail",
-		"--worktree",
-		"--network",
-		"claude",
-		"-p",
-		"--dangerously-skip-permissions",
-	)
+// sandbox rooted at the worktree. agentArgs are appended to claude's fixed
+// argument set before -p. The prompt travels via stdin, not argv: argv is
+// visible in `ps` and per-argument size limits would make large review
+// prompts (which embed the full diff) fail the run.
+func runJailed(ctx context.Context, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
+	args := []string{"--worktree", "--network", "claude"}
+	args = append(args, agentArgs...)
+	args = append(args, "-p", "--dangerously-skip-permissions")
+	cmd := exec.CommandContext(ctx, "ai-jail", args...)
 	cmd.Dir = worktreePath
 	// os.Environ() carries the provider settings the worker exported from
 	// config.yaml or inherited; pass them through as-is.
@@ -252,19 +298,67 @@ func activityLogger(ctx context.Context) (l log.Logger) {
 }
 
 // RunJailedClaudeActivity runs Claude Code inside an ai-jail sandbox rooted at
-// the worktree. The agent's output goes to the worker log, not the activity
-// result — results are serialized into Temporal history.
-func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) error {
-	res, err := runJailed(ctx, input.WorktreePath, input.Prompt)
+// the worktree. The agent runs with stream-json output so its chain of
+// thought and visible text come back as structured messages; both are
+// returned tail-bounded in the activity result (serialized into Temporal
+// history, visible in the UI per round), while the worker log keeps the full
+// untruncated stream.
+func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
+	res, err := runJailed(ctx, input.WorktreePath, input.Prompt,
+		"--output-format", "stream-json", "--verbose")
 	if err != nil {
-		return err
+		return AgentRunResult{}, err
+	}
+	thinking, text := parseAgentStream(res.Stdout)
+	if text == "" {
+		// Not stream-json (a CLI without the flag, or a parse miss): keep
+		// whatever the agent did print rather than an empty result.
+		text = res.Stdout
 	}
 	logger := activityLogger(ctx)
 	logger.Info("Agent run completed", "Stdout", res.Stdout)
 	if res.Stderr != "" {
 		logger.Info("Agent run stderr", "Stderr", res.Stderr)
 	}
-	return nil
+	return AgentRunResult{
+		Text:     truncateTail(text, maxAgentOutput),
+		Thinking: truncateTail(thinking, maxAgentOutput),
+	}, nil
+}
+
+// streamMessage is one line of claude --output-format stream-json output:
+// assistant messages carry the content blocks (thinking, text); other lines
+// (system, stream_event, result) are not needed here.
+type streamMessage struct {
+	Type    string `json:"type"`
+	Message struct {
+		Content []struct {
+			Type     string `json:"type"`
+			Thinking string `json:"thinking"`
+			Text     string `json:"text"`
+		} `json:"content"`
+	} `json:"message"`
+}
+
+// parseAgentStream extracts the agent's chain of thought and visible text
+// from stream-json output. Non-JSON or uninteresting lines are skipped —
+// the stream also carries system/init and delta events.
+func parseAgentStream(stdout string) (thinking, text string) {
+	for line := range strings.SplitSeq(stdout, "\n") {
+		var m streamMessage
+		if json.Unmarshal([]byte(line), &m) != nil || m.Type != "assistant" {
+			continue
+		}
+		for _, block := range m.Message.Content {
+			switch block.Type {
+			case "thinking":
+				thinking += block.Thinking
+			case "text":
+				text += block.Text
+			}
+		}
+	}
+	return thinking, text
 }
 
 // RunJailedReviewerActivity has a jailed reviewer agent review the current
@@ -277,7 +371,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	prompt, err := template.Review(input.Focus, diff, input.TestLogs)
+	prompt, err := template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -361,14 +455,20 @@ func parseReviewVerdict(out string) ReviewResult {
 // truncateLogs bounds the logs carried in the activity result, keeping the
 // tail (where test failures usually are) and a truncation marker.
 func truncateLogs(logs string) string {
-	if len(logs) <= maxTestLogs {
-		return logs
+	return truncateTail(logs, maxTestLogs)
+}
+
+// truncateTail bounds s to its last max bytes (keeping whole UTF-8 runes)
+// with a truncation marker.
+func truncateTail(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	cut := len(logs) - maxTestLogs
-	for cut < len(logs) && !utf8.RuneStart(logs[cut]) {
+	cut := len(s) - max
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
 		cut++
 	}
-	return "[... earlier output truncated ...]\n" + logs[cut:]
+	return "[... earlier output truncated ...]\n" + s[cut:]
 }
 
 // RunNativeTestsActivity runs the repository's own Go test suite inside the

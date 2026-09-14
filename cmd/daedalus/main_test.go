@@ -3,9 +3,68 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+// TestParseFlagsDetach covers both spellings and that -d never consumes a
+// positional argument.
+func TestParseFlagsDetach(t *testing.T) {
+	for _, flag := range []string{"-d", "--detach"} {
+		f, rest, err := parseFlags([]string{"run", flag, "/repo", "42", "do it"})
+		if err != nil {
+			t.Fatalf("parseFlags(%q): %v", flag, err)
+		}
+		if !f.detach {
+			t.Errorf("parseFlags(%q) detach = false, want true", flag)
+		}
+		wantRest := []string{"run", "/repo", "42", "do it"}
+		if !reflect.DeepEqual(rest, wantRest) {
+			t.Errorf("parseFlags(%q) rest = %v, want %v", flag, rest, wantRest)
+		}
+	}
+
+	f, rest, err := parseFlags([]string{"run", "/repo", "42", "do it"})
+	if err != nil {
+		t.Fatalf("parseFlags(no -d): %v", err)
+	}
+	if f.detach {
+		t.Error("detach should default to false")
+	}
+	if len(rest) != 4 {
+		t.Errorf("parseFlags(no -d) rest = %v", rest)
+	}
+}
+
+// TestParseFlagsAppend covers both spellings and that -a consumes exactly
+// one value while the prompt stays positional.
+func TestParseFlagsAppend(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"run", "-a", "daedalus-issue-0", "steer it"}, "daedalus-issue-0"},
+		{[]string{"run", "--append", "daedalus-issue-0", "steer it"}, "daedalus-issue-0"},
+		{[]string{"run", "--append=daedalus-issue-1", "steer it"}, "daedalus-issue-1"},
+	} {
+		f, rest, err := parseFlags(c.args)
+		if err != nil {
+			t.Fatalf("parseFlags(%q): %v", c.args, err)
+		}
+		if f.appendID != c.want {
+			t.Errorf("parseFlags(%q) appendID = %q, want %q", c.args, f.appendID, c.want)
+		}
+		wantRest := []string{"run", "steer it"}
+		if !reflect.DeepEqual(rest, wantRest) {
+			t.Errorf("parseFlags(%q) rest = %v, want %v", c.args, rest, wantRest)
+		}
+	}
+
+	if _, _, err := parseFlags([]string{"run", "-a"}); err == nil {
+		t.Error("-a without a value should error")
+	}
+}
 
 func TestRunPrompt(t *testing.T) {
 	dir := t.TempDir()
