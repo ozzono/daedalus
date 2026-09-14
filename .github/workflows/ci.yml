@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    # labeled/unlabeled so the release-label check re-runs when labels change
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # First, blocking check: a PR must carry exactly one release label
+  # (patch/minor/major) before it can be approved or merged. Add "CI /
+  # release-label" as a required status check in branch protection (dragged
+  # to the top of the list) to enforce it on approval and merge.
+  release-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a release label (patch/minor/major)
+        # no-op on master pushes: the step is skipped and the job succeeds,
+        # so the downstream needs chain is not broken
+        if: github.event_name == 'pull_request'
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          matches=$(printf '%s' "$LABELS" | jq -r '.[] | select(. == "patch" or . == "minor" or . == "major")')
+          count=$(printf '%s' "$matches" | grep -c . || true)
+          case "$count" in
+            1) echo "release label: $matches" ;;
+            0) echo "no release label on this PR — add exactly one of: patch, minor, major" >&2; exit 1 ;;
+            *) echo "multiple release labels on this PR — keep exactly one of: patch, minor, major" >&2; exit 1 ;;
+          esac
+
+  test:
+    needs: release-label
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.coverage.outputs.pct }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: Measure coverage
+        id: coverage
+        run: |
+          pct=$(go tool cover -func=coverage.out | awk '$1 == "total:" { sub(/%$/, "", $3); print $3 }')
+          [[ -n "$pct" ]] || { echo "no total: line in coverage output" >&2; exit 1; }
+          echo "total coverage: $pct%"
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+
+  # After master is green: tag the tested code with the current version, bump
+  # the version file, push, and refresh the coverage badge. The bot's push uses
+  # GITHUB_TOKEN, which never triggers workflows, so the loop does not feed
+  # itself; the actor check below is redundancy on top of that.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Tag release and bump version
+        env:
+          VERSION_FILE: internal/version/VERSION
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          v=$(cat "$VERSION_FILE")
+          # Reject leading zeros: the arithmetic below reads an octal "08" as an error.
+          [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "invalid version in $VERSION_FILE: '$v' (expected X.Y.Z)" >&2
+            exit 1
+          }
+          git tag "v$v" 2>/dev/null || echo "tag v$v already exists — tagging skipped"
+
+          IFS='.' read -r major minor patch <<<"$v"
+          next="$major.$minor.$((patch + 1))"
+          echo "$next" > "$VERSION_FILE"
+          git add "$VERSION_FILE"
+          git commit -m "release: tag v$v, bump version to $next"
+
+          # checkout is the event SHA, not the branch tip: if a merge landed
+          # mid-run (or this is a re-run), the push is rejected as non-FF.
+          # Reconcile with the new tip instead of failing the run.
+          if ! git push origin master "refs/tags/v$v"; then
+            echo "master moved since checkout — reconciling with the new tip"
+            git fetch origin
+            tip=$(git show "origin/master:$VERSION_FILE")
+            if [[ "$tip" == "$next" ]]; then
+              # A concurrent run already landed this bump; our commit is
+              # redundant. Its tag may be on the remote too — possibly at a
+              # different SHA — and re-pushing it would be rejected, so only
+              # push if it is missing.
+              if git ls-remote --exit-code --tags origin "refs/tags/v$v" >/dev/null; then
+                echo "tag v$v already on remote — tag push skipped"
+              else
+                git push origin "refs/tags/v$v"
+              fi
+            else
+              git rebase origin/master
+              git push origin master "refs/tags/v$v"
+            fi
+          fi
+      - name: Update coverage badge
+        env:
+          COVERAGE: ${{ needs.test.outputs.coverage }}
+        run: |
+          set -euo pipefail
+          [[ -n "$COVERAGE" ]] || { echo "coverage output from the test job is empty" >&2; exit 1; }
+          git fetch origin badges 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/badges; then
+            git checkout -B badges origin/badges
+          else
+            git checkout --orphan badges
+          fi
+          git rm -rq --ignore-unmatch .
+
+          color=$(awk -v p="$COVERAGE" 'BEGIN { print (p >= 80) ? "brightgreen" : (p >= 60) ? "yellow" : "red" }')
+          mkdir badges
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$COVERAGE" "$color" > badges/coverage.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add badges
+          if git diff --cached --quiet; then
+            echo "coverage unchanged — badge not updated"
+          else
+            git commit -m "coverage: $COVERAGE%"
+            # The badge is fully generated, so losing a race with a concurrent
+            # master merge is fine — take the branch rather than fail the run.
+            git push --force-with-lease origin badges
+          fi

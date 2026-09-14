@@ -24,6 +24,7 @@ import (
 
 	"daedalus/internal/activities"
 	"daedalus/internal/config"
+	"daedalus/internal/version"
 	"daedalus/internal/workflows"
 )
 
@@ -48,6 +49,7 @@ var workflowRegistry = map[string]any{
 var usage = `Daedalus — a local, sandboxed AI developer agent control plane.
 
 Usage:
+  daedalus -v, --version        Print the version and exit.
   daedalus init
       Write config-example.yaml in the current directory: every field with
       its default value, fully commented. Copy it to config.yaml and edit.
@@ -124,6 +126,8 @@ func main() {
 	switch args[0] {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
+	case "-v", "--version":
+		fmt.Println(version.String())
 	case "init":
 		if err := writeExampleConfig("."); err != nil {
 			fmt.Fprintf(os.Stderr, "init failed: %v\n", err)
