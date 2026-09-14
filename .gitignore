@@ -1,0 +1,8 @@
+bin/
+
+.ai-jail
+config.yaml
+.mirror/
+.gocache/
+.gomodcache/
+backlog/

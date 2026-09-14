@@ -1,0 +1,405 @@
+// Package activities implements the Temporal activities that make up a
+// Daedalus pipeline: worktree lifecycle, jailed agent and reviewer runs, and
+// tests.
+package activities
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"syscall"
+	"unicode/utf8"
+
+	"daedalus/internal/template"
+
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/log"
+)
+
+// Provider settings (API keys, base URLs, models) reach the jailed agent
+// through the worker's environment, exported from config.yaml at startup
+// when set there — never through workflow history or activity inputs (both
+// would persist them in Temporal events). Nothing here requires them: an
+// unset setting simply falls back to whatever the worker inherited.
+
+// WorktreeInput identifies the repository and the per-issue worktree to operate on.
+type WorktreeInput struct {
+	RepoPath   string
+	TaskQueue  string
+	IssueID    string
+	BranchName string
+}
+
+// WorktreeOutput reports the location of a created worktree.
+type WorktreeOutput struct {
+	WorktreePath string
+}
+
+// AgentRunInput describes a single jailed Claude Code invocation.
+type AgentRunInput struct {
+	WorktreePath string
+	Prompt       string
+}
+
+// TestResult reports the outcome of a native test run. A failing suite is
+// reported via Passed=false (not a system error) so the workflow can feed the
+// logs back to the agent. Logs are tail-truncated (see maxTestLogs) because
+// activity results are serialized into Temporal history.
+type TestResult struct {
+	Passed bool
+	Logs   string
+}
+
+// ReviewInput describes a review request for the current state of the
+// worktree. Focus says what is being reviewed (e.g. "the implementation",
+// "the test suite"); TestLogs optionally carries the latest test output for
+// the reviewer to consider.
+type ReviewInput struct {
+	WorktreePath string
+	Focus        string
+	TestLogs     string
+}
+
+// ReviewResult is a reviewer verdict. Comments holds everything the reviewer
+// wrote above its verdict line, to be fed back to the implementing agent.
+type ReviewResult struct {
+	Approved bool
+	Comments string
+}
+
+// Branch name prefixes: feat/ marks in-flight runs (always cleaned up, along
+// with any stale feat/ branches from crashed runs); daedalus/ marks approved
+// work committed by FinalizeWorktreeActivity, which is preserved.
+const (
+	inFlightPrefix  = "feat/"
+	preservedPrefix = "daedalus/"
+)
+
+// maxTestLogs bounds the test output carried in the activity result (and
+// hence Temporal history). The tail is kept — it usually holds the failures.
+const maxTestLogs = 16 * 1024
+
+// WorktreePathFor returns the path for a given issue's worktree, scoped by
+// task queue so pipelines from different projects or flows sharing one
+// worker never collide: ~/.daedalus/worktrees/<taskQueue>/issue-<IssueID>.
+// Both segments are validated — they become filesystem path components.
+func WorktreePathFor(taskQueue, issueID string) (string, error) {
+	if err := validatePathSegment(taskQueue); err != nil {
+		return "", fmt.Errorf("task queue: %w", err)
+	}
+	if err := validatePathSegment(issueID); err != nil {
+		return "", fmt.Errorf("issue id: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".daedalus", "worktrees", taskQueue, "issue-"+issueID), nil
+}
+
+// validatePathSegment rejects values that would escape the worktree root
+// when joined into a path.
+func validatePathSegment(s string) error {
+	if s == "" || s == "." || s == ".." || strings.ContainsAny(s, `/\`) {
+		return fmt.Errorf("%q is not a valid path segment", s)
+	}
+	return nil
+}
+
+// runGit runs a git command and returns its combined output, wrapping any
+// failure with the command line and output for diagnostics.
+func runGit(ctx context.Context, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
+	}
+	return string(out), nil
+}
+
+// setProcessGroup puts the subprocess in its own process group and arranges
+// for the whole group to be SIGKILLed on context cancellation, so a timeout
+// cannot orphan the subprocess's children.
+func setProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+}
+
+// cleanWorktree removes all traces of a worktree from the repository: the
+// worktree itself (registered or not), its git admin metadata, the run's
+// in-flight branch, stale in-flight branches from crashed runs of the same
+// issue, and any leftover directory. It is tolerant by design — remove and
+// branch failures such as "not a working tree" or "branch not found" are
+// ignored, because a partially-failed previous run must not poison the next
+// one — while prune failures and an undeletable directory are surfaced as
+// errors. Preserved daedalus/ branches are never touched.
+func cleanWorktree(ctx context.Context, repoPath, worktreePath, branchName, issueID string) error {
+	// Best-effort: fall through to prune and the RemoveAll fallback below.
+	_, _ = runGit(ctx, "-C", repoPath, "worktree", "remove", worktreePath, "--force")
+
+	if out, err := runGit(ctx, "-C", repoPath, "worktree", "prune"); err != nil {
+		return fmt.Errorf("git worktree prune: %w: %s", err, out)
+	}
+
+	if branchName != "" {
+		_, _ = runGit(ctx, "-C", repoPath, "branch", "-D", branchName)
+	}
+	deleteStaleBranches(ctx, repoPath, issueID)
+
+	if _, err := os.Stat(worktreePath); err == nil {
+		if err := os.RemoveAll(worktreePath); err != nil {
+			return fmt.Errorf("remove stale worktree %s: %w", worktreePath, err)
+		}
+	}
+	return nil
+}
+
+// deleteStaleBranches sweeps leftover in-flight (feat/) branches of this
+// issue from runs that crashed before cleanup. Best-effort: on a listing
+// failure, cleanup still proceeds.
+func deleteStaleBranches(ctx context.Context, repoPath, issueID string) {
+	if issueID == "" {
+		return
+	}
+	pattern := inFlightPrefix + "issue-" + issueID + "-*"
+	out, err := runGit(ctx, "-C", repoPath, "branch", "--list", pattern, "--format=%(refname:short)")
+	if err != nil {
+		return
+	}
+	for name := range strings.FieldsSeq(out) {
+		_, _ = runGit(ctx, "-C", repoPath, "branch", "-D", name)
+	}
+}
+
+// CreateWorktreeActivity creates a fresh git worktree for the issue on a new
+// branch, healing any state left behind by a failed previous run first.
+func CreateWorktreeActivity(ctx context.Context, input WorktreeInput) (WorktreeOutput, error) {
+	worktreePath, err := WorktreePathFor(input.TaskQueue, input.IssueID)
+	if err != nil {
+		return WorktreeOutput{}, err
+	}
+
+	if err := cleanWorktree(ctx, input.RepoPath, worktreePath, input.BranchName, input.IssueID); err != nil {
+		return WorktreeOutput{}, fmt.Errorf("clean stale worktree state: %w", err)
+	}
+
+	if out, err := runGit(ctx, "-C", input.RepoPath, "worktree", "add", worktreePath, "-b", input.BranchName); err != nil {
+		return WorktreeOutput{}, fmt.Errorf("git worktree add %s: %w: %s", worktreePath, err, out)
+	}
+
+	return WorktreeOutput{WorktreePath: worktreePath}, nil
+}
+
+// jailResult captures the jailed process's output streams separately: the
+// verdict parser must see stdout only, so trailing stderr noise cannot flip
+// a verdict, while stderr stays available for error reporting.
+type jailResult struct {
+	Stdout string
+	Stderr string
+}
+
+// runJailed runs one autonomous Claude Code invocation inside an ai-jail
+// sandbox rooted at the worktree. The prompt travels via stdin, not argv:
+// argv is visible in `ps` and per-argument size limits would make large
+// review prompts (which embed the full diff) fail the run.
+func runJailed(ctx context.Context, worktreePath, prompt string) (jailResult, error) {
+	cmd := exec.CommandContext(ctx, "ai-jail",
+		"--worktree",
+		"--network",
+		"claude",
+		"-p",
+		"--dangerously-skip-permissions",
+	)
+	cmd.Dir = worktreePath
+	// os.Environ() carries the provider settings the worker exported from
+	// config.yaml or inherited; pass them through as-is.
+	cmd.Env = os.Environ()
+	cmd.Stdin = strings.NewReader(prompt)
+	setProcessGroup(cmd)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	res := jailResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	if err != nil {
+		return res, fmt.Errorf("ai-jail claude run: %w: %s", err, res.Stdout+res.Stderr)
+	}
+	return res, nil
+}
+
+// activityLogger returns the activity-scoped logger, falling back to a
+// discard logger outside a real activity context (unit tests invoke
+// activities directly; the SDK panics in that case by design).
+func activityLogger(ctx context.Context) (l log.Logger) {
+	l = log.NewStructuredLogger(slog.New(slog.DiscardHandler))
+	defer func() { recover() }()
+	if al := activity.GetLogger(ctx); al != nil {
+		l = al
+	}
+	return l
+}
+
+// RunJailedClaudeActivity runs Claude Code inside an ai-jail sandbox rooted at
+// the worktree. The agent's output goes to the worker log, not the activity
+// result — results are serialized into Temporal history.
+func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) error {
+	res, err := runJailed(ctx, input.WorktreePath, input.Prompt)
+	if err != nil {
+		return err
+	}
+	logger := activityLogger(ctx)
+	logger.Info("Agent run completed", "Stdout", res.Stdout)
+	if res.Stderr != "" {
+		logger.Info("Agent run stderr", "Stderr", res.Stderr)
+	}
+	return nil
+}
+
+// RunJailedReviewerActivity has a jailed reviewer agent review the current
+// state of the worktree and return a machine-readable verdict. The diff (and,
+// when provided, the latest test output) is collected inside the activity, so
+// large payloads stay out of workflow history; only the verdict travels on.
+// The verdict is parsed from stdout alone.
+func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewResult, error) {
+	diff, err := stagedDiff(ctx, input.WorktreePath)
+	if err != nil {
+		return ReviewResult{}, err
+	}
+	prompt, err := template.Review(input.Focus, diff, input.TestLogs)
+	if err != nil {
+		return ReviewResult{}, err
+	}
+	res, err := runJailed(ctx, input.WorktreePath, prompt)
+	if err != nil {
+		return ReviewResult{}, fmt.Errorf("review run: %w", err)
+	}
+	if res.Stderr != "" {
+		activityLogger(ctx).Info("Reviewer stderr", "Stderr", res.Stderr)
+	}
+	return parseReviewVerdict(res.Stdout), nil
+}
+
+// stagedDiff returns the full diff of the worktree against HEAD, including
+// new files, without leaving the tree staged: intent-to-add (-N) makes new
+// files visible to `git diff` while the index stays effectively untouched,
+// so the next agent round sees normal `git diff`/`git status` output.
+func stagedDiff(ctx context.Context, worktreePath string) (string, error) {
+	if _, err := runGit(ctx, "-C", worktreePath, "add", "-N", "-A"); err != nil {
+		return "", fmt.Errorf("stage intent-to-add: %w", err)
+	}
+	out, err := runGit(ctx, "-C", worktreePath, "diff")
+	if err != nil {
+		return "", fmt.Errorf("collect diff: %w", err)
+	}
+	return out, nil
+}
+
+// FinalizeWorktreeActivity commits the approved work and renames the run's
+// branch from the in-flight feat/ prefix to the preserved daedalus/ prefix,
+// so the deliverable survives cleanup. The workflow returns the preserved
+// branch name to the caller. A run whose approved change produced no diff
+// fails here — an approval of nothing is an anomaly, not a deliverable.
+func FinalizeWorktreeActivity(ctx context.Context, input WorktreeInput) (string, error) {
+	worktreePath, err := WorktreePathFor(input.TaskQueue, input.IssueID)
+	if err != nil {
+		return "", err
+	}
+	if _, err := runGit(ctx, "-C", worktreePath, "add", "-A"); err != nil {
+		return "", fmt.Errorf("stage approved work: %w", err)
+	}
+	msg := fmt.Sprintf("daedalus: issue %s", input.IssueID)
+	if _, err := runGit(ctx, "-C", worktreePath,
+		"-c", "user.name=daedalus", "-c", "user.email=daedalus@local",
+		"commit", "-m", msg); err != nil {
+		return "", fmt.Errorf("commit approved work: %w", err)
+	}
+	if !strings.HasPrefix(input.BranchName, inFlightPrefix) {
+		return "", fmt.Errorf("unexpected branch name %q: expected %s prefix", input.BranchName, inFlightPrefix)
+	}
+	preserved := preservedPrefix + strings.TrimPrefix(input.BranchName, inFlightPrefix)
+	if _, err := runGit(ctx, "-C", worktreePath, "branch", "-m", preserved); err != nil {
+		return "", fmt.Errorf("rename branch to %s: %w", preserved, err)
+	}
+	return preserved, nil
+}
+
+// parseReviewVerdict extracts the verdict from reviewer output: the last
+// non-empty line decides. APPROVED approves; CHANGES_REQUESTED (or any other
+// unrecognized line, including a missing marker) counts as changes requested,
+// with everything above the verdict line — or the whole output, when no
+// marker was found — as the comments to feed back to the implementing agent.
+func parseReviewVerdict(out string) ReviewResult {
+	lines := strings.Split(out, "\n")
+	for i, raw := range slices.Backward(lines) {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if line == "APPROVED" || line == "CHANGES_REQUESTED" {
+			return ReviewResult{
+				Approved: line == "APPROVED",
+				Comments: strings.TrimSpace(strings.Join(lines[:i], "\n")),
+			}
+		}
+		break
+	}
+	return ReviewResult{Approved: false, Comments: strings.TrimSpace(out)}
+}
+
+// truncateLogs bounds the logs carried in the activity result, keeping the
+// tail (where test failures usually are) and a truncation marker.
+func truncateLogs(logs string) string {
+	if len(logs) <= maxTestLogs {
+		return logs
+	}
+	cut := len(logs) - maxTestLogs
+	for cut < len(logs) && !utf8.RuneStart(logs[cut]) {
+		cut++
+	}
+	return "[... earlier output truncated ...]\n" + logs[cut:]
+}
+
+// RunNativeTestsActivity runs the repository's own Go test suite inside the
+// worktree. A non-zero exit from `go test` is a test failure (Passed=false);
+// any other error (e.g. no `go` binary on PATH) is a system error.
+func RunNativeTestsActivity(ctx context.Context, worktreePath string) (TestResult, error) {
+	cmd := exec.CommandContext(ctx, "go", "test", "./...")
+	cmd.Dir = worktreePath
+	setProcessGroup(cmd)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	if err != nil {
+		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
+			return TestResult{}, fmt.Errorf("go test: %w", err)
+		}
+		return TestResult{Passed: false, Logs: truncateLogs(out.String())}, nil
+	}
+	return TestResult{Passed: true, Logs: truncateLogs(out.String())}, nil
+}
+
+// CleanupWorktreeActivity removes the issue's worktree, its admin metadata,
+// and the run's in-flight branch, leaving no dangling directories or git
+// refs behind. Preserved daedalus/ branches are deliberately kept — they are
+// the run's deliverable.
+func CleanupWorktreeActivity(ctx context.Context, input WorktreeInput) error {
+	worktreePath, err := WorktreePathFor(input.TaskQueue, input.IssueID)
+	if err != nil {
+		return err
+	}
+	return cleanWorktree(ctx, input.RepoPath, worktreePath, input.BranchName, input.IssueID)
+}
