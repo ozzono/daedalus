@@ -4,6 +4,8 @@ on:
   push:
     branches: [master]
   pull_request:
+    # labeled/unlabeled so the release-label check re-runs when labels change
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -13,7 +15,31 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # First, blocking check: a PR must carry exactly one release label
+  # (patch/minor/major) before it can be approved or merged. Add "CI /
+  # release-label" as a required status check in branch protection (dragged
+  # to the top of the list) to enforce it on approval and merge.
+  release-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a release label (patch/minor/major)
+        # no-op on master pushes: the step is skipped and the job succeeds,
+        # so the downstream needs chain is not broken
+        if: github.event_name == 'pull_request'
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          matches=$(printf '%s' "$LABELS" | jq -r '.[] | select(. == "patch" or . == "minor" or . == "major")')
+          count=$(printf '%s' "$matches" | grep -c . || true)
+          case "$count" in
+            1) echo "release label: $matches" ;;
+            0) echo "no release label on this PR — add exactly one of: patch, minor, major" >&2; exit 1 ;;
+            *) echo "multiple release labels on this PR — keep exactly one of: patch, minor, major" >&2; exit 1 ;;
+          esac
+
   test:
+    needs: release-label
     runs-on: ubuntu-latest
     outputs:
       coverage: ${{ steps.coverage.outputs.pct }}
