@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"daedalus/internal/config"
 )
 
 // TestParseFlagsDetach covers both spellings and that -d never consumes a
@@ -187,5 +189,26 @@ func TestParseFlagsFile(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// TestWriteExampleConfig pins the init behavior: writes the example, refuses
+// to overwrite.
+func TestWriteExampleConfig(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := writeExampleConfig(dir); err != nil {
+		t.Fatalf("writeExampleConfig: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config-example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != config.ExampleYAML {
+		t.Error("written file should carry config.ExampleYAML verbatim")
+	}
+
+	if err := writeExampleConfig(dir); err == nil {
+		t.Error("second init should refuse to overwrite")
 	}
 }

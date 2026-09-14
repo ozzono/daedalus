@@ -143,3 +143,35 @@ func TestLoadInvalidYAML(t *testing.T) {
 		t.Fatal("want error for invalid YAML")
 	}
 }
+
+// TestExampleYAML pins that loading the example yields exactly the default
+// configuration — every field at its default, nothing more.
+func TestExampleYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config-example.yaml")
+	if err := os.WriteFile(path, []byte(ExampleYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(ExampleYAML): %v", err)
+	}
+	if cfg.Agent != DefaultAgent || cfg.Temporal.Host != DefaultTemporalHost ||
+		cfg.Temporal.UIPort != DefaultTemporalUIPort || cfg.Temporal.TaskQueue != DefaultTaskQueue {
+		t.Errorf("ExampleYAML values = %+v, want the documented defaults", cfg)
+	}
+	if cfg.Anthropic != (AnthropicConfig{}) || cfg.OpenAI != (OpenAIConfig{}) {
+		t.Errorf("ExampleYAML provider values = %+v %+v, want empty (inherit the environment)", cfg.Anthropic, cfg.OpenAI)
+	}
+}
+
+// TestExampleYAMLMatchesRepoFile keeps the shipped constant and the
+// repository's config-example.yaml in lockstep.
+func TestExampleYAMLMatchesRepoFile(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "config-example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != ExampleYAML {
+		t.Error("config-example.yaml and config.ExampleYAML drifted apart — update both (or regenerate the file via `daedalus init`)")
+	}
+}
