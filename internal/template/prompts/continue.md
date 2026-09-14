@@ -6,6 +6,6 @@ The previous attempt's last review feedback — the reason it stopped where it d
 
 {{.PriorFeedback}}
 {{end}}
-Implement the change. Do not write, modify, or delete test code — the test suite is handled in a separate phase; leave every existing test file untouched.
+Continue the work where the previous attempt left off; the operator's task below and the review feedback set the scope — tests included when that is what the round is about.
 
 Keep it lazy and minimal: shortest working diff, reuse existing helpers, no new abstractions or dependencies unless the task requires them — and never simplify away validation, error handling, or edge cases.

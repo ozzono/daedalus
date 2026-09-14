@@ -720,11 +720,136 @@ exit 0`)
 	}
 }
 
+// goWorktree returns a temp worktree carrying a go.mod marker so the static
+// detection resolves `go test ./...`.
+func goWorktree(t *testing.T) string {
+	t.Helper()
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return wt
+}
+
+// TestNativeTestsDeclaredCommand pins the precedence: a .daedalus.yaml
+// declaration wins over every detection.
+func TestNativeTestsDeclaredCommand(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "sh", "echo 'suite green'; exit 0")
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".daedalus.yaml"), []byte("tests: pnpm test --filter ui\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RunNativeTestsActivity(context.Background(), wt)
+	if err != nil {
+		t.Fatalf("RunNativeTestsActivity: %v", err)
+	}
+	if !result.Passed {
+		t.Error("Passed = false, want true")
+	}
+	if result.Command != "sh -c pnpm test --filter ui" {
+		t.Errorf("Command = %q, want the declared command", result.Command)
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 1 || !contains(calls[0].Args, "pnpm") {
+		t.Errorf("sh calls = %+v, want the declared command", calls)
+	}
+}
+
+// TestNativeTestsMakefileTargets pins the Makefile fallback: whichever of
+// test-ui / test-api the Makefile declares, in that order.
+func TestNativeTestsMakefileTargets(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "make", "echo 'ui+api green'; exit 0")
+
+	wt := t.TempDir()
+	mk := "build:\n\tgo build ./...\n\ntest-ui:\n\tnpx vitest run\n\ntest-api:\n\tnpx pytest api\n"
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte(mk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RunNativeTestsActivity(context.Background(), wt)
+	if err != nil {
+		t.Fatalf("RunNativeTestsActivity: %v", err)
+	}
+	if !result.Passed {
+		t.Error("Passed = false, want true")
+	}
+	if result.Command != "make test-ui test-api" {
+		t.Errorf("Command = %q, want make test-ui test-api", result.Command)
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("make called %d times, want 1", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{"test-ui", "test-api"}, "make")
+
+	// A Makefile with only test-api runs only that target.
+	wt2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt2, "Makefile"), []byte("test-api:\n\tpytest api\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	argv, ok := detectedTestCommand(wt2)
+	if !ok || strings.Join(argv, " ") != "make test-api" {
+		t.Errorf("detectedTestCommand = %v, %v; want make test-api", argv, ok)
+	}
+}
+
+// TestNativeTestsAIDiscovery pins the general fallback: with no static
+// markers, a short jailed agent round names the command.
+func TestNativeTestsAIDiscovery(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "ai-jail",
+		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test-ui test-api"}'; exit 0`)
+	stubBin(t, "sh", "echo 'suite green'; exit 0")
+
+	result, err := RunNativeTestsActivity(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("RunNativeTestsActivity: %v", err)
+	}
+	if !result.Passed {
+		t.Error("Passed = false, want true")
+	}
+	if result.Command != "sh -c make test-ui test-api" {
+		t.Errorf("Command = %q, want the AI-discovered command", result.Command)
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 2 {
+		t.Fatalf("called %d times, want 2 (discovery + test run)", len(calls))
+	}
+}
+
+// TestFirstCommandLine pins the reply hygiene: fences and backticks are
+// stripped, the first usable line wins.
+func TestFirstCommandLine(t *testing.T) {
+	for _, c := range []struct {
+		in, want string
+	}{
+		{"make test-ui", "make test-ui"},
+		{"```sh\nmake test-ui\n```", "make test-ui"},
+		{"`npm test`", "npm test"},
+		{"\n\npytest -q\nplus more", "pytest -q"},
+		{"```\nnothing usable\n", "nothing usable"},
+	} {
+		if got := firstCommandLine(c.in); got != c.want {
+			t.Errorf("firstCommandLine(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	if got := firstCommandLine(""); got != "" {
+		t.Errorf("firstCommandLine(empty) = %q, want empty", got)
+	}
+}
+
 func TestRunNativeTestsActivityPass(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "go", "echo 'ok all packages'; exit 0")
 
-	worktree := t.TempDir()
+	worktree := goWorktree(t)
 	result, err := RunNativeTestsActivity(context.Background(), worktree)
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
@@ -750,7 +875,7 @@ func TestRunNativeTestsActivityFail(t *testing.T) {
 	newStubLog(t)
 	stubBin(t, "go", "echo 'FAIL: TestBoom'; exit 1")
 
-	result, err := RunNativeTestsActivity(context.Background(), t.TempDir())
+	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t))
 	if err != nil {
 		t.Fatalf("test failure must not be a system error, got %v", err)
 	}
@@ -768,7 +893,7 @@ func TestRunNativeTestsActivityTruncates(t *testing.T) {
 	newStubLog(t)
 	stubBin(t, "go", `head -c 100000 /dev/zero | tr '\0' 'x'; echo 'FAIL: at the end'; exit 1`)
 
-	result, err := RunNativeTestsActivity(context.Background(), t.TempDir())
+	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t))
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
@@ -797,7 +922,7 @@ func TestRunNativeTestsActivitySystemError(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	result, err := RunNativeTestsActivity(context.Background(), t.TempDir())
+	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t))
 	if err == nil {
 		t.Fatal("want system error when go cannot be executed")
 	}

@@ -5,8 +5,10 @@ import (
 	"testing"
 )
 
-// TestContinue pins the resumed-run opener: continuation framing, the prior
-// feedback section only when feedback exists, and the no-test-code rule.
+// TestContinue pins the resumed-run opener: continuation framing and the
+// prior feedback section only when feedback exists. The template is
+// phase-neutral — a continuation may resume the dev or the test loop, so it
+// carries no test-scoping rule of its own.
 func TestContinue(t *testing.T) {
 	got, err := Continue("finish the feature", "finding 1\nfinding 2")
 	if err != nil {
@@ -16,11 +18,13 @@ func TestContinue(t *testing.T) {
 		"finish the feature",
 		"continuing a previous attempt",
 		"finding 1\nfinding 2",
-		"Do not write, modify, or delete test code",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Continue = %q, want it to contain %q", got, want)
 		}
+	}
+	if strings.Contains(got, "test code") {
+		t.Errorf("Continue = %q, should not carry a test-scoping rule", got)
 	}
 
 	got, err = Continue("finish the feature", "")
@@ -38,7 +42,7 @@ func TestImplement(t *testing.T) {
 		t.Fatalf("Implement: %v", err)
 	}
 	want := "add the feature\n\n" +
-		"Implement the change. Do not write, modify, or delete test code — the test suite is handled in a separate phase; leave every existing test file untouched.\n\n" +
+		"Implement the change. Do not write, modify, or delete test code; leave every existing test file untouched and pay it no attention.\n\n" +
 		"Work style — the laziest solution that actually works:\n\n" +
 		"- Question whether each piece needs to exist (YAGNI). Skip speculative generality, flags, and future-proofing.\n" +
 		"- Reuse what already exists in this codebase; prefer the standard library over new dependencies — never add one for what a few lines of stdlib can do.\n" +
@@ -56,7 +60,7 @@ func TestImplementFix(t *testing.T) {
 		t.Fatalf("ImplementFix: %v", err)
 	}
 	want := "Code review feedback on your implementation:\n\nrename foo to bar\n\n" +
-		"Address the review comments. Do not write, modify, or delete test code — the test suite is handled in a separate phase; leave every existing test file untouched.\n\n" +
+		"Address the review comments. Do not write, modify, or delete test code; leave every existing test file untouched and pay it no attention.\n\n" +
 		"Keep it lazy and minimal: shortest working diff, reuse existing helpers, no new abstractions or dependencies unless the comments require them — and never simplify away validation, error handling, or edge cases."
 	if got != want {
 		t.Errorf("ImplementFix = %q, want %q", got, want)
@@ -68,7 +72,9 @@ func TestTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tests: %v", err)
 	}
-	want := "Write, fix, or improve the test suite covering the change in this repository. Run the tests and make sure they pass.\n\n" +
+	want := "Write, fix, or improve the test suite covering the change in this repository.\n\n" +
+		"Changes in this round are test-scoped: write only test code and leave the implementation as-is — its current behavior is the contract the tests verify. If a test exposes an implementation bug, say so in your reply rather than changing the implementation.\n\n" +
+		"While iterating you may run only the tests you are working on, but know that the pipeline's final gate runs the COMPLETE test suite, not a subset — do not consider the round done until the full suite passes.\n\n" +
 		"Keep it lazy and minimal: test observable behavior, not implementation details. Cover the change's behavior, edge cases, and error paths with the fewest tests that genuinely verify them — no redundant happy-path duplicates, no speculative tests, no over-mocking."
 	if got != want {
 		t.Errorf("Tests = %q, want %q", got, want)
@@ -77,9 +83,9 @@ func TestTests(t *testing.T) {
 
 func TestTestsFix(t *testing.T) {
 	const failed = "Tests failed with output:\n\n--- FAIL: TestBoom\n\n" +
-		"Fix the tests so they pass. Find the root cause first: if the tests assert implementation details, fix the tests; if the code is wrong, fix the code. Shortest working change wins."
+		"Fix the tests so they pass. Find the root cause first: if the tests assert implementation details, fix the tests; if the code is wrong, fix the code — shortest working change wins, and nothing else. Remember the final gate runs the COMPLETE test suite: verify the whole suite passes, not just the cases that were failing."
 	const review = "Test review feedback:\n\ncover the error path\n\n" +
-		"Address the review comments. Keep it lazy and minimal: the fewest tests that genuinely verify the behavior the comments name — no redundant or speculative tests, no over-mocking."
+		"Address the review comments. Changes stay test-scoped: touch only test code; if a comment seems to require an implementation change, say so in your reply instead of making it. Keep it lazy and minimal: the fewest tests that genuinely verify the behavior the comments name — no redundant or speculative tests, no over-mocking. Remember the final gate runs the COMPLETE test suite, not just the tests under discussion."
 
 	tests := []struct {
 		name               string

@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"unicode/utf8"
 
+	"gopkg.in/yaml.v3"
+
 	"daedalus/internal/template"
 
 	"go.temporal.io/sdk/activity"
@@ -69,10 +71,13 @@ type AgentRunResult struct {
 // TestResult reports the outcome of a native test run. A failing suite is
 // reported via Passed=false (not a system error) so the workflow can feed the
 // logs back to the agent. Logs are tail-truncated (see maxTestLogs) because
-// activity results are serialized into Temporal history.
+// activity results are serialized into Temporal history. Command records the
+// entrypoint that ran — declared, detected, or AI-discovered — for
+// visibility in history.
 type TestResult struct {
-	Passed bool
-	Logs   string
+	Passed  bool
+	Logs    string
+	Command string
 }
 
 // ReviewInput describes a review request for the current state of the
@@ -577,25 +582,150 @@ func truncateTail(s string, max int) string {
 	return "[... earlier output truncated ...]\n" + s[cut:]
 }
 
-// RunNativeTestsActivity runs the repository's own Go test suite inside the
-// worktree. A non-zero exit from `go test` is a test failure (Passed=false);
-// any other error (e.g. no `go` binary on PATH) is a system error.
+// RunNativeTestsActivity runs the repository's own test suite inside the
+// worktree, whatever that suite is: the command is resolved per repo — a
+// `.daedalus.yaml` declaration first, then static detection, then an
+// AI discovery round for repos nothing recognizes (see nativeTestCommand).
+// A non-zero exit is a test failure (Passed=false); any other error (e.g. no
+// test binary on PATH) is a system error.
 func RunNativeTestsActivity(ctx context.Context, worktreePath string) (TestResult, error) {
-	cmd := exec.CommandContext(ctx, "go", "test", "./...")
+	argv, err := nativeTestCommand(ctx, worktreePath)
+	if err != nil {
+		return TestResult{}, err
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = worktreePath
 	setProcessGroup(cmd)
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	err := cmd.Run()
+	res := TestResult{Command: strings.Join(argv, " ")}
+	err = cmd.Run()
 	if err != nil {
 		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
-			return TestResult{}, fmt.Errorf("go test: %w", err)
+			return TestResult{}, fmt.Errorf("run tests (%s): %w", res.Command, err)
 		}
-		return TestResult{Passed: false, Logs: truncateLogs(out.String())}, nil
+		res.Passed, res.Logs = false, truncateLogs(out.String())
+		return res, nil
 	}
-	return TestResult{Passed: true, Logs: truncateLogs(out.String())}, nil
+	res.Passed, res.Logs = true, truncateLogs(out.String())
+	return res, nil
+}
+
+// nativeTestCommand resolves how to run the worktree's own test suite:
+//  1. a `tests:` declaration in the repo's .daedalus.yaml — the repo owner's
+//     explicit word, always winning;
+//  2. static detection: marker files (go.mod, package.json with a test
+//     script, pytest config) and Makefile test-ui/test-api targets;
+//  3. an AI discovery round — a short jailed agent run that answers with
+//     the command — for repositories none of the above recognize.
+func nativeTestCommand(ctx context.Context, worktreePath string) ([]string, error) {
+	if declared, ok := declaredTestCommand(worktreePath); ok {
+		return []string{"sh", "-c", declared}, nil
+	}
+	if argv, ok := detectedTestCommand(worktreePath); ok {
+		return argv, nil
+	}
+	return discoverTestCommand(ctx, worktreePath)
+}
+
+// declaredTestCommand reads the repo-owned test declaration.
+func declaredTestCommand(worktreePath string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(worktreePath, ".daedalus.yaml"))
+	if err != nil {
+		return "", false
+	}
+	var decl struct {
+		Tests string `yaml:"tests"`
+	}
+	if err := yaml.Unmarshal(data, &decl); err != nil {
+		return "", false
+	}
+	if s := strings.TrimSpace(decl.Tests); s != "" {
+		return s, true
+	}
+	return "", false
+}
+
+// detectedTestCommand recognizes the common test entrypoints from marker
+// files. Order matters only in that go.mod wins over a Makefile — a Go repo
+// that also has make targets usually wraps the same suite.
+func detectedTestCommand(worktreePath string) ([]string, bool) {
+	if _, err := os.Stat(filepath.Join(worktreePath, "go.mod")); err == nil {
+		return []string{"go", "test", "./..."}, true
+	}
+	if pkg, err := os.ReadFile(filepath.Join(worktreePath, "package.json")); err == nil {
+		var p struct {
+			Scripts struct {
+				Test string `json:"test"`
+			} `json:"scripts"`
+		}
+		if json.Unmarshal(pkg, &p) == nil && strings.TrimSpace(p.Scripts.Test) != "" {
+			return []string{"npm", "test"}, true
+		}
+	}
+	for _, marker := range []string{"pyproject.toml", "pytest.ini", "setup.cfg"} {
+		if _, err := os.Stat(filepath.Join(worktreePath, marker)); err == nil {
+			return []string{"pytest", "-q"}, true
+		}
+	}
+	if mk, err := os.ReadFile(filepath.Join(worktreePath, "Makefile")); err == nil {
+		var targets []string
+		for _, target := range []string{"test-ui", "test-api"} {
+			if makefileHasTarget(string(mk), target) {
+				targets = append(targets, target)
+			}
+		}
+		if len(targets) > 0 {
+			return append([]string{"make"}, targets...), true
+		}
+	}
+	return nil, false
+}
+
+// makefileHasTarget reports whether the Makefile declares target as a rule
+// ("target:" starting a line).
+func makefileHasTarget(mk, target string) bool {
+	for line := range strings.SplitSeq(mk, "\n") {
+		if strings.HasPrefix(line, target+":") {
+			return true
+		}
+	}
+	return false
+}
+
+// discoverTestCommand asks a short jailed agent run for the repository's
+// test entrypoint — the general, AI-led fallback.
+func discoverTestCommand(ctx context.Context, worktreePath string) ([]string, error) {
+	res, err := runJailed(ctx, worktreePath,
+		"Inspect this repository and determine the exact shell command that runs its full test suite. "+
+			"Reply with ONLY that command on a single line — no explanation, no code fences.")
+	if err != nil {
+		return nil, fmt.Errorf("discover test command: %w", err)
+	}
+	_, text := parseAgentStream(res.Stdout)
+	cmd := firstCommandLine(text)
+	if cmd == "" {
+		return nil, fmt.Errorf("no test command found for %s — declare one in .daedalus.yaml (tests: <command>)", worktreePath)
+	}
+	return []string{"sh", "-c", cmd}, nil
+}
+
+// firstCommandLine extracts a single-line command from an agent reply: the
+// first non-empty, non-fence line, stripped of backticks.
+func firstCommandLine(text string) string {
+	for line := range strings.SplitSeq(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "```") {
+			continue
+		}
+		line = strings.TrimSpace(strings.Trim(line, "`"))
+		if line != "" && len(line) <= 500 {
+			return line
+		}
+	}
+	return ""
 }
 
 // CleanupWorktreeActivity removes the issue's worktree, its admin metadata,
