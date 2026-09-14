@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -39,6 +40,28 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.Temporal.TaskQueue != DefaultTaskQueue {
 		t.Errorf("Temporal.TaskQueue = %q, want %q", cfg.Temporal.TaskQueue, DefaultTaskQueue)
+	}
+	if cfg.Agent != DefaultAgent {
+		t.Errorf("Agent = %q, want %q", cfg.Agent, DefaultAgent)
+	}
+}
+
+// TestLoadAgent pins the accepted agent values: both shipped agents load,
+// anything else is rejected with the available choices named.
+func TestLoadAgent(t *testing.T) {
+	for _, agent := range []string{"claude", "opencode"} {
+		cfg, err := Load(writeConfig(t, "agent: "+agent+"\n"))
+		if err != nil {
+			t.Fatalf("Load(agent: %s): %v", agent, err)
+		}
+		if cfg.Agent != agent {
+			t.Errorf("Agent = %q, want %q", cfg.Agent, agent)
+		}
+	}
+
+	_, err := Load(writeConfig(t, "agent: cursor\n"))
+	if err == nil || !strings.Contains(err.Error(), "unknown agent") {
+		t.Fatalf("want unknown-agent error, got %v", err)
 	}
 }
 

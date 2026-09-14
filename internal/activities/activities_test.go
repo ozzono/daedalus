@@ -458,6 +458,46 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 	}
 }
 
+// TestRunJailedClaudeActivityOpenCode pins the opencode path: DAEDALUS_AGENT
+// switches the jailed CLI, the headless flags replace claude's, no
+// stream-json is requested, and the plain output is taken as-is.
+func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", "echo OPENCODE-OUTPUT; exit 0")
+	t.Setenv("DAEDALUS_AGENT", "opencode")
+
+	worktree := t.TempDir()
+	result, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: worktree,
+		Prompt:       "fix the bug",
+	})
+	if err != nil {
+		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+	if result.Text != "OPENCODE-OUTPUT\n" {
+		t.Errorf("result.Text = %q, want the raw plain-mode output", result.Text)
+	}
+	if result.Thinking != "" {
+		t.Errorf("result.Thinking = %q, want empty (plain output has no thinking)", result.Thinking)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("ai-jail called %d times, want 1", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{
+		"--worktree",
+		"--network",
+		"--",
+		"opencode",
+		"run",
+		"--auto",
+	}, "ai-jail")
+	if calls[0].Stdin != "fix the bug" {
+		t.Errorf("ai-jail stdin = %q, want the prompt", calls[0].Stdin)
+	}
+}
+
 // TestRunJailedClaudeActivityWithoutKey pins the no-key behavior: an unset
 // API key is not an error — the agent is simply launched and left to
 // authenticate on its own (worker-inherited env or its own login).

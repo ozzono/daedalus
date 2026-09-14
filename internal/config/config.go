@@ -4,6 +4,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -19,6 +21,8 @@ const (
 	DefaultTemporalHost = "127.0.0.1:7233"
 	// DefaultTemporalUIPort is the Temporal UI's own default port.
 	DefaultTemporalUIPort = 8233
+	// DefaultAgent is the jailed agent CLI used when config agent is unset.
+	DefaultAgent = "claude"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -54,10 +58,17 @@ type OpenAIConfig struct {
 // Config holds the runtime configuration for a Daedalus process, loaded
 // from a YAML file (see config-example.yaml).
 type Config struct {
+	// Agent selects which jailed CLI runs the implementing and reviewer
+	// agents: "claude" (Claude Code) or "opencode" (see agents for the
+	// accepted values).
+	Agent     string          `yaml:"agent"`
 	Temporal  TemporalConfig  `yaml:"temporal"`
 	Anthropic AnthropicConfig `yaml:"anthropic"`
 	OpenAI    OpenAIConfig    `yaml:"openai"`
 }
+
+// agents lists the accepted config Agent values.
+var agents = []string{"claude", "opencode"}
 
 // UIURL returns the Temporal UI address corresponding to Temporal.UIPort.
 func (c Config) UIURL() string {
@@ -100,10 +111,17 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	c.applyDefaults()
+	if !slices.Contains(agents, c.Agent) {
+		return c, fmt.Errorf("config %s: agent: unknown agent %q (available: %s)",
+			path, c.Agent, strings.Join(agents, ", "))
+	}
 	return c, nil
 }
 
 func (c *Config) applyDefaults() {
+	if c.Agent == "" {
+		c.Agent = DefaultAgent
+	}
 	if c.Temporal.Host == "" {
 		c.Temporal.Host = DefaultTemporalHost
 	}
