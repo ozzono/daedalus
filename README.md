@@ -250,7 +250,8 @@ Releases are git tags. CI runs the suite on every PR and master push — a PR
 must carry exactly one release label (`patch`, `minor`, or `major`) before it
 can merge. After a green master push, CI tags the merged code with the next
 version, using that PR's label to pick the bump level (`patch` for pushes
-that are not PR merges) — there is no version file and no other release
+that are not PR merges) and publishes a GitHub Release for the tag with
+auto-generated notes — there is no version file and no other release
 tooling. `daedalus --version` reports the tag-stamped version of a
 `make build` binary; a plain `go build`/`go install` binary reports
 `(devel)`.
