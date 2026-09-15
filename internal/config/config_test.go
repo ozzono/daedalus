@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, content string) string {
@@ -50,6 +51,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Anthropic.TimeoutMS != DefaultAnthropicTimeoutMS {
 		t.Errorf("Anthropic.TimeoutMS = %d, want %d", cfg.Anthropic.TimeoutMS, DefaultAnthropicTimeoutMS)
 	}
+	if cfg.TestsTimeout != DefaultTestsTimeout {
+		t.Errorf("TestsTimeout = %v, want %v", cfg.TestsTimeout, DefaultTestsTimeout)
+	}
 }
 
 // TestLoadAgent pins the accepted agent values: both shipped agents load,
@@ -71,6 +75,24 @@ func TestLoadAgent(t *testing.T) {
 	}
 }
 
+// TestLoadTestsTimeout pins the tests_timeout parsing: duration strings
+// load, and a negative value is rejected up front rather than silently
+// becoming "no ceiling" downstream.
+func TestLoadTestsTimeout(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "tests_timeout: 1h30m\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TestsTimeout != 90*time.Minute {
+		t.Errorf("TestsTimeout = %v, want 1h30m", cfg.TestsTimeout)
+	}
+
+	_, err = Load(writeConfig(t, "tests_timeout: -5m\n"))
+	if err == nil || !strings.Contains(err.Error(), "tests_timeout") {
+		t.Fatalf("want tests_timeout error, got %v", err)
+	}
+}
+
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `
 temporal:
@@ -86,6 +108,7 @@ openai:
   url: https://oa.example/v1
   key: sk-oa-test
   model: gpt-test
+tests_timeout: 45m
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -111,6 +134,9 @@ openai:
 	}
 	if cfg.OpenAI.Model != "gpt-test" {
 		t.Errorf("OpenAI.Model = %q, want gpt-test", cfg.OpenAI.Model)
+	}
+	if cfg.TestsTimeout != 45*time.Minute {
+		t.Errorf("TestsTimeout = %v, want 45m", cfg.TestsTimeout)
 	}
 
 	env := cfg.AgentEnv()

@@ -22,10 +22,10 @@ import (
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
 
-	"daedalus/internal/activities"
-	"daedalus/internal/config"
-	"daedalus/internal/version"
-	"daedalus/internal/workflows"
+	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/version"
+	"github.com/ozzono/daedalus/internal/workflows"
 )
 
 // runWaitTimeout bounds how long `daedalus run` waits for a pipeline to
@@ -743,6 +743,7 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		IssueID:      issueID,
 		Prompt:       prompt,
 		BranchPrefix: branchPrefix,
+		TestTimeout:  cfg.TestsTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -851,6 +852,7 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		// A pre-branch-prefix run (empty in its recorded history) resolves
 		// like a fresh run: through the operator's current config.
 		BranchPrefix:  resolveBranchPrefix(prev.BranchPrefix, cfg.BranchPrefix),
+		TestTimeout:   cfg.TestsTimeout,
 		BaseBranch:    base,
 		PriorFeedback: tail(lastReview.Comments, maxPriorFeedback),
 	})

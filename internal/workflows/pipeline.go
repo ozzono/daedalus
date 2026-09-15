@@ -10,8 +10,9 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
-	"daedalus/internal/activities"
-	"daedalus/internal/template"
+	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/template"
 )
 
 // PipelineInput is the sole input to FeatureDevWorkflow. It deliberately
@@ -33,6 +34,10 @@ type PipelineInput struct {
 	// folded into the opening prompt.
 	BaseBranch    string
 	PriorFeedback string
+	// TestTimeout bounds one execution of the native test suite (config
+	// tests_timeout). Zero — a run whose input predates the field, replayed
+	// by a newer worker — falls back to config.DefaultTestsTimeout.
+	TestTimeout time.Duration
 }
 
 // FeatureDevWorkflow drives a full issue-development cycle in two
@@ -188,9 +193,21 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err := runAgent(testsPrompt, "tests"); err != nil {
 		return "", fmt.Errorf("test-phase agent run: %w", err)
 	}
+	// The native suite gets a wider ceiling than the shared 15 minutes:
+	// command discovery (itself an agent round when nothing statically
+	// detects) plus a cold build can legitimately overrun it. The Get still
+	// uses ctx so cancellation propagates normally.
+	testTimeout := input.TestTimeout
+	if testTimeout <= 0 {
+		testTimeout = config.DefaultTestsTimeout
+	}
+	testsCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: testTimeout,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
+	})
 	for {
 		var result activities.TestResult
-		if err := workflow.ExecuteActivity(ctx, activities.RunNativeTestsActivity, worktree.WorktreePath).Get(ctx, &result); err != nil {
+		if err := workflow.ExecuteActivity(testsCtx, activities.RunNativeTestsActivity, worktree.WorktreePath).Get(ctx, &result); err != nil {
 			return "", fmt.Errorf("run tests: %w", err)
 		}
 		verdict, err := review("the test suite", result.Logs, true)

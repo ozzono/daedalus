@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"daedalus/internal/config"
-	"daedalus/internal/version"
+	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/version"
 )
 
 // TestParseFlagsDetach covers both spellings and that -d never consumes a
@@ -149,12 +149,12 @@ func TestResolveConfigPath(t *testing.T) {
 			wantCwdConfig:   true,
 		},
 		{
-			name:          "home config found from a bare directory",
+			name:            "home config found from a bare directory",
 			writeHomeConfig: true,
-			wantHomeConfig: true,
+			wantHomeConfig:  true,
 		},
 		{
-			name:            "no config anywhere",
+			name:             "no config anywhere",
 			wantErrSubstring: "no config found",
 		},
 	} {
