@@ -54,6 +54,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TestsTimeout != DefaultTestsTimeout {
 		t.Errorf("TestsTimeout = %v, want %v", cfg.TestsTimeout, DefaultTestsTimeout)
 	}
+	if cfg.Anthropic.TimeoutMS != DefaultAnthropicTimeoutMS {
+		t.Errorf("Anthropic.TimeoutMS = %d, want %d", cfg.Anthropic.TimeoutMS, DefaultAnthropicTimeoutMS)
+	}
 }
 
 // TestLoadAgent pins the accepted agent values: both shipped agents load,

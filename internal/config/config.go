@@ -38,6 +38,11 @@ const (
 	// ceiling because test-command discovery and a cold build legitimately
 	// overrun it.
 	DefaultTestsTimeout = 30 * time.Minute
+	// DefaultAnthropicTimeoutMS bounds the jailed agent's API requests,
+	// exported to the agent as API_TIMEOUT_MS. Generous by design: agent
+	// rounds legitimately run long (whole-repo analyses, slow builds), and a
+	// tight client-side ceiling kills rounds the pipeline would keep.
+	DefaultAnthropicTimeoutMS = 3_000_000
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -215,5 +220,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.TestsTimeout == 0 {
 		c.TestsTimeout = DefaultTestsTimeout
+	}
+	if c.Anthropic.TimeoutMS == 0 {
+		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS
 	}
 }
