@@ -58,64 +58,81 @@ jobs:
           echo "total coverage: $pct%"
           echo "pct=$pct" >> "$GITHUB_OUTPUT"
 
-  # After master is green: tag the tested code with the current version, bump
-  # the version file, push, and refresh the coverage badge. The bot's push uses
-  # GITHUB_TOKEN, which never triggers workflows, so the loop does not feed
-  # itself; the actor check below is redundancy on top of that.
+  # After master is green: tag the tested code with the next version. The
+  # bump level is the merged PR's release label (patch/minor/major; patch for
+  # a push that is not a PR merge). Only tags are pushed — master is protected
+  # and receives no release commits — and the bot's GITHUB_TOKEN push never
+  # triggers workflows, so the loop does not feed itself.
   release:
     needs: test
     if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
     permissions:
       contents: write
+      pull-requests: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Tag release and bump version
+      - name: Tag release
         env:
-          VERSION_FILE: internal/version/VERSION
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          v=$(cat "$VERSION_FILE")
-          # Reject leading zeros: the arithmetic below reads an octal "08" as an error.
-          [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
-            echo "invalid version in $VERSION_FILE: '$v' (expected X.Y.Z)" >&2
-            exit 1
-          }
-          git tag "v$v" 2>/dev/null || echo "tag v$v already exists — tagging skipped"
-
-          IFS='.' read -r major minor patch <<<"$v"
-          next="$major.$minor.$((patch + 1))"
-          echo "$next" > "$VERSION_FILE"
-          git add "$VERSION_FILE"
-          git commit -m "release: tag v$v, bump version to $next"
-
-          # checkout is the event SHA, not the branch tip: if a merge landed
-          # mid-run (or this is a re-run), the push is rejected as non-FF.
-          # Reconcile with the new tip instead of failing the run.
-          if ! git push origin master "refs/tags/v$v"; then
-            echo "master moved since checkout — reconciling with the new tip"
-            git fetch origin
-            tip=$(git show "origin/master:$VERSION_FILE")
-            if [[ "$tip" == "$next" ]]; then
-              # A concurrent run already landed this bump; our commit is
-              # redundant. Its tag may be on the remote too — possibly at a
-              # different SHA — and re-pushing it would be rejected, so only
-              # push if it is missing.
-              if git ls-remote --exit-code --tags origin "refs/tags/v$v" >/dev/null; then
-                echo "tag v$v already on remote — tag push skipped"
-              else
-                git push origin "refs/tags/v$v"
-              fi
-            else
-              git rebase origin/master
-              git push origin master "refs/tags/v$v"
-            fi
+          # A re-run of a run that already tagged this merge has nothing to do.
+          if existing=$(git tag --points-at HEAD); [[ -n "$existing" ]]; then
+            echo "HEAD already tagged ($existing) — nothing to release"
+            exit 0
           fi
+
+          # The bump level is the merged PR's release label; a push that is
+          # not a PR merge (or carries no label — pre-protection merges)
+          # releases as a patch.
+          level=patch
+          subject=$(git log -1 --format=%s)
+          pr=$(printf '%s\n' "$subject" | grep -oE '#[0-9]+' | head -1 | tr -d '#') || true
+          if [[ -n "$pr" ]]; then
+            label=$(gh api "repos/${{ github.repository }}/pulls/$pr" \
+              --jq '.labels[].name | select(. == "patch" or . == "minor" or . == "major")' | head -1) || true
+            [[ -z "$label" ]] || level=$label
+          fi
+          echo "bump level: $level"
+
+          bump() {
+            local v=$1 major minor patch
+            [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+              echo "invalid latest tag '$v' (expected vX.Y.Z)" >&2; exit 1;
+            }
+            IFS='.' read -r major minor patch <<<"$v"
+            case "$level" in
+              major) echo "$((major + 1)).0.0" ;;
+              minor) echo "$major.$((minor + 1)).0" ;;
+              *)     echo "$major.$minor.$((patch + 1))" ;;
+            esac
+          }
+
+          # Retry loop: a concurrent release of another merge may claim the
+          # computed tag name first — re-fetch and recompute rather than fail.
+          for attempt in 1 2 3; do
+            git fetch --tags origin
+            latest=$(git tag --list 'v*' | sed 's/^v//' | sort -V | tail -1)
+            latest=${latest:-0.0.0}
+            new=$(bump "$latest")
+            echo "attempt $attempt: latest v$latest -> tagging v$new"
+            git tag "v$new"
+            if git push origin "refs/tags/v$new"; then
+              # A bare tag does not render on the Releases page — publish a
+              # release for it. Idempotent: a re-run skips an existing one.
+              if ! gh release view "v$new" >/dev/null 2>&1; then
+                gh release create "v$new" --generate-notes --latest
+              fi
+              exit 0
+            fi
+            git tag -d "v$new" >/dev/null
+          done
+          echo "could not claim a tag name after 3 attempts — re-run this job" >&2
+          exit 1
       - name: Update coverage badge
         env:
           COVERAGE: ${{ needs.test.outputs.coverage }}
@@ -128,7 +145,10 @@ jobs:
           else
             git checkout --orphan badges
           fi
-          git rm -rq --ignore-unmatch .
+          # -f: on a fresh orphan branch every file is a staged add (no HEAD),
+          # so git rm refuses to discard them without it. Nothing is lost —
+          # the content is already committed on master.
+          git rm -rfq --ignore-unmatch .
 
           color=$(awk -v p="$COVERAGE" 'BEGIN { print (p >= 80) ? "brightgreen" : (p >= 60) ? "yellow" : "red" }')
           mkdir badges

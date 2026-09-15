@@ -1,4 +1,9 @@
-.PHONY: test test-coverage
+.PHONY: test test-coverage build
+
+# build stamps the binary with the most recent release tag (no tags yet →
+# the binary reports "(devel)", same as a plain go build/install).
+build:
+	go build -ldflags "-X daedalus/internal/version.ldflagsVersion=$$(git describe --tags --abbrev=0 2>/dev/null)" ./cmd/daedalus
 
 test:
 	go test ./...
