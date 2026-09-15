@@ -128,7 +128,10 @@ jobs:
           else
             git checkout --orphan badges
           fi
-          git rm -rq --ignore-unmatch .
+          # -f: on a fresh orphan branch every file is a staged add (no HEAD),
+          # so git rm refuses to discard them without it. Nothing is lost —
+          # the content is already committed on master.
+          git rm -rfq --ignore-unmatch .
 
           color=$(awk -v p="$COVERAGE" 'BEGIN { print (p >= 80) ? "brightgreen" : (p >= 60) ? "yellow" : "red" }')
           mkdir badges
