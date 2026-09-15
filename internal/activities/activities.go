@@ -20,6 +20,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"daedalus/internal/config"
 	"daedalus/internal/template"
 
 	"go.temporal.io/sdk/activity"
@@ -38,6 +39,11 @@ type WorktreeInput struct {
 	TaskQueue  string
 	IssueID    string
 	BranchName string
+	// BranchPrefix names the preserved branch for this run (config
+	// branch_prefix, overridable per run via `daedalus run --prefix`).
+	// Empty means the default — workflow inputs recorded before the
+	// setting existed replay with an empty value.
+	BranchPrefix string
 	// BaseBranch, when set, is the ref the new worktree's branch starts
 	// from instead of HEAD — the aborted/<issue> branch a continued run
 	// resumes (see ContinueWorktreeFrom / `daedalus continue`).
@@ -102,16 +108,32 @@ type ReviewResult struct {
 }
 
 // Branch name prefixes: feat/ marks in-flight runs (always cleaned up, along
-// with any stale feat/ branches from crashed runs); daedalus/ marks approved
-// work committed by FinalizeWorktreeActivity, which is preserved. aborted/
-// carries a run that closed without approval — committed and kept so
-// `daedalus continue` can resume it; each abort replaces the previous
+// with any stale feat/ branches from crashed runs); the preserved prefix
+// (default daedalus/, configurable via branch_prefix / --prefix) marks
+// approved work committed by FinalizeWorktreeActivity, which is kept.
+// aborted/ carries a run that closed without approval — committed and kept
+// so `daedalus continue` can resume it; each abort replaces the previous
 // snapshot.
 const (
-	inFlightPrefix  = "feat/"
-	preservedPrefix = "daedalus/"
-	abortedPrefix   = "aborted/"
+	inFlightPrefix         = "feat/"
+	defaultPreservedPrefix = "daedalus"
+	abortedPrefix          = "aborted/"
 )
+
+// preservedPrefix returns the validated prefix naming this run's preserved
+// branch: the run's BranchPrefix when set, the historical default otherwise.
+// Workflow inputs are a trust boundary (see WorktreePathFor), so the prefix is
+// validated here too: an unvalidated one could aim the finalized-check glob at
+// a reserved namespace and silently suppress the aborted-work snapshot.
+func (in WorktreeInput) preservedPrefix() (string, error) {
+	if in.BranchPrefix == "" {
+		return defaultPreservedPrefix, nil
+	}
+	if err := config.ValidateBranchPrefix(in.BranchPrefix); err != nil {
+		return "", err
+	}
+	return in.BranchPrefix, nil
+}
 
 // AbortedBranchName returns the per-issue branch carrying an aborted run's
 // preserved work — the base ref a continued run starts from.
@@ -213,20 +235,20 @@ func setProcessGroup(cmd *exec.Cmd) {
 // branch failures such as "not a working tree" or "branch not found" are
 // ignored, because a partially-failed previous run must not poison the next
 // one — while prune failures and an undeletable directory are surfaced as
-// errors. Preserved daedalus/ branches are never touched.
-func cleanWorktree(ctx context.Context, repoPath, worktreePath, branchName, issueID string) error {
-	if err := preserveAbortedWork(ctx, repoPath, worktreePath, branchName, issueID); err != nil {
+// errors. Preserved branches are never touched.
+func cleanWorktree(ctx context.Context, input WorktreeInput, worktreePath string) error {
+	if err := preserveAbortedWork(ctx, input, worktreePath); err != nil {
 		return err
 	}
 
 	// Best-effort: fall through to prune and the RemoveAll fallback below.
-	_, _ = runGit(ctx, "-C", repoPath, "worktree", "remove", worktreePath, "--force")
+	_, _ = runGit(ctx, "-C", input.RepoPath, "worktree", "remove", worktreePath, "--force")
 
-	if out, err := runGit(ctx, "-C", repoPath, "worktree", "prune"); err != nil {
+	if out, err := runGit(ctx, "-C", input.RepoPath, "worktree", "prune"); err != nil {
 		return fmt.Errorf("git worktree prune: %w: %s", err, out)
 	}
 
-	deleteStaleBranches(ctx, repoPath, issueID)
+	deleteStaleBranches(ctx, input.RepoPath, input.IssueID)
 
 	if _, err := os.Stat(worktreePath); err == nil {
 		if err := os.RemoveAll(worktreePath); err != nil {
@@ -239,18 +261,22 @@ func cleanWorktree(ctx context.Context, repoPath, worktreePath, branchName, issu
 // preserveAbortedWork keeps a run that closed without approval resumable:
 // the worktree's contents are committed and the in-flight branch renamed to
 // the per-issue aborted/ branch that `daedalus continue` builds on. A
-// finalized run (its daedalus/ deliverable exists) deletes the in-flight
+// finalized run (its preserved deliverable exists) deletes the in-flight
 // branch instead — the deliverable already carries the work. Best-effort
 // throughout: any git hiccup still lets cleanup proceed, and stale state
 // from a crashed run is preserved too (the worktree may hold its work).
-func preserveAbortedWork(ctx context.Context, repoPath, worktreePath, branchName, issueID string) error {
-	if branchName == "" {
+func preserveAbortedWork(ctx context.Context, input WorktreeInput, worktreePath string) error {
+	if input.BranchName == "" {
 		return nil
 	}
-	preserved, _ := runGit(ctx, "-C", repoPath, "branch", "--list",
-		preservedPrefix+"issue-"+issueID+"-*", "--format=%(refname:short)")
+	prefix, err := input.preservedPrefix()
+	if err != nil {
+		return fmt.Errorf("branch prefix: %w", err)
+	}
+	preserved, _ := runGit(ctx, "-C", input.RepoPath, "branch", "--list",
+		prefix+"/issue-"+input.IssueID+"-*", "--format=%(refname:short)")
 	if strings.TrimSpace(preserved) != "" {
-		_, _ = runGit(ctx, "-C", repoPath, "branch", "-D", branchName)
+		_, _ = runGit(ctx, "-C", input.RepoPath, "branch", "-D", input.BranchName)
 		return nil
 	}
 	if _, err := os.Stat(worktreePath); err != nil {
@@ -258,7 +284,7 @@ func preserveAbortedWork(ctx context.Context, repoPath, worktreePath, branchName
 		// still runs.
 		return nil
 	}
-	aborted, err := AbortedBranchName(issueID)
+	aborted, err := AbortedBranchName(input.IssueID)
 	if err != nil {
 		return err
 	}
@@ -266,7 +292,7 @@ func preserveAbortedWork(ctx context.Context, repoPath, worktreePath, branchName
 	_, _ = runGit(ctx, "-C", worktreePath,
 		"-c", "user.name=daedalus", "-c", "user.email=daedalus@local",
 		"commit", "-m", "daedalus: run closed without approval, work preserved for continue")
-	_, _ = runGit(ctx, "-C", repoPath, "branch", "-D", aborted)
+	_, _ = runGit(ctx, "-C", input.RepoPath, "branch", "-D", aborted)
 	_, _ = runGit(ctx, "-C", worktreePath, "branch", "-m", aborted)
 	return nil
 }
@@ -296,7 +322,7 @@ func CreateWorktreeActivity(ctx context.Context, input WorktreeInput) (WorktreeO
 		return WorktreeOutput{}, err
 	}
 
-	if err := cleanWorktree(ctx, input.RepoPath, worktreePath, input.BranchName, input.IssueID); err != nil {
+	if err := cleanWorktree(ctx, input, worktreePath); err != nil {
 		return WorktreeOutput{}, fmt.Errorf("clean stale worktree state: %w", err)
 	}
 
@@ -534,10 +560,11 @@ func stagedDiff(ctx context.Context, worktreePath string) (string, error) {
 }
 
 // FinalizeWorktreeActivity commits the approved work and renames the run's
-// branch from the in-flight feat/ prefix to the preserved daedalus/ prefix,
-// so the deliverable survives cleanup. The workflow returns the preserved
-// branch name to the caller. A run whose approved change produced no diff
-// fails here — an approval of nothing is an anomaly, not a deliverable.
+// branch from the in-flight feat/ prefix to the run's preserved prefix
+// (branch_prefix / --prefix), so the deliverable survives cleanup. The
+// workflow returns the preserved branch name to the caller. A run whose
+// approved change produced no diff fails here — an approval of nothing is
+// an anomaly, not a deliverable.
 func FinalizeWorktreeActivity(ctx context.Context, input WorktreeInput) (string, error) {
 	worktreePath, err := WorktreePathFor(input.TaskQueue, input.IssueID)
 	if err != nil {
@@ -555,7 +582,11 @@ func FinalizeWorktreeActivity(ctx context.Context, input WorktreeInput) (string,
 	if !strings.HasPrefix(input.BranchName, inFlightPrefix) {
 		return "", fmt.Errorf("unexpected branch name %q: expected %s prefix", input.BranchName, inFlightPrefix)
 	}
-	preserved := preservedPrefix + strings.TrimPrefix(input.BranchName, inFlightPrefix)
+	prefix, err := input.preservedPrefix()
+	if err != nil {
+		return "", fmt.Errorf("branch prefix: %w", err)
+	}
+	preserved := prefix + "/" + strings.TrimPrefix(input.BranchName, inFlightPrefix)
 	if _, err := runGit(ctx, "-C", worktreePath, "branch", "-m", preserved); err != nil {
 		return "", fmt.Errorf("rename branch to %s: %w", preserved, err)
 	}
@@ -752,12 +783,12 @@ func firstCommandLine(text string) string {
 
 // CleanupWorktreeActivity removes the issue's worktree, its admin metadata,
 // and the run's in-flight branch, leaving no dangling directories or git
-// refs behind. Preserved daedalus/ branches are deliberately kept — they are
-// the run's deliverable.
+// refs behind. Preserved branches are deliberately kept — they are the run's
+// deliverable.
 func CleanupWorktreeActivity(ctx context.Context, input WorktreeInput) error {
 	worktreePath, err := WorktreePathFor(input.TaskQueue, input.IssueID)
 	if err != nil {
 		return err
 	}
-	return cleanWorktree(ctx, input.RepoPath, worktreePath, input.BranchName, input.IssueID)
+	return cleanWorktree(ctx, input, worktreePath)
 }

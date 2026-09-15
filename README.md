@@ -154,6 +154,7 @@ All configuration lives in `config.yaml` (override the path with
 | Field                 | Default            | Purpose                              |
 | --------------------- | ------------------ | ------------------------------------ |
 | `agent`               | `claude`           | Jailed agent CLI: `claude` or `opencode` |
+| `branch_prefix`       | `daedalus`         | Prefix for preserved branches (`<prefix>/issue-<id>-<ts>`); `run -p/--prefix` overrides per run |
 | `temporal.host`       | `127.0.0.1:7233`   | Temporal frontend address            |
 | `temporal.ui_port`    | `8233`             | Temporal UI port (shown at startup)  |
 | `temporal.task_queue` | `daedalus`         | Routing key; distinct projects/flows on one Temporal use distinct queues |
@@ -197,7 +198,8 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   the command. The resolved command is recorded in the workflow history.
 - **Branch lifecycle**: `feat/issue-<id>-<unix>` is the in-flight branch
   (always cleaned up, along with stale `feat/` branches from crashed runs);
-  `daedalus/issue-<id>-<unix>` is the committed, approved deliverable;
+  `<branch_prefix>/issue-<id>-<unix>` (default `daedalus`) is the committed,
+  approved deliverable;
   `aborted/issue-<id>` carries a run that closed without approval, replaced
   by each newer abort and consumed by `daedalus continue`.
 - **Operator guidance**: `daedalus guide` (or `run -a`) messages arrive as a
@@ -213,6 +215,17 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   the whole jailed process group, not just the jail wrapper. Agent/reviewer
   failures that look like provider quota or rate limits are labeled as API
   exhaustion so the halt is recognizable as `continue`-able.
+- **Deliverable preservation**: once both phases pass, a finalize activity
+  commits the approved work and renames the run's branch from
+  `feat/issue-<id>-<unix-timestamp>` (in-flight) to
+  `<branch_prefix>/issue-<id>-<unix-timestamp>` (preserved; default prefix
+  `daedalus`, from `branch_prefix` or `run -p/--prefix`; prefixes colliding
+  with the reserved `feat`/`aborted` namespaces are rejected up front). The
+  prefix scopes the preserved branch and the finalized-deliverable check, but
+  not the `aborted/issue-<id>` snapshot, which is shared per issue across
+  prefixes: a failing run under another prefix replaces it and is not
+  suppressed by a deliverable finalized under this prefix. The workflow
+  returns the preserved branch name and `daedalus run` prints it.
 - **Prompt transport**: prompts travel to the jailed agent via stdin, not
   argv — no `ps` visibility, no per-argument size limit on review prompts
   that embed the full diff. Verdicts are parsed from stdout only, so
@@ -229,8 +242,8 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   cancellation (via a disconnected context) and agent, reviewer, or test
   failures — to remove the worktree (`--force`), prune git's worktree
   metadata, sweep stale `feat/issue-<id>-*` branches left by crashed runs,
-  and preserve unapproved work on `aborted/` first. Preserved `daedalus/`
-  branches are never touched; leftover worktree state is healed on the next
+  and preserve unapproved work on `aborted/` first. Preserved
+  `<branch_prefix>/` branches are never touched; leftover worktree state is healed on the next
   run of the same issue.
 
 ## Development

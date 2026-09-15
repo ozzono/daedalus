@@ -14,6 +14,19 @@ const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; eve
 # claude (Claude Code, the default) or opencode.
 agent: claude
 
+# Prefix naming the preserved branch that carries a run's approved, committed
+# work: <prefix>/issue-<id>-<unix timestamp>. Independent of
+# temporal.task_queue (which routes workflows and scopes worktree paths) —
+# this is repo-facing branch naming. "daedalus run --prefix" overrides it
+# per run. The in-flight feat/ and aborted/ snapshot branches are internal
+# and keep their fixed names, so a branch_prefix starting with feat or
+# aborted is rejected. The prefix scopes the run's preserved branch and the
+# finalized-deliverable check, but not the aborted/issue-<id> snapshot,
+# which is shared per issue across prefixes: a failing run under another
+# prefix replaces it and is not suppressed by a deliverable finalized under
+# this prefix.
+branch_prefix: daedalus
+
 temporal:
   # Temporal frontend address. 7233 is Temporal's own default, so a plain
   # "temporal server start-dev" matches.

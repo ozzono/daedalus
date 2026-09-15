@@ -740,6 +740,138 @@ func TestFinalizeWorktreeActivity(t *testing.T) {
 	assertArgs(t, calls[2].Args, []string{"-C", worktreePath, "branch", "-m", "daedalus/issue-42-123"}, "branch rename")
 }
 
+// TestFinalizeWorktreeActivityCustomPrefix pins the per-run prefix: the
+// deliverable branch lands under BranchPrefix instead of the default
+// daedalus/ namespace.
+func TestFinalizeWorktreeActivityCustomPrefix(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	stubBin(t, "git", "exit 0")
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+
+	preserved, err := FinalizeWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:     "/repo",
+		TaskQueue:    "daedalus",
+		IssueID:      "42",
+		BranchName:   "feat/issue-42-123",
+		BranchPrefix: "team/ship",
+	})
+	if err != nil {
+		t.Fatalf("FinalizeWorktreeActivity: %v", err)
+	}
+	if preserved != "team/ship/issue-42-123" {
+		t.Errorf("preserved branch = %q, want team/ship/issue-42-123", preserved)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 3 {
+		t.Fatalf("git called %d times, want 3 (add, commit, branch -m)", len(calls))
+	}
+	assertArgs(t, calls[2].Args, []string{"-C", worktreePath, "branch", "-m", "team/ship/issue-42-123"}, "branch rename")
+}
+
+// TestCleanupFinalizedCheckUsesRunPrefix pins that the is-this-run-finalized
+// check looks under the run's own prefix: a deliverable preserved under a
+// custom prefix still suppresses the aborted-work snapshot.
+func TestCleanupFinalizedCheckUsesRunPrefix(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	// branch --list under the run's prefix reports the preserved deliverable;
+	// argv: -C repo branch --list <pattern> — the pattern is $5.
+	stubBin(t, "git", `case "$5" in
+  team/ship/*) printf 'team/ship/issue-42-1\n'; exit 0 ;;
+esac
+exit 0`)
+	// The real worktree path CleanupWorktreeActivity stats, so the preserve
+	// sequence is genuinely reachable and only the prefix check can suppress it.
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:     "/repo",
+		TaskQueue:    "daedalus",
+		IssueID:      "42",
+		BranchName:   "feat/issue-42-7",
+		BranchPrefix: "team/ship",
+	}); err != nil {
+		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	// Finalized check, in-flight delete, remove, prune, stale sweep — and
+	// crucially no preserve commit / aborted rename, despite the worktree
+	// directory still existing.
+	if len(calls) != 5 {
+		t.Fatalf("git called %d times, want 5 (finalized check, drop in-flight, remove, prune, sweep)", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "team/ship/issue-42-*", "--format=%(refname:short)"}, "finalized check")
+	assertArgs(t, calls[1].Args, []string{"-C", "/repo", "branch", "-D", "feat/issue-42-7"}, "drop in-flight branch")
+}
+
+// TestCleanupFinalizedCheckIgnoresOtherPrefixes is the mirror of
+// TestCleanupFinalizedCheckUsesRunPrefix: a deliverable finalized under a
+// different prefix must not suppress this run's aborted-work snapshot.
+func TestCleanupFinalizedCheckIgnoresOtherPrefixes(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	// branch --list reports a deliverable only under daedalus/, not the run's
+	// team/ship prefix; argv: -C repo branch --list <pattern> — $5.
+	stubBin(t, "git", `case "$5" in
+  daedalus/*) printf 'daedalus/issue-42-1\n'; exit 0 ;;
+esac
+exit 0`)
+	// The real worktree path, so the preserve sequence is genuinely reachable
+	// and only the prefix check could suppress it.
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:     "/repo",
+		TaskQueue:    "daedalus",
+		IssueID:      "42",
+		BranchName:   "feat/issue-42-7",
+		BranchPrefix: "team/ship",
+	}); err != nil {
+		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 8 {
+		t.Fatalf("git called %d times, want 8 (list, add, commit, drop aborted, rename, remove, prune, sweep)", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "team/ship/issue-42-*", "--format=%(refname:short)"}, "finalized check")
+	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+}
+
+// TestCleanupRejectsReservedBranchPrefix pins the trust boundary: a workflow
+// input whose BranchPrefix collides with a reserved namespace fails loudly
+// before any git runs, so it can neither suppress the aborted-work snapshot
+// nor delete the in-flight branch.
+func TestCleanupRejectsReservedBranchPrefix(t *testing.T) {
+	fakeHome(t)
+	log := newStubLog(t)
+	stubBin(t, "git", "exit 0")
+
+	err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:     "/repo",
+		TaskQueue:    "daedalus",
+		IssueID:      "42",
+		BranchName:   "feat/issue-42-7",
+		BranchPrefix: "feat",
+	})
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("want reserved-namespace rejection, got %v", err)
+	}
+	// The stub log only exists once git runs; its absence is the assertion.
+	if _, err := os.Stat(log); !os.IsNotExist(err) {
+		t.Errorf("git ran despite the reserved prefix (stat err = %v)", err)
+	}
+}
+
 // TestFinalizeWorktreeActivityNothingToCommit pins the anomaly path: an
 // approved change with an empty diff fails finalize instead of preserving a
 // meaningless branch.

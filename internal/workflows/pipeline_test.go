@@ -266,13 +266,30 @@ func TestFeatureDevWorkflowContinued(t *testing.T) {
 		Return(activities.ReviewResult{Approved: true}, nil)
 	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil)
+	var finalized, cleanedUp activities.WorktreeInput
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
-		Return("daedalus/issue-42-2", nil)
-	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil)
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.WorktreeInput); ok {
+					finalized = in
+				}
+			}
+		}).
+		Return("team/ship/issue-42-2", nil)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.WorktreeInput); ok {
+					cleanedUp = in
+				}
+			}
+		}).
+		Return(nil)
 
 	in := baseInput()
 	in.BaseBranch = "aborted/issue-42"
 	in.PriorFeedback = "finding 1"
+	in.BranchPrefix = "team/ship"
 	env.ExecuteWorkflow(FeatureDevWorkflow, in)
 
 	if err := env.GetWorkflowError(); err != nil {
@@ -280,6 +297,18 @@ func TestFeatureDevWorkflowContinued(t *testing.T) {
 	}
 	if created.BaseBranch != "aborted/issue-42" {
 		t.Errorf("CreateWorktreeActivity BaseBranch = %q, want aborted/issue-42", created.BaseBranch)
+	}
+	if created.BranchPrefix != "team/ship" {
+		t.Errorf("CreateWorktreeActivity BranchPrefix = %q, want team/ship", created.BranchPrefix)
+	}
+	// The prefix must reach the activities whose behavior depends on it:
+	// finalize names the deliverable branch under it, and cleanup's
+	// finalized check globs under it.
+	if finalized.BranchPrefix != "team/ship" {
+		t.Errorf("FinalizeWorktreeActivity BranchPrefix = %q, want team/ship", finalized.BranchPrefix)
+	}
+	if cleanedUp.BranchPrefix != "team/ship" {
+		t.Errorf("CleanupWorktreeActivity BranchPrefix = %q, want team/ship", cleanedUp.BranchPrefix)
 	}
 	if len(rec.inputs) == 0 {
 		t.Fatal("agent never ran")

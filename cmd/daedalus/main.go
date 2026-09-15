@@ -67,19 +67,23 @@ Usage:
       newest first: session id, status, last interaction datetime (close
       time once closed, start time while running). Defaults to the 10 most
       recent; pass a larger max to list more.
-  daedalus [-c config.yaml] [-w workflow] run [-d] <repo-path> <issue-id> "<prompt>"
+  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] <repo-path> <issue-id> "<prompt>"
       Start a pipeline for an issue. -w selects the workflow
       (default: feature-dev; available: ` + workflowNames() + `).
       The "<prompt>" argument is the full task description; pass
       -f/--file <path> to read it from a file instead — either the
       argument or the file, never both.
+      -p/--prefix names the preserved branch <prefix>/issue-<id>-<timestamp>
+      for this run, overriding the config's branch_prefix (the issue part of
+      the name stays as given).
       -d/--detach starts the pipeline and returns immediately instead of
       blocking until it finishes; "daedalus attach" reconnects later.
   daedalus [-c config.yaml] run -a <workflow-id> "<prompt>"
       Append instructions to a pipeline that is already running instead of
       starting a new run: the prompt is folded into the agent's next fix
       round (same as "daedalus guide"); -f/--file works here too.
-      -d has no effect in append mode.
+      -d has no effect in append mode, and -p is rejected there: the run
+      keeps the branch prefix it started with.
   daedalus [-c config.yaml] guide <workflow-id> "<message>"
       Send operator guidance to a running pipeline: the message is folded
       into the agent's next fix prompt, steering a stuck review loop
@@ -89,7 +93,8 @@ Usage:
       agent API exhaustion) under a new prompt: the aborted attempt's work,
       preserved on its aborted/ branch, becomes the new run's starting
       point, and that attempt's last review feedback is folded into the
-      opening prompt. -d works here too.
+      opening prompt. -d works here too; -p does not — the continued run
+      keeps the original run's branch prefix.
   daedalus [-c config.yaml] attach <workflow-id>
       Reattach to a running (or already finished) pipeline, block until it
       finishes, and report the outcome — the other half of "run -d".
@@ -99,6 +104,8 @@ Usage:
 Configuration is read from config.yaml (-c/--config to override the path);
 see config-example.yaml for all fields and their defaults:
   agent                Jailed agent CLI: claude or opencode (default claude)
+  branch_prefix        Prefix for preserved branches, <prefix>/issue-<id>-<ts>
+                       (default daedalus; run -p/--prefix overrides per run)
   temporal.host        Temporal frontend address   (default 127.0.0.1:7233)
   temporal.ui_port     Temporal UI port, shown at worker startup (default 8233)
   temporal.task_queue  routing key; distinct projects or flows sharing one
@@ -242,7 +249,8 @@ func main() {
 				fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
 				os.Exit(1)
 			}
-			err = startPipeline(cfg, configPath.workflow, args[1], args[2], prompt, configPath.detach)
+			err = startPipeline(cfg, configPath.workflow, args[1], args[2], prompt, configPath.detach,
+				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
 				os.Exit(1)
@@ -303,6 +311,9 @@ type flags struct {
 	workflow   string
 	taskFile   string
 	detach     bool
+	// branchPrefix, set via -p/--prefix on `run`, overrides the config's
+	// branch_prefix for that run's preserved branch.
+	branchPrefix string
 	// appendID, set via -a/--append on `run`, targets an already-running
 	// pipeline instead of starting a new one.
 	appendID string
@@ -326,21 +337,27 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 				return fmt.Errorf("unknown workflow %q (available: %s)", value, workflowNames())
 			}
 			f.workflow = value
+		case "prefix":
+			if err := config.ValidateBranchPrefix(value); err != nil {
+				return err
+			}
+			f.branchPrefix = value
 		}
 		return nil
 	}
+parse:
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		// "--" ends flag parsing: everything after it is positional, so a
 		// prompt that happens to start with -c or --workflow= survives.
 		if a == "--" {
 			rest = append(rest, args[i+1:]...)
-			return f, rest, nil
+			break parse
 		}
 		var name string
 		var value string
 		switch {
-		case a == "-c" || a == "--config" || a == "-w" || a == "--workflow" || a == "-f" || a == "--file" || a == "-a" || a == "--append":
+		case a == "-c" || a == "--config" || a == "-w" || a == "--workflow" || a == "-f" || a == "--file" || a == "-a" || a == "--append" || a == "-p" || a == "--prefix":
 			if i+1 >= len(args) {
 				return f, nil, fmt.Errorf("%s requires a value", a)
 			}
@@ -352,6 +369,8 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 				name = "file"
 			case "-a", "--append":
 				name = "append"
+			case "-p", "--prefix":
+				name = "prefix"
 			default:
 				name = "workflow"
 			}
@@ -362,6 +381,8 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 			name, value = "file", strings.TrimPrefix(a, "--file=")
 		case strings.HasPrefix(a, "--append="):
 			name, value = "append", strings.TrimPrefix(a, "--append=")
+		case strings.HasPrefix(a, "--prefix="):
+			name, value = "prefix", strings.TrimPrefix(a, "--prefix=")
 		case a == "-d" || a == "--detach":
 			f.detach = true
 			continue
@@ -375,7 +396,23 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 			return f, nil, err
 		}
 	}
+	// -p/--prefix only means anything on a fresh `run`; reject it elsewhere —
+	// append mode included — instead of accepting (and validating) an option
+	// the subcommand ignores.
+	if f.branchPrefix != "" && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
+		return f, nil, errors.New("-p/--prefix only applies to run")
+	}
 	return f, rest, nil
+}
+
+// resolveBranchPrefix picks a new run's branch prefix: -p/--prefix wins for
+// this run; otherwise the config's (already validated and defaulted)
+// branch_prefix applies.
+func resolveBranchPrefix(flagPrefix, configPrefix string) string {
+	if flagPrefix != "" {
+		return flagPrefix
+	}
+	return configPrefix
 }
 
 // runPrompt resolves the task description for `daedalus run`: the content of
@@ -615,9 +652,9 @@ func runWorker(cfg config.Config) error {
 }
 
 // startPipeline triggers the named workflow for the given issue on the
-// configured task queue. Unless detach is set, it then blocks until the
-// pipeline finishes.
-func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt string, detach bool) error {
+// configured task queue. branchPrefix names the run's preserved branch.
+// Unless detach is set, it then blocks until the pipeline finishes.
+func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix string) error {
 	workflowFn, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
@@ -642,10 +679,11 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		// instead of failing with an already-exists error.
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 	}, workflowFn, workflows.PipelineInput{
-		RepoPath:  repoPath,
-		TaskQueue: cfg.Temporal.TaskQueue,
-		IssueID:   issueID,
-		Prompt:    prompt,
+		RepoPath:     repoPath,
+		TaskQueue:    cfg.Temporal.TaskQueue,
+		IssueID:      issueID,
+		Prompt:       prompt,
+		BranchPrefix: branchPrefix,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -747,10 +785,13 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		TaskQueue:             cfg.Temporal.TaskQueue,
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 	}, workflows.FeatureDevWorkflow, workflows.PipelineInput{
-		RepoPath:      prev.RepoPath,
-		TaskQueue:     cfg.Temporal.TaskQueue,
-		IssueID:       prev.IssueID,
-		Prompt:        prompt,
+		RepoPath:  prev.RepoPath,
+		TaskQueue: cfg.Temporal.TaskQueue,
+		IssueID:   prev.IssueID,
+		Prompt:    prompt,
+		// A pre-branch-prefix run (empty in its recorded history) resolves
+		// like a fresh run: through the operator's current config.
+		BranchPrefix:  resolveBranchPrefix(prev.BranchPrefix, cfg.BranchPrefix),
 		BaseBranch:    base,
 		PriorFeedback: tail(lastReview.Comments, maxPriorFeedback),
 	})
