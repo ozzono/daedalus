@@ -48,7 +48,8 @@ func TestImplement(t *testing.T) {
 		"- Reuse what already exists in this codebase; prefer the standard library over new dependencies — never add one for what a few lines of stdlib can do.\n" +
 		"- Shortest working diff wins: one line before fifty, fewest files, no single-caller abstractions or pass-through wrappers.\n" +
 		"- Fix the root cause, not the symptom — one guard where all callers route through beats a guard per caller.\n" +
-		"- Never lazy about correctness: keep validation, error handling, edge cases, and cleanup intact. Mark a deliberate corner-cut with a `ponytail:` comment naming its ceiling."
+		"- Never lazy about correctness: keep validation, error handling, edge cases, and cleanup intact. Mark a deliberate corner-cut with a `ponytail:` comment naming its ceiling.\n\n" +
+		"Bug policy — every bug you find, in your diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. If it is in scope for this task, fix it now as part of the change. If it is out of scope, leave the code untouched — record it and add an alert about it in the docs."
 	if got != want {
 		t.Errorf("Implement = %q, want %q", got, want)
 	}
@@ -75,6 +76,7 @@ func TestTests(t *testing.T) {
 	want := "Write, fix, or improve the test suite covering the change in this repository.\n\n" +
 		"Changes in this round are test-scoped: write only test code and leave the implementation as-is — its current behavior is the contract the tests verify. If a test exposes an implementation bug, say so in your reply rather than changing the implementation.\n\n" +
 		"While iterating you may run only the tests you are working on, but know that the pipeline's final gate runs the COMPLETE test suite, not a subset — do not consider the round done until the full suite passes.\n\n" +
+		"Bug policy — every bug you find, in the tests or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. A bug in the tests you are writing is in scope: fix it. Everything else — implementation bugs the tests expose included — is documented only, never fixed here; report what you found in your reply.\n\n" +
 		"Keep it lazy and minimal: test observable behavior, not implementation details. Cover the change's behavior, edge cases, and error paths with the fewest tests that genuinely verify them — no redundant happy-path duplicates, no speculative tests, no over-mocking."
 	if got != want {
 		t.Errorf("Tests = %q, want %q", got, want)
@@ -123,6 +125,7 @@ func TestReview(t *testing.T) {
 		"and bloat — speculative abstractions, dead code, needless dependencies, diffs wider than the task. " +
 		"When uncertain, request changes and state exactly what must be verified; approve only what you have checked in full.\n\n" +
 		"Tests are out of scope for this review. The test suite is written and reviewed in a separate phase after this one: missing, absent, or thin tests are not findings — do not request changes over test coverage. Judge only the implementation. (You may still build and run the existing suite to verify the change is sound.)\n\n" +
+		"Bug policy — every bug you find, in the diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. If it is in scope for this review, make it a finding and request changes. If it is out of scope, do not block approval over it — record it and add an alert about it in the docs.\n\n" +
 		"End your response with a final line containing exactly APPROVED if it is acceptable as-is, " +
 		"or CHANGES_REQUESTED if changes are required. Put all review comments above that final line."
 	if got != want {
@@ -149,5 +152,11 @@ func TestReviewWithTestLogs(t *testing.T) {
 	}
 	if strings.Contains(got, "Tests are out of scope") {
 		t.Error("test review must not declare tests out of scope")
+	}
+	if !strings.Contains(got, "Only a bug in the tests under review is a finding") {
+		t.Error("test review should carry the test-scoped bug policy")
+	}
+	if strings.Contains(got, "do not block approval") {
+		t.Error("test review must not carry the dev-review bug policy")
 	}
 }
