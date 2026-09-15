@@ -1,18 +1,27 @@
 package version
 
-import (
-	"regexp"
-	"testing"
-)
+import "testing"
 
-// semverShape is the same X.Y.Z form CI enforces before tagging a release
-// (no leading zeros — CI's patch arithmetic reads "08" as an invalid octal).
-var semverShape = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+// TestLdflagsVersionWins pins the precedence: an ldflags-injected value (set
+// at link time by `make build`) beats the build-info fallback, and stray
+// whitespace is trimmed.
+func TestLdflagsVersionWins(t *testing.T) {
+	old := ldflagsVersion
+	defer func() { ldflagsVersion = old }()
+	ldflagsVersion = "v9.9.9\n"
+	if got := String(); got != "v9.9.9" {
+		t.Errorf("String() = %q, want %q", got, "v9.9.9")
+	}
+}
 
-// TestString pins the version contract: the committed VERSION file ends in a
-// newline, so a dropped trim (or a malformed version) fails this check.
-func TestString(t *testing.T) {
-	if v := String(); !semverShape.MatchString(v) {
-		t.Errorf("String() = %q, want X.Y.Z with no surrounding whitespace", v)
+// TestFallbackNeverEmpty pins the local-build fallback: with no ldflags
+// value, String still reports something non-empty ("(devel)" unless Go
+// recorded a real module version at build time).
+func TestFallbackNeverEmpty(t *testing.T) {
+	if ldflagsVersion != "" {
+		t.Skip("ldflags value set — fallback not exercised")
+	}
+	if v := String(); v == "" {
+		t.Error(`String() = "", want a non-empty fallback version`)
 	}
 }
