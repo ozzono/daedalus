@@ -121,6 +121,8 @@ all fields and their defaults:
   anthropic.url        Anthropic API base URL       (default https://api.anthropic.com)
   anthropic.key        Anthropic API key            (optional — skipped if unset)
   anthropic.model      Model for the jailed agent   (agent default if unset)
+  anthropic.timeout_ms Agent API timeout in ms, exported as API_TIMEOUT_MS
+                       (default 3000000 = 50 minutes)
   openai.url/key/model Optional OpenAI settings injected into the agent environment
 
 For a local Temporal dev server matching the defaults:

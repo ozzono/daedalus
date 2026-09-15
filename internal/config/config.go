@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -26,6 +27,11 @@ const (
 	// DefaultBranchPrefix prefixes the preserved branch that carries a run's
 	// approved work when config branch_prefix is unset.
 	DefaultBranchPrefix = "daedalus"
+	// DefaultAnthropicTimeoutMS bounds the jailed agent's API requests,
+	// exported to the agent as API_TIMEOUT_MS. Generous by design: agent
+	// rounds legitimately run long (whole-repo analyses, slow builds), and a
+	// tight client-side ceiling kills rounds the pipeline would keep.
+	DefaultAnthropicTimeoutMS = 3_000_000
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -42,11 +48,17 @@ type TemporalConfig struct {
 
 // AnthropicConfig configures the jailed agent's Anthropic backend. The
 // values are injected into the agent's environment (ANTHROPIC_BASE_URL,
-// ANTHROPIC_API_KEY, ANTHROPIC_MODEL); the key is required for the worker.
+// ANTHROPIC_API_KEY, ANTHROPIC_MODEL, API_TIMEOUT_MS); the key is required
+// for the worker.
 type AnthropicConfig struct {
 	URL   string `yaml:"url"`
 	Key   string `yaml:"key"`
 	Model string `yaml:"model"`
+	// TimeoutMS bounds the agent's API requests, exported as API_TIMEOUT_MS.
+	// Zero (unset) defaults to DefaultAnthropicTimeoutMS — unlike the string
+	// fields there is no "inherit the environment" escape hatch: the jailed
+	// agent gets an explicit ceiling either way.
+	TimeoutMS int `yaml:"timeout_ms"`
 }
 
 // OpenAIConfig is injected into the jailed agent's environment as
@@ -102,6 +114,7 @@ func (c Config) AgentEnv() []string {
 	add("ANTHROPIC_BASE_URL", c.Anthropic.URL)
 	add("ANTHROPIC_API_KEY", c.Anthropic.Key)
 	add("ANTHROPIC_MODEL", c.Anthropic.Model)
+	add("API_TIMEOUT_MS", strconv.Itoa(c.Anthropic.TimeoutMS))
 	add("OPENAI_BASE_URL", c.OpenAI.URL)
 	add("OPENAI_API_KEY", c.OpenAI.Key)
 	add("OPENAI_MODEL", c.OpenAI.Model)
@@ -182,5 +195,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Temporal.TaskQueue == "" {
 		c.Temporal.TaskQueue = DefaultTaskQueue
+	}
+	if c.Anthropic.TimeoutMS == 0 {
+		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS
 	}
 }
