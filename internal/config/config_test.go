@@ -47,6 +47,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.BranchPrefix != DefaultBranchPrefix {
 		t.Errorf("BranchPrefix = %q, want %q", cfg.BranchPrefix, DefaultBranchPrefix)
 	}
+	if cfg.Anthropic.TimeoutMS != DefaultAnthropicTimeoutMS {
+		t.Errorf("Anthropic.TimeoutMS = %d, want %d", cfg.Anthropic.TimeoutMS, DefaultAnthropicTimeoutMS)
+	}
 }
 
 // TestLoadAgent pins the accepted agent values: both shipped agents load,
@@ -78,6 +81,7 @@ anthropic:
   url: https://proxy.example
   key: sk-ant-test
   model: claude-opus-5
+  timeout_ms: 60000
 openai:
   url: https://oa.example/v1
   key: sk-oa-test
@@ -102,6 +106,9 @@ openai:
 	if cfg.Anthropic.Model != "claude-opus-5" {
 		t.Errorf("Anthropic.Model = %q, want claude-opus-5", cfg.Anthropic.Model)
 	}
+	if cfg.Anthropic.TimeoutMS != 60000 {
+		t.Errorf("Anthropic.TimeoutMS = %d, want 60000", cfg.Anthropic.TimeoutMS)
+	}
 	if cfg.OpenAI.Model != "gpt-test" {
 		t.Errorf("OpenAI.Model = %q, want gpt-test", cfg.OpenAI.Model)
 	}
@@ -111,6 +118,7 @@ openai:
 		"ANTHROPIC_BASE_URL=https://proxy.example",
 		"ANTHROPIC_API_KEY=sk-ant-test",
 		"ANTHROPIC_MODEL=claude-opus-5",
+		"API_TIMEOUT_MS=60000",
 		"OPENAI_BASE_URL=https://oa.example/v1",
 		"OPENAI_API_KEY=sk-oa-test",
 		"OPENAI_MODEL=gpt-test",
@@ -129,6 +137,7 @@ func TestAgentEnvOmitsEmpty(t *testing.T) {
 	env := cfg.AgentEnv()
 	want := []string{
 		"ANTHROPIC_API_KEY=sk-only",
+		"API_TIMEOUT_MS=3000000",
 	}
 	if !slices.Equal(env, want) {
 		t.Errorf("AgentEnv() = %v, want %v", env, want)
@@ -208,8 +217,9 @@ func TestExampleYAML(t *testing.T) {
 		cfg.Temporal.UIPort != DefaultTemporalUIPort || cfg.Temporal.TaskQueue != DefaultTaskQueue {
 		t.Errorf("ExampleYAML values = %+v, want the documented defaults", cfg)
 	}
-	if cfg.Anthropic != (AnthropicConfig{}) || cfg.OpenAI != (OpenAIConfig{}) {
-		t.Errorf("ExampleYAML provider values = %+v %+v, want empty (inherit the environment)", cfg.Anthropic, cfg.OpenAI)
+	if cfg.Anthropic.URL != "" || cfg.Anthropic.Key != "" || cfg.Anthropic.Model != "" ||
+		cfg.Anthropic.TimeoutMS != DefaultAnthropicTimeoutMS || cfg.OpenAI != (OpenAIConfig{}) {
+		t.Errorf("ExampleYAML provider values = %+v %+v, want empty (inherit the environment) except the timeout default", cfg.Anthropic, cfg.OpenAI)
 	}
 }
 

@@ -43,6 +43,11 @@ anthropic:
   key: ""
   # Model for the jailed agent; empty means the agent's own default.
   model: ""
+  # API request timeout for the jailed agent, in milliseconds, exported as
+  # API_TIMEOUT_MS. Agent rounds run long — builds, whole-repo analyses — so
+  # the default is generous: 3000000 = 50 minutes. Zero/unset falls back to
+  # this default; there is no inherit-the-environment escape hatch.
+  timeout_ms: 3000000
 
 openai:
   # Optional OpenAI settings, injected into the jailed agent's environment
