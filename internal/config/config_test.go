@@ -44,6 +44,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Agent != DefaultAgent {
 		t.Errorf("Agent = %q, want %q", cfg.Agent, DefaultAgent)
 	}
+	if cfg.BranchPrefix != DefaultBranchPrefix {
+		t.Errorf("BranchPrefix = %q, want %q", cfg.BranchPrefix, DefaultBranchPrefix)
+	}
 }
 
 // TestLoadAgent pins the accepted agent values: both shipped agents load,
@@ -132,6 +135,51 @@ func TestAgentEnvOmitsEmpty(t *testing.T) {
 	}
 }
 
+// TestLoadBranchPrefix pins that a configured prefix loads through and an
+// unusable one fails at config load, before any run starts.
+func TestLoadBranchPrefix(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "branch_prefix: team/ship\n"))
+	if err != nil {
+		t.Fatalf("Load(branch_prefix): %v", err)
+	}
+	if cfg.BranchPrefix != "team/ship" {
+		t.Errorf("BranchPrefix = %q, want team/ship", cfg.BranchPrefix)
+	}
+
+	_, err = Load(writeConfig(t, "branch_prefix: feat\n"))
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("want reserved-namespace error, got %v", err)
+	}
+}
+
+// TestValidateBranchPrefix pins the accepted and rejected prefixes, following
+// git check-ref-format for the prospective <prefix>/issue-<id>-<ts> plus the
+// reserved feat/aborted namespaces.
+func TestValidateBranchPrefix(t *testing.T) {
+	for _, p := range []string{"daedalus", "team", "team/ship", "v1.x", "a-b_c"} {
+		if err := ValidateBranchPrefix(p); err != nil {
+			t.Errorf("ValidateBranchPrefix(%q) = %v, want nil", p, err)
+		}
+	}
+	for _, p := range []string{
+		"",                 // unset means default, but a flag value must be real
+		"-x",               // would read as an option
+		"/x", "x/", "a//b", // empty path components
+		"a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", `a\b`,
+		"a..b",       // range syntax
+		"a@{b",       // reflog syntax
+		".x", "x/.y", // components may not begin with "."
+		"x.lock", "a/b.lock", // lock suffix is reserved
+		"feat", "aborted", // daedalus's own namespaces
+		"feat/x", "aborted/y", // ... including as a leading component
+		"a\x01b", // control characters
+	} {
+		if err := ValidateBranchPrefix(p); err == nil {
+			t.Errorf("ValidateBranchPrefix(%q) = nil, want rejection", p)
+		}
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
 		t.Fatal("want error for a missing config file")
@@ -155,7 +203,8 @@ func TestExampleYAML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(ExampleYAML): %v", err)
 	}
-	if cfg.Agent != DefaultAgent || cfg.Temporal.Host != DefaultTemporalHost ||
+	if cfg.Agent != DefaultAgent || cfg.BranchPrefix != DefaultBranchPrefix ||
+		cfg.Temporal.Host != DefaultTemporalHost ||
 		cfg.Temporal.UIPort != DefaultTemporalUIPort || cfg.Temporal.TaskQueue != DefaultTaskQueue {
 		t.Errorf("ExampleYAML values = %+v, want the documented defaults", cfg)
 	}

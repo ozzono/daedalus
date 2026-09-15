@@ -72,6 +72,51 @@ func TestParseFlagsAppend(t *testing.T) {
 	}
 }
 
+// TestParseFlagsPrefix covers both spellings of the run prefix flag, that an
+// unusable prefix is rejected at parse time, and that -p consumes exactly one
+// value.
+func TestParseFlagsPrefix(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"run", "-p", "team", "/repo", "42", "do it"}, "team"},
+		{[]string{"run", "--prefix", "team", "/repo", "42", "do it"}, "team"},
+		{[]string{"run", "--prefix=team/ship", "/repo", "42", "do it"}, "team/ship"},
+	} {
+		f, rest, err := parseFlags(c.args)
+		if err != nil {
+			t.Fatalf("parseFlags(%q): %v", c.args, err)
+		}
+		if f.branchPrefix != c.want {
+			t.Errorf("parseFlags(%q) branchPrefix = %q, want %q", c.args, f.branchPrefix, c.want)
+		}
+		wantRest := []string{"run", "/repo", "42", "do it"}
+		if !reflect.DeepEqual(rest, wantRest) {
+			t.Errorf("parseFlags(%q) rest = %v, want %v", c.args, rest, wantRest)
+		}
+	}
+
+	if _, _, err := parseFlags([]string{"run", "-p"}); err == nil {
+		t.Error("-p without a value should error")
+	}
+	// A reserved namespace must fail here, not at finalize after the run.
+	if _, _, err := parseFlags([]string{"run", "-p", "feat", "/repo", "42", "do it"}); err == nil ||
+		!strings.Contains(err.Error(), "reserved") {
+		t.Errorf("parseFlags(-p feat) err = %v, want a reserved-namespace rejection", err)
+	}
+	// -p names a fresh-run option; elsewhere — append mode included — it
+	// would be silently ignored.
+	if _, _, err := parseFlags([]string{"guide", "-p", "team", "wf-1", "hi"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to run") {
+		t.Errorf("parseFlags(guide -p) err = %v, want a -p-outside-run rejection", err)
+	}
+	if _, _, err := parseFlags([]string{"run", "-a", "wf-1", "-p", "team", "steer it"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to run") {
+		t.Errorf("parseFlags(run -a -p) err = %v, want a -p-in-append-mode rejection", err)
+	}
+}
+
 // TestPruneOldLogs pins the retention rule: logs untouched for over a week
 // are removed, recent ones and non-log files stay.
 func TestPruneOldLogs(t *testing.T) {

@@ -23,6 +23,10 @@ type PipelineInput struct {
 	TaskQueue string
 	IssueID   string
 	Prompt    string
+	// BranchPrefix names the preserved branch that carries the run's
+	// approved work (config branch_prefix, `run --prefix`). Empty means
+	// the activities' default.
+	BranchPrefix string
 	// BaseBranch, when set, starts the worktree from an aborted attempt's
 	// preserved branch instead of HEAD — a continued run (`daedalus
 	// continue`). PriorFeedback is that attempt's last review feedback,
@@ -35,7 +39,7 @@ type PipelineInput struct {
 // review-gated phases: (1) implementation ↔ code review until the reviewer
 // approves, then (2) tests ↔ test review until the reviewer approves AND the
 // native test suite passes. On success the approved work is committed and
-// the run's branch renamed to the preserved daedalus/ prefix; the workflow
+// the run's branch renamed to its preserved prefix; the workflow
 // returns that branch name. Both loops are intentionally unbounded — they
 // run until approval, with no attempt cap; each round is durable, auditable,
 // and individually timed-out via activity options.
@@ -52,11 +56,12 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 
 	branchName := fmt.Sprintf("feat/issue-%s-%d", input.IssueID, workflow.Now(ctx).Unix())
 	worktreeInput := activities.WorktreeInput{
-		RepoPath:   input.RepoPath,
-		TaskQueue:  input.TaskQueue,
-		IssueID:    input.IssueID,
-		BranchName: branchName,
-		BaseBranch: input.BaseBranch,
+		RepoPath:     input.RepoPath,
+		TaskQueue:    input.TaskQueue,
+		IssueID:      input.IssueID,
+		BranchName:   branchName,
+		BranchPrefix: input.BranchPrefix,
+		BaseBranch:   input.BaseBranch,
 	}
 
 	// Guarantee the workspace is cleaned up on every exit path. The defer is
@@ -66,7 +71,8 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// on a disconnected context so that cancelling the workflow does not
 	// cancel the cleanup itself, and tolerates state that never came to
 	// exist. It deletes only the in-flight feat/ branch; approved work was
-	// renamed to daedalus/ by FinalizeWorktreeActivity and survives.
+	// renamed to the preserved prefix by FinalizeWorktreeActivity and
+	// survives.
 	defer func() {
 		// NewDisconnectedContext returns (Context, CancelFunc) — the second
 		// value is not an error. Detach the cancel from this deferred func's

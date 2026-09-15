@@ -119,6 +119,7 @@ All configuration lives in `config.yaml` (override the path with
 | Field                 | Default                     | Purpose                              |
 | --------------------- | --------------------------- | ------------------------------------ |
 | `agent`               | `claude`                    | Jailed agent CLI: `claude` or `opencode` |
+| `branch_prefix`       | `daedalus`                  | Prefix for preserved branches (`<prefix>/issue-<id>-<ts>`); `run -p/--prefix` overrides per run |
 | `temporal.host`       | `127.0.0.1:7233`            | Temporal frontend address            |
 | `temporal.ui_port`    | `8233`                      | Temporal UI port (shown at startup)  |
 | `temporal.task_queue` | `daedalus`                  | Routing key; distinct projects/flows on one Temporal use distinct queues |
@@ -163,8 +164,14 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
 - **Deliverable preservation**: once both phases pass, a finalize activity
   commits the approved work and renames the run's branch from
   `feat/issue-<id>-<unix-timestamp>` (in-flight) to
-  `daedalus/issue-<id>-<unix-timestamp>` (preserved). The workflow returns
-  the preserved branch name and `daedalus run` prints it.
+  `<branch_prefix>/issue-<id>-<unix-timestamp>` (preserved; default prefix
+  `daedalus`, from `branch_prefix` or `run -p/--prefix`; prefixes colliding
+  with the reserved `feat`/`aborted` namespaces are rejected up front). The
+  prefix scopes the preserved branch and the finalized-deliverable check, but
+  not the `aborted/issue-<id>` snapshot, which is shared per issue across
+  prefixes: a failing run under another prefix replaces it and is not
+  suppressed by a deliverable finalized under this prefix. The workflow
+  returns the preserved branch name and `daedalus run` prints it.
 - **Prompt transport**: prompts travel to the jailed agent via stdin, not
   argv — no `ps` visibility, no per-argument size limit on review prompts
   that embed the full diff. Verdicts are parsed from stdout only, so

@@ -23,6 +23,9 @@ const (
 	DefaultTemporalUIPort = 8233
 	// DefaultAgent is the jailed agent CLI used when config agent is unset.
 	DefaultAgent = "claude"
+	// DefaultBranchPrefix prefixes the preserved branch that carries a run's
+	// approved work when config branch_prefix is unset.
+	DefaultBranchPrefix = "daedalus"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -61,10 +64,16 @@ type Config struct {
 	// Agent selects which jailed CLI runs the implementing and reviewer
 	// agents: "claude" (Claude Code) or "opencode" (see agents for the
 	// accepted values).
-	Agent     string          `yaml:"agent"`
-	Temporal  TemporalConfig  `yaml:"temporal"`
-	Anthropic AnthropicConfig `yaml:"anthropic"`
-	OpenAI    OpenAIConfig    `yaml:"openai"`
+	Agent string `yaml:"agent"`
+	// BranchPrefix names the preserved branch carrying a run's approved
+	// work: <prefix>/issue-<id>-<unix timestamp>. It is deliberately
+	// separate from temporal.task_queue — the queue routes workflows and
+	// scopes worktree paths, while this is repo-facing branch naming.
+	// `daedalus run --prefix` overrides it per run.
+	BranchPrefix string          `yaml:"branch_prefix"`
+	Temporal     TemporalConfig  `yaml:"temporal"`
+	Anthropic    AnthropicConfig `yaml:"anthropic"`
+	OpenAI       OpenAIConfig    `yaml:"openai"`
 }
 
 // agents lists the accepted config Agent values.
@@ -115,12 +124,55 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("config %s: agent: unknown agent %q (available: %s)",
 			path, c.Agent, strings.Join(agents, ", "))
 	}
+	if err := ValidateBranchPrefix(c.BranchPrefix); err != nil {
+		return c, fmt.Errorf("config %s: %w", path, err)
+	}
 	return c, nil
+}
+
+// reservedBranchPrefixes are daedalus's internal branch namespaces — the
+// in-flight feat/ prefix and the aborted/ continue-snapshot prefix in
+// internal/activities. A preserved-branch prefix colliding with either
+// would make cleanup and abort/continue logic treat approved deliverables
+// as their own bookkeeping, so validation rejects them up front.
+var reservedBranchPrefixes = []string{"feat", "aborted"}
+
+// ValidateBranchPrefix rejects values that cannot head a git branch name,
+// following git check-ref-format's rules for the prospective name
+// <prefix>/issue-<id>-<timestamp>: no component may begin with "." or end
+// with ".lock"; no control characters, space, or ~ ^ : ? * [ \ anywhere;
+// no "..", "//", or "@{"; the name cannot begin with "-". A bad prefix
+// must fail here, at the start of a run, rather
+// than at the finalize step after the whole pipeline has already run.
+func ValidateBranchPrefix(p string) error {
+	if p == "" || strings.HasPrefix(p, "-") || strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") ||
+		strings.ContainsAny(p, " ~^:?*[\\") ||
+		strings.Contains(p, "..") || strings.Contains(p, "//") || strings.Contains(p, "@{") {
+		return fmt.Errorf("branch prefix %q is not a valid git branch name prefix", p)
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("branch prefix %q is not a valid git branch name prefix", p)
+		}
+	}
+	for seg := range strings.SplitSeq(p, "/") {
+		if strings.HasPrefix(seg, ".") || strings.HasSuffix(seg, ".lock") {
+			return fmt.Errorf("branch prefix %q is not a valid git branch name prefix", p)
+		}
+	}
+	if slices.Contains(reservedBranchPrefixes, strings.Split(p, "/")[0]) {
+		return fmt.Errorf("branch prefix %q collides with a reserved daedalus namespace (reserved: %s)",
+			p, strings.Join(reservedBranchPrefixes, ", "))
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
 	if c.Agent == "" {
 		c.Agent = DefaultAgent
+	}
+	if c.BranchPrefix == "" {
+		c.BranchPrefix = DefaultBranchPrefix
 	}
 	if c.Temporal.Host == "" {
 		c.Temporal.Host = DefaultTemporalHost
