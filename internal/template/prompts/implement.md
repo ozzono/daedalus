@@ -9,3 +9,5 @@ Work style — the laziest solution that actually works:
 - Shortest working diff wins: one line before fifty, fewest files, no single-caller abstractions or pass-through wrappers.
 - Fix the root cause, not the symptom — one guard where all callers route through beats a guard per caller.
 - Never lazy about correctness: keep validation, error handling, edge cases, and cleanup intact. Mark a deliberate corner-cut with a `ponytail:` comment naming its ceiling.
+
+Bug policy — every bug you find, in your diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. If it is in scope for this task, fix it now as part of the change. If it is out of scope, leave the code untouched — record it and add an alert about it in the docs.

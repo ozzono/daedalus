@@ -82,9 +82,14 @@ up.
 
    ```sh
    daedalus init                  # writes config-example.yaml
-   cp config-example.yaml config.yaml   # then edit as needed
+   mkdir -p ~/.config/daedalus && cp config-example.yaml ~/.config/daedalus/config.yaml   # then edit as needed
    daedalus worker
    ```
+
+   A config in `~/.config/daedalus/config.yaml` is found from any
+   directory, so `worker`, `run`, and the other commands work wherever you
+   invoke them (a `./config.yaml` in the working directory wins when
+   present).
 
    `daedalus worker` runs the worker as a detached daemon: one per task
    queue, logs appending to `/tmp/daedalus/worker-<queue>.log` (pruned to
@@ -147,8 +152,11 @@ session id, status, and last interaction time.
 
 ## Configuration
 
-All configuration lives in `config.yaml` (override the path with
-`-c/--config`); `daedalus init` writes a fully commented
+All configuration lives in `config.yaml`, read from the working directory
+when one is there, otherwise from `~/.config/daedalus/config.yaml`
+(override the path with `-c/--config`). Keeping the config in
+`~/.config/daedalus/` makes every command — `worker`, `run`, `list`, … —
+work from any directory; `daedalus init` writes a fully commented
 `config-example.yaml` documenting every field and its default:
 
 | Field                 | Default            | Purpose                              |
