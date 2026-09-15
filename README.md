@@ -21,25 +21,34 @@ preserved and resumable.
 
 ```mermaid
 flowchart TD
-    PROMPT["daedalus run &lt;repo&gt; &lt;issue&gt; &lt;prompt&gt;"] --> CREATE["CreateWorktree<br/>(branch feat/issue-&lt;id&gt;-&lt;ts&gt;)"]
-    CREATE --> IMPL
+    PROMPT["issue"] --> CREATE["CreateWorktree"]
+    CREATE --> P1_IMPL
 
-    subgraph PHASE1 ["Phase 1 — implementation"]
-        IMPL["agent: implement"] --> REV1["reviewer: code"]
-        REV1 -- "CHANGES_REQUESTED" --> FIX1["agent: fix<br/>+ operator guidance"] --> REV1
-    end
-    REV1 -- "APPROVED" --> TESTS
+    %% Phase 1 Nodes
+    P1_IMPL["<b> PHASE 1: IMPLEMENTATION </b><hr/>RunJailedClaude<br/><i>(implements, no tests yet)</i>"]
+    P1_REV["<b> PHASE 1: REVIEW </b><hr/>RunJailedReviewer<br/><i>(code)</i>"]
 
-    subgraph PHASE2 ["Phase 2 — tests"]
-        TESTS["agent: write tests"] --> NATIVE["run repo's own<br/>test suite"]
-        NATIVE --> REV2["reviewer: tests"]
-        REV2 -- "red tests and/or<br/>CHANGES_REQUESTED" --> FIX2["agent: tests fix<br/>+ operator guidance"] --> NATIVE
-    end
-    REV2 -- "APPROVED and green" --> FINALIZE
+    P1_IMPL --> P1_REV
+    P1_REV -- "review comments<br/>(until APPROVED)" --> P1_IMPL
 
-    FINALIZE["finalize: commit, rename branch to<br/>daedalus/issue-&lt;id&gt;-&lt;ts&gt; (the deliverable)"] --> CLEAN
-    CREATE -. "every exit path" .-> CLEAN["cleanup: remove worktree,<br/>sweep stale feat/ branches"]
-    CLEAN -. "closed without approval" .-> ABORTED["work preserved on<br/>aborted/issue-&lt;id&gt;<br/>(daedalus continue resumes it)"]
+    P1_REV -- "APPROVED" --> P2_IMPL
+
+    %% Phase 2 Nodes
+    P2_IMPL["<b> PHASE 2: TESTS </b><hr/>RunJailedClaude<br/><i>(writes/fixes/improves tests)</i>"]
+    P2_TEST["<b> PHASE 2: SUITE </b><hr/>RunNativeTests"]
+    P2_REV["<b> PHASE 2: REVIEW </b><hr/>RunJailedReviewer<br/><i>(tests)</i>"]
+
+    P2_IMPL --> P2_TEST
+    P2_TEST --> P2_REV
+    P2_REV -- "test output + comments<br/>(until APPROVED & green)" --> P2_IMPL
+
+    P2_REV -- "APPROVED & green" --> CLEAN
+
+    %% Final Nodes
+    CLEAN["<b> CLEANUP </b><hr/>Cleanup<br/><i>(guaranteed on every exit path)</i>"]
+    DONE["done"]
+
+    CLEAN --> DONE
 ```
 
 ## Why
@@ -65,10 +74,10 @@ up.
 
 ## Usage
 
-1. **Build and install** the CLI:
+1. **Install** the CLI:
 
    ```sh
-   go install ./cmd/daedalus
+   go install github.com/ozzono/daedalus/cmd/daedalus@latest
    ```
 
 2. **Start a Temporal server** (first terminal — skip if one is already
@@ -274,5 +283,6 @@ version, using that PR's label to pick the bump level (`patch` for pushes
 that are not PR merges) and publishes a GitHub Release for the tag with
 auto-generated notes — there is no version file and no other release
 tooling. `daedalus --version` reports the tag-stamped version of a
-`make build` binary; a plain `go build`/`go install` binary reports
-`(devel)`.
+`make build` binary and of one installed via
+`go install github.com/ozzono/daedalus/cmd/daedalus@latest`; a plain
+`go build` from a checkout reports `(devel)`.
