@@ -1,4 +1,4 @@
-module daedalus
+module github.com/ozzono/daedalus
 
 go 1.26.5
 

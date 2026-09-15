@@ -27,6 +27,12 @@ agent: claude
 # this prefix.
 branch_prefix: daedalus
 
+# Ceiling for one execution of the repo's native test suite (a Go
+# duration string). Test-command discovery and the suite itself share this
+# budget, so it is wider than the 15-minute ceiling the other activities
+# use. Every other activity keeps that fixed 15-minute StartToClose.
+tests_timeout: 30m
+
 temporal:
   # Temporal frontend address. 7233 is Temporal's own default, so a plain
   # "temporal server start-dev" matches.

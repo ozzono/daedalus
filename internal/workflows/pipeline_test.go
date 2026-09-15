@@ -10,8 +10,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/sdk/testsuite"
 
-	"daedalus/internal/activities"
-	"daedalus/internal/template"
+	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/template"
 )
 
 var (

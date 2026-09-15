@@ -20,8 +20,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"daedalus/internal/config"
-	"daedalus/internal/template"
+	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/template"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/log"

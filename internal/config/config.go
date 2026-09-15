@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -32,6 +33,11 @@ const (
 	// rounds legitimately run long (whole-repo analyses, slow builds), and a
 	// tight client-side ceiling kills rounds the pipeline would keep.
 	DefaultAnthropicTimeoutMS = 3_000_000
+	// DefaultTestsTimeout bounds one execution of a repo's native test suite
+	// when config tests_timeout is unset. Wider than the shared activity
+	// ceiling because test-command discovery and a cold build legitimately
+	// overrun it.
+	DefaultTestsTimeout = 30 * time.Minute
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -82,7 +88,12 @@ type Config struct {
 	// separate from temporal.task_queue — the queue routes workflows and
 	// scopes worktree paths, while this is repo-facing branch naming.
 	// `daedalus run --prefix` overrides it per run.
-	BranchPrefix string          `yaml:"branch_prefix"`
+	BranchPrefix string `yaml:"branch_prefix"`
+	// TestsTimeout bounds one execution of the repo's native test suite
+	// (RunNativeTestsActivity): test-command discovery and the suite itself
+	// share this budget. A time.ParseDuration string in YAML ("30m");
+	// DefaultTestsTimeout when unset.
+	TestsTimeout time.Duration   `yaml:"tests_timeout"`
 	Temporal     TemporalConfig  `yaml:"temporal"`
 	Anthropic    AnthropicConfig `yaml:"anthropic"`
 	OpenAI       OpenAIConfig    `yaml:"openai"`
@@ -139,6 +150,9 @@ func Load(path string) (Config, error) {
 	}
 	if err := ValidateBranchPrefix(c.BranchPrefix); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
+	}
+	if c.TestsTimeout < 0 {
+		return c, fmt.Errorf("config %s: tests_timeout: must not be negative", path)
 	}
 	return c, nil
 }
@@ -198,5 +212,14 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS
+	}
+	if c.TestsTimeout == 0 {
+		c.TestsTimeout = DefaultTestsTimeout
+	}
+	if c.Anthropic.TimeoutMS == 0 {
+		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS
+	}
+	if c.TestsTimeout == 0 {
+		c.TestsTimeout = DefaultTestsTimeout
 	}
 }

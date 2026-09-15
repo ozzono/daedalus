@@ -10,7 +10,7 @@ import (
 )
 
 // ldflagsVersion is set at link time:
-// -ldflags "-X daedalus/internal/version.ldflagsVersion=v1.2.3"
+// -ldflags "-X github.com/ozzono/daedalus/internal/version.ldflagsVersion=v1.2.3"
 var ldflagsVersion string
 
 // String returns the CLI's version: the ldflags-injected value when set,
