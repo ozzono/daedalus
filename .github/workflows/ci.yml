@@ -122,6 +122,11 @@ jobs:
             echo "attempt $attempt: latest v$latest -> tagging v$new"
             git tag "v$new"
             if git push origin "refs/tags/v$new"; then
+              # A bare tag does not render on the Releases page — publish a
+              # release for it. Idempotent: a re-run skips an existing one.
+              if ! gh release view "v$new" >/dev/null 2>&1; then
+                gh release create "v$new" --generate-notes --latest
+              fi
               exit 0
             fi
             git tag -d "v$new" >/dev/null
