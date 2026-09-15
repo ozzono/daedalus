@@ -117,6 +117,103 @@ func TestParseFlagsPrefix(t *testing.T) {
 	}
 }
 
+// TestResolveConfigPath pins the discovery order: an explicit -c is honored
+// verbatim, ./config.yaml wins over the home fallback, and the home config
+// (~/.config/daedalus/config.yaml) is found when the working directory has
+// none — the property that lets the CLI run from any directory.
+func TestResolveConfigPath(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		// writeCwdConfig and writeHomeConfig seed the two lookup locations
+		// for this case; each subtest gets a fresh home and workdir, so
+		// cases cannot see each other's configs.
+		writeCwdConfig  bool
+		writeHomeConfig bool
+		given           string
+		// wantCwdConfig/wantHomeConfig name that location's config.yaml as
+		// the expected result (its path is only known inside the subtest).
+		wantCwdConfig    bool
+		wantHomeConfig   bool
+		want             string
+		wantErrSubstring string
+	}{
+		{
+			name:  "explicit -c is verbatim",
+			given: "/elsewhere/config.yaml",
+			want:  "/elsewhere/config.yaml",
+		},
+		{
+			name:            "cwd config wins over home",
+			writeCwdConfig:  true,
+			writeHomeConfig: true,
+			wantCwdConfig:   true,
+		},
+		{
+			name:          "home config found from a bare directory",
+			writeHomeConfig: true,
+			wantHomeConfig: true,
+		},
+		{
+			name:            "no config anywhere",
+			wantErrSubstring: "no config found",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			homeCfg := filepath.Join(home, homeConfigDir, defaultConfigPath)
+			if err := os.MkdirAll(filepath.Dir(homeCfg), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			workdir := t.TempDir()
+			if c.writeCwdConfig {
+				writeConfig(t, filepath.Join(workdir, defaultConfigPath))
+			}
+			if c.writeHomeConfig {
+				writeConfig(t, homeCfg)
+			}
+			t.Chdir(workdir)
+
+			// Cases without an explicit given exercise the parseFlags
+			// default, never an empty string (Abs("") would be the cwd).
+			given := c.given
+			if given == "" {
+				given = defaultConfigPath
+			}
+			got, err := resolveConfigPath(given)
+			if c.wantErrSubstring != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErrSubstring) {
+					t.Errorf("resolveConfigPath error = %v, want it to contain %q", err, c.wantErrSubstring)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveConfigPath: %v", err)
+			}
+			var want string
+			switch {
+			case c.wantCwdConfig:
+				want = filepath.Join(workdir, defaultConfigPath)
+			case c.wantHomeConfig:
+				want = homeCfg
+			default:
+				want = c.want
+			}
+			if got != want {
+				t.Errorf("resolveConfigPath = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// writeConfig drops a minimal readable config file at path.
+func writeConfig(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("agent: claude\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestPruneOldLogs pins the retention rule: logs untouched for over a week
 // are removed, recent ones and non-log files stay.
 func TestPruneOldLogs(t *testing.T) {

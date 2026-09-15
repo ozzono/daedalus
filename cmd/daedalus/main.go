@@ -33,8 +33,14 @@ import (
 // comfortably.
 const runWaitTimeout = 4 * time.Hour
 
-// defaultConfigPath is used when -c/--config is not given.
+// defaultConfigPath is used when -c/--config is not given: looked up in the
+// working directory, then in the user-level home (see resolveConfigPath).
 const defaultConfigPath = "config.yaml"
+
+// homeConfigDir is the config's user-level home, ~/.config/daedalus. A
+// config there is found from any directory, so worker and client commands
+// work wherever they are invoked.
+const homeConfigDir = ".config/daedalus"
 
 // defaultWorkflowName is used when -w/--workflow is not given.
 const defaultWorkflowName = "feature-dev"
@@ -101,8 +107,10 @@ Usage:
       <workflow-id> is the identifier printed by "run" (also visible in
       "temporal workflow list").
 
-Configuration is read from config.yaml (-c/--config to override the path);
-see config-example.yaml for all fields and their defaults:
+Configuration is read from the first of ./config.yaml and
+~/.config/daedalus/config.yaml (-c/--config to override the path); the
+latter makes the CLI work from any directory. See config-example.yaml for
+all fields and their defaults:
   agent                Jailed agent CLI: claude or opencode (default claude)
   branch_prefix        Prefix for preserved branches, <prefix>/issue-<id>-<ts>
                        (default daedalus; run -p/--prefix overrides per run)
@@ -128,6 +136,21 @@ func main() {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
+	}
+
+	// Every subcommand except the no-config ones (help, version, init)
+	// loads a configuration; resolve its location once, up front, so the
+	// subcommand — and the daemon `worker start` re-executes — agree on
+	// it wherever the CLI is invoked from.
+	switch args[0] {
+	case "-h", "--help", "help", "-v", "--version", "init":
+	default:
+		path, err := resolveConfigPath(configPath.configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		configPath.configPath = path
 	}
 
 	switch args[0] {
@@ -405,6 +428,40 @@ parse:
 	return f, rest, nil
 }
 
+// resolveConfigPath locates the configuration when -c/--config is absent:
+// ./config.yaml first (a deployment kept in the working directory), then
+// ~/.config/daedalus/config.yaml (the user-level home), so worker and
+// client commands work from any directory. An explicit -c is honored
+// verbatim. The path is returned absolute so the re-exec'd daemon child
+// does not depend on the working directory it inherited at start time.
+func resolveConfigPath(given string) (string, error) {
+	if given != defaultConfigPath {
+		return filepath.Abs(given)
+	}
+	if _, err := os.Stat(defaultConfigPath); err == nil {
+		return filepath.Abs(defaultConfigPath)
+	}
+	fallback, err := homeConfigPath()
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(fallback); err == nil {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("no config found — looked for ./%s and %s (pass -c, or `daedalus init` into one of them)",
+		defaultConfigPath, fallback)
+}
+
+// homeConfigPath is the config's fallback location under the user-level
+// config home, ~/.config/daedalus.
+func homeConfigPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, homeConfigDir, defaultConfigPath), nil
+}
+
 // resolveBranchPrefix picks a new run's branch prefix: -p/--prefix wins for
 // this run; otherwise the config's (already validated and defaulted)
 // branch_prefix applies.
@@ -499,10 +556,10 @@ func workerStart(cfg config.Config, configPath string) error {
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
-	childArgs := []string{"worker", "foreground"}
-	if configPath != defaultConfigPath {
-		childArgs = append(childArgs, "-c", configPath)
-	}
+	// The resolved config path is absolute (resolveConfigPath), so the
+	// daemon never re-resolves against the working directory it was
+	// started from — it keeps serving if that directory goes away.
+	childArgs := []string{"worker", "foreground", "-c", configPath}
 	cmd := exec.Command(self, childArgs...)
 	cmd.Env = append(os.Environ(), daemonEnv+"=1")
 	cmd.Stdout = log
