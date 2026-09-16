@@ -59,10 +59,10 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
-// TestLoadAgent pins the accepted agent values: both shipped agents load,
+// TestLoadAgent pins the accepted agent values: every shipped agent loads,
 // anything else is rejected with the available choices named.
 func TestLoadAgent(t *testing.T) {
-	for _, agent := range []string{"claude", "opencode"} {
+	for _, agent := range []string{"claude", "opencode", "amp"} {
 		cfg, err := Load(writeConfig(t, "agent: "+agent+"\n"))
 		if err != nil {
 			t.Fatalf("Load(agent: %s): %v", agent, err)
