@@ -15,26 +15,35 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # First, blocking check: a PR must carry exactly one release label
-  # (patch/minor/major) before it can be approved or merged. Add "CI /
+  # First, blocking check: a PR must declare a release level before it can be
+  # approved or merged — either a branch prefix (patch/minor/major/...) or,
+  # failing that, exactly one release label of the same names. Add "CI /
   # release-label" as a required status check in branch protection (dragged
   # to the top of the list) to enforce it on approval and merge.
   release-label:
     runs-on: ubuntu-latest
     steps:
-      - name: Require a release label (patch/minor/major)
+      - name: Require a release level (branch prefix, else label)
         # no-op on master pushes: the step is skipped and the job succeeds,
         # so the downstream needs chain is not broken
         if: github.event_name == 'pull_request'
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
+          # The branch prefix is the default signal; the label is the fallback.
+          case "$BRANCH" in
+            patch/*|minor/*|major/*)
+              echo "release level from branch prefix: ${BRANCH%%/*}"
+              exit 0
+              ;;
+          esac
           matches=$(printf '%s' "$LABELS" | jq -r '.[] | select(. == "patch" or . == "minor" or . == "major")')
           count=$(printf '%s' "$matches" | grep -c . || true)
           case "$count" in
             1) echo "release label: $matches" ;;
-            0) echo "no release label on this PR — add exactly one of: patch, minor, major" >&2; exit 1 ;;
+            0) echo "no release level on this PR — name the branch patch/*, minor/* or major/*, or add exactly one of those labels" >&2; exit 1 ;;
             *) echo "multiple release labels on this PR — keep exactly one of: patch, minor, major" >&2; exit 1 ;;
           esac
 
@@ -59,8 +68,9 @@ jobs:
           echo "pct=$pct" >> "$GITHUB_OUTPUT"
 
   # After master is green: tag the tested code with the next version. The
-  # bump level is the merged PR's release label (patch/minor/major; patch for
-  # a push that is not a PR merge). Only tags are pushed — master is protected
+  # bump level is the merged PR's branch prefix (patch/minor/major), falling
+  # back to its release label (patch for a push that is not a PR merge).
+  # Only tags are pushed — master is protected
   # and receives no release commits — and the bot's GITHUB_TOKEN push never
   # triggers workflows, so the loop does not feed itself.
   release:
@@ -86,16 +96,24 @@ jobs:
             exit 0
           fi
 
-          # The bump level is the merged PR's release label; a push that is
-          # not a PR merge (or carries no label — pre-protection merges)
-          # releases as a patch.
+          # The bump level is the merged PR's branch prefix, falling back to
+          # its release label; a push that is not a PR merge (or declares
+          # neither — pre-protection merges) releases as a patch.
           level=patch
           subject=$(git log -1 --format=%s)
           pr=$(printf '%s\n' "$subject" | grep -oE '#[0-9]+' | head -1 | tr -d '#') || true
           if [[ -n "$pr" ]]; then
-            label=$(gh api "repos/${{ github.repository }}/pulls/$pr" \
-              --jq '.labels[].name | select(. == "patch" or . == "minor" or . == "major")' | head -1) || true
-            [[ -z "$label" ]] || level=$label
+            branch=$(gh api "repos/${{ github.repository }}/pulls/$pr" --jq .head.ref) || branch=""
+            case "$branch" in
+              patch/*|minor/*|major/*)
+                level=${branch%%/*}
+                ;;
+              *)
+                label=$(gh api "repos/${{ github.repository }}/pulls/$pr" \
+                  --jq '.labels[].name | select(. == "patch" or . == "minor" or . == "major")' | head -1) || true
+                [[ -z "$label" ]] || level=$label
+                ;;
+            esac
           fi
           echo "bump level: $level"
 

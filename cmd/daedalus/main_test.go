@@ -122,6 +122,49 @@ func TestParseFlagsPrefix(t *testing.T) {
 	}
 }
 
+// TestParseFlagsCLI covers both spellings of the worker agent flag, that an
+// unknown agent is rejected at parse time (with the same error Load would
+// give), and that -cli is refused outside `worker`.
+func TestParseFlagsCLI(t *testing.T) {
+	// wantRest is always ["worker", action]: parseFlags strips only
+	// the flags, leaving the subcommand and its action in place.
+	for _, c := range []struct {
+		args     []string
+		want     string
+		wantRest []string
+	}{
+		{[]string{"worker", "start", "-cli", "amp"}, "amp", []string{"worker", "start"}},
+		{[]string{"worker", "--cli", "opencode", "restart"}, "opencode", []string{"worker", "restart"}},
+		{[]string{"worker", "--cli=amp", "foreground"}, "amp", []string{"worker", "foreground"}},
+	} {
+		f, rest, err := parseFlags(c.args)
+		if err != nil {
+			t.Fatalf("parseFlags(%q): %v", c.args, err)
+		}
+		if f.agentCLI != c.want {
+			t.Errorf("parseFlags(%q) agentCLI = %q, want %q", c.args, f.agentCLI, c.want)
+		}
+		wantRest := c.wantRest
+		if !reflect.DeepEqual(rest, wantRest) {
+			t.Errorf("parseFlags(%q) rest = %v, want %v", c.args, rest, wantRest)
+		}
+	}
+
+	if _, _, err := parseFlags([]string{"worker", "-cli"}); err == nil {
+		t.Error("-cli without a value should error")
+	}
+	// The override must fail here, not at worker startup.
+	if _, _, err := parseFlags([]string{"worker", "-cli", "cursor"}); err == nil ||
+		!strings.Contains(err.Error(), "unknown agent") {
+		t.Errorf("parseFlags(-cli cursor) err = %v, want an unknown-agent rejection", err)
+	}
+	// -cli names a worker option; elsewhere it would be silently ignored.
+	if _, _, err := parseFlags([]string{"run", "-cli", "amp", "/repo", "42", "do it"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to worker") {
+		t.Errorf("parseFlags(run -cli) err = %v, want a -cli-outside-worker rejection", err)
+	}
+}
+
 // TestResolveConfigPath pins the discovery order: an explicit -c is honored
 // verbatim, ./config.yaml wins over the home fallback, and the home config
 // (~/.config/daedalus/config.yaml) is found when the working directory has

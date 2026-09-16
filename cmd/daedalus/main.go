@@ -72,6 +72,9 @@ Usage:
       lives in /tmp/daedalus/worker-<queue>.pid, one daemon per task queue.
       stop drains it gracefully (SIGTERM); restart is stop + start; status
       reports pid and log path. foreground runs attached to this terminal.
+      -cli/--cli <agent> overrides the config's agent (claude, opencode,
+      amp) for this worker: the jailed agent runs in the worker process,
+      so the selection is a worker-start-time setting, not a per-run one.
       anthropic.key is optional — if unset, the jailed agent authenticates
       through the worker's inherited environment or its own login.
   daedalus [-c config.yaml] list [max]
@@ -118,7 +121,8 @@ Configuration is read from the first of ./config.yaml and
 ~/.config/daedalus/config.yaml (-c/--config to override the path); the
 latter makes the CLI work from any directory. See config-example.yaml for
 all fields and their defaults:
-  agent                Jailed agent CLI: claude or opencode (default claude)
+  agent                Jailed agent CLI: claude, opencode, or amp (default
+                       claude; worker -cli/--cli overrides per worker)
   branch_prefix        Prefix for preserved branches, <prefix>/issue-<id>-<ts>
                        (default daedalus; run -p/--prefix overrides per run)
   temporal.host        Temporal frontend address   (default 127.0.0.1:7233)
@@ -195,9 +199,13 @@ func main() {
 			usageFail("worker takes at most one action")
 		}
 		cfg := loadConfig(configPath.configPath)
+		// -cli/--cli overrides the config's agent for this worker.
+		if configPath.agentCLI != "" {
+			cfg.Agent = configPath.agentCLI
+		}
 		switch action {
 		case "start":
-			if err := workerStart(cfg, configPath.configPath); err != nil {
+			if err := workerStart(cfg, configPath.configPath, configPath.agentCLI); err != nil {
 				fail("worker start", err)
 			}
 		case "stop":
@@ -210,7 +218,7 @@ func main() {
 			if err := workerStop(cfg); err != nil {
 				fail("worker stop", err)
 			}
-			if err := workerStart(cfg, configPath.configPath); err != nil {
+			if err := workerStart(cfg, configPath.configPath, configPath.agentCLI); err != nil {
 				fail("worker start", err)
 			}
 		case "foreground":
@@ -330,6 +338,10 @@ type flags struct {
 	// appendID, set via -a/--append on `run`, targets an already-running
 	// pipeline instead of starting a new one.
 	appendID string
+	// agentCLI, set via -cli/--cli on `worker`, overrides the config's
+	// agent for that worker: the jailed agent runs in the worker process,
+	// so the selection is a worker-start-time setting, not a per-run one.
+	agentCLI string
 }
 
 // parseFlags extracts -c/--config and -w/--workflow (which may appear
@@ -355,6 +367,11 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 				return err
 			}
 			f.branchPrefix = value
+		case "cli":
+			if err := config.ValidateAgent(value); err != nil {
+				return err
+			}
+			f.agentCLI = value
 		}
 		return nil
 	}
@@ -370,7 +387,7 @@ parse:
 		var name string
 		var value string
 		switch {
-		case a == "-c" || a == "--config" || a == "-w" || a == "--workflow" || a == "-f" || a == "--file" || a == "-a" || a == "--append" || a == "-p" || a == "--prefix":
+		case a == "-c" || a == "--config" || a == "-w" || a == "--workflow" || a == "-f" || a == "--file" || a == "-a" || a == "--append" || a == "-p" || a == "--prefix" || a == "-cli" || a == "--cli":
 			if i+1 >= len(args) {
 				return f, nil, fmt.Errorf("%s requires a value", a)
 			}
@@ -384,6 +401,8 @@ parse:
 				name = "append"
 			case "-p", "--prefix":
 				name = "prefix"
+			case "-cli", "--cli":
+				name = "cli"
 			default:
 				name = "workflow"
 			}
@@ -396,6 +415,8 @@ parse:
 			name, value = "append", strings.TrimPrefix(a, "--append=")
 		case strings.HasPrefix(a, "--prefix="):
 			name, value = "prefix", strings.TrimPrefix(a, "--prefix=")
+		case strings.HasPrefix(a, "--cli="):
+			name, value = "cli", strings.TrimPrefix(a, "--cli=")
 		case a == "-d" || a == "--detach":
 			f.detach = true
 			continue
@@ -414,6 +435,12 @@ parse:
 	// the subcommand ignores.
 	if f.branchPrefix != "" && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
 		return f, nil, errors.New("-p/--prefix only applies to run")
+	}
+	// Likewise -cli/--cli: the jailed agent selection takes effect in the
+	// worker process, so only `worker` (whose daemon child re-receives the
+	// flag) can honor it.
+	if f.agentCLI != "" && len(rest) > 0 && rest[0] != "worker" {
+		return f, nil, errors.New("-cli/--cli only applies to worker")
 	}
 	return f, rest, nil
 }
@@ -531,7 +558,7 @@ func daemonPaths(queue string) (pidFile, logFile string) {
 // workerStart launches the worker as a detached daemon: it re-executes
 // itself with `worker foreground`, redirected into the per-queue log, in
 // its own session so the terminal is released immediately.
-func workerStart(cfg config.Config, configPath string) error {
+func workerStart(cfg config.Config, configPath, agentOverride string) error {
 	pidFile, logFile := daemonPaths(cfg.Temporal.TaskQueue)
 	if pid, ok := readLivePid(pidFile); ok {
 		return fmt.Errorf("already running (pid %d) — use 'daedalus worker restart' or 'stop'", pid)
@@ -555,6 +582,11 @@ func workerStart(cfg config.Config, configPath string) error {
 	// daemon never re-resolves against the working directory it was
 	// started from — it keeps serving if that directory goes away.
 	childArgs := []string{"worker", "foreground", "-c", configPath}
+	// Forward a -cli override so the daemon runs the agent the operator
+	// selected; without it the child would fall back to the config's.
+	if agentOverride != "" {
+		childArgs = append(childArgs, "-cli", agentOverride)
+	}
 	cmd := exec.Command(self, childArgs...)
 	cmd.Env = append(os.Environ(), daemonEnv+"=1")
 	cmd.Stdout = log

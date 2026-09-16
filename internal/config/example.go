@@ -11,7 +11,10 @@ const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; eve
 # jailed agent then inherits whatever the worker's environment provides.
 
 # Which jailed agent CLI runs the implementing and reviewer agents:
-# claude (Claude Code, the default) or opencode.
+# claude (Claude Code, the default), opencode, or amp (Sourcegraph Amp —
+# authenticates via AMP_API_KEY in the worker's environment, passed into
+# the jail when set; amp's own host login does not reach the jail, and the
+# anthropic/openai sections below do not apply to it).
 agent: claude
 
 # Prefix naming the preserved branch that carries a run's approved, committed

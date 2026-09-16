@@ -49,6 +49,7 @@ printf 'STDIN:' >> "$STUB_LOG"
 cat | tr '\n' '\036' >> "$STUB_LOG"
 printf '\n' >> "$STUB_LOG"
 echo "ENV:ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" >> "$STUB_LOG"
+echo "ENV:AMP_API_KEY=$AMP_API_KEY" >> "$STUB_LOG"
 ` + body + "\n"
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -495,6 +496,80 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 	}, "ai-jail")
 	if calls[0].Stdin != "fix the bug" {
 		t.Errorf("ai-jail stdin = %q, want the prompt", calls[0].Stdin)
+	}
+}
+
+// TestRunJailedClaudeActivityAmp pins the amp path: DAEDALUS_AGENT switches
+// to amp's headless flags and --stream-json-thinking output mode (whose
+// events parse like claude's), and a set AMP_API_KEY reaches the jail via
+// --env, by name only — never in argv. Without a key no --env is passed.
+func TestRunJailedClaudeActivityAmp(t *testing.T) {
+	log := newStubLog(t)
+	script := `printf '%s\n' ` +
+		`'{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"plan via amp"}]}}' ` +
+		`'{"type":"assistant","message":{"content":[{"type":"text","text":"did it via amp"}]}}'; exit 0`
+	stubBin(t, "ai-jail", script)
+	t.Setenv("DAEDALUS_AGENT", "amp")
+
+	// No key: the agent still runs, just without the forwarded credential.
+	t.Setenv("AMP_API_KEY", "")
+	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "fix the bug",
+	}); err != nil {
+		t.Fatalf("RunJailedClaudeActivity without a key: %v", err)
+	}
+
+	// Key set: it travels by name for ai-jail to copy from the environment.
+	t.Setenv("AMP_API_KEY", "amp-test-key")
+	result, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "fix the bug",
+	})
+	if err != nil {
+		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+	if result.Thinking != "plan via amp" {
+		t.Errorf("result.Thinking = %q, want the stream's thinking block", result.Thinking)
+	}
+	if result.Text != "did it via amp" {
+		t.Errorf("result.Text = %q, want the stream's text block", result.Text)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 2 {
+		t.Fatalf("ai-jail called %d times, want 2", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{
+		"--worktree",
+		"--network",
+		"--",
+		"amp",
+		"--stream-json-thinking",
+		"-x",
+		"--dangerously-allow-all",
+	}, "ai-jail without a key")
+	assertArgs(t, calls[1].Args, []string{
+		"--worktree",
+		"--network",
+		"--env",
+		"AMP_API_KEY",
+		"--",
+		"amp",
+		"--stream-json-thinking",
+		"-x",
+		"--dangerously-allow-all",
+	}, "ai-jail with a key")
+	if calls[1].Env["AMP_API_KEY"] != "amp-test-key" {
+		t.Errorf("ai-jail AMP_API_KEY = %q, want carried via the environment", calls[1].Env["AMP_API_KEY"])
+	}
+	for _, call := range calls {
+		if contains(call.Args, "amp-test-key") {
+			t.Errorf("API key leaked into argv: %v", call.Args)
+		}
+		if call.Stdin != "fix the bug" {
+			t.Errorf("ai-jail stdin = %q, want the prompt", call.Stdin)
+		}
 	}
 }
 
