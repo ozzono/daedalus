@@ -38,6 +38,11 @@ const (
 	// ceiling because test-command discovery and a cold build legitimately
 	// overrun it.
 	DefaultTestsTimeout = 30 * time.Minute
+	// DefaultAgentRunTimeout bounds one jailed-agent round
+	// (implementation or review) when config agent_run_timeout is unset.
+	// Wider than the shared activity ceiling because agent rounds
+	// legitimately run long (whole-repo analyses, slow builds).
+	DefaultAgentRunTimeout = 45 * time.Minute
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -93,10 +98,14 @@ type Config struct {
 	// (RunNativeTestsActivity): test-command discovery and the suite itself
 	// share this budget. A time.ParseDuration string in YAML ("30m");
 	// DefaultTestsTimeout when unset.
-	TestsTimeout time.Duration   `yaml:"tests_timeout"`
-	Temporal     TemporalConfig  `yaml:"temporal"`
-	Anthropic    AnthropicConfig `yaml:"anthropic"`
-	OpenAI       OpenAIConfig    `yaml:"openai"`
+	TestsTimeout time.Duration `yaml:"tests_timeout"`
+	// AgentRunTimeout bounds one jailed-agent round — implementation
+	// or review (RunJailedClaudeActivity). A time.ParseDuration string
+	// in YAML ("45m"); DefaultAgentRunTimeout when unset.
+	AgentRunTimeout time.Duration   `yaml:"agent_run_timeout"`
+	Temporal        TemporalConfig  `yaml:"temporal"`
+	Anthropic       AnthropicConfig `yaml:"anthropic"`
+	OpenAI          OpenAIConfig    `yaml:"openai"`
 }
 
 // agents lists the accepted config Agent values.
@@ -153,6 +162,9 @@ func Load(path string) (Config, error) {
 	}
 	if c.TestsTimeout < 0 {
 		return c, fmt.Errorf("config %s: tests_timeout: must not be negative", path)
+	}
+	if c.AgentRunTimeout < 0 {
+		return c, fmt.Errorf("config %s: agent_run_timeout: must not be negative", path)
 	}
 	return c, nil
 }
@@ -215,6 +227,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.TestsTimeout == 0 {
 		c.TestsTimeout = DefaultTestsTimeout
+	}
+	if c.AgentRunTimeout == 0 {
+		c.AgentRunTimeout = DefaultAgentRunTimeout
 	}
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS

@@ -54,6 +54,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TestsTimeout != DefaultTestsTimeout {
 		t.Errorf("TestsTimeout = %v, want %v", cfg.TestsTimeout, DefaultTestsTimeout)
 	}
+	if cfg.AgentRunTimeout != DefaultAgentRunTimeout {
+		t.Errorf("AgentRunTimeout = %v, want %v", cfg.AgentRunTimeout, DefaultAgentRunTimeout)
+	}
 }
 
 // TestLoadAgent pins the accepted agent values: both shipped agents load,
@@ -93,6 +96,23 @@ func TestLoadTestsTimeout(t *testing.T) {
 	}
 }
 
+// TestLoadAgentRunTimeout pins the agent_run_timeout parsing: duration
+// strings load, and a negative value is rejected up front rather than
+// silently widening the ceiling downstream.
+func TestLoadAgentRunTimeout(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "agent_run_timeout: 1h30m\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AgentRunTimeout != 90*time.Minute {
+		t.Errorf("AgentRunTimeout = %v, want 1h30m", cfg.AgentRunTimeout)
+	}
+	_, err = Load(writeConfig(t, "agent_run_timeout: -5m\n"))
+	if err == nil || !strings.Contains(err.Error(), "agent_run_timeout") {
+		t.Fatalf("want agent_run_timeout error, got %v", err)
+	}
+}
+
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(writeConfig(t, `
 temporal:
@@ -109,6 +129,7 @@ openai:
   key: sk-oa-test
   model: gpt-test
 tests_timeout: 45m
+agent_run_timeout: 30m
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -137,6 +158,9 @@ tests_timeout: 45m
 	}
 	if cfg.TestsTimeout != 45*time.Minute {
 		t.Errorf("TestsTimeout = %v, want 45m", cfg.TestsTimeout)
+	}
+	if cfg.AgentRunTimeout != 30*time.Minute {
+		t.Errorf("AgentRunTimeout = %v, want 30m", cfg.AgentRunTimeout)
 	}
 
 	env := cfg.AgentEnv()

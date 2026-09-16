@@ -38,7 +38,18 @@ type PipelineInput struct {
 	// tests_timeout). Zero — a run whose input predates the field, replayed
 	// by a newer worker — falls back to config.DefaultTestsTimeout.
 	TestTimeout time.Duration
+	// AgentRunTimeout bounds one jailed-agent round (config
+	// agent_run_timeout). Zero — a run whose input predates the field,
+	// replayed by a newer worker — falls back to
+	// config.DefaultAgentRunTimeout.
+	AgentRunTimeout time.Duration
 }
+
+// maxConsecutiveTimeouts caps how many timed-out rounds in a row the
+// pipeline absorbs before failing the run: recovery assumes the agent
+// makes progress each round, and a run wedged at its ceiling every
+// time would otherwise loop forever on the agent budget.
+const maxConsecutiveTimeouts = 3
 
 // FeatureDevWorkflow drives a full issue-development cycle in two
 // review-gated phases: (1) implementation ↔ code review until the reviewer
@@ -58,6 +69,17 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		},
 	}
 	ctx = workflow.WithActivityOptions(ctx, ao)
+	// Agent rounds get their own, wider ceiling: a whole-repo analysis
+	// or slow build legitimately overruns the shared 15 minutes. Same
+	// replay-safe zero fallback as TestTimeout below.
+	agentTimeout := input.AgentRunTimeout
+	if agentTimeout <= 0 {
+		agentTimeout = config.DefaultAgentRunTimeout
+	}
+	agentCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: agentTimeout,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
+	})
 
 	branchName := fmt.Sprintf("feat/issue-%s-%d", input.IssueID, workflow.Now(ctx).Unix())
 	worktreeInput := activities.WorktreeInput{
@@ -123,27 +145,72 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return "OPERATOR GUIDANCE (sent while this pipeline was running — treat as direct instructions from the operator, taking precedence over earlier plan assumptions):\n- " +
 			strings.Join(parts, "\n- ")
 	}
+	// A timed-out round is recoverable, not fatal: the worktree keeps
+	// the attempt's partial work, so the round re-runs as a
+	// continuation — the agent inspects what it already did and drives
+	// on instead of starting over. Any completed round resets the
+	// streak.
+	consecutiveTimeouts := 0
 	runAgent := func(prompt string, stage string) error {
-		var result activities.AgentRunResult
-		err := workflow.ExecuteActivity(ctx, activities.RunJailedClaudeActivity, activities.AgentRunInput{
-			WorktreePath: worktree.WorktreePath,
-			Prompt:       prompt,
-		}).Get(ctx, &result)
-		if err == nil {
-			logger.Info("Agent run completed", "Stage", stage,
-				"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
+		for {
+			var result activities.AgentRunResult
+			err := workflow.ExecuteActivity(agentCtx, activities.RunJailedClaudeActivity, activities.AgentRunInput{
+				WorktreePath: worktree.WorktreePath,
+				Prompt:       prompt,
+			}).Get(ctx, &result)
+			if err == nil {
+				consecutiveTimeouts = 0
+				logger.Info("Agent run completed", "Stage", stage,
+					"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
+				return nil
+			}
+			if !temporal.IsTimeoutError(err) {
+				return err
+			}
+			consecutiveTimeouts++
+			logger.Warn("Agent round hit the timeout ceiling; continuing from partial work",
+				"Stage", stage, "ConsecutiveTimeouts", consecutiveTimeouts,
+				"AgentRunTimeout", agentTimeout)
+			if consecutiveTimeouts >= maxConsecutiveTimeouts {
+				return fmt.Errorf("agent run timed out %d rounds in a row (stage %q): %w",
+					consecutiveTimeouts, stage, err)
+			}
+			followUp, ferr := template.Continue(prompt, fmt.Sprintf(
+				"the previous attempt was cut off by the round's %s timeout ceiling before it finished",
+				agentTimeout))
+			if ferr != nil {
+				return fmt.Errorf("build timeout-continuation prompt (stage %q): %w", stage, ferr)
+			}
+			prompt = followUp
 		}
-		return err
 	}
+	// Reviewer timeouts retry the same round unchanged — there is no
+	// partial work to continue, the verdict simply never arrived.
+	reviewTimeouts := 0
 	review := func(focus, testLogs string, testsInScope bool) (activities.ReviewResult, error) {
-		var result activities.ReviewResult
-		err := workflow.ExecuteActivity(ctx, activities.RunJailedReviewerActivity, activities.ReviewInput{
-			WorktreePath: worktree.WorktreePath,
-			Focus:        focus,
-			TestLogs:     testLogs,
-			TestsInScope: testsInScope,
-		}).Get(ctx, &result)
-		return result, err
+		for {
+			var result activities.ReviewResult
+			err := workflow.ExecuteActivity(ctx, activities.RunJailedReviewerActivity, activities.ReviewInput{
+				WorktreePath: worktree.WorktreePath,
+				Focus:        focus,
+				TestLogs:     testLogs,
+				TestsInScope: testsInScope,
+			}).Get(ctx, &result)
+			if err == nil {
+				reviewTimeouts = 0
+				return result, nil
+			}
+			if !temporal.IsTimeoutError(err) {
+				return result, err
+			}
+			reviewTimeouts++
+			logger.Warn("Reviewer round hit the timeout ceiling; retrying",
+				"Focus", focus, "ConsecutiveTimeouts", reviewTimeouts)
+			if reviewTimeouts >= maxConsecutiveTimeouts {
+				return result, fmt.Errorf("reviewer timed out %d rounds in a row (focus %q): %w",
+					reviewTimeouts, focus, err)
+			}
+		}
 	}
 
 	// Phase 1: implementation ↔ code review, until the reviewer approves.
@@ -208,7 +275,18 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	for {
 		var result activities.TestResult
 		if err := workflow.ExecuteActivity(testsCtx, activities.RunNativeTestsActivity, worktree.WorktreePath).Get(ctx, &result); err != nil {
-			return "", fmt.Errorf("run tests: %w", err)
+			if !temporal.IsTimeoutError(err) {
+				return "", fmt.Errorf("run tests: %w", err)
+			}
+			// A timed-out suite is a failing round, not a dead run: the
+			// fix loop already digests red logs, so hand it a synthetic
+			// one describing the timeout.
+			logger.Warn("Native test suite hit the timeout ceiling; treating as a failing round",
+				"TestsTimeout", testTimeout)
+			result = activities.TestResult{
+				Passed: false,
+				Logs:   fmt.Sprintf("NATIVE TEST SUITE TIMED OUT: the suite did not finish within %s. Cut runtime (parallelism, caching, narrower scope) or raise config tests_timeout.", testTimeout),
+			}
 		}
 		verdict, err := review("the test suite", result.Logs, true)
 		if err != nil {
