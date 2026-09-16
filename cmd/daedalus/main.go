@@ -29,9 +29,15 @@ import (
 )
 
 // runWaitTimeout bounds how long `daedalus run` waits for a pipeline to
-// finish. Multiple agent and review rounds at a 15-minute ceiling each fit
-// comfortably.
-const runWaitTimeout = 4 * time.Hour
+// finish. It is a client-side patience budget, not a coverage guarantee:
+// both review loops are unbounded, so a many-round run can exceed it with
+// no quota trouble at all, and a quota-exhaustion streak (five hourly
+// sleeps, with the budget reset by any completed round) starting late in a
+// long run can push the park itself past the deadline — the operator then
+// sees the deadline error below instead of the park's resume hint. The
+// wait giving out does not stop the workflow; `daedalus attach` reconnects
+// to it and reports the eventual outcome, parked or otherwise.
+const runWaitTimeout = 12 * time.Hour
 
 // defaultConfigPath is used when -c/--config is not given: looked up in the
 // working directory, then in the user-level home (see resolveConfigPath).
@@ -95,12 +101,13 @@ Usage:
       into the agent's next fix prompt, steering a stuck review loop
       without restarting the run.
   daedalus [-c config.yaml] continue <workflow-id> "<prompt>"
-      Resume a closed session (canceled or failed — including a halt on
-      agent API exhaustion) under a new prompt: the aborted attempt's work,
-      preserved on its aborted/ branch, becomes the new run's starting
-      point, and that attempt's last review feedback is folded into the
-      opening prompt. -d works here too; -p does not — the continued run
-      keeps the original run's branch prefix.
+      Resume a closed session (canceled, failed, or parked — an
+      API-exhaustion halt past its hourly heartbeats, or a reviewer
+      NEEDS_MAINTAINER halt on an impossible task) under a new prompt: the
+      aborted attempt's work, preserved on its aborted/ branch, becomes
+      the new run's starting point, and that attempt's last review
+      feedback is folded into the opening prompt. -d works here too; -p
+      does not — the continued run keeps the original run's branch prefix.
   daedalus [-c config.yaml] attach <workflow-id>
       Reattach to a running (or already finished) pipeline, block until it
       finishes, and report the outcome — the other half of "run -d".
@@ -973,14 +980,34 @@ func attachPipeline(cfg config.Config, workflowID string) error {
 	return awaitPipeline(c.GetWorkflow(context.Background(), workflowID, exec.GetRunId()))
 }
 
+// errRunParked distinguishes a parked outcome from success for callers
+// gating on the exit code of `daedalus run`/`attach`/`continue`: the run
+// produced no deliverable and is FAILED in Temporal. awaitPipeline has
+// already printed the resume hint by the time it returns this; the error
+// only labels the outcome.
+var errRunParked = errors.New("run parked awaiting maintainer input")
+
 // awaitPipeline blocks until the run finishes (bounded by runWaitTimeout) and
-// reports the outcome: the preserved branch on success, the execution error
-// otherwise.
+// reports the outcome: the preserved branch on success, a parked run's
+// resume hint (as errRunParked, so callers gating on the exit code see a
+// non-zero one), or the execution error.
 func awaitPipeline(run client.WorkflowRun) error {
 	waitCtx, cancel := context.WithTimeout(context.Background(), runWaitTimeout)
 	defer cancel()
 	var preservedBranch string
 	if err := run.Get(waitCtx, &preservedBranch); err != nil {
+		// A parked run arrives here as a workflow failure carrying
+		// ErrAwaitingMaintainer — API exhausted past every heartbeat, or a
+		// reviewer halt on an impossible task. The failure already put the
+		// reason in the history and FAILED in `daedalus list`; here it just
+		// needs the resume hint. Crossing the workflow→client boundary the
+		// typed error survives only as its message text, so match it the
+		// same way isAPIExhaustion does on the workflow side.
+		if strings.Contains(err.Error(), workflows.ErrAwaitingMaintainer.Error()) {
+			fmt.Printf("Workflow parked: %v\n", err)
+			fmt.Printf("The attempt's work is preserved on its aborted/ branch — resume with: daedalus continue %s \"<prompt>\"\n", run.GetID())
+			return errRunParked
+		}
 		return fmt.Errorf("workflow execution: %w", err)
 	}
 	fmt.Printf("Workflow completed successfully — approved work committed to branch %s\n", preservedBranch)

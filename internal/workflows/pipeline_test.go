@@ -3,9 +3,11 @@ package workflows
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/api/enums/v1"
@@ -713,4 +715,406 @@ func TestFeatureDevWorkflowReviewerTimeoutRetries(t *testing.T) {
 		t.Fatalf("review calls = %d, want the timed-out round retried", reviewCalls)
 	}
 	env.AssertExpectations(t)
+}
+
+// errQuotaStub mirrors how a quota-exhausted activity round surfaces on the
+// workflow side: the ErrAPIExhausted sentinel wrapped in richer text, matched
+// by substring across the worker→workflow boundary.
+var errQuotaStub = fmt.Errorf("run jailed: %w: usage limit reached", activities.ErrAPIExhausted)
+
+// TestFeatureDevWorkflowQuotaHeartbeatRecovers pins the pause semantics: an
+// exhausted round is retried unchanged after an hourly heartbeat, the streak
+// budget resets on any completed round (a later exhaustion gets a full five
+// heartbeats again), and the run still finishes.
+func TestFeatureDevWorkflowQuotaHeartbeatRecovers(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	// Implement round: one exhaustion, then through. Tests round: five
+	// exhaustions in a row — only survivable because the earlier completed
+	// round reset the budget — then through.
+	var calls int
+	var inputs []activities.AgentRunInput
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					inputs = append(inputs, in)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			switch calls {
+			case 1, 3, 4, 5, 6, 7:
+				return activities.AgentRunResult{}, errQuotaStub
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if calls != 8 {
+		t.Fatalf("agent calls = %d, want 8 (exhausted+retry, then 5 exhausted+retry in the tests round)", calls)
+	}
+	// The retried round must be the same round, not a continuation.
+	if inputs[1].Prompt != inputs[0].Prompt {
+		t.Errorf("heartbeat retry changed the prompt:\n%q\n!=\n%q", inputs[1].Prompt, inputs[0].Prompt)
+	}
+	if inputs[7].Prompt != inputs[2].Prompt {
+		t.Errorf("heartbeat retry changed the tests-round prompt")
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowQuotaHeartbeatParks pins the cap: still exhausted
+// past five heartbeats, the run parks itself with ErrAwaitingMaintainer
+// instead of failing with a raw error — and still cleans up.
+func TestFeatureDevWorkflowQuotaHeartbeatParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { calls++ }).
+		Return(activities.AgentRunResult{}, errQuotaStub)
+
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error when the API stays exhausted")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"still exhausted after 5 hourly heartbeats",
+		`stage "implement"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	// Five heartbeats retry the round five times: six exhausted attempts.
+	if calls != 6 {
+		t.Errorf("agent calls = %d, want 6 (initial attempt plus five heartbeat retries)", calls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowQuotaHeartbeatCancelled pins the sleep-error branch
+// of the heartbeat: a cancellation landing mid-sleep — a brand-new window,
+// now that an exhausted run sits in an hourly Sleep instead of failing
+// immediately — must fail the run promptly rather than retry past the error,
+// and still clean up.
+func TestFeatureDevWorkflowQuotaHeartbeatCancelled(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { calls++ }).
+		Return(activities.AgentRunResult{}, errQuotaStub)
+
+	var cleanupCount int
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { cleanupCount++ }).
+		Return(nil).Once()
+
+	// The first agent call exhausts the API and the run enters its hourly
+	// sleep; cancel 30 minutes in, mid-heartbeat.
+	env.RegisterDelayedCallback(func() { env.CancelWorkflow() }, 30*time.Minute)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error when cancelled during a heartbeat sleep")
+	}
+	if !strings.Contains(err.Error(), "quota heartbeat sleep") {
+		t.Errorf("error %q should name the interrupted heartbeat sleep", err)
+	}
+	if calls != 1 {
+		t.Errorf("agent calls = %d, want 1 (no retry past a cancelled sleep)", calls)
+	}
+	if cleanupCount != 1 {
+		t.Fatalf("cleanup ran %d times after cancellation, want 1", cleanupCount)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowReviewerQuotaHeartbeatRecovers pins the review
+// call site: an exhausted reviewer round heartbeats and retries, and the
+// verdict then flows normally.
+func TestFeatureDevWorkflowReviewerQuotaHeartbeatRecovers(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	var reviewCalls int
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			reviewCalls++
+			if reviewCalls == 1 {
+				return activities.ReviewResult{}, errQuotaStub
+			}
+			return activities.ReviewResult{Approved: true}, nil
+		})
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if reviewCalls != 3 {
+		t.Fatalf("review calls = %d, want 3 (exhausted code review, retry, test review)", reviewCalls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowTestsQuotaHeartbeatRecovers pins the suite call
+// site: test-command discovery can exhaust the API too, and the suite round
+// is retried after a heartbeat rather than failing the run.
+func TestFeatureDevWorkflowTestsQuotaHeartbeatRecovers(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	var suiteCalls int
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, path string) (activities.TestResult, error) {
+			suiteCalls++
+			if suiteCalls == 1 {
+				return activities.TestResult{}, errQuotaStub
+			}
+			return activities.TestResult{Passed: true, Logs: "ok"}, nil
+		})
+
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if suiteCalls != 2 {
+		t.Fatalf("suite calls = %d, want 2 (exhausted discovery round plus retry)", suiteCalls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowQuotaHeartbeatResetsOnRedSuite pins the "even a red
+// one" reset: a suite round that ran to completion but failed still resets
+// the heartbeat streak. The suite exhausts once (streak = 1) before its red
+// round, and the very next call — the test review — then exhausts: with the
+// reset it gets a full five heartbeats (six attempts before parking); a
+// stale streak would park one attempt earlier. Routing through the test
+// review, not a fix round, matters: a successful review resets the streak
+// itself and would mask the suite round's reset.
+func TestFeatureDevWorkflowQuotaHeartbeatResetsOnRedSuite(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	agentRec := &agentRecorder{env: env}
+	agentRec.record()
+
+	// Code review approves; every test-review call is exhausted.
+	var reviewCalls int
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { reviewCalls++ }).
+		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			if reviewCalls == 1 {
+				return activities.ReviewResult{Approved: true}, nil
+			}
+			return activities.ReviewResult{}, errQuotaStub
+		})
+
+	var suiteCalls int
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, path string) (activities.TestResult, error) {
+			suiteCalls++
+			if suiteCalls == 1 {
+				return activities.TestResult{}, errQuotaStub
+			}
+			return activities.TestResult{Passed: false, Logs: "--- FAIL: TestBoom"}, nil
+		})
+
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error when the API stays exhausted at test review")
+	}
+	for _, want := range []string{
+		"still exhausted after 5 hourly heartbeats",
+		`stage "review"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	// One approving code review plus six exhausted test-review attempts
+	// (initial plus five heartbeat retries): the full budget only a reset
+	// streak grants.
+	if reviewCalls != 7 {
+		t.Errorf("review calls = %d, want 7 — a red-but-completed suite round must reset the heartbeat budget", reviewCalls)
+	}
+	if len(agentRec.inputs) != 2 || suiteCalls != 2 {
+		t.Errorf("agent ran %d times and suite %d times, want 2 and 2 (implement, tests; exhausted retry, red round)",
+			len(agentRec.inputs), suiteCalls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowCodeReviewNeedsMaintainerParks pins the reviewer
+// halt: a NEEDS_MAINTAINER verdict in phase 1 parks the run carrying
+// ErrAwaitingMaintainer and the halting round's comments. The halt arrives
+// after one changes-requested round — the realistic shape, a reviewer that
+// tries to fix and then gives up — so prior rounds are proven not to steer
+// the park path or leak their comments into the error.
+func TestFeatureDevWorkflowCodeReviewNeedsMaintainerParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "rename foo to bar"},
+		{NeedsMaintainer: true, Comments: "the fix needs a secret only the maintainer can provide"},
+	}}
+	rev.record()
+
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from a NEEDS_MAINTAINER verdict")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"code review halted the run",
+		"the fix needs a secret only the maintainer can provide",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "rename foo to bar") {
+		t.Errorf("park error %q should carry the halting round's comments, not an earlier round's", err)
+	}
+	if len(rec.inputs) != 2 {
+		t.Errorf("agent ran %d times, want 2 (implement plus one fix round; no fix round after a halt)", len(rec.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowTestReviewNeedsMaintainerParks pins the phase-2
+// halt: a NEEDS_MAINTAINER verdict after the suite ran parks the run the
+// same way, labeled as a test-review halt.
+func TestFeatureDevWorkflowTestReviewNeedsMaintainerParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: true},
+		{NeedsMaintainer: true, Comments: "the suite requires a license key"},
+	}}
+	rev.record()
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from a NEEDS_MAINTAINER verdict")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"test review halted the run",
+		"the suite requires a license key",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	env.AssertExpectations(t)
+}
+
+// TestTruncateParkComments pins the park-error excerpt rule: short comments
+// pass through untouched, long ones are cut at the byte cap on a whole-rune
+// boundary and marked as truncated.
+func TestTruncateParkComments(t *testing.T) {
+	const marker = "\n[... review comments truncated ...]"
+
+	exact := strings.Repeat("a", maxParkCommentBytes)
+	if got := truncateParkComments(exact); got != exact {
+		t.Errorf("input at the cap should pass through, got %q-ish (len %d)", got[:32], len(got))
+	}
+
+	long := strings.Repeat("a", maxParkCommentBytes+50)
+	got := truncateParkComments(long)
+	if want := strings.Repeat("a", maxParkCommentBytes) + marker; got != want {
+		t.Errorf("ASCII truncation: got %d bytes, want cap+marker (%d bytes)", len(got), len(want))
+	}
+
+	// The byte cap lands mid-rune (each € is three bytes): the cut must
+	// slide forward to a whole rune, never emitting half of one.
+	runes := strings.Repeat("€", 342) + strings.Repeat("a", 10) // 1026 + 10 bytes
+	got = truncateParkComments(runes)
+	if want := strings.Repeat("€", 342) + marker; got != want {
+		t.Errorf("multibyte truncation: got %d bytes (valid=%v), want 342 whole runes + marker",
+			len(got), utf8.ValidString(got))
+	}
+
+	// The cap lands exactly on a rune boundary: no slide, the multibyte
+	// tail is simply dropped.
+	boundary := strings.Repeat("a", maxParkCommentBytes) + "€€"
+	got = truncateParkComments(boundary)
+	if want := strings.Repeat("a", maxParkCommentBytes) + marker; got != want {
+		t.Errorf("rune-boundary truncation: got %d bytes, want cap+marker (%d bytes)",
+			len(got), len(want))
+	}
 }

@@ -3,9 +3,11 @@
 package workflows
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
@@ -51,6 +53,25 @@ type PipelineInput struct {
 // time would otherwise loop forever on the agent budget.
 const maxConsecutiveTimeouts = 3
 
+// quotaHeartbeatInterval is how long a run sleeps when the agent API is
+// exhausted (hard cap, rate limit, overload) before retrying the same
+// round unchanged.
+const quotaHeartbeatInterval = time.Hour
+
+// maxQuotaHeartbeats caps the hourly retries; once the API is still
+// exhausted after this many heartbeats the run parks itself for a
+// maintainer restart instead of failing.
+const maxQuotaHeartbeats = 5
+
+// ErrAwaitingMaintainer parks a run instead of failing it with a raw error:
+// the API stayed exhausted past every heartbeat, or the reviewer halted with
+// NEEDS_MAINTAINER on a task that cannot be completed as stated. A park is
+// reported as a workflow failure carrying this error, so the reason lands
+// in the workflow history and `daedalus list` shows the run as FAILED —
+// the attempt's work is already preserved on its aborted/ branch by the
+// deferred cleanup, so `daedalus continue` restarts from it.
+var ErrAwaitingMaintainer = errors.New("run parked awaiting maintainer restart")
+
 // FeatureDevWorkflow drives a full issue-development cycle in two
 // review-gated phases: (1) implementation ↔ code review until the reviewer
 // approves, then (2) tests ↔ test review until the reviewer approves AND the
@@ -58,7 +79,14 @@ const maxConsecutiveTimeouts = 3
 // the run's branch renamed to its preserved prefix; the workflow
 // returns that branch name. Both loops are intentionally unbounded — they
 // run until approval, with no attempt cap; each round is durable, auditable,
-// and individually timed-out via activity options.
+// and individually timed-out via activity options. Two conditions park the
+// run for a maintainer restart rather than failing it with a raw error (see
+// ErrAwaitingMaintainer): the provider API staying exhausted past every
+// quota heartbeat, or a reviewer NEEDS_MAINTAINER verdict on a task that
+// cannot be completed as stated. A parked run fails with ErrAwaitingMaintainer
+// (and so with the reason in the history and FAILED in `daedalus list`);
+// the deferred cleanup preserves the attempt's work on its aborted/ branch
+// either way.
 func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	logger := workflow.GetLogger(ctx)
 
@@ -145,6 +173,26 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return "OPERATOR GUIDANCE (sent while this pipeline was running — treat as direct instructions from the operator, taking precedence over earlier plan assumptions):\n- " +
 			strings.Join(parts, "\n- ")
 	}
+	// Quota exhaustion is a pause, not a failure: when the provider's hard
+	// cap is reached, the run heartbeats — sleeping an hour and retrying
+	// the same round unchanged — up to maxQuotaHeartbeats times. Still
+	// exhausted after that, the run parks itself for the maintainer
+	// (ErrAwaitingMaintainer) instead of failing. Any completed round
+	// resets the streak, so a later exhaustion gets a fresh budget.
+	quotaHeartbeats := 0
+	heartbeat := func(err error, stage string) error {
+		quotaHeartbeats++
+		if quotaHeartbeats > maxQuotaHeartbeats {
+			return fmt.Errorf("%w: agent API still exhausted after %d hourly heartbeats (stage %q): %v",
+				ErrAwaitingMaintainer, maxQuotaHeartbeats, stage, err)
+		}
+		logger.Warn("Agent API exhausted; sleeping one hour before retrying the round",
+			"Stage", stage, "Heartbeat", quotaHeartbeats, "Of", maxQuotaHeartbeats)
+		if serr := workflow.Sleep(ctx, quotaHeartbeatInterval); serr != nil {
+			return fmt.Errorf("quota heartbeat sleep (stage %q): %w", stage, serr)
+		}
+		return nil
+	}
 	// A timed-out round is recoverable, not fatal: the worktree keeps
 	// the attempt's partial work, so the round re-runs as a
 	// continuation — the agent inspects what it already did and drives
@@ -160,9 +208,16 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			}).Get(ctx, &result)
 			if err == nil {
 				consecutiveTimeouts = 0
+				quotaHeartbeats = 0
 				logger.Info("Agent run completed", "Stage", stage,
 					"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
 				return nil
+			}
+			if isAPIExhaustion(err) {
+				if herr := heartbeat(err, stage); herr != nil {
+					return herr
+				}
+				continue
 			}
 			if !temporal.IsTimeoutError(err) {
 				return err
@@ -198,7 +253,14 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			}).Get(ctx, &result)
 			if err == nil {
 				reviewTimeouts = 0
+				quotaHeartbeats = 0
 				return result, nil
+			}
+			if isAPIExhaustion(err) {
+				if herr := heartbeat(err, "review"); herr != nil {
+					return result, herr
+				}
+				continue
 			}
 			if !temporal.IsTimeoutError(err) {
 				return result, err
@@ -232,6 +294,11 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		verdict, err := review("the implementation", "", false)
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
+		}
+		if verdict.NeedsMaintainer {
+			logger.Info("Code review halted the run for maintainer input")
+			return "", fmt.Errorf("%w: code review halted the run — the task cannot be completed as stated: %s",
+				ErrAwaitingMaintainer, truncateParkComments(verdict.Comments))
 		}
 		if verdict.Approved {
 			logger.Info("Code review approved")
@@ -275,6 +342,14 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	for {
 		var result activities.TestResult
 		if err := workflow.ExecuteActivity(testsCtx, activities.RunNativeTestsActivity, worktree.WorktreePath).Get(ctx, &result); err != nil {
+			if isAPIExhaustion(err) {
+				// Test-command discovery runs a jailed agent round, so the
+				// suite activity can hit the provider cap too.
+				if herr := heartbeat(err, "tests"); herr != nil {
+					return "", fmt.Errorf("run tests: %w", herr)
+				}
+				continue
+			}
 			if !temporal.IsTimeoutError(err) {
 				return "", fmt.Errorf("run tests: %w", err)
 			}
@@ -287,10 +362,20 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				Passed: false,
 				Logs:   fmt.Sprintf("NATIVE TEST SUITE TIMED OUT: the suite did not finish within %s. Cut runtime (parallelism, caching, narrower scope) or raise config tests_timeout.", testTimeout),
 			}
+		} else {
+			// A suite round that ran to completion resets the quota streak
+			// like any other completed round — even a red one, since the
+			// provider was reachable for it.
+			quotaHeartbeats = 0
 		}
 		verdict, err := review("the test suite", result.Logs, true)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
+		}
+		if verdict.NeedsMaintainer {
+			logger.Info("Test review halted the run for maintainer input")
+			return "", fmt.Errorf("%w: test review halted the run — the task cannot be completed as stated: %s",
+				ErrAwaitingMaintainer, truncateParkComments(verdict.Comments))
 		}
 		if result.Passed && verdict.Approved {
 			logger.Info("Tests pass and test review approved")
@@ -310,6 +395,26 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			return "", fmt.Errorf("test-fix agent run: %w", err)
 		}
 	}
+}
+
+// maxParkCommentBytes bounds the reviewer comments embedded in a park
+// error — same ceiling as the exhaustion excerpt on the activity side.
+// The full text already travels in the history's activity result (where
+// `continue` reads it from), so the failure event needs only enough to
+// identify the halt, not a second full copy.
+const maxParkCommentBytes = 1024
+
+// truncateParkComments bounds s to its first maxParkCommentBytes bytes
+// (keeping whole UTF-8 runes) with a truncation marker.
+func truncateParkComments(s string) string {
+	if len(s) <= maxParkCommentBytes {
+		return s
+	}
+	cut := maxParkCommentBytes
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return s[:cut] + "\n[... review comments truncated ...]"
 }
 
 // testFixPrompt builds the phase-2 fix prompt from whatever failed: test
@@ -332,4 +437,13 @@ func testFixPrompt(result activities.TestResult, verdict activities.ReviewResult
 		return fmt.Sprintf("Internal error building the fix prompt: %v", err)
 	}
 	return prompt
+}
+
+// isAPIExhaustion reports whether err is the activities' ErrAPIExhausted.
+// Crossing the worker→workflow boundary an activity error survives only as
+// the application error's message text, and the activities wrap the
+// sentinel with %w (directly in runJailed, nested inside test-command
+// discovery), so a plain substring match covers every case.
+func isAPIExhaustion(err error) bool {
+	return err != nil && strings.Contains(err.Error(), activities.ErrAPIExhausted.Error())
 }
