@@ -139,8 +139,7 @@ For a local Temporal dev server matching the defaults:
 func main() {
 	configPath, args, err := parseFlags(os.Args[1:])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
-		os.Exit(1)
+		usageFail("%v", err)
 	}
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usage)
@@ -156,8 +155,7 @@ func main() {
 	default:
 		path, err := resolveConfigPath(configPath.configPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-			os.Exit(1)
+			exitf("load config: %v", err)
 		}
 		configPath.configPath = path
 	}
@@ -169,8 +167,7 @@ func main() {
 		fmt.Println(version.String())
 	case "init":
 		if err := writeExampleConfig("."); err != nil {
-			fmt.Fprintf(os.Stderr, "init failed: %v\n", err)
-			os.Exit(1)
+			fail("init", err)
 		}
 	case "list":
 		// daedalus list [max] — the most recent sessions, newest first.
@@ -178,22 +175,15 @@ func main() {
 		if len(args) == 2 {
 			n, err := strconv.Atoi(args[1])
 			if err != nil || n <= 0 {
-				fmt.Fprintf(os.Stderr, "list takes an optional maximum number of sessions (got %q)\n\n%s", args[1], usage)
-				os.Exit(1)
+				usageFail("list takes an optional maximum number of sessions (got %q)", args[1])
 			}
 			max = n
 		} else if len(args) > 2 {
-			fmt.Fprintf(os.Stderr, "list takes at most one argument\n\n%s", usage)
-			os.Exit(1)
+			usageFail("list takes at most one argument")
 		}
-		cfg, err := config.Load(configPath.configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-			os.Exit(1)
-		}
+		cfg := loadConfig(configPath.configPath)
 		if err := listPipelines(cfg, max); err != nil {
-			fmt.Fprintf(os.Stderr, "list failed: %v\n", err)
-			os.Exit(1)
+			fail("list", err)
 		}
 	case "worker":
 		// daedalus worker [start|stop|status|restart|foreground] — default
@@ -202,138 +192,129 @@ func main() {
 		if len(args) == 2 {
 			action = args[1]
 		} else if len(args) > 2 {
-			fmt.Fprintf(os.Stderr, "worker takes at most one action\n\n%s", usage)
-			os.Exit(1)
+			usageFail("worker takes at most one action")
 		}
-		cfg, err := config.Load(configPath.configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-			os.Exit(1)
-		}
+		cfg := loadConfig(configPath.configPath)
 		switch action {
 		case "start":
 			if err := workerStart(cfg, configPath.configPath); err != nil {
-				fmt.Fprintf(os.Stderr, "worker start failed: %v\n", err)
-				os.Exit(1)
+				fail("worker start", err)
 			}
 		case "stop":
 			if err := workerStop(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "worker stop failed: %v\n", err)
-				os.Exit(1)
+				fail("worker stop", err)
 			}
 		case "status":
 			workerStatus(cfg)
 		case "restart":
 			if err := workerStop(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "worker stop failed: %v\n", err)
-				os.Exit(1)
+				fail("worker stop", err)
 			}
 			if err := workerStart(cfg, configPath.configPath); err != nil {
-				fmt.Fprintf(os.Stderr, "worker start failed: %v\n", err)
-				os.Exit(1)
+				fail("worker start", err)
 			}
 		case "foreground":
 			// Run attached to this terminal — the daemon child's mode, and
 			// the way to debug a worker that will not start.
 			if err := runWorker(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "worker failed: %v\n", err)
-				os.Exit(1)
+				fail("worker", err)
 			}
 			if os.Getenv(daemonEnv) == "1" {
 				pidFile, _ := daemonPaths(cfg.Temporal.TaskQueue)
 				os.Remove(pidFile)
 			}
 		default:
-			fmt.Fprintf(os.Stderr, "unknown worker action %q (start, stop, status, restart, foreground)\n\n%s", action, usage)
-			os.Exit(1)
+			usageFail("unknown worker action %q (start, stop, status, restart, foreground)", action)
 		}
 	case "run":
-		cfg, err := config.Load(configPath.configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-			os.Exit(1)
-		}
+		cfg := loadConfig(configPath.configPath)
 		if configPath.appendID != "" {
 			// Append mode: no repo path or issue id — just a prompt (or
 			// -f file) for the pipeline that is already running.
 			var prompt string
 			switch {
 			case configPath.taskFile != "" && len(args) == 1:
-				data, err := os.ReadFile(configPath.taskFile)
+				p, err := readTaskFile(configPath.taskFile)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "read task file: %v\n", err)
-					os.Exit(1)
+					exitf("%v", err)
 				}
-				prompt = string(data)
+				prompt = p
 			case configPath.taskFile == "" && len(args) == 2:
 				prompt = args[1]
 			default:
-				fmt.Fprintf(os.Stderr, "run -a/--append takes <workflow-id> \"<prompt>\" (or -f <file>)\n\n%s", usage)
-				os.Exit(1)
+				usageFail(`run -a/--append takes <workflow-id> "<prompt>" (or -f <file>)`)
 			}
 			if err := guidePipeline(cfg, configPath.appendID, prompt); err != nil {
-				fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
-				os.Exit(1)
+				fail("run", err)
 			}
 		} else {
 			prompt, err := runPrompt(configPath.taskFile, args[1:])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
-				os.Exit(1)
+				usageFail("%v", err)
 			}
 			err = startPipeline(cfg, configPath.workflow, args[1], args[2], prompt, configPath.detach,
 				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
-				os.Exit(1)
+				fail("run", err)
 			}
 		}
 	case "guide":
 		if len(args) != 3 {
-			fmt.Fprintf(os.Stderr, "guide takes <workflow-id> \"<message>\"\n\n%s", usage)
-			os.Exit(1)
+			usageFail(`guide takes <workflow-id> "<message>"`)
 		}
-		cfg, err := config.Load(configPath.configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-			os.Exit(1)
-		}
+		cfg := loadConfig(configPath.configPath)
 		if err := guidePipeline(cfg, args[1], args[2]); err != nil {
-			fmt.Fprintf(os.Stderr, "guide failed: %v\n", err)
-			os.Exit(1)
+			fail("guide", err)
 		}
 	case "continue":
 		if len(args) != 3 {
-			fmt.Fprintf(os.Stderr, "continue takes <workflow-id> \"<prompt>\"\n\n%s", usage)
-			os.Exit(1)
+			usageFail(`continue takes <workflow-id> "<prompt>"`)
 		}
-		cfg, err := config.Load(configPath.configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-			os.Exit(1)
-		}
+		cfg := loadConfig(configPath.configPath)
 		if err := continuePipeline(cfg, args[1], args[2], configPath.detach); err != nil {
-			fmt.Fprintf(os.Stderr, "continue failed: %v\n", err)
-			os.Exit(1)
+			fail("continue", err)
 		}
 	case "attach":
 		if len(args) != 2 {
-			fmt.Fprintf(os.Stderr, "attach takes <workflow-id>\n\n%s", usage)
-			os.Exit(1)
+			usageFail("attach takes <workflow-id>")
 		}
-		cfg, err := config.Load(configPath.configPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-			os.Exit(1)
-		}
+		cfg := loadConfig(configPath.configPath)
 		if err := attachPipeline(cfg, args[1]); err != nil {
-			fmt.Fprintf(os.Stderr, "attach failed: %v\n", err)
-			os.Exit(1)
+			fail("attach", err)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n%s", args[0], usage)
-		os.Exit(1)
+		usageFail("unknown subcommand %q", args[0])
 	}
+}
+
+// exitf prints the formatted diagnostic to stderr and exits nonzero — the
+// CLI's uniform failure exit.
+func exitf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", a...)
+	os.Exit(1)
+}
+
+// fail reports a failing subcommand ("<cmd> failed: <err>") and exits.
+func fail(cmd string, err error) {
+	exitf("%s failed: %v", cmd, err)
+}
+
+// usageFail reports an argument error — the message followed by the usage
+// text — and exits nonzero.
+func usageFail(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n\n", a...)
+	fmt.Fprint(os.Stderr, usage)
+	os.Exit(1)
+}
+
+// loadConfig loads a subcommand's configuration, exiting with the shared
+// diagnostic when it cannot be read.
+func loadConfig(path string) config.Config {
+	cfg, err := config.Load(path)
+	if err != nil {
+		exitf("load config: %v", err)
+	}
+	return cfg
 }
 
 // flags holds the global options extractable from anywhere in the argument
@@ -481,6 +462,15 @@ func resolveBranchPrefix(flagPrefix, configPrefix string) string {
 	return configPrefix
 }
 
+// readTaskFile reads the task description given via -f/--file.
+func readTaskFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read task file: %w", err)
+	}
+	return string(data), nil
+}
+
 // runPrompt resolves the task description for `daedalus run`: the content of
 // the file given via -f/--file, or the trailing positional argument — exactly
 // one of the two. args are the positional arguments after the subcommand
@@ -488,11 +478,7 @@ func resolveBranchPrefix(flagPrefix, configPrefix string) string {
 func runPrompt(taskFile string, args []string) (string, error) {
 	switch {
 	case taskFile != "" && len(args) == 2:
-		data, err := os.ReadFile(taskFile)
-		if err != nil {
-			return "", fmt.Errorf("read task file: %w", err)
-		}
-		return string(data), nil
+		return readTaskFile(taskFile)
 	case taskFile == "" && len(args) == 3:
 		return args[2], nil
 	case taskFile != "":
