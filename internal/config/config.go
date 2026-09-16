@@ -85,8 +85,8 @@ type OpenAIConfig struct {
 // from a YAML file (see config-example.yaml).
 type Config struct {
 	// Agent selects which jailed CLI runs the implementing and reviewer
-	// agents: "claude" (Claude Code) or "opencode" (see agents for the
-	// accepted values).
+	// agents: "claude" (Claude Code), "opencode", or "amp" (see agents for
+	// the accepted values).
 	Agent string `yaml:"agent"`
 	// BranchPrefix names the preserved branch carrying a run's approved
 	// work: <prefix>/issue-<id>-<unix timestamp>. It is deliberately
@@ -108,8 +108,21 @@ type Config struct {
 	OpenAI          OpenAIConfig    `yaml:"openai"`
 }
 
-// agents lists the accepted config Agent values.
-var agents = []string{"claude", "opencode"}
+// agents lists the accepted config Agent values. amp authenticates through
+// AMP_API_KEY in the worker's environment (runJailed passes it into the jail
+// when set; amp's host login does not reach the jail) — the anthropic/openai
+// config sections do not apply to it.
+var agents = []string{"claude", "opencode", "amp"}
+
+// ValidateAgent rejects Agent values Load would refuse. The CLI's
+// -cli/--cli flag overrides the config's agent and must fail up front,
+// with the same error, rather than at worker startup.
+func ValidateAgent(a string) error {
+	if !slices.Contains(agents, a) {
+		return fmt.Errorf("unknown agent %q (available: %s)", a, strings.Join(agents, ", "))
+	}
+	return nil
+}
 
 // UIURL returns the Temporal UI address corresponding to Temporal.UIPort.
 func (c Config) UIURL() string {
@@ -153,9 +166,8 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	c.applyDefaults()
-	if !slices.Contains(agents, c.Agent) {
-		return c, fmt.Errorf("config %s: agent: unknown agent %q (available: %s)",
-			path, c.Agent, strings.Join(agents, ", "))
+	if err := ValidateAgent(c.Agent); err != nil {
+		return c, fmt.Errorf("config %s: agent: %w", path, err)
 	}
 	if err := ValidateBranchPrefix(c.BranchPrefix); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)

@@ -10,8 +10,8 @@ orchestrated via [Temporal](https://temporal.io).
 Daedalus turns an issue into working, reviewed, tested code. Given a
 repository, an issue ID, and a prompt, it spins up an isolated git worktree
 and runs two review-gated loops inside it: a jailed agent —
-[Claude Code](https://claude.com/claude-code) by default, or
-[opencode](https://opencode.ai) — implements the change
+[Claude Code](https://claude.com/claude-code) by default,
+[opencode](https://opencode.ai), or [Amp](https://ampcode.com) — implements the change
 while a jailed reviewer approves the code; the agent then writes the test
 suite while the reviewer — and the repository's own test suite — approve the
 tests. Each loop runs until its reviewer approves. Temporal provides durable
@@ -70,8 +70,11 @@ up.
 - A Temporal server: `temporal server start-dev` — all defaults match
   (frontend `127.0.0.1:7233`, UI :8233)
 - The `ai-jail` CLI on your `PATH`
-- The `claude` CLI (invoked by the jail), or `opencode` when
-  `agent: opencode` is set in config.yaml
+- The `claude` CLI (invoked by the jail), `opencode` when
+  `agent: opencode` is set in config.yaml, or `amp` when `agent: amp` is
+  (amp authenticates via `AMP_API_KEY` in the worker's environment, which
+  daedalus passes into the jail when set; amp's own host login does not
+  reach the jail)
 
 ## Usage
 
@@ -177,7 +180,7 @@ work from any directory; `daedalus init` writes a fully commented
 
 | Field                 | Default            | Purpose                              |
 | --------------------- | ------------------ | ------------------------------------ |
-| `agent`               | `claude`           | Jailed agent CLI: `claude` or `opencode` |
+| `agent`               | `claude`           | Jailed agent CLI: `claude`, `opencode`, or `amp` (`worker -cli/--cli` overrides per worker) |
 | `branch_prefix`       | `daedalus`         | Prefix for preserved branches (`<prefix>/issue-<id>-<ts>`); `run -p/--prefix` overrides per run |
 | `temporal.host`       | `127.0.0.1:7233`   | Temporal frontend address            |
 | `temporal.ui_port`    | `8233`             | Temporal UI port (shown at startup)  |

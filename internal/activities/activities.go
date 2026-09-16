@@ -356,12 +356,32 @@ type jailResult struct {
 	Stderr string
 }
 
-// jailedAgentIsOpenCode reports whether the worker is configured to jail
-// opencode instead of Claude Code. The selection (config.yaml `agent`,
-// default claude) travels via the worker's environment like the provider
-// settings: DAEDALUS_AGENT, exported at worker startup.
-func jailedAgentIsOpenCode() bool {
-	return os.Getenv("DAEDALUS_AGENT") == "opencode"
+// jailedAgentCLI returns the jailed agent CLI, its headless flags, and the
+// output-mode flags for full agent rounds. The selection (config.yaml
+// `agent`, default claude) travels via the worker's environment like the
+// provider settings: DAEDALUS_AGENT, exported at worker startup. All three
+// CLIs read the prompt from piped stdin; each headless flag set approves
+// every tool call, which is only safe inside the jail.
+func jailedAgentCLI() (agent string, headless, output []string) {
+	switch os.Getenv("DAEDALUS_AGENT") {
+	case "opencode":
+		// opencode reads the prompt from piped stdin just like claude -p;
+		// --auto approves everything not explicitly denied. Plain text
+		// mode, so Thinking stays empty; capturing it means parsing
+		// opencode's --format json event stream.
+		return "opencode", []string{"run", "--auto"}, nil
+	case "amp":
+		// -x is amp's execute mode (single-shot, prompt from stdin);
+		// --dangerously-allow-all approves all tool calls. It is absent
+		// from amp's --help (only the settings key amp.dangerouslyAllowAll
+		// is documented), so its disappearance across updates is the first
+		// thing to check if amp rounds start failing on unknown flags.
+		// --stream-json-thinking implies --stream-json and adds thinking
+		// blocks, which parseAgentStream reads like claude's.
+		return "amp", []string{"-x", "--dangerously-allow-all"}, []string{"--stream-json-thinking"}
+	default:
+		return "claude", []string{"-p", "--dangerously-skip-permissions"}, []string{"--output-format", "json"}
+	}
 }
 
 // runJailed runs one autonomous agent invocation inside an ai-jail sandbox
@@ -370,18 +390,20 @@ func jailedAgentIsOpenCode() bool {
 // argv: argv is visible in `ps` and per-argument size limits would make
 // large review prompts (which embed the full diff) fail the run.
 func runJailed(ctx context.Context, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
-	agent := "claude"
-	headless := []string{"-p", "--dangerously-skip-permissions"}
-	if jailedAgentIsOpenCode() {
-		// opencode reads the prompt from piped stdin just like claude -p;
-		// --auto approves everything not explicitly denied.
-		agent = "opencode"
-		headless = []string{"run", "--auto"}
+	agent, headless, _ := jailedAgentCLI()
+	args := []string{"--worktree", "--network"}
+	// amp's host login state (~/.config/amp) is not among ai-jail's
+	// agent-state dirs and AMP_API_KEY is not in its default env allowlist,
+	// so neither documented auth route reaches the jailed child on a stock
+	// jail. --env copies the value from this process's environment (set
+	// below), making the key route work without operator jail config.
+	if agent == "amp" && os.Getenv("AMP_API_KEY") != "" {
+		args = append(args, "--env", "AMP_API_KEY")
 	}
 	// "--" ends ai-jail's own flags: everything after it is the jailed
 	// command, verbatim — otherwise ai-jail rejects child flags that
 	// resemble its own (e.g. claude's --verbose) as misplaced.
-	args := []string{"--worktree", "--network", "--", agent}
+	args = append(args, "--", agent)
 	args = append(args, agentArgs...)
 	args = append(args, headless...)
 	cmd := exec.CommandContext(ctx, "ai-jail", args...)
@@ -442,22 +464,19 @@ func activityLogger(ctx context.Context) (l log.Logger) {
 	return l
 }
 
-// RunJailedClaudeActivity runs the jailed agent (Claude Code or opencode,
-// per config) inside an ai-jail sandbox rooted at the worktree. Claude runs
-// with json output so its visible text comes back structured and lands
+// RunJailedClaudeActivity runs the jailed agent (Claude Code, opencode, or
+// amp, per config) inside an ai-jail sandbox rooted at the worktree. Claude
+// runs with json output so its visible text comes back structured and lands
 // tail-bounded in the activity result (serialized into Temporal history,
 // visible in the UI per round), while the worker log keeps the full
-// untruncated output; opencode's plain output is taken as-is (its thinking
-// is not captured). stream-json (which also carries the chain of thought
-// via --verbose) is blocked for now: ai-jail's flag guard rejects
+// untruncated output; amp's --stream-json-thinking emits
+// Claude-Code-compatible events including thinking blocks, so the same
+// parser applies; opencode's plain output is taken as-is (its thinking is
+// not captured). stream-json (which also carries the chain of thought via
+// --verbose) is blocked for claude for now: ai-jail's flag guard rejects
 // --verbose after the command by prefix match, even behind --.
 func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
-	var agentArgs []string
-	if !jailedAgentIsOpenCode() {
-		agentArgs = []string{"--output-format", "json"}
-	}
-	// opencode runs in plain text mode, so Thinking stays empty;
-	// capturing it means parsing opencode's --format json event stream.
+	_, _, agentArgs := jailedAgentCLI()
 	res, err := runJailed(ctx, input.WorktreePath, input.Prompt, agentArgs...)
 	if err != nil {
 		return AgentRunResult{}, err
