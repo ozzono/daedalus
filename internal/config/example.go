@@ -30,8 +30,14 @@ branch_prefix: daedalus
 # Ceiling for one execution of the repo's native test suite (a Go
 # duration string). Test-command discovery and the suite itself share this
 # budget, so it is wider than the 15-minute ceiling the other activities
-# use. Every other activity keeps that fixed 15-minute StartToClose.
+# use. Every other activity keeps that fixed 15-minute StartToClose;
+# the jailed agent gets its own, wider ceiling below.
 tests_timeout: 30m
+# Ceiling for one jailed-agent round — implementation or review
+# (RunJailedClaudeActivity), a Go duration string. Agent rounds
+# legitimately run long, so this is wider than the fixed 15-minute
+# StartToClose the other activities use.
+agent_run_timeout: 45m
 
 temporal:
   # Temporal frontend address. 7233 is Temporal's own default, so a plain

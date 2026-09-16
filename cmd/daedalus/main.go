@@ -738,12 +738,13 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		// instead of failing with an already-exists error.
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 	}, workflowFn, workflows.PipelineInput{
-		RepoPath:     repoPath,
-		TaskQueue:    cfg.Temporal.TaskQueue,
-		IssueID:      issueID,
-		Prompt:       prompt,
-		BranchPrefix: branchPrefix,
-		TestTimeout:  cfg.TestsTimeout,
+		RepoPath:        repoPath,
+		TaskQueue:       cfg.Temporal.TaskQueue,
+		IssueID:         issueID,
+		Prompt:          prompt,
+		BranchPrefix:    branchPrefix,
+		TestTimeout:     cfg.TestsTimeout,
+		AgentRunTimeout: cfg.AgentRunTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -851,10 +852,11 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		Prompt:    prompt,
 		// A pre-branch-prefix run (empty in its recorded history) resolves
 		// like a fresh run: through the operator's current config.
-		BranchPrefix:  resolveBranchPrefix(prev.BranchPrefix, cfg.BranchPrefix),
-		TestTimeout:   cfg.TestsTimeout,
-		BaseBranch:    base,
-		PriorFeedback: tail(lastReview.Comments, maxPriorFeedback),
+		BranchPrefix:    resolveBranchPrefix(prev.BranchPrefix, cfg.BranchPrefix),
+		TestTimeout:     cfg.TestsTimeout,
+		AgentRunTimeout: cfg.AgentRunTimeout,
+		BaseBranch:      base,
+		PriorFeedback:   tail(lastReview.Comments, maxPriorFeedback),
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)

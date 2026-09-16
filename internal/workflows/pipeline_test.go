@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/mock"
+	"go.temporal.io/api/enums/v1"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/ozzono/daedalus/internal/activities"
@@ -554,6 +556,161 @@ func TestFeatureDevWorkflowCleanupOnCancellation(t *testing.T) {
 	}
 	if cleanupCount != 1 {
 		t.Fatalf("cleanup ran %d times after cancellation, want 1 — the deferred cleanup must use a disconnected context", cleanupCount)
+	}
+	env.AssertExpectations(t)
+}
+
+// errTimeoutStub is what a timed-out activity surfaces to workflow code
+// (temporal.NewTimeoutError exists for exactly this unit-testing use).
+var errTimeoutStub = temporal.NewTimeoutError(enums.TIMEOUT_TYPE_START_TO_CLOSE, nil)
+
+// TestFeatureDevWorkflowAgentTimeoutRecovers pins the core recovery: a
+// round that dies at the StartToClose ceiling re-runs as a continuation
+// of its own partial work instead of failing the run.
+func TestFeatureDevWorkflowAgentTimeoutRecovers(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var inputs []activities.AgentRunInput
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					inputs = append(inputs, in)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			if calls == 1 {
+				return activities.AgentRunResult{}, errTimeoutStub
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	// Three rounds: implement (timed out), its continuation, then the
+	// phase-2 tests round a fresh approval leads into.
+	if calls != 3 {
+		t.Fatalf("agent calls = %d, want 3 (timed-out round, continuation, tests round)", calls)
+	}
+	if len(inputs) != 3 || inputs[1].Prompt == inputs[0].Prompt {
+		t.Fatalf("retry must re-prompt, inputs recorded: %d", len(inputs))
+	}
+	if !strings.Contains(inputs[1].Prompt, "continuing a previous attempt") {
+		t.Errorf("retry prompt is not a continuation: %q", inputs[1].Prompt)
+	}
+	if !strings.Contains(inputs[1].Prompt, "timeout ceiling") {
+		t.Errorf("retry prompt does not explain the timeout: %q", inputs[1].Prompt)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowAgentTimeoutStreakFails pins the cap: a run whose
+// every round dies at the ceiling fails loudly instead of looping forever.
+func TestFeatureDevWorkflowAgentTimeoutStreakFails(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Return(activities.AgentRunResult{}, errTimeoutStub)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error after a timeout streak")
+	}
+	if !strings.Contains(err.Error(), "timed out 3 rounds in a row") {
+		t.Errorf("error does not name the streak: %v", err)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowTestsTimeoutRecovers pins that a timed-out native
+// suite becomes a failing round: the fix loop gets synthetic timeout logs
+// and the run still finishes.
+func TestFeatureDevWorkflowTestsTimeoutRecovers(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var inputs []activities.AgentRunInput
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					inputs = append(inputs, in)
+				}
+			}
+		}).
+		Return(activities.AgentRunResult{Text: "done"}, nil)
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	var suiteCalls int
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, path string) (activities.TestResult, error) {
+			suiteCalls++
+			if suiteCalls == 1 {
+				return activities.TestResult{}, errTimeoutStub
+			}
+			return activities.TestResult{Passed: true, Logs: "ok"}, nil
+		})
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if suiteCalls != 2 {
+		t.Fatalf("suite calls = %d, want 2 (timed-out round plus rerun)", suiteCalls)
+	}
+	// The last round is the fix: implement, tests round, then the fix
+	// digesting the synthetic timeout logs.
+	last := inputs[len(inputs)-1]
+	if !strings.Contains(last.Prompt, "NATIVE TEST SUITE TIMED OUT") {
+		t.Errorf("fix prompt does not carry the timeout logs: %q", last.Prompt)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowReviewerTimeoutRetries pins that a reviewer round
+// lost to the ceiling is simply retried.
+func TestFeatureDevWorkflowReviewerTimeoutRetries(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	rec := &agentRecorder{env: env}
+	rec.record()
+	var reviewCalls int
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			reviewCalls++
+			if reviewCalls == 1 {
+				return activities.ReviewResult{}, errTimeoutStub
+			}
+			return activities.ReviewResult{Approved: true}, nil
+		})
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if reviewCalls < 2 {
+		t.Fatalf("review calls = %d, want the timed-out round retried", reviewCalls)
 	}
 	env.AssertExpectations(t)
 }
