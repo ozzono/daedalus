@@ -109,7 +109,14 @@ up.
    the past week), pid in `/tmp/daedalus/worker-<queue>.pid`. Manage it with
    `daedalus worker stop|status|restart`, or `daedalus worker foreground` to
    run it attached to a terminal (the way to debug a worker that will not
-   start).
+   start). Each worker records the config it was started with (in
+   `/tmp/daedalus/worker-<queue>.conf`), so `restart` reuses the recorded
+   settings wherever it's invoked, as long as some config resolves to name
+   the queue (pass `-c` or keep a user-level config) — stop then
+   `start -c <new>` to move a worker to a different config.
+   `daedalus worker restart all` restarts every worker on record, each
+   with its own config, in one call — records alone, no config needed
+   (an explicit `-c` is rejected there; it would have no effect).
 
 4. **Trigger a pipeline** (third terminal):
 

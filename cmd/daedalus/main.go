@@ -70,11 +70,21 @@ Usage:
       start, runs it as a detached daemon: logs append to
       /tmp/daedalus/worker-<queue>.log (pruned to the past week), the pid
       lives in /tmp/daedalus/worker-<queue>.pid, one daemon per task queue.
-      stop drains it gracefully (SIGTERM); restart is stop + start; status
-      reports pid and log path. foreground runs attached to this terminal.
+      stop drains it gracefully (SIGTERM); restart is stop + start, reusing
+      the config the worker was started with (recorded per queue, so the
+      restart reuses the recorded settings wherever it's invoked, as long
+      as some config resolves to name the queue — pass -c or keep a
+      user-level config; stop then "start -c <new>" to move a worker to a
+      different config); "restart all" does every worker on record, each
+      with its own config, working from records alone (-c and -cli are
+      rejected there — they would have no effect). status reports pid
+      and log path.
+      foreground runs attached to this terminal.
       -cli/--cli <agent> overrides the config's agent (claude, opencode,
       amp) for this worker: the jailed agent runs in the worker process,
       so the selection is a worker-start-time setting, not a per-run one.
+      On a plain restart the override still applies, on top of whatever
+      config the restart resolves to.
       anthropic.key is optional — if unset, the jailed agent authenticates
       through the worker's inherited environment or its own login.
   daedalus [-c config.yaml] list [max]
@@ -150,12 +160,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Every subcommand except the no-config ones (help, version, init)
+	// Every subcommand except the no-config ones (help, version, init, and
+	// `worker restart all`, which reads only the recorded per-queue configs)
 	// loads a configuration; resolve its location once, up front, so the
 	// subcommand — and the daemon `worker start` re-executes — agree on
 	// it wherever the CLI is invoked from.
-	switch args[0] {
-	case "-h", "--help", "help", "-v", "--version", "init":
+	switch {
+	case args[0] == "-h", args[0] == "--help", args[0] == "help",
+		args[0] == "-v", args[0] == "--version", args[0] == "init",
+		isRestartAll(args):
 	default:
 		path, err := resolveConfigPath(configPath.configPath)
 		if err != nil {
@@ -191,17 +204,28 @@ func main() {
 		}
 	case "worker":
 		// daedalus worker [start|stop|status|restart|foreground] — default
-		// start runs the worker as a detached daemon.
+		// start runs the worker as a detached daemon. `restart` additionally
+		// takes `all` (or --all): restart every worker on record in one call.
 		action := "start"
-		if len(args) == 2 {
+		all := false
+		if len(args) >= 2 {
 			action = args[1]
+		}
+		if isRestartAll(args) {
+			all = true
 		} else if len(args) > 2 {
 			usageFail("worker takes at most one action")
 		}
-		cfg := loadConfig(configPath.configPath)
-		// -cli/--cli overrides the config's agent for this worker.
-		if configPath.agentCLI != "" {
-			cfg.Agent = configPath.agentCLI
+		// `restart all` works purely from the recorded per-queue configs and
+		// must not depend on whatever the invoking directory resolves to;
+		// every other action needs the CLI's config.
+		var cfg config.Config
+		if !(action == "restart" && all) {
+			cfg = loadConfig(configPath.configPath)
+			// -cli/--cli overrides the config's agent for this worker.
+			if configPath.agentCLI != "" {
+				cfg.Agent = configPath.agentCLI
+			}
 		}
 		switch action {
 		case "start":
@@ -215,11 +239,12 @@ func main() {
 		case "status":
 			workerStatus(cfg)
 		case "restart":
-			if err := workerStop(cfg); err != nil {
-				fail("worker stop", err)
-			}
-			if err := workerStart(cfg, configPath.configPath, configPath.agentCLI); err != nil {
-				fail("worker start", err)
+			if all {
+				if err := workerRestartAll(); err != nil {
+					fail("worker restart", err)
+				}
+			} else if err := workerRestart(cfg, configPath.configPath, configPath.agentCLI); err != nil {
+				fail("worker restart", err)
 			}
 		case "foreground":
 			// Run attached to this terminal — the daemon child's mode, and
@@ -228,7 +253,7 @@ func main() {
 				fail("worker", err)
 			}
 			if os.Getenv(daemonEnv) == "1" {
-				pidFile, _ := daemonPaths(cfg.Temporal.TaskQueue)
+				pidFile, _, _ := daemonPaths(cfg.Temporal.TaskQueue)
 				os.Remove(pidFile)
 			}
 		default:
@@ -329,9 +354,12 @@ func loadConfig(path string) config.Config {
 // list.
 type flags struct {
 	configPath string
-	workflow   string
-	taskFile   string
-	detach     bool
+	// configSet reports that -c/--config appeared on the command line, so
+	// an explicit (but ignored) -c can be told apart from the default.
+	configSet bool
+	workflow  string
+	taskFile  string
+	detach    bool
 	// branchPrefix, set via -p/--prefix on `run`, overrides the config's
 	// branch_prefix for that run's preserved branch.
 	branchPrefix string
@@ -353,6 +381,7 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 		switch name {
 		case "config":
 			f.configPath = value
+			f.configSet = true
 		case "file":
 			f.taskFile = value
 		case "append":
@@ -441,6 +470,16 @@ parse:
 	// flag) can honor it.
 	if f.agentCLI != "" && len(rest) > 0 && rest[0] != "worker" {
 		return f, nil, errors.New("-cli/--cli only applies to worker")
+	}
+	// `worker restart all` works from the recorded per-queue configs alone;
+	// an explicit -c there is silently ignored by every step — reject it
+	// instead of accepting an option the subcommand never uses. -cli too:
+	// every restarted worker keeps its recorded config's agent.
+	if f.configSet && isRestartAll(rest) {
+		return f, nil, errors.New("-c/--config does not apply to worker restart all")
+	}
+	if f.agentCLI != "" && isRestartAll(rest) {
+		return f, nil, errors.New("-cli/--cli does not apply to worker restart all")
 	}
 	return f, rest, nil
 }
@@ -547,19 +586,66 @@ const daemonEnv = "DAEDALUS_WORKER_DAEMON"
 // logRetention bounds how long daemon logs are kept.
 const logRetention = 7 * 24 * time.Hour
 
-// daemonPaths returns the per-task-queue pid and log file paths. One daemon
-// per queue: a second `worker start` on a live queue refuses rather than
-// doubles up.
-func daemonPaths(queue string) (pidFile, logFile string) {
+// daemonPaths returns the per-task-queue pid, log, and config-record file
+// paths. One daemon per queue: a second `worker start` on a live queue
+// refuses rather than doubles up. The config record holds the absolute path
+// of the config the worker was started with — the worker's own copy, so a
+// restart brings it back with the settings it was born with, whatever
+// directory the restart is invoked from.
+func daemonPaths(queue string) (pidFile, logFile, confFile string) {
 	return filepath.Join(daemonDir, "worker-"+queue+".pid"),
-		filepath.Join(daemonDir, "worker-"+queue+".log")
+		filepath.Join(daemonDir, "worker-"+queue+".log"),
+		filepath.Join(daemonDir, "worker-"+queue+".conf")
+}
+
+// recordedConfigPath returns the config file the worker on queue was started
+// with, or "" when no record exists (the worker predates records, or the
+// record was wiped). An empty or unreadable record counts as no record.
+func recordedConfigPath(queue string) string {
+	_, _, confFile := daemonPaths(queue)
+	data, err := os.ReadFile(confFile)
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(string(data))
+	if path == "" {
+		return ""
+	}
+	return path
+}
+
+// isRestartAll reports whether args spell out `worker restart all` (or its
+// --all spelling; -a is taken by run's --append) — the one invocation whose
+// behavior is record-driven end to end, needing no config of its own.
+func isRestartAll(args []string) bool {
+	return len(args) == 3 && args[0] == "worker" && args[1] == "restart" &&
+		(args[2] == "all" || args[2] == "--all")
+}
+
+// recordedQueues lists the task queues with a config record on file, sorted —
+// the roster of workers this deployment has started, running or not.
+func recordedQueues() ([]string, error) {
+	entries, err := os.ReadDir(daemonDir)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", daemonDir, err)
+	}
+	var queues []string
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".conf")
+		if !ok || !strings.HasPrefix(name, "worker-") || name == "worker-" {
+			continue
+		}
+		queues = append(queues, strings.TrimPrefix(name, "worker-"))
+	}
+	sort.Strings(queues)
+	return queues, nil
 }
 
 // workerStart launches the worker as a detached daemon: it re-executes
 // itself with `worker foreground`, redirected into the per-queue log, in
 // its own session so the terminal is released immediately.
 func workerStart(cfg config.Config, configPath, agentOverride string) error {
-	pidFile, logFile := daemonPaths(cfg.Temporal.TaskQueue)
+	pidFile, logFile, confFile := daemonPaths(cfg.Temporal.TaskQueue)
 	if pid, ok := readLivePid(pidFile); ok {
 		return fmt.Errorf("already running (pid %d) — use 'daedalus worker restart' or 'stop'", pid)
 	}
@@ -582,6 +668,14 @@ func workerStart(cfg config.Config, configPath, agentOverride string) error {
 	// daemon never re-resolves against the working directory it was
 	// started from — it keeps serving if that directory goes away.
 	childArgs := []string{"worker", "foreground", "-c", configPath}
+	// Record the config this worker will be started with so restarts —
+	// here or via `restart --all` — reuse it rather than whatever the
+	// invoking directory resolves to. Written before the spawn: a failed
+	// write leaves only a harmlessly-updated record, instead of a running
+	// daemon the record no longer describes.
+	if err := os.WriteFile(confFile, []byte(configPath), 0o644); err != nil {
+		return fmt.Errorf("write config record %s: %w", confFile, err)
+	}
 	// Forward a -cli override so the daemon runs the agent the operator
 	// selected; without it the child would fall back to the config's.
 	if agentOverride != "" {
@@ -610,7 +704,7 @@ func workerStart(cfg config.Config, configPath, agentOverride string) error {
 // workerStop gracefully terminates the daemon: SIGTERM lets Temporal's
 // worker drain, then the pid file is cleared once the process is gone.
 func workerStop(cfg config.Config) error {
-	pidFile, logFile := daemonPaths(cfg.Temporal.TaskQueue)
+	pidFile, logFile, _ := daemonPaths(cfg.Temporal.TaskQueue)
 	pid, ok := readLivePid(pidFile)
 	if !ok {
 		os.Remove(pidFile)
@@ -639,9 +733,115 @@ func workerStop(cfg config.Config) error {
 	return nil
 }
 
+// workerRestart stops and restarts the worker on cfg's task queue with the
+// config it was originally started with: the recorded config takes priority
+// over the invoking command's own resolution, so a worker restarted from a
+// different directory (or with a different -c on the CLI) keeps its settings.
+// To move a worker to a new config, `stop` it and `start -c <new>` — start
+// overwrites the record. A record that no longer loads, or whose queue was
+// edited away from this one, falls back to the CLI's config: restarting
+// beats refusing over a moved file. An explicit agentOverride (-cli) still
+// applies, on top of whichever config the restart resolves to; `restart
+// all` passes none, keeping each worker's recorded config verbatim.
+func workerRestart(cfg config.Config, cliConfigPath, agentOverride string) error {
+	queue := cfg.Temporal.TaskQueue
+	if recorded := recordedConfigPath(queue); recorded != "" {
+		if rc, err := config.Load(recorded); err != nil {
+			fmt.Printf("recorded config %s unreadable (%v) — restarting with %s\n", recorded, err, cliConfigPath)
+		} else if rc.Temporal.TaskQueue != queue {
+			fmt.Printf("recorded config %s now names queue %q, not %q — restarting with %s\n",
+				recorded, rc.Temporal.TaskQueue, queue, cliConfigPath)
+		} else {
+			cfg, cliConfigPath = rc, recorded
+		}
+	}
+	if err := workerStop(cfg); err != nil {
+		return err
+	}
+	return workerStart(cfg, cliConfigPath, agentOverride)
+}
+
+// workerRestartAll restarts every worker with a config record on file — the
+// single call that cycles a multi-queue deployment, each worker with its own
+// recorded config. A worker whose config no longer loads is reported and
+// skipped; the rest still get restarted.
+func workerRestartAll() error {
+	queues, err := recordedQueues()
+	if err != nil {
+		return err
+	}
+	onRecord := make(map[string]bool, len(queues))
+	for _, queue := range queues {
+		onRecord[queue] = true
+	}
+	if len(queues) == 0 {
+		// Even with nothing on record there may be live workers this
+		// command cannot restart; name them rather than imply none exist.
+		if live := runningUnrecordedQueues(onRecord); len(live) > 0 {
+			return fmt.Errorf("no workers on record in %s — start one first (these are running without a record, left alone: %s)",
+				daemonDir, strings.Join(live, ", "))
+		}
+		return fmt.Errorf("no workers on record in %s — start one first", daemonDir)
+	}
+	var skipped []error
+	for _, queue := range queues {
+		recorded := recordedConfigPath(queue)
+		if recorded == "" {
+			skipped = append(skipped, fmt.Errorf("queue %s: empty config record", queue))
+			continue
+		}
+		cfg, err := config.Load(recorded)
+		if err != nil {
+			skipped = append(skipped, fmt.Errorf("queue %s: load %s: %w", queue, recorded, err))
+			continue
+		}
+		if cfg.Temporal.TaskQueue != queue {
+			skipped = append(skipped, fmt.Errorf("queue %s: recorded config %s now names queue %q", queue, recorded, cfg.Temporal.TaskQueue))
+			continue
+		}
+		fmt.Printf("== worker %s (%s)\n", queue, recorded)
+		if err := workerRestart(cfg, recorded, ""); err != nil {
+			skipped = append(skipped, fmt.Errorf("queue %s: %w", queue, err))
+		}
+	}
+	// A worker with a live pid but no record (started before records
+	// existed, or with the record wiped) is not this command's to restart;
+	// report it instead of silently leaving it out.
+	if live := runningUnrecordedQueues(onRecord); len(live) > 0 {
+		fmt.Printf("skipped %d running worker(s) without a config record: %s\n",
+			len(live), strings.Join(live, ", "))
+	}
+	return errors.Join(skipped...)
+}
+
+// runningUnrecordedQueues lists the task queues with a live pid file but no
+// config record — workers running from before records existed.
+func runningUnrecordedQueues(onRecord map[string]bool) []string {
+	entries, err := os.ReadDir(daemonDir)
+	if err != nil {
+		return nil
+	}
+	var live []string
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".pid")
+		if !ok || !strings.HasPrefix(name, "worker-") || name == "worker-" {
+			continue
+		}
+		queue := strings.TrimPrefix(name, "worker-")
+		if onRecord[queue] {
+			continue
+		}
+		if _, ok := readLivePid(filepath.Join(daemonDir, e.Name())); ok {
+			live = append(live, queue)
+		}
+	}
+	sort.Strings(live)
+	return live
+}
+
 // workerStatus reports whether the daemon is running and where it logs.
 func workerStatus(cfg config.Config) {
-	pidFile, logFile := daemonPaths(cfg.Temporal.TaskQueue)
+	pidFile, logFile, _ := daemonPaths(cfg.Temporal.TaskQueue)
 	if pid, ok := readLivePid(pidFile); ok {
 		fmt.Printf("worker running (pid %d)\n  log: %s\n", pid, logFile)
 		return
