@@ -16,8 +16,9 @@ while a jailed reviewer approves the code; the agent then writes the test
 suite while the reviewer — and the repository's own test suite — approve the
 tests. Each loop runs until its reviewer approves. Temporal provides durable
 execution: every step is auditable and survives worker restarts, and a run
-that dies (crash, cancellation, API quota exhaustion) leaves its work
-preserved and resumable.
+that dies (crash, cancellation) or parks itself — provider quota exhausted
+past its hourly heartbeats, or a reviewer halt on an impossible task —
+leaves its work preserved and resumable.
 
 ```mermaid
 flowchart TD
@@ -131,9 +132,10 @@ up.
    ```
 
 `run` prints the Workflow ID (`daedalus-issue-42`) and Run ID, then blocks
-until the pipeline finishes (up to 4 h; the workflow keeps running past
+until the pipeline finishes (up to 12 h; the workflow keeps running past
 that). On success it prints the preserved branch holding the committed,
-approved work, e.g. `daedalus/issue-42-1726320000`. Follow along in the
+approved work, e.g. `daedalus/issue-42-1726320000`; a parked run prints a
+`daedalus continue` resume hint instead. Follow along in the
 Temporal UI at http://127.0.0.1:8233, or with `temporal workflow show`.
 
 Prefer fire-and-forget? `daedalus run -d` starts the pipeline and returns
@@ -150,12 +152,17 @@ session id, status, and last interaction time.
   `daedalus run -a <workflow-id> "<prompt>"` is the same thing with a
   fuller prompt (`-f/--file` works there too).
 - **Resume a closed one**: `daedalus continue <workflow-id> "<prompt>"`
-  restarts a canceled, failed, or API-exhausted session under a new prompt.
+  restarts a canceled, failed, or parked session under a new prompt.
   The aborted attempt's preserved work (its `aborted/<issue>` branch)
   becomes the new run's starting point, and that attempt's last review
-  feedback is folded into the opening prompt. An agent run that fails on
-  provider quota/rate limits is labeled as such (`agent api exhausted or
-  unavailable`) so you can tell "continue later" apart from a code failure.
+  feedback is folded into the opening prompt. A run that exhausts the
+  provider quota first heartbeats — sleeping an hour and retrying the same
+  round, up to five times — and then parks itself: it fails with a `run
+  parked awaiting maintainer restart` error (the reason visible in the
+  workflow history and as FAILED in `daedalus list`) so you can tell
+  "continue later" apart from a code failure. A reviewer that judges the
+  task impossible ends with NEEDS_MAINTAINER and parks the run the same
+  way, with its comments carried in the error.
 
 `daedalus` or `daedalus --help` prints full usage.
 
@@ -203,9 +210,12 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   ends only on approval, with every round durable and auditable.
 - **Reviewer protocol**: the reviewer sees the diff of the worktree (plus
   the latest test output in phase 2) and must end its response with a final
-  line `APPROVED` or `CHANGES_REQUESTED`. Anything else — including a
-  malformed response — counts as changes requested, with the full output fed
-  back to the implementing agent.
+  line `APPROVED`, `CHANGES_REQUESTED`, or `NEEDS_MAINTAINER`. The last
+  parks the run for a maintainer restart — used when the task as stated
+  cannot be completed by editing files in the worktree, so an impossible
+  task cannot loop forever. Anything else — including a malformed response —
+  counts as changes requested, with the full output fed back to the
+  implementing agent.
 - **The repo's own test suite**, whatever it is: the test command is
   resolved per repository — a `tests:` declaration in `.daedalus.yaml` wins;
   otherwise marker files are detected (`go.mod` → `go test ./...`,
@@ -231,7 +241,11 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   re-running an agent that already mutated the worktree. Cancellation kills
   the whole jailed process group, not just the jail wrapper. Agent/reviewer
   failures that look like provider quota or rate limits are labeled as API
-  exhaustion so the halt is recognizable as `continue`-able.
+  exhaustion. The match is heuristic (a substring test against the error
+  text), so a mislabeled failure can idle a run for hours of heartbeats
+  before it parks. The workflow then heartbeats — one hourly retry at a
+  time, up to five — before parking the run as a labeled, `continue`-able
+  failure.
 - **Deliverable preservation**: once both phases pass, a finalize activity
   commits the approved work and renames the run's branch from
   `feat/issue-<id>-<unix-timestamp>` (in-flight) to

@@ -102,9 +102,14 @@ type ReviewInput struct {
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
 // wrote above its verdict line, to be fed back to the implementing agent.
+// NeedsMaintainer marks the third verdict, NEEDS_MAINTAINER: the task as
+// stated cannot be completed by editing files in this worktree, so the
+// workflow parks the run for a maintainer restart instead of requesting
+// changes the agent can never satisfy.
 type ReviewResult struct {
-	Approved bool
-	Comments string
+	Approved        bool
+	NeedsMaintainer bool
+	Comments        string
 }
 
 // Branch name prefixes: feat/ marks in-flight runs (always cleaned up, along
@@ -410,10 +415,11 @@ var apiExhaustionMarkers = []string{
 }
 
 // ErrAPIExhausted marks an agent or reviewer run that failed because the
-// provider API is out of quota or unavailable. Activities do not retry, so
-// the workflow halts immediately; the work is preserved on the aborted/
-// branch and the run is resumable via `daedalus continue` once the API is
-// available again.
+// provider API is out of quota or unavailable. Activities do not retry;
+// the workflow heartbeats — sleeping an hour and retrying the same round,
+// up to five times — and parks the run for a maintainer restart once the
+// API is still exhausted past that. Either way the work is preserved on
+// the aborted/ branch and the run is resumable via `daedalus continue`.
 var ErrAPIExhausted = errors.New("agent api exhausted or unavailable")
 
 // matchesAny reports whether s contains any marker, case-insensitively.
@@ -594,10 +600,11 @@ func FinalizeWorktreeActivity(ctx context.Context, input WorktreeInput) (string,
 }
 
 // parseReviewVerdict extracts the verdict from reviewer output: the last
-// non-empty line decides. APPROVED approves; CHANGES_REQUESTED (or any other
-// unrecognized line, including a missing marker) counts as changes requested,
-// with everything above the verdict line — or the whole output, when no
-// marker was found — as the comments to feed back to the implementing agent.
+// non-empty line decides. APPROVED approves; NEEDS_MAINTAINER parks the run
+// for a maintainer; CHANGES_REQUESTED (or any other unrecognized line,
+// including a missing marker) counts as changes requested, with everything
+// above the verdict line — or the whole output, when no marker was found —
+// as the comments to feed back to the implementing agent.
 func parseReviewVerdict(out string) ReviewResult {
 	lines := strings.Split(out, "\n")
 	for i, raw := range slices.Backward(lines) {
@@ -605,10 +612,11 @@ func parseReviewVerdict(out string) ReviewResult {
 		if line == "" {
 			continue
 		}
-		if line == "APPROVED" || line == "CHANGES_REQUESTED" {
+		if line == "APPROVED" || line == "CHANGES_REQUESTED" || line == "NEEDS_MAINTAINER" {
 			return ReviewResult{
-				Approved: line == "APPROVED",
-				Comments: strings.TrimSpace(strings.Join(lines[:i], "\n")),
+				Approved:        line == "APPROVED",
+				NeedsMaintainer: line == "NEEDS_MAINTAINER",
+				Comments:        strings.TrimSpace(strings.Join(lines[:i], "\n")),
 			}
 		}
 		break

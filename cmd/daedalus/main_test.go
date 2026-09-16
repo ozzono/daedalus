@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,8 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"go.temporal.io/sdk/client"
+
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/version"
+	"github.com/ozzono/daedalus/internal/workflows"
 )
 
 // TestParseFlagsDetach covers both spellings and that -d never consumes a
@@ -381,5 +386,100 @@ func TestWriteExampleConfig(t *testing.T) {
 
 	if err := writeExampleConfig(dir); err == nil {
 		t.Error("second init should refuse to overwrite")
+	}
+}
+
+// stubWorkflowRun is a client.WorkflowRun whose outcome is scripted — all
+// awaitPipeline needs: the workflow's ID and its result or failure.
+type stubWorkflowRun struct {
+	id      string
+	getErr  error
+	getResp string
+}
+
+func (s stubWorkflowRun) GetID() string                  { return s.id }
+func (s stubWorkflowRun) GetRunID() string               { return "run-1" }
+func (s stubWorkflowRun) GetFirstExecutionRunID() string { return "run-1" }
+func (s stubWorkflowRun) Get(ctx context.Context, valuePtr interface{}) error {
+	if s.getErr != nil {
+		return s.getErr
+	}
+	*(valuePtr.(*string)) = s.getResp
+	return nil
+}
+func (s stubWorkflowRun) GetWithOptions(ctx context.Context, valuePtr interface{}, options client.WorkflowRunGetOptions) error {
+	return s.Get(ctx, valuePtr)
+}
+
+// captureStdout runs f with os.Stdout redirected to a pipe and returns
+// whatever f printed. The restore, close, and drain all run deferred: f may
+// call t.Fatal (runtime.Goexit runs defers, not the statements after f) or
+// panic. Nothing drains the pipe until the close, so captured output must
+// stay smaller than the OS pipe buffer or f blocks.
+func captureStdout(t *testing.T, f func()) (out string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = w
+	defer func() {
+		os.Stdout = stdout
+		w.Close()
+		if b, rerr := io.ReadAll(r); rerr == nil {
+			out = string(b)
+		}
+		r.Close()
+	}()
+	f()
+	return
+}
+
+// TestAwaitPipelineParked pins the parked-run reporting: a workflow failure
+// carrying the ErrAwaitingMaintainer message (the sentinel survives the
+// workflow→client boundary as text only) prints the resume hint and returns
+// errRunParked, while any other failure stays a plain execution error and a
+// success still reports the preserved branch.
+func TestAwaitPipelineParked(t *testing.T) {
+	parked := errors.New(workflows.ErrAwaitingMaintainer.Error() +
+		`: code review halted the run — the task cannot be completed as stated: needs a secret`)
+
+	out := captureStdout(t, func() {
+		err := awaitPipeline(stubWorkflowRun{id: "daedalus-issue-42", getErr: parked})
+		if !errors.Is(err, errRunParked) {
+			t.Errorf("awaitPipeline(parked) = %v, want errRunParked", err)
+		}
+	})
+	for _, want := range []string{
+		"Workflow parked",
+		"run parked awaiting maintainer restart",
+		`daedalus continue daedalus-issue-42`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("parked-run output %q should contain %q", out, want)
+		}
+	}
+
+	out = captureStdout(t, func() {
+		err := awaitPipeline(stubWorkflowRun{id: "daedalus-issue-42", getErr: errors.New("activity timed out")})
+		if err == nil || !strings.Contains(err.Error(), "workflow execution") {
+			t.Errorf("awaitPipeline(failed) = %v, want a wrapped execution error", err)
+		}
+		if errors.Is(err, errRunParked) {
+			t.Error("a plain failure must not be labeled as parked")
+		}
+	})
+	if strings.Contains(out, "continue") {
+		t.Errorf("failed-run output %q should not carry the resume hint", out)
+	}
+
+	out = captureStdout(t, func() {
+		if err := awaitPipeline(stubWorkflowRun{id: "daedalus-issue-42", getResp: "daedalus/issue-42-1"}); err != nil {
+			t.Errorf("awaitPipeline(success) = %v, want nil", err)
+		}
+	})
+	if !strings.Contains(out, "daedalus/issue-42-1") {
+		t.Errorf("success output %q should name the preserved branch", out)
 	}
 }

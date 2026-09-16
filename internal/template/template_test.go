@@ -18,6 +18,10 @@ func TestContinue(t *testing.T) {
 		"finish the feature",
 		"continuing a previous attempt",
 		"finding 1\nfinding 2",
+		// The continuation opener carries the same impossibility escape
+		// hatch as the fresh implement prompt: say what cannot be done so
+		// the reviewer can halt for maintainer input.
+		"Never silently loop over an impossible goal",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Continue = %q, want it to contain %q", got, want)
@@ -43,6 +47,7 @@ func TestImplement(t *testing.T) {
 	}
 	want := "add the feature\n\n" +
 		"Implement the change. Do not write, modify, or delete test code; leave every existing test file untouched and pay it no attention.\n\n" +
+		"If the task as stated cannot be completed — contradictory requirements, something missing from the worktree or outside your reach — say exactly what is impossible and why in your reply, then do the best sound partial work you can. Never silently loop over an impossible goal; your reply is what lets the reviewer halt the run for maintainer input instead of requesting changes forever.\n\n" +
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
 		"Work style — the laziest solution that actually works:\n\n" +
 		"- Question whether each piece needs to exist (YAGNI). Skip speculative generality, flags, and future-proofing.\n" +
@@ -127,11 +132,18 @@ func TestReview(t *testing.T) {
 		"trust-boundary breaches (path traversal, injection, secrets leaking into logs, argv, or history); " +
 		"and bloat — speculative abstractions, dead code, needless dependencies, diffs wider than the task. " +
 		"When uncertain, request changes and state exactly what must be verified; approve only what you have checked in full.\n\n" +
-		"Everything here — your review included — runs inside the same sandbox, and git writes are forbidden to every agent: never request a git operation (stage, commit, branch, restore) or a change to anything beyond the implementing agent's reach. Your scope is the diff above and the code it touches, nothing else: changes outside it — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated worktree noise — are not part of this work; ignore them and never flag them, no matter how wrong they look. Every finding must be fixable by editing files in this worktree alone; anything that is not, is not a finding.\n\n" +
+		"Everything here — your review included — runs inside the same sandbox, and git writes are forbidden to every agent: never request a git operation (stage, commit, branch, restore) or a change to anything beyond the implementing agent's reach. Your scope is the diff above and the code it touches, nothing else: changes outside it — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated worktree noise — are not part of this work; ignore them and never flag them, no matter how wrong they look. Every finding must be fixable by editing files in this worktree alone; anything that is not, is not a finding — unless it makes the task itself impossible to complete as stated, which is the one case where you halt instead (see NEEDS_MAINTAINER below).\n\n" +
 		"Tests are out of scope for this review. The test suite is written and reviewed in a separate phase after this one: missing, absent, or thin tests are not findings — do not request changes over test coverage. Judge only the implementation. (You may still build and run the existing suite to verify the change is sound.)\n\n" +
 		"Bug policy — every bug you find, in the diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. If it is in scope for this review, make it a finding and request changes. If it is out of scope, do not block approval over it — record it and add an alert about it in the docs.\n\n" +
 		"End your response with a final line containing exactly APPROVED if it is acceptable as-is, " +
-		"or CHANGES_REQUESTED if changes are required. Put all review comments above that final line."
+		"CHANGES_REQUESTED if changes are required, " +
+		"or NEEDS_MAINTAINER if the task as stated cannot be completed by editing files in this worktree alone — " +
+		"contradictory or impossible requirements, a missing dependency or resource outside the worktree, " +
+		"a constraint only a human can lift. NEEDS_MAINTAINER stops the pipeline and waits for the maintainer: " +
+		"use it whenever you have good reason to believe the implementing agent can never satisfy what you would " +
+		"otherwise request — an endless fix loop is a worse outcome than a halt — but never as an escape from " +
+		"ordinary hard work that is merely difficult. Above the verdict line, state exactly what the maintainer " +
+		"must decide, provide, or relax. Put all review comments above that final line."
 	if got != want {
 		t.Errorf("Review = %q, want %q", got, want)
 	}

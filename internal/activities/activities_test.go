@@ -585,25 +585,32 @@ func TestParseAgentStreamNoise(t *testing.T) {
 }
 
 // TestParseReviewVerdict pins the verdict protocol: the last non-empty line
-// decides, and anything not exactly APPROVED counts as changes requested.
+// decides, NEEDS_MAINTAINER parks for a maintainer, and anything not exactly
+// APPROVED counts as changes requested.
 func TestParseReviewVerdict(t *testing.T) {
 	cases := []struct {
-		name     string
-		out      string
-		approved bool
-		comments string
+		name            string
+		out             string
+		approved        bool
+		needsMaintainer bool
+		comments        string
 	}{
-		{"approved", "Looks good.\nAPPROVED\n", true, "Looks good."},
-		{"changes requested", "Do X.\nCHANGES_REQUESTED", false, "Do X."},
-		{"trailing blank lines", "fine\nAPPROVED\n\n\n", true, "fine"},
-		{"no marker keeps whole output", "the error path is untested", false, "the error path is untested"},
-		{"lowercase is not approved", "fine\napproved", false, "fine\napproved"},
+		{"approved", "Looks good.\nAPPROVED\n", true, false, "Looks good."},
+		{"changes requested", "Do X.\nCHANGES_REQUESTED", false, false, "Do X."},
+		{"needs maintainer", "Need a secret.\nNEEDS_MAINTAINER", false, true, "Need a secret."},
+		{"trailing blank lines", "fine\nAPPROVED\n\n\n", true, false, "fine"},
+		{"no marker keeps whole output", "the error path is untested", false, false, "the error path is untested"},
+		{"lowercase is not approved", "fine\napproved", false, false, "fine\napproved"},
+		{"lowercase is not a maintainer halt", "fine\nneeds_maintainer", false, false, "fine\nneeds_maintainer"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := parseReviewVerdict(tc.out)
 			if got.Approved != tc.approved {
 				t.Errorf("Approved = %v, want %v", got.Approved, tc.approved)
+			}
+			if got.NeedsMaintainer != tc.needsMaintainer {
+				t.Errorf("NeedsMaintainer = %v, want %v", got.NeedsMaintainer, tc.needsMaintainer)
 			}
 			if got.Comments != tc.comments {
 				t.Errorf("Comments = %q, want %q", got.Comments, tc.comments)
