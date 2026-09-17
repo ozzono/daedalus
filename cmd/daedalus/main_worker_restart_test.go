@@ -34,6 +34,18 @@ func writeQueueConfig(t *testing.T, queue string) string {
 	return path
 }
 
+// writeWorkerIDConfig writes a loadable config whose worker is named by an
+// explicit worker_id (queue q7 — deliberately different from the id, so the
+// test proves the id, not the queue, keys the daemon files).
+func writeWorkerIDConfig(t *testing.T, id string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("agent: claude\nworker_id: "+id+"\ntemporal:\n  task_queue: q7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // writeRecord seeds queue's config record with path.
 func writeRecord(t *testing.T, queue, path string) {
 	t.Helper()
@@ -84,10 +96,10 @@ func TestRecordedConfigPath(t *testing.T) {
 	}
 }
 
-// TestRecordedQueues pins the roster: every worker-<queue>.conf counts,
+// TestRecordedWorkers pins the roster: every worker-<name>.conf counts,
 // sorted, while bare, unprefixed, and non-record files do not — and an
 // unreadable daemon dir is an error, not an empty roster.
-func TestRecordedQueues(t *testing.T) {
+func TestRecordedWorkers(t *testing.T) {
 	dir := useDaemonDir(t)
 	for _, name := range []string{
 		"worker-b.conf", "worker-a.conf", "worker-.conf", "unrelated.conf",
@@ -97,12 +109,12 @@ func TestRecordedQueues(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := recordedQueues()
+	got, err := recordedWorkers()
 	if err != nil {
-		t.Fatalf("recordedQueues: %v", err)
+		t.Fatalf("recordedWorkers: %v", err)
 	}
 	if want := "a,b"; strings.Join(got, ",") != want {
-		t.Errorf("recordedQueues = %v, want [%s]", got, want)
+		t.Errorf("recordedWorkers = %v, want [%s]", got, want)
 	}
 
 	// A daemon dir that cannot be read must surface as an error — an empty
@@ -112,25 +124,26 @@ func TestRecordedQueues(t *testing.T) {
 		t.Fatal(err)
 	}
 	daemonDir = notDir
-	if _, err := recordedQueues(); err == nil || !strings.Contains(err.Error(), "read") {
-		t.Errorf("recordedQueues(unreadable dir) err = %v, want a read failure", err)
+	if _, err := recordedWorkers(); err == nil || !strings.Contains(err.Error(), "read") {
+		t.Errorf("recordedWorkers(unreadable dir) err = %v, want a read failure", err)
 	}
 }
 
-// TestParseFlagsRestartAllConfig pins the -c rejection: an explicit
-// -c/--config alongside `worker restart all` (either spelling, either side
-// of the subcommand) is refused, while the same flag on the neighboring
-// worker actions still parses — the rejection is scoped to the one
-// subcommand that never uses the config.
-func TestParseFlagsRestartAllConfig(t *testing.T) {
-	const rejection = "-c/--config does not apply to worker restart all"
+// TestParseFlagsRecordDrivenRestartConfig pins the -c/-cli rejections: an
+// explicit -c/--config alongside the record-driven restarts (`worker
+// restart all`, either spelling and either side of the subcommand, and
+// `worker restart <name>`) is refused, while the same flag on a plain
+// restart still parses — the rejection is scoped to the invocations that
+// never use the config.
+func TestParseFlagsRecordDrivenRestartConfig(t *testing.T) {
+	const rejection = "-c/--config does not apply to worker restart all or restart <worker>"
 	for _, c := range []struct {
 		name    string
 		args    []string
 		wantErr string
 	}{
 		{
-			name:    "-c before the subcommand",
+			name:    "-c before restart all",
 			args:    []string{"-c", "cfg.yaml", "worker", "restart", "all"},
 			wantErr: rejection,
 		},
@@ -140,8 +153,18 @@ func TestParseFlagsRestartAllConfig(t *testing.T) {
 			wantErr: rejection,
 		},
 		{
-			name:    "flag after the subcommand",
+			name:    "flag after restart all",
 			args:    []string{"worker", "restart", "all", "-c", "cfg.yaml"},
+			wantErr: rejection,
+		},
+		{
+			name:    "-c before restart <worker>",
+			args:    []string{"-c", "cfg.yaml", "worker", "restart", "arete"},
+			wantErr: rejection,
+		},
+		{
+			name:    "flag after restart <worker>",
+			args:    []string{"worker", "restart", "arete", "--config=cfg.yaml"},
 			wantErr: rejection,
 		},
 		{
@@ -166,8 +189,8 @@ func TestParseFlagsRestartAllConfig(t *testing.T) {
 		})
 	}
 
-	// Without -c the subcommand parses untouched — the rejection must not
-	// reach the default config path.
+	// Without -c the record-driven restarts parse untouched — the rejection
+	// must not reach the default config path.
 	f, rest, err := parseFlags([]string{"worker", "restart", "all"})
 	if err != nil {
 		t.Fatalf("parseFlags(worker restart all): %v", err)
@@ -178,15 +201,24 @@ func TestParseFlagsRestartAllConfig(t *testing.T) {
 	if want := []string{"worker", "restart", "all"}; strings.Join(rest, ",") != strings.Join(want, ",") {
 		t.Errorf("parseFlags rest = %v, want %v", rest, want)
 	}
+	f, rest, err = parseFlags([]string{"worker", "restart", "arete"})
+	if err != nil {
+		t.Fatalf("parseFlags(worker restart arete): %v", err)
+	}
+	if f.configSet {
+		t.Error("configSet should be false without an explicit -c")
+	}
+	if want := []string{"worker", "restart", "arete"}; strings.Join(rest, ",") != strings.Join(want, ",") {
+		t.Errorf("parseFlags rest = %v, want %v", rest, want)
+	}
 }
 
-// TestWorkerRestartUsesRecordedConfig pins the restart's config choice: a
-// loadable record naming the same queue wins over the invoking command's
-// own config, and a record that no longer loads or has been edited to
-// another queue falls back to the CLI's — the observable being which path
-// the restart re-records (workerStart rewrites the record with the config
-// it actually started the worker with).
-func TestWorkerRestartUsesRecordedConfig(t *testing.T) {
+// TestWorkerRestartUsesCLIConfig pins the restart's config choice: the
+// invoking command's config always wins — the record is not consulted — so
+// values changed since the worker was started take effect on every restart.
+// The observable is which path the restart re-records (workerStart rewrites
+// the record with the config it actually started the worker with).
+func TestWorkerRestartUsesCLIConfig(t *testing.T) {
 	const queue = "daedalus"
 	// restart runs the stop/start cycle for real; the spawned child is
 	// defused per-subtest by noDaemonSpawn.
@@ -205,7 +237,7 @@ func TestWorkerRestartUsesRecordedConfig(t *testing.T) {
 	// workerStart rewrites the record with the config it started with.
 	recordedAfter := func() string { return recordedConfigPath(queue) }
 
-	t.Run("recorded config wins over the CLI's", func(t *testing.T) {
+	t.Run("CLI config wins over a differing record", func(t *testing.T) {
 		useDaemonDir(t)
 		noDaemonSpawn(t)
 		cliCfg := writeQueueConfig(t, queue)
@@ -216,35 +248,19 @@ func TestWorkerRestartUsesRecordedConfig(t *testing.T) {
 		if !strings.Contains(out, "worker started") {
 			t.Errorf("restart output %q should report a started worker", out)
 		}
-		if got := recordedAfter(); got != recordedCfg {
-			t.Errorf("restart re-recorded %q, want the recorded config %q (not the CLI's %q)", got, recordedCfg, cliCfg)
-		}
-	})
-
-	t.Run("unreadable record falls back to the CLI's", func(t *testing.T) {
-		useDaemonDir(t)
-		noDaemonSpawn(t)
-		cliCfg := writeQueueConfig(t, queue)
-		writeRecord(t, queue, filepath.Join(t.TempDir(), "gone.yaml"))
-
-		out := restart(t, cliCfg)
-		if !strings.Contains(out, "unreadable") {
-			t.Errorf("restart output %q should carry the unreadable-record diagnostic", out)
-		}
 		if got := recordedAfter(); got != cliCfg {
-			t.Errorf("restart re-recorded %q, want the CLI's config %q", got, cliCfg)
+			t.Errorf("restart re-recorded %q, want the CLI's config %q (not the stale record %q)", got, cliCfg, recordedCfg)
 		}
 	})
 
-	t.Run("record naming another queue falls back to the CLI's", func(t *testing.T) {
+	t.Run("no record at all still restarts with the CLI's", func(t *testing.T) {
 		useDaemonDir(t)
 		noDaemonSpawn(t)
 		cliCfg := writeQueueConfig(t, queue)
-		writeRecord(t, queue, writeQueueConfig(t, "elsewhere"))
 
 		out := restart(t, cliCfg)
-		if !strings.Contains(out, "now names queue") {
-			t.Errorf("restart output %q should carry the queue-mismatch diagnostic", out)
+		if !strings.Contains(out, "worker started") {
+			t.Errorf("restart output %q should report a started worker", out)
 		}
 		if got := recordedAfter(); got != cliCfg {
 			t.Errorf("restart re-recorded %q, want the CLI's config %q", got, cliCfg)
@@ -252,8 +268,91 @@ func TestWorkerRestartUsesRecordedConfig(t *testing.T) {
 	})
 }
 
+// TestWorkerRestartNamed pins the record-driven single-worker restart: the
+// named worker is restarted from its recorded config (re-read from disk, so
+// edits apply), an explicit worker_id — not the task queue — keys the daemon
+// files, and a missing record, an unloadable one, or one whose config now
+// names a different worker is an error rather than a best-effort fallback.
+func TestWorkerRestartNamed(t *testing.T) {
+	t.Run("restarts by worker_id, re-reading the recorded config", func(t *testing.T) {
+		useDaemonDir(t)
+		noDaemonSpawn(t)
+		cfgPath := writeWorkerIDConfig(t, "arete")
+		writeRecord(t, "arete", cfgPath)
+
+		out := captureStdout(t, func() {
+			if err := workerRestartNamed("arete"); err != nil {
+				t.Errorf("workerRestartNamed: %v", err)
+			}
+		})
+		if !strings.Contains(out, "worker started") {
+			t.Errorf("restart output %q should report a started worker", out)
+		}
+		if got := recordedConfigPath("arete"); got != cfgPath {
+			t.Errorf("restart re-recorded %q, want the recorded config %q", got, cfgPath)
+		}
+		// The id, not the queue (q7), keyed the daemon files.
+		if _, err := os.Stat(filepath.Join(daemonDir, "worker-arete.pid")); err != nil {
+			t.Errorf("restart should key its files by the worker id: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(daemonDir, "worker-q7.pid")); err == nil {
+			t.Error("restart should not key its files by the task queue when a worker id is set")
+		}
+	})
+
+	t.Run("edits to the recorded config are picked up", func(t *testing.T) {
+		useDaemonDir(t)
+		cfgPath := writeQueueConfig(t, "daedalus")
+		writeRecord(t, "daedalus", cfgPath)
+		// Edit the config in place — the restart must re-read the file from
+		// disk, not reuse what an earlier start loaded. The observable edit:
+		// the config now names a different worker, which the named restart
+		// must refuse.
+		if err := os.WriteFile(cfgPath, []byte("agent: claude\nworker_id: moved\ntemporal:\n  task_queue: daedalus\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := workerRestartNamed("daedalus")
+		if err == nil || !strings.Contains(err.Error(), `now names worker "moved"`) {
+			t.Errorf("workerRestartNamed(edited config) err = %v, want the renamed-worker diagnostic proving a fresh read", err)
+		}
+	})
+
+	t.Run("missing record is an error", func(t *testing.T) {
+		useDaemonDir(t)
+		err := workerRestartNamed("ghost")
+		if err == nil || !strings.Contains(err.Error(), `no worker "ghost" on record`) {
+			t.Errorf("workerRestartNamed(missing) err = %v, want the no-record diagnostic", err)
+		}
+	})
+
+	t.Run("unloadable record is an error", func(t *testing.T) {
+		useDaemonDir(t)
+		writeRecord(t, "daedalus", filepath.Join(t.TempDir(), "gone.yaml"))
+		err := workerRestartNamed("daedalus")
+		if err == nil || !strings.Contains(err.Error(), "load") {
+			t.Errorf("workerRestartNamed(unloadable) err = %v, want a load failure", err)
+		}
+	})
+
+	t.Run("record whose config now names another worker is an error", func(t *testing.T) {
+		useDaemonDir(t)
+		writeRecord(t, "arete", writeWorkerIDConfig(t, "elsewhere"))
+		err := workerRestartNamed("arete")
+		if err == nil || !strings.Contains(err.Error(), `now names worker "elsewhere"`) {
+			t.Errorf("workerRestartNamed(renamed) err = %v, want the renamed-worker diagnostic", err)
+		}
+	})
+
+	t.Run("invalid name is an error", func(t *testing.T) {
+		useDaemonDir(t)
+		if err := workerRestartNamed("../evil"); err == nil {
+			t.Error("workerRestartNamed(path smuggle) should be rejected")
+		}
+	})
+}
+
 // TestWorkerRestartAll pins the record-driven roster logic: every recorded
-// queue is restarted with its own config in roster order, broken records
+// worker is restarted with its own config in roster order, broken records
 // are skipped and reported while the rest still restart, an empty roster is
 // an error (naming any live unrecorded workers rather than implying none
 // exist), and live workers without a record are reported, not restarted.
@@ -272,15 +371,15 @@ func TestWorkerRestartAll(t *testing.T) {
 		err := workerRestartAll()
 		if err == nil || !strings.Contains(err.Error(), "running without a record") ||
 			!strings.Contains(err.Error(), "old") {
-			t.Errorf("workerRestartAll(empty, live stray) err = %v, want it to name queue old as left alone", err)
+			t.Errorf("workerRestartAll(empty, live stray) err = %v, want it to name worker old as left alone", err)
 		}
 	})
 
-	t.Run("restarts every recorded queue with its own config", func(t *testing.T) {
+	t.Run("restarts every recorded worker with its own config", func(t *testing.T) {
 		useDaemonDir(t)
 		noDaemonSpawn(t)
 		// Recorded out of order: the roster runs sorted, one restart per
-		// queue, each under its own recorded config.
+		// worker, each under its own recorded config.
 		cfgB, cfgA := writeQueueConfig(t, "b"), writeQueueConfig(t, "a")
 		writeRecord(t, "b", cfgB)
 		writeRecord(t, "a", cfgA)
@@ -297,9 +396,9 @@ func TestWorkerRestartAll(t *testing.T) {
 		if ia > ib {
 			t.Errorf("restart-all output %q should run the roster sorted (a before b)", out)
 		}
-		for queue, want := range map[string]string{"a": cfgA, "b": cfgB} {
-			if got := recordedConfigPath(queue); got != want {
-				t.Errorf("queue %s re-recorded %q, want its own config %q", queue, got, want)
+		for name, want := range map[string]string{"a": cfgA, "b": cfgB} {
+			if got := recordedConfigPath(name); got != want {
+				t.Errorf("worker %s re-recorded %q, want its own config %q", name, got, want)
 			}
 		}
 	})
@@ -315,22 +414,17 @@ func TestWorkerRestartAll(t *testing.T) {
 
 		out := captureStdout(t, func() {
 			err := workerRestartAll()
-			for _, queue := range []string{"missing", "blank", "moved"} {
-				if err == nil || !strings.Contains(err.Error(), "queue "+queue) {
-					t.Errorf("workerRestartAll err = %v, want it to report skipped queue %s", err, queue)
+			for _, name := range []string{"missing", "blank", "moved"} {
+				if err == nil || !strings.Contains(err.Error(), "worker "+name) {
+					t.Errorf("workerRestartAll err = %v, want it to report skipped worker %s", err, name)
 				}
 			}
 			if err == nil {
-				t.Error("workerRestartAll should fail when a recorded queue is skipped")
+				t.Error("workerRestartAll should fail when a recorded worker is skipped")
 			}
 		})
 		if !strings.Contains(out, "== worker good (") {
 			t.Errorf("restart-all output %q should still restart the healthy worker", out)
-		}
-		for _, queue := range []string{"missing", "blank", "moved"} {
-			if strings.Contains(out, "== worker "+queue+" (") {
-				t.Errorf("restart-all output %q should not restart broken queue %s", out, queue)
-			}
 		}
 	})
 
@@ -384,9 +478,11 @@ func TestMainRestartAllNeedsNoConfig(t *testing.T) {
 // TestMainRestartAllRejectsConfig pins the -c rejection's exit contract in
 // a subprocess: usageFail's shape (diagnostic, blank line, usage text) and
 // exit 1 — asserted only on paths that fail before the real daemon dir is
-// ever read, so the live workers in /tmp/daedalus are never touched.
+// ever read, so the live workers in /tmp/daedalus are never touched. The
+// same rejection covers the record-driven `restart <worker>`.
 func TestMainRestartAllRejectsConfig(t *testing.T) {
 	cfg := validConfig(t)
+	const rejection = "-c/--config does not apply to worker restart all or restart <worker>"
 
 	stdout, stderr, code := runMainIn(t, "", "-c", cfg, "worker", "restart", "all")
 	if code != 1 {
@@ -395,11 +491,19 @@ func TestMainRestartAllRejectsConfig(t *testing.T) {
 	if stdout != "" {
 		t.Errorf("stdout = %q, want empty", stdout)
 	}
-	if !strings.HasPrefix(stderr, "-c/--config does not apply to worker restart all\n\n") {
+	if !strings.HasPrefix(stderr, rejection+"\n\n") {
 		t.Errorf("stderr should start with the rejection and a blank line, got %q", stderr)
 	}
 	if !strings.HasSuffix(stderr, usage) {
 		t.Errorf("stderr should end with the usage text, got %q", stderr)
+	}
+
+	_, stderr, code = runMainIn(t, "", "-c", cfg, "worker", "restart", "arete")
+	if code != 1 {
+		t.Errorf("daedalus -c <config> worker restart arete exit code = %d, want 1", code)
+	}
+	if !strings.HasPrefix(stderr, rejection+"\n\n") {
+		t.Errorf("stderr should start with the rejection and a blank line, got %q", stderr)
 	}
 
 	// Anything beyond `restart all` is a plain usage error, not restart-all.
@@ -409,5 +513,35 @@ func TestMainRestartAllRejectsConfig(t *testing.T) {
 	}
 	if !strings.HasPrefix(stderr, "worker takes at most one action\n\n") {
 		t.Errorf("stderr should start with the too-many-actions rejection, got %q", stderr)
+	}
+}
+
+// TestMainRestartNamedNeedsNoConfig pins the by-name dispatch wiring
+// in-process, mirroring TestMainRestartAllNeedsNoConfig: `worker restart
+// <name>` runs with no config resolvable anywhere (bare cwd, empty HOME)
+// and still completes against the record — without the isRestartNamed
+// bypass in main, resolveConfigPath would exit(1) with a "load config"
+// diagnostic before any record is read. The one recorded worker is
+// restarted against a throwaway daemon dir, with the re-exec'd child
+// defused by noDaemonSpawn, so main() returns instead of exiting.
+func TestMainRestartNamedNeedsNoConfig(t *testing.T) {
+	useDaemonDir(t)
+	noDaemonSpawn(t)
+	cfg := writeWorkerIDConfig(t, "arete")
+	writeRecord(t, "arete", cfg)
+
+	t.Setenv("HOME", t.TempDir()) // no ~/.config/daedalus/config.yaml fallback
+	t.Chdir(t.TempDir())          // no ./config.yaml
+
+	args := os.Args
+	os.Args = []string{"daedalus", "worker", "restart", "arete"}
+	defer func() { os.Args = args }()
+	out := captureStdout(t, main)
+
+	if !strings.Contains(out, "worker started") {
+		t.Errorf("worker restart arete output %q should restart the recorded worker", out)
+	}
+	if got := recordedConfigPath("arete"); got != cfg {
+		t.Errorf("restart re-recorded %q, want %q", got, cfg)
 	}
 }

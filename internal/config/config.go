@@ -94,6 +94,14 @@ type Config struct {
 	// scopes worktree paths, while this is repo-facing branch naming.
 	// `daedalus run --prefix` overrides it per run.
 	BranchPrefix string `yaml:"branch_prefix"`
+	// WorkerID names this deployment's worker daemon for management: the
+	// daemon-dir pid/log/config-record files are keyed by it, and
+	// `daedalus worker restart <id>` addresses it from any directory. It is
+	// deliberately separate from temporal.task_queue — two workers may
+	// share one queue under different ids, each with its own config (e.g. a
+	// rotated API key). Empty means the task queue names the worker, so a
+	// single-queue deployment needs no id.
+	WorkerID string `yaml:"worker_id"`
 	// TestsTimeout bounds one execution of the repo's native test suite
 	// (RunNativeTestsActivity): test-command discovery and the suite itself
 	// share this budget. A time.ParseDuration string in YAML ("30m");
@@ -127,6 +135,38 @@ func ValidateAgent(a string) error {
 // UIURL returns the Temporal UI address corresponding to Temporal.UIPort.
 func (c Config) UIURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", c.Temporal.UIPort)
+}
+
+// WorkerName returns the name the worker daemon is managed under: the
+// worker id when set, else the task queue. Callers key the daemon-dir
+// files and record-driven restarts by it.
+func (c Config) WorkerName() string {
+	if c.WorkerID != "" {
+		return c.WorkerID
+	}
+	return c.Temporal.TaskQueue
+}
+
+// ValidateWorkerID rejects ids that cannot key the daemon-dir file names
+// (worker-<id>.pid/.log/.conf) or would smuggle a path: no path
+// separators, whitespace, control characters, dot components, or a
+// leading dash. Empty is valid — it means the task queue names the worker.
+func ValidateWorkerID(id string) error {
+	if id == "" {
+		return nil
+	}
+	bad := func() error {
+		return fmt.Errorf("worker id %q must be a plain file-name-safe token (letters, digits, dashes, dots inside)", id)
+	}
+	if strings.HasPrefix(id, "-") || id == "." || id == ".." || strings.ContainsAny(id, "/\\ \t\r\n") {
+		return bad()
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return bad()
+		}
+	}
+	return nil
 }
 
 // AgentEnv translates provider configuration into environment variables for
@@ -170,6 +210,9 @@ func Load(path string) (Config, error) {
 		return c, fmt.Errorf("config %s: agent: %w", path, err)
 	}
 	if err := ValidateBranchPrefix(c.BranchPrefix); err != nil {
+		return c, fmt.Errorf("config %s: %w", path, err)
+	}
+	if err := ValidateWorkerID(c.WorkerID); err != nil {
 		return c, fmt.Errorf("config %s: %w", path, err)
 	}
 	if c.TestsTimeout < 0 {
