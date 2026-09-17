@@ -307,14 +307,31 @@ func isWaitDelay(err error) bool {
 // branch failures such as "not a working tree" or "branch not found" are
 // ignored, because a partially-failed previous run must not poison the next
 // one — while prune failures and an undeletable directory are surfaced as
-// errors. Preserved branches are never touched.
-func cleanWorktree(ctx context.Context, input WorktreeInput, worktreePath string) error {
-	if err := preserveAbortedWork(ctx, input, worktreePath); err != nil {
+// errors. Preserved branches are never touched. Each step is logged with
+// its duration (with a logger the caller supplies), so a cleanup that
+// burns its whole StartToClose budget leaves a record of where the time
+// went; before anything else, stragglers left in the worktree by a killed
+// agent round are swept, so they cannot churn the tree the steps below
+// snapshot and delete.
+func cleanWorktree(ctx context.Context, input WorktreeInput, worktreePath string, logger log.Logger) error {
+	killWorktreeStragglers(logger, worktreePath)
+	step := func(name string, fn func() error) error {
+		start := time.Now()
+		err := fn()
+		logger.Info("Worktree cleanup step", "Step", name, "Duration", time.Since(start).Round(time.Millisecond), "Error", err)
+		return err
+	}
+	if err := step("preserve aborted work", func() error {
+		return preserveAbortedWork(ctx, input, worktreePath)
+	}); err != nil {
 		return err
 	}
 
 	// Best-effort: fall through to prune and the RemoveAll fallback below.
-	_, _ = runGit(ctx, "-C", input.RepoPath, "worktree", "remove", worktreePath, "--force")
+	step("git worktree remove", func() error {
+		_, err := runGit(ctx, "-C", input.RepoPath, "worktree", "remove", worktreePath, "--force")
+		return err
+	})
 
 	if out, err := runGit(ctx, "-C", input.RepoPath, "worktree", "prune"); err != nil {
 		return fmt.Errorf("git worktree prune: %w: %s", err, out)
@@ -323,20 +340,103 @@ func cleanWorktree(ctx context.Context, input WorktreeInput, worktreePath string
 	deleteStaleBranches(ctx, input.RepoPath, input.IssueID)
 
 	if _, err := os.Stat(worktreePath); err == nil {
-		if err := os.RemoveAll(worktreePath); err != nil {
+		if err := step("remove leftover directory", func() error {
+			return os.RemoveAll(worktreePath)
+		}); err != nil {
 			return fmt.Errorf("remove stale worktree %s: %w", worktreePath, err)
 		}
 	}
 	return nil
 }
 
+// stragglerTimeout bounds each command of a straggler sweep.
+const stragglerTimeout = 10 * time.Second
+
+// killWorktreeStragglers SIGKILLs processes still referencing a worktree
+// path, best-effort and logged. A killed agent round leaves descendants
+// behind — test runners that escaped the jail's process group can keep
+// respawning, racing the cleanup's git snapshot and directory removal
+// (observed as a cleanup burning its whole timeout without finishing).
+// The match is an exact string compare against ps's argument text — not a
+// pkill pattern, whose regex wildcards and lack of anchoring made one
+// issue's path match sibling issues' longer paths (issue-4 vs issue-42)
+// and any operator process carrying the path — gated by a boundary check
+// (referencesPath) so only the worktree itself and paths inside it match.
+// It runs before any of cleanup's own git commands, so those cannot be
+// caught either.
+func killWorktreeStragglers(logger log.Logger, worktreePath string) {
+	lines, pids := stragglersIn(logger, worktreePath)
+	if len(pids) == 0 {
+		return
+	}
+	logger.Warn("Killing worktree stragglers", "Worktree", worktreePath, "Processes", strings.Join(lines, "\n"))
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+}
+
+// stragglersIn lists the processes whose command line references path,
+// best-effort: their ps lines and pids. An enumeration failure is logged
+// rather than swallowed — "could not look" must not read as "none left".
+func stragglersIn(logger log.Logger, path string) (lines []string, pids []int) {
+	ctx, cancel := context.WithTimeout(context.Background(), stragglerTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		logger.Warn("Worktree straggler sweep could not enumerate processes", "Error", err)
+		return nil, nil
+	}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 || pid == os.Getpid() {
+			continue
+		}
+		// ps printed "pid command…"; recover the command text verbatim.
+		argv := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), fields[0]))
+		if referencesPath(argv, path) {
+			lines = append(lines, strings.TrimSpace(line))
+			pids = append(pids, pid)
+		}
+	}
+	return lines, pids
+}
+
+// referencesPath reports whether argv mentions path at a path boundary:
+// the match must end argv or be followed by whitespace, a quote, or a
+// slash (a file inside the worktree). A bare substring match would let a
+// per-issue path claim its longer siblings — issue-4 matching issue-42 —
+// and any process merely quoting the path as part of a longer word.
+func referencesPath(argv, path string) bool {
+	for i := 0; i+len(path) <= len(argv); i++ {
+		if argv[i:i+len(path)] != path {
+			continue
+		}
+		switch end := i + len(path); {
+		case end == len(argv):
+			return true
+		case argv[end] == ' ', argv[end] == '\t', argv[end] == '"', argv[end] == '\'':
+			return true
+		case argv[end] == '/':
+			return true
+		}
+	}
+	return false
+}
+
 // preserveAbortedWork keeps a run that closed without approval resumable:
 // the worktree's contents are committed and the in-flight branch renamed to
 // the per-issue aborted/ branch that `daedalus continue` builds on. A
 // finalized run (its preserved deliverable exists) deletes the in-flight
-// branch instead — the deliverable already carries the work. Best-effort
-// throughout: any git hiccup still lets cleanup proceed, and stale state
-// from a crashed run is preserved too (the worktree may hold its work).
+// branch instead — the deliverable already carries the work. Deletion must
+// never outrun preservation: a staging or commit failure here aborts the
+// cleanup (a "nothing to commit" tree is fine — there is no work to lose),
+// because proceeding would remove a worktree whose contents were never
+// saved. Stale state from a crashed run is preserved too (the worktree may
+// hold its work).
 func preserveAbortedWork(ctx context.Context, input WorktreeInput, worktreePath string) error {
 	if input.BranchName == "" {
 		return nil
@@ -360,13 +460,65 @@ func preserveAbortedWork(ctx context.Context, input WorktreeInput, worktreePath 
 	if err != nil {
 		return err
 	}
-	_, _ = runGit(ctx, "-C", worktreePath, "add", "-A")
-	_, _ = runGit(ctx, "-C", worktreePath,
+	if _, err := runGit(ctx, "-C", worktreePath, "add", "-A"); err != nil {
+		// A stale index.lock — left by the git of a killed round, the very
+		// state cleanup runs after — holds no work and would wedge every
+		// later cleanup of this issue. Sweep it and retry once; anything
+		// still failing is a genuine stage failure.
+		if removed := removeStaleIndexLock(ctx, worktreePath); removed {
+			_, err = runGit(ctx, "-C", worktreePath, "add", "-A")
+		}
+		if err != nil {
+			return fmt.Errorf("preserve aborted work (stage): %w", err)
+		}
+	}
+	if out, err := runGit(ctx, "-C", worktreePath,
 		"-c", "user.name=daedalus", "-c", "user.email=daedalus@local",
-		"commit", "-m", "daedalus: run closed without approval, work preserved for continue")
+		"commit", "-m", "daedalus: run closed without approval, work preserved for continue"); err != nil {
+		// A clean tree reports "nothing to commit" — nothing to lose. Any
+		// other failure means the work was not saved; abort before any
+		// deletion step can run.
+		if !strings.Contains(out, "nothing to commit") {
+			return fmt.Errorf("preserve aborted work (commit): %w: %s", err, out)
+		}
+	}
 	_, _ = runGit(ctx, "-C", input.RepoPath, "branch", "-D", aborted)
-	_, _ = runGit(ctx, "-C", worktreePath, "branch", "-m", aborted)
+	if _, err := runGit(ctx, "-C", worktreePath, "branch", "-m", aborted); err != nil {
+		// The rename can fail with nothing at stake — detached HEAD, or
+		// the best-effort delete above left the old aborted ref in place
+		// ("already exists"). The commit is what holds the work: point the
+		// aborted ref straight at it instead. Only a failure of that too
+		// (and of the rename) means the snapshot is not saved.
+		if _, ferr := runGit(ctx, "-C", worktreePath, "branch", "-f", aborted, "HEAD"); ferr != nil {
+			return fmt.Errorf("preserve aborted work (rename to %s): %w: %w", aborted, err, ferr)
+		}
+	}
 	return nil
+}
+
+// removeStaleIndexLock deletes the worktree's index.lock when present,
+// reporting whether it did. The lock is resolved through git itself
+// (`rev-parse --git-path`) because a linked worktree keeps its state under
+// the main repo's .git/worktrees/, not under the worktree. Safe in the
+// cleanup context — the round's processes are gone by now — and the
+// retry that follows immediately fails loudly if the lock was live after
+// all.
+func removeStaleIndexLock(ctx context.Context, worktreePath string) bool {
+	out, err := runGit(ctx, "-C", worktreePath, "rev-parse", "--git-path", "index.lock")
+	if err != nil {
+		return false
+	}
+	lock := strings.TrimSpace(out)
+	if lock == "" {
+		return false
+	}
+	if !filepath.IsAbs(lock) {
+		lock = filepath.Join(worktreePath, lock)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		return false
+	}
+	return os.Remove(lock) == nil
 }
 
 // deleteStaleBranches sweeps leftover in-flight (feat/) branches of this
@@ -394,7 +546,7 @@ func CreateWorktreeActivity(ctx context.Context, input WorktreeInput) (WorktreeO
 		return WorktreeOutput{}, err
 	}
 
-	if err := cleanWorktree(ctx, input, worktreePath); err != nil {
+	if err := cleanWorktree(ctx, input, worktreePath, activityLogger(ctx)); err != nil {
 		return WorktreeOutput{}, fmt.Errorf("clean stale worktree state: %w", err)
 	}
 
@@ -578,15 +730,96 @@ func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArg
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	start := time.Now()
+	logger := activityLogger(ctx)
+	if err := cmd.Start(); err != nil {
+		return jailResult{}, fmt.Errorf("ai-jail agent start: %w", err)
+	}
+	// The jailed process leads its own group (Setpgid), so pid == pgid.
+	// Logged at spawn so a round that dies to an outside SIGKILL — not one
+	// of daedalus's own kill paths — can be correlated with host logs
+	// afterward.
+	logger.Info("Jailed agent started", "Agent", selected, "PID", cmd.Process.Pid)
+	err := cmd.Wait()
 	res := jailResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil && !isWaitDelay(err) {
+		if sig := deathSignal(err); sig != "" {
+			logDeath(logger, cmd, err, start, sig)
+			// A signaled death is wait-status-derived, so it outranks the
+			// output-text exhaustion markers below: an externally killed
+			// round whose earlier stdout happens to contain one must not
+			// park the run in the quota heartbeat. The wrap deliberately
+			// carries no output — the diagnostics live in the death log
+			// above, and embedding output here would let agent text forge
+			// the workflow-side classification.
+			return res, fmt.Errorf("%w: %w", ErrAgentKilled, err)
+		}
 		if out := res.Stdout + res.Stderr; matchesAny(out, apiExhaustionMarkers) {
 			return res, fmt.Errorf("%w: %w: %s", ErrAPIExhausted, err, truncateTail(out, 1024))
 		}
-		return res, fmt.Errorf("ai-jail agent run: %w: %s", err, res.Stdout+res.Stderr)
+		return res, fmt.Errorf("ai-jail agent run: %w: %s", err, truncateTail(res.Stdout+res.Stderr, 1024))
 	}
 	return res, nil
+}
+
+// logDeath records post-mortem telemetry for a jailed round that died to
+// a signal: which signal (daedalus's own kill paths fire only at activity
+// timeouts and cancel via context, so a signal here means something
+// outside daedalus killed the group leader), what survived in the process
+// group after the leader died (escaped descendants, with their memory
+// footprint), and how long the round ran. Logged before killGroup sweeps,
+// so the snapshot shows the survivors.
+func logDeath(logger log.Logger, cmd *exec.Cmd, err error, start time.Time, sig string) {
+	logger.Error("Jailed agent died abruptly",
+		"Error", err,
+		"Exit", sig,
+		"PGID", cmd.Process.Pid,
+		"Elapsed", time.Since(start).Round(time.Second),
+		"GroupAfterDeath", groupSnapshot(cmd.Process.Pid))
+}
+
+// deathSignal describes the exit of a failed command when it was killed by
+// a signal rather than exiting on its own, "" otherwise. Only abrupt
+// deaths are worth post-mortem telemetry.
+func deathSignal(err error) string {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return ""
+	}
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() {
+		return ""
+	}
+	return fmt.Sprintf("signal %d (%s)", ws.Signal(), ws.Signal())
+}
+
+// snapshotTimeout bounds a process-group snapshot: telemetry must never
+// wedge the activity it is trying to explain.
+const snapshotTimeout = 2 * time.Second
+
+// groupSnapshot lists the surviving members of process group pgid (pid,
+// parent, RSS in KB, command) for post-mortem telemetry. macOS has no
+// /proc, so the whole table is listed and filtered. Best-effort: any
+// failure yields "".
+func groupSnapshot(pgid int) string {
+	if pgid <= 0 {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=,pgid=,rss=,command=").Output()
+	if err != nil {
+		return ""
+	}
+	want := strconv.Itoa(pgid)
+	var lines []string
+	for line := range strings.SplitSeq(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[2] == want {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // apiExhaustionMarkers are the phrases provider APIs (and their CLIs) emit
@@ -613,6 +846,16 @@ var ErrAPIExhausted = errors.New("agent api exhausted or unavailable")
 // for partial work that never happened. Its text deliberately avoids every
 // apiExhaustionMarker so isAPIExhaustion cannot claim it.
 var ErrAgentSlotsBusy = errors.New("all jailed-agent slots busy")
+
+// ErrAgentKilled marks a jailed round whose process died to a signal —
+// an abrupt, external death: neither of daedalus's own kill paths can
+// surface that way (the context-cancel kill reports a context error, and
+// the deferred group sweep runs only after the wait already returned).
+// Derived from the wait status in-worker, never from output text, so the
+// workflow can trust the classification: it answers a killed round with a
+// continuation from partial work, like a timeout. The wrap carries no
+// output — the workflow must not classify on text an agent printed.
+var ErrAgentKilled = errors.New("jailed agent killed by signal")
 
 // matchesAny reports whether s contains any marker, case-insensitively.
 func matchesAny(s string, markers []string) bool {
@@ -1029,9 +1272,15 @@ func firstCommandLine(text string) string {
 // refs behind. Preserved branches are deliberately kept — they are the run's
 // deliverable.
 func CleanupWorktreeActivity(ctx context.Context, input WorktreeInput) error {
+	// Cleanup can run long on a big tree (a full worktree removal is a lot
+	// of filesystem work); heartbeats keep Temporal's history showing it
+	// as alive rather than indistinguishable from a hang.
+	hbDone := make(chan struct{})
+	defer close(hbDone)
+	go heartbeatLoop(ctx, hbDone)
 	worktreePath, err := WorktreePathFor(input.TaskQueue, input.IssueID)
 	if err != nil {
 		return err
 	}
-	return cleanWorktree(ctx, input, worktreePath)
+	return cleanWorktree(ctx, input, worktreePath, activityLogger(ctx))
 }

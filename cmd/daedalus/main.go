@@ -1000,7 +1000,13 @@ func runWorker(cfg config.Config) error {
 	w.RegisterActivity(activities.FinalizeWorktreeActivity)
 	w.RegisterActivity(activities.CleanupWorktreeActivity)
 
-	fmt.Printf("daedalus worker listening on task queue %q (temporal %s, UI %s)\n",
+	// The worker log is opened in append mode by workerStart, so this start
+	// record — timestamped, versioned — separates restarts in one file and
+	// says which build served each stretch. Without the version, a worker
+	// running an unidentified local build is indistinguishable from the
+	// checked-out code it should match.
+	fmt.Printf("daedalus worker %s starting %s on task queue %q (temporal %s, UI %s)\n",
+		version.String(), time.Now().Format(time.RFC3339),
 		cfg.Temporal.TaskQueue, cfg.Temporal.Host, cfg.UIURL())
 	return w.Run(worker.InterruptCh())
 }
@@ -1043,6 +1049,7 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		Agent:           agent,
 		TestTimeout:     cfg.TestsTimeout,
 		AgentRunTimeout: cfg.AgentRunTimeout,
+		CleanupTimeout:  cfg.CleanupTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -1156,6 +1163,7 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		Agent:           prev.Agent,
 		TestTimeout:     cfg.TestsTimeout,
 		AgentRunTimeout: cfg.AgentRunTimeout,
+		CleanupTimeout:  cfg.CleanupTimeout,
 		BaseBranch:      base,
 		PriorFeedback:   tail(lastReview.Comments, maxPriorFeedback),
 	})

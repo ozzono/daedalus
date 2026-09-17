@@ -49,6 +49,10 @@ type PipelineInput struct {
 	// replayed by a newer worker — falls back to
 	// config.DefaultAgentRunTimeout.
 	AgentRunTimeout time.Duration
+	// CleanupTimeout bounds one CleanupWorktreeActivity (config
+	// cleanup_timeout). Same replay-safe zero fallback as AgentRunTimeout:
+	// config.DefaultCleanupTimeout.
+	CleanupTimeout time.Duration
 }
 
 // maxConsecutiveTimeouts caps how many timed-out rounds in a row the
@@ -120,6 +124,19 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		StartToCloseTimeout: agentTimeout,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
 	})
+	// Cleanup gets its own ceiling too: committing the aborted snapshot
+	// and removing a large worktree (a build tree can hold hundreds of
+	// thousands of files) is filesystem-bound work that legitimately
+	// overruns the shared 15 minutes. Same replay-safe zero fallback as
+	// the agent timeout.
+	cleanupTimeout := input.CleanupTimeout
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = config.DefaultCleanupTimeout
+	}
+	cleanupCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: cleanupTimeout,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
+	})
 
 	branchName := fmt.Sprintf("feat/issue-%s-%d", input.IssueID, workflow.Now(ctx).Unix())
 	worktreeInput := activities.WorktreeInput{
@@ -144,7 +161,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		// NewDisconnectedContext returns (Context, CancelFunc) — the second
 		// value is not an error. Detach the cancel from this deferred func's
 		// lifetime only after the cleanup activity has completed.
-		dctx, cancel := workflow.NewDisconnectedContext(ctx)
+		dctx, cancel := workflow.NewDisconnectedContext(cleanupCtx)
 		defer cancel()
 		if err := workflow.ExecuteActivity(dctx, activities.CleanupWorktreeActivity, worktreeInput).Get(dctx, nil); err != nil {
 			logger.Error("Failed to clean up worktree", "Error", err)
@@ -244,13 +261,19 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 					"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
 				return nil
 			}
-			if isAPIExhaustion(err) {
+			// The kill classification runs first: its marker is
+			// wait-status-derived in the worker (ErrAgentKilled), while
+			// the exhaustion and slot markers below match output text an
+			// externally killed round may well have printed before it
+			// died — a kill must not park the run in the quota heartbeat.
+			killed := isAgentKilled(err)
+			if !killed && isAPIExhaustion(err) {
 				if herr := heartbeat(err, stage); herr != nil {
 					return herr
 				}
 				continue
 			}
-			if isSlotWait(err) {
+			if !killed && isSlotWait(err) {
 				// The round never launched — re-queue it unchanged, do not
 				// count it against the timeout streak (whose continuation
 				// prompt would fabricate partial work).
@@ -261,7 +284,15 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				}
 				continue
 			}
-			if !temporal.IsTimeoutError(err) {
+			// An abruptly killed round is as recoverable as a timed-out
+			// one — the worktree keeps whatever the agent finished before
+			// it died (only daedalus's own timeout paths kill cleanly via
+			// context; a signal means something external took the round,
+			// e.g. an operator sweep or a host-level kill). It falls
+			// through to the timeout handling below: continuation prompt,
+			// counted against the same streak so a repeat killer still
+			// fails the run.
+			if !killed && !temporal.IsTimeoutError(err) {
 				if *session != "" && !freshFallback {
 					freshFallback = true
 					logger.Warn("Resumed agent round failed; retrying the round with a fresh session",
@@ -272,16 +303,20 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				return err
 			}
 			consecutiveTimeouts++
-			logger.Warn("Agent round hit the timeout ceiling; continuing from partial work",
+			cutoff := fmt.Sprintf(
+				"the previous attempt was cut off by the round's %s timeout ceiling before it finished",
+				agentTimeout)
+			if killed {
+				cutoff = "the previous attempt was cut off abruptly before it finished (the agent process was killed mid-round)"
+			}
+			logger.Warn("Agent round cut off; continuing from partial work",
 				"Stage", stage, "ConsecutiveTimeouts", consecutiveTimeouts,
-				"AgentRunTimeout", agentTimeout)
+				"AgentRunTimeout", agentTimeout, "Killed", killed)
 			if consecutiveTimeouts >= maxConsecutiveTimeouts {
-				return fmt.Errorf("agent run timed out %d rounds in a row (stage %q): %w",
+				return fmt.Errorf("agent run cut off %d rounds in a row (stage %q): %w",
 					consecutiveTimeouts, stage, err)
 			}
-			followUp, ferr := template.Continue(prompt, fmt.Sprintf(
-				"the previous attempt was cut off by the round's %s timeout ceiling before it finished",
-				agentTimeout))
+			followUp, ferr := template.Continue(prompt, cutoff)
 			if ferr != nil {
 				return fmt.Errorf("build timeout-continuation prompt (stage %q): %w", stage, ferr)
 			}
@@ -311,13 +346,17 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				*session = result.SessionID
 				return result, nil
 			}
-			if isAPIExhaustion(err) {
+			// Same kill-first precedence as the agent rounds: a killed
+			// reviewer must not park in the quota heartbeat over output
+			// text it printed before dying.
+			killed := isAgentKilled(err)
+			if !killed && isAPIExhaustion(err) {
 				if herr := heartbeat(err, "review"); herr != nil {
 					return result, herr
 				}
 				continue
 			}
-			if isSlotWait(err) {
+			if !killed && isSlotWait(err) {
 				// Same re-queue as the agent rounds: the reviewer never
 				// launched, so the focus is retried as-is.
 				logger.Warn("All jailed-agent slots busy; backing off before re-queuing the review",
@@ -327,7 +366,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				}
 				continue
 			}
-			if !temporal.IsTimeoutError(err) {
+			if !killed && !temporal.IsTimeoutError(err) {
 				if *session != "" && !freshFallback {
 					freshFallback = true
 					logger.Warn("Resumed reviewer round failed; retrying the review with a fresh session",
@@ -338,7 +377,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				return result, err
 			}
 			reviewTimeouts++
-			logger.Warn("Reviewer round hit the timeout ceiling; retrying",
+			logger.Warn("Reviewer round cut off (timeout or kill); retrying",
 				"Focus", focus, "ConsecutiveTimeouts", reviewTimeouts)
 			if reviewTimeouts >= maxConsecutiveTimeouts {
 				return result, fmt.Errorf("reviewer timed out %d rounds in a row (focus %q): %w",
@@ -539,4 +578,15 @@ func isAPIExhaustion(err error) bool {
 // every case.
 func isSlotWait(err error) bool {
 	return err != nil && strings.Contains(err.Error(), activities.ErrAgentSlotsBusy.Error())
+}
+
+// isAgentKilled reports whether err is the activities' ErrAgentKilled —
+// a jailed round whose process died to a signal, an abrupt external death
+// rather than a timeout or a clean failure. Unlike the exhaustion and
+// slot markers (output text), this one is derived from the wait status in
+// the worker and wrapped without any agent output, so text an agent
+// printed cannot forge it. Same boundary note as isAPIExhaustion: the
+// sentinel travels as error text, so a substring match carries it.
+func isAgentKilled(err error) bool {
+	return err != nil && strings.Contains(err.Error(), activities.ErrAgentKilled.Error())
 }

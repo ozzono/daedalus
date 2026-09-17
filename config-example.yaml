@@ -34,14 +34,21 @@ worker_id: ""
 # Ceiling for one execution of the repo's native test suite (a Go
 # duration string). Test-command discovery and the suite itself share this
 # budget, so it is wider than the 15-minute ceiling the other activities
-# use. Every other activity keeps that fixed 15-minute StartToClose;
-# the jailed agent gets its own, wider ceiling below.
+# use. The jailed agent and worktree cleanup each get their own, wider
+# ceilings below; every remaining activity keeps the fixed 15-minute
+# StartToClose.
 tests_timeout: 30m
 # Ceiling for one jailed-agent round — implementation or review
 # (RunJailedClaudeActivity), a Go duration string. Agent rounds
 # legitimately run long, so this is wider than the fixed 15-minute
 # StartToClose the other activities use.
 agent_run_timeout: 45m
+# Ceiling for one CleanupWorktreeActivity — committing the aborted-work
+# snapshot, unregistering the worktree, and removing its directory — a Go
+# duration string. Wider than the shared 15-minute activity ceiling:
+# removing a large worktree (e.g. one holding a build tree) is
+# filesystem-bound work that has burned the full 15 minutes in practice.
+cleanup_timeout: 30m
 # How many jailed-agent rounds may run at once on this worker; further
 # rounds queue until a slot frees (heartbeating while they wait).
 # Concurrent cold agent sessions share one provider account's throughput,

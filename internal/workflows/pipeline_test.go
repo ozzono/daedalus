@@ -880,8 +880,152 @@ func TestFeatureDevWorkflowAgentTimeoutStreakFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("want workflow error after a timeout streak")
 	}
-	if !strings.Contains(err.Error(), "timed out 3 rounds in a row") {
+	if !strings.Contains(err.Error(), "cut off 3 rounds in a row") {
 		t.Errorf("error does not name the streak: %v", err)
+	}
+	env.AssertExpectations(t)
+}
+
+// errKilledStub is an abruptly killed agent round as the workflow sees it:
+// the ErrAgentKilled sentinel wrapped the way runJailed wraps it in
+// production — wait-status-derived, with no agent output embedded.
+var errKilledStub = fmt.Errorf("%w: signal: killed", activities.ErrAgentKilled)
+
+// TestFeatureDevWorkflowAgentKilledRecovers pins that an externally killed
+// round — not a timeout, none of daedalus's own kill paths — is recovered
+// like one: the run continues from the round's partial work instead of
+// failing, and the continuation prompt says the round was cut off abruptly.
+func TestFeatureDevWorkflowAgentKilledRecovers(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var inputs []activities.AgentRunInput
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					inputs = append(inputs, in)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			if calls == 1 {
+				return activities.AgentRunResult{}, errKilledStub
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("agent calls = %d, want 3 (killed round, continuation, tests round)", calls)
+	}
+	if len(inputs) != 3 || inputs[1].Prompt == inputs[0].Prompt {
+		t.Fatalf("retry must re-prompt, inputs recorded: %d", len(inputs))
+	}
+	if !strings.Contains(inputs[1].Prompt, "killed mid-round") {
+		t.Errorf("retry prompt does not explain the abrupt cutoff: %q", inputs[1].Prompt)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowAgentKilledStreakFails pins that kills count against
+// the same streak as timeouts: a run killed every round fails loudly instead
+// of looping forever.
+func TestFeatureDevWorkflowAgentKilledStreakFails(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Return(activities.AgentRunResult{}, errKilledStub)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error after a kill streak")
+	}
+	if !strings.Contains(err.Error(), "cut off 3 rounds in a row") {
+		t.Errorf("error does not name the streak: %v", err)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowAgentKilledWrappedErrorClassifies pins the
+// workflow side of the kill sentinel: across the Temporal activity
+// boundary the sentinel arrives as error text inside the worker's wrapper,
+// so classification is a substring match — the sentinel embedded in
+// surrounding wrapper text still routes the round to kill recovery.
+func TestFeatureDevWorkflowAgentKilledWrappedErrorClassifies(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var prompts []string
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					prompts = append(prompts, in.Prompt)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			if calls == 1 {
+				return activities.AgentRunResult{}, fmt.Errorf(
+					"activity RunJailedClaudeActivity (type ...) failed: %w", errKilledStub)
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("agent calls = %d, want 3 (killed round, continuation, tests round)", calls)
+	}
+	if len(prompts) != 3 || !strings.Contains(prompts[1], "killed mid-round") {
+		t.Errorf("sentinel inside wrapper text did not route to kill recovery, prompts: %d", len(prompts))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowKillWordsWithoutSentinelFailNormally is the flip
+// side of the substring surface: a generic failure whose embedded output
+// tail merely says something similar — signal-death words without the
+// sentinel itself — must not be diverted into kill recovery.
+func TestFeatureDevWorkflowKillWordsWithoutSentinelFailNormally(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Return(activities.AgentRunResult{}, errors.New(
+			"agent failed; output tail: ... terminating on signal: killed ... exit status 1"))
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from a normal agent failure")
+	}
+	if strings.Contains(err.Error(), "cut off") {
+		t.Errorf("near-miss text diverted into kill recovery: %v", err)
 	}
 	env.AssertExpectations(t)
 }
@@ -961,6 +1105,38 @@ func TestFeatureDevWorkflowReviewerTimeoutRetries(t *testing.T) {
 	}
 	if reviewCalls < 2 {
 		t.Fatalf("review calls = %d, want the timed-out round retried", reviewCalls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowReviewerKilledRetries pins that a reviewer round
+// lost to an abrupt kill (not a timeout) is retried like a timed-out one.
+func TestFeatureDevWorkflowReviewerKilledRetries(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	rec := &agentRecorder{env: env}
+	rec.record()
+	var reviewCalls int
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			reviewCalls++
+			if reviewCalls == 1 {
+				return activities.ReviewResult{}, errKilledStub
+			}
+			return activities.ReviewResult{Approved: true}, nil
+		})
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if reviewCalls < 2 {
+		t.Fatalf("review calls = %d, want the killed round retried", reviewCalls)
 	}
 	env.AssertExpectations(t)
 }
