@@ -972,6 +972,12 @@ func runWorker(cfg config.Config) error {
 	if err := os.Setenv("DAEDALUS_AGENT", cfg.Agent); err != nil {
 		return fmt.Errorf("set DAEDALUS_AGENT: %w", err)
 	}
+	// So does the concurrency cap: activities read
+	// DAEDALUS_MAX_CONCURRENT_AGENT_RUNS when sizing the semaphore that
+	// bounds concurrent jailed-agent rounds on this worker.
+	if err := os.Setenv("DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", strconv.Itoa(cfg.MaxConcurrentAgentRuns)); err != nil {
+		return fmt.Errorf("set DAEDALUS_MAX_CONCURRENT_AGENT_RUNS: %w", err)
+	}
 
 	if err := activities.PreflightWorktreeRoot(cfg.Temporal.TaskQueue); err != nil {
 		return fmt.Errorf("worktree preflight: %w", err)

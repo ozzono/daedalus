@@ -58,6 +58,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.AgentRunTimeout != DefaultAgentRunTimeout {
 		t.Errorf("AgentRunTimeout = %v, want %v", cfg.AgentRunTimeout, DefaultAgentRunTimeout)
 	}
+	if cfg.MaxConcurrentAgentRuns != DefaultMaxConcurrentAgentRuns {
+		t.Errorf("MaxConcurrentAgentRuns = %d, want %d", cfg.MaxConcurrentAgentRuns, DefaultMaxConcurrentAgentRuns)
+	}
 }
 
 // TestLoadAgent pins the accepted agent values: every shipped agent loads,
@@ -111,6 +114,24 @@ func TestLoadAgentRunTimeout(t *testing.T) {
 	_, err = Load(writeConfig(t, "agent_run_timeout: -5m\n"))
 	if err == nil || !strings.Contains(err.Error(), "agent_run_timeout") {
 		t.Fatalf("want agent_run_timeout error, got %v", err)
+	}
+}
+
+// TestLoadMaxConcurrentAgentRuns pins the max_concurrent_agent_runs parsing:
+// an explicit value loads, and a negative value is rejected up front rather
+// than becoming a zero-capacity (permanently stuck) semaphore downstream.
+func TestLoadMaxConcurrentAgentRuns(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "max_concurrent_agent_runs: 4\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MaxConcurrentAgentRuns != 4 {
+		t.Errorf("MaxConcurrentAgentRuns = %d, want 4", cfg.MaxConcurrentAgentRuns)
+	}
+
+	_, err = Load(writeConfig(t, "max_concurrent_agent_runs: -1\n"))
+	if err == nil || !strings.Contains(err.Error(), "max_concurrent_agent_runs") {
+		t.Fatalf("want max_concurrent_agent_runs error, got %v", err)
 	}
 }
 

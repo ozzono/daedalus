@@ -43,6 +43,12 @@ const (
 	// Wider than the shared activity ceiling because agent rounds
 	// legitimately run long (whole-repo analyses, slow builds).
 	DefaultAgentRunTimeout = 45 * time.Minute
+	// DefaultMaxConcurrentAgentRuns caps how many jailed-agent rounds run at
+	// once on this worker when config max_concurrent_agent_runs is unset.
+	// Concurrent cold sessions share one provider account's throughput, so
+	// unbounded parallelism slows every run; queued rounds wait for a slot
+	// (heartbeating while they do) and then run at full speed.
+	DefaultMaxConcurrentAgentRuns = 2
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -110,10 +116,16 @@ type Config struct {
 	// AgentRunTimeout bounds one jailed-agent round — implementation
 	// or review (RunJailedClaudeActivity). A time.ParseDuration string
 	// in YAML ("45m"); DefaultAgentRunTimeout when unset.
-	AgentRunTimeout time.Duration   `yaml:"agent_run_timeout"`
-	Temporal        TemporalConfig  `yaml:"temporal"`
-	Anthropic       AnthropicConfig `yaml:"anthropic"`
-	OpenAI          OpenAIConfig    `yaml:"openai"`
+	AgentRunTimeout time.Duration `yaml:"agent_run_timeout"`
+	// MaxConcurrentAgentRuns caps how many jailed-agent rounds run at once
+	// on this worker; further rounds queue until a slot frees. Concurrent
+	// cold agent sessions share one provider account, so unbounded
+	// parallelism (many workflows on one task queue) slows every run.
+	// DefaultMaxConcurrentAgentRuns when unset.
+	MaxConcurrentAgentRuns int             `yaml:"max_concurrent_agent_runs"`
+	Temporal               TemporalConfig  `yaml:"temporal"`
+	Anthropic              AnthropicConfig `yaml:"anthropic"`
+	OpenAI                 OpenAIConfig    `yaml:"openai"`
 }
 
 // agents lists the accepted config Agent values. amp authenticates through
@@ -221,6 +233,9 @@ func Load(path string) (Config, error) {
 	if c.AgentRunTimeout < 0 {
 		return c, fmt.Errorf("config %s: agent_run_timeout: must not be negative", path)
 	}
+	if c.MaxConcurrentAgentRuns < 0 {
+		return c, fmt.Errorf("config %s: max_concurrent_agent_runs: must not be negative", path)
+	}
 	return c, nil
 }
 
@@ -285,6 +300,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.AgentRunTimeout == 0 {
 		c.AgentRunTimeout = DefaultAgentRunTimeout
+	}
+	if c.MaxConcurrentAgentRuns == 0 {
+		c.MaxConcurrentAgentRuns = DefaultMaxConcurrentAgentRuns
 	}
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS

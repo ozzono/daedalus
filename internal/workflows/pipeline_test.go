@@ -41,10 +41,20 @@ func newTestEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	return env
 }
 
+// agentStep is one scripted agent-round outcome: the recorder plays the
+// script in order, one entry per call, then falls back to its default.
+type agentStep struct {
+	result activities.AgentRunResult
+	err    error
+}
+
 // agentRecorder captures every RunJailedClaudeActivity input.
 type agentRecorder struct {
-	env     *testsuite.TestWorkflowEnvironment
-	inputs  []activities.AgentRunInput
+	env    *testsuite.TestWorkflowEnvironment
+	inputs []activities.AgentRunInput
+	// result is the default outcome once script (if any) is exhausted.
+	result  activities.AgentRunResult
+	script  []agentStep
 	stubErr error
 }
 
@@ -58,15 +68,33 @@ func (r *agentRecorder) record() {
 			}
 		}).
 		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
-			return activities.AgentRunResult{Text: "stub agent output"}, r.stubErr
+			if len(r.script) > 0 {
+				step := r.script[0]
+				r.script = r.script[1:]
+				return step.result, step.err
+			}
+			if r.result == (activities.AgentRunResult{}) {
+				r.result = activities.AgentRunResult{Text: "stub agent output"}
+			}
+			return r.result, r.stubErr
 		})
+}
+
+// reviewStep is one scripted reviewer-round outcome: the recorder plays the
+// script in order, one entry per call, then falls back to its verdict stub.
+type reviewStep struct {
+	result activities.ReviewResult
+	err    error
 }
 
 // reviewerRecorder captures every RunJailedReviewerActivity input and replays
 // the given verdicts in order (repeating the last one if more are needed).
 type reviewerRecorder struct {
-	env     *testsuite.TestWorkflowEnvironment
-	inputs  []activities.ReviewInput
+	env    *testsuite.TestWorkflowEnvironment
+	inputs []activities.ReviewInput
+	// script, when non-empty, is played one entry per call before the stub
+	// verdicts take over.
+	script  []reviewStep
 	stub    []activities.ReviewResult
 	stubErr error
 }
@@ -81,6 +109,11 @@ func (r *reviewerRecorder) record() {
 			}
 		}).
 		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			if len(r.script) > 0 {
+				step := r.script[0]
+				r.script = r.script[1:]
+				return step.result, step.err
+			}
 			if r.stubErr != nil {
 				return activities.ReviewResult{}, r.stubErr
 			}
@@ -300,6 +333,164 @@ func TestFeatureDevWorkflowGuidanceSignal(t *testing.T) {
 	// Guidance must not leak into rounds it was not sent for.
 	if strings.Contains(rec.inputs[2].Prompt, "OPERATOR GUIDANCE") {
 		t.Errorf("guidance leaked into the tests prompt: %q", rec.inputs[2].Prompt)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowSessionChaining pins the four role-separated
+// sessions: each role's first round starts cold, later rounds of the same
+// role resume its session, and no round ever carries another role's session.
+func TestFeatureDevWorkflowSessionChaining(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env, result: activities.AgentRunResult{Text: "ok", SessionID: "agent-s1"}}
+	rec.record()
+
+	// Code review rejects once, then approves; test review approves. The
+	// code-review rounds report one reviewer session; the test review would
+	// report its own (empty here — it is the last review, nothing resumes
+	// it).
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "rename foo to bar", SessionID: "review-s1"},
+		{Approved: true, SessionID: "review-s1"},
+	}}
+	rev.record()
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement, review-fix, tests)", len(rec.inputs))
+	}
+	if got := rec.inputs[0].SessionID; got != "" {
+		t.Errorf("implement round SessionID = %q, want empty (dev agent starts cold)", got)
+	}
+	if got := rec.inputs[1].SessionID; got != "agent-s1" {
+		t.Errorf("fix round SessionID = %q, want the dev agent session", got)
+	}
+	if got := rec.inputs[2].SessionID; got != "" {
+		t.Errorf("tests round SessionID = %q, want empty (test agent is its own session, not the dev agent's)", got)
+	}
+
+	if len(rev.inputs) != 3 {
+		t.Fatalf("reviewer ran %d times, want 3 (code review x2, test review)", len(rev.inputs))
+	}
+	if got := rev.inputs[0].SessionID; got != "" {
+		t.Errorf("first code review SessionID = %q, want empty (dev reviewer starts cold)", got)
+	}
+	if got := rev.inputs[1].SessionID; got != "review-s1" {
+		t.Errorf("second code review SessionID = %q, want the dev reviewer session", got)
+	}
+	if got := rev.inputs[2].SessionID; got != "" {
+		t.Errorf("test review SessionID = %q, want empty (test reviewer is separate from the dev reviewer)", got)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowSessionFallback pins the lost-session fallback: a
+// resumed round that fails outright (its session no longer exists under the
+// jail's state dir, say) is retried once with a fresh session instead of
+// failing the whole run.
+func TestFeatureDevWorkflowSessionFallback(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env, script: []agentStep{
+		// implement: establishes the dev agent session
+		{result: activities.AgentRunResult{Text: "ok", SessionID: "sess-1"}},
+		// fix: the resume fails — session gone
+		{err: errors.New("no conversation found with session ID: sess-1")},
+		// fix retried fresh: succeeds under a new session
+		{result: activities.AgentRunResult{Text: "ok", SessionID: "sess-2"}},
+	}, result: activities.AgentRunResult{Text: "ok"}}
+	rec.record()
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "rename foo to bar"},
+		{Approved: true},
+	}}
+	rev.record()
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rec.inputs) != 4 {
+		t.Fatalf("agent ran %d times, want 4 (implement, failed fix, fresh fix, tests)", len(rec.inputs))
+	}
+	if got := rec.inputs[1].SessionID; got != "sess-1" {
+		t.Errorf("failed fix round SessionID = %q, want sess-1 (the resumed session)", got)
+	}
+	if got := rec.inputs[2].SessionID; got != "" {
+		t.Errorf("fallback fix round SessionID = %q, want empty (fresh session)", got)
+	}
+	if got := rec.inputs[3].SessionID; got != "" {
+		t.Errorf("tests round SessionID = %q, want empty (test agent starts cold regardless of the dev session)", got)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowReviewerSessionFallback pins the reviewer's
+// lost-session fallback: a resumed review that fails outright is retried
+// once with a fresh session, same as the agent rounds.
+func TestFeatureDevWorkflowReviewerSessionFallback(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env, result: activities.AgentRunResult{Text: "ok"}}
+	rec.record()
+
+	// Code review 1 rejects (establishing the reviewer session); code
+	// review 2's resume fails; code review 2 retried fresh approves. Test
+	// review approves.
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: activities.ReviewResult{Approved: false, Comments: "rename foo to bar", SessionID: "rev-1"}},
+		{err: errors.New("no conversation found with session ID: rev-1")},
+		{result: activities.ReviewResult{Approved: true}},
+	}, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rev.inputs) != 4 {
+		t.Fatalf("reviewer ran %d times, want 4 (code review, failed resume, fresh retry, test review)", len(rev.inputs))
+	}
+	if got := rev.inputs[1].SessionID; got != "rev-1" {
+		t.Errorf("failed resume review SessionID = %q, want rev-1", got)
+	}
+	if got := rev.inputs[2].SessionID; got != "" {
+		t.Errorf("fallback review SessionID = %q, want empty (fresh session)", got)
+	}
+	if got := rev.inputs[3].SessionID; got != "" {
+		t.Errorf("test review SessionID = %q, want empty (own session, unaffected by the dev reviewer's fallback)", got)
 	}
 	env.AssertExpectations(t)
 }
@@ -779,6 +970,12 @@ func TestFeatureDevWorkflowReviewerTimeoutRetries(t *testing.T) {
 // by substring across the worker→workflow boundary.
 var errQuotaStub = fmt.Errorf("run jailed: %w: usage limit reached", activities.ErrAPIExhausted)
 
+// errSlotStub is a round that gave up waiting for a concurrency slot, as
+// the workflow sees it: the sentinel wrapped the way the activities wrap
+// it in production (runJailed's own %w here, "review run:"/"discover test
+// command:" prefixes at the other call sites).
+var errSlotStub = fmt.Errorf("%w: no slot freed within 5m0s", activities.ErrAgentSlotsBusy)
+
 // TestFeatureDevWorkflowQuotaHeartbeatRecovers pins the pause semantics: an
 // exhausted round is retried unchanged after an hourly heartbeat, the streak
 // budget resets on any completed round (a later exhaustion gets a full five
@@ -987,6 +1184,133 @@ func TestFeatureDevWorkflowTestsQuotaHeartbeatRecovers(t *testing.T) {
 	}
 	if suiteCalls != 2 {
 		t.Fatalf("suite calls = %d, want 2 (exhausted discovery round plus retry)", suiteCalls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowSlotWaitRetries pins the agent call site: a round
+// that gave up waiting for a concurrency slot is re-queued unchanged after
+// the backoff — the prompt must not become a timeout continuation, whose
+// "here's what you produced so far" framing would fabricate partial work
+// for a round that never launched.
+func TestFeatureDevWorkflowSlotWaitRetries(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	var calls int
+	var inputs []activities.AgentRunInput
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					inputs = append(inputs, in)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			if calls == 1 {
+				return activities.AgentRunResult{}, errSlotStub
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("agent calls = %d, want 3 (slot-busy implement round, re-queue, tests round)", calls)
+	}
+	if inputs[1].Prompt != inputs[0].Prompt {
+		t.Errorf("slot re-queue changed the prompt:\n%q\n!=\n%q", inputs[1].Prompt, inputs[0].Prompt)
+	}
+	if strings.Contains(inputs[1].Prompt, "timeout ceiling") {
+		t.Errorf("slot re-queue was answered as a timeout continuation: %q", inputs[1].Prompt)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowReviewerSlotWaitRetries pins the review call site:
+// a reviewer round that never got a slot is retried with the same focus,
+// and the verdict then flows normally.
+func TestFeatureDevWorkflowReviewerSlotWaitRetries(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	rev.script = []reviewStep{{err: errSlotStub}}
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(rev.inputs) != 3 {
+		t.Fatalf("review calls = %d, want 3 (slot-busy code review, re-queue, test review)", len(rev.inputs))
+	}
+	if rev.inputs[1].Focus != rev.inputs[0].Focus {
+		t.Errorf("slot re-queue changed the review focus: %q != %q", rev.inputs[1].Focus, rev.inputs[0].Focus)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowTestsSlotWaitRetries pins the suite call site:
+// test-command discovery queues on the same semaphore as every other
+// jailed round, so the suite round can come back slot-busy too — and is
+// re-queued rather than failing the run.
+func TestFeatureDevWorkflowTestsSlotWaitRetries(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	var suiteCalls int
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, path, agent string) (activities.TestResult, error) {
+			suiteCalls++
+			if suiteCalls == 1 {
+				return activities.TestResult{}, errSlotStub
+			}
+			return activities.TestResult{Passed: true, Logs: "ok"}, nil
+		})
+
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if suiteCalls != 2 {
+		t.Fatalf("suite calls = %d, want 2 (slot-busy discovery round plus re-queue)", suiteCalls)
 	}
 	env.AssertExpectations(t)
 }

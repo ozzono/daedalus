@@ -14,8 +14,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
@@ -62,6 +65,12 @@ type AgentRunInput struct {
 	// Agent, set by `run -cli/--cli`, overrides the worker's agent for this
 	// run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
 	Agent string
+	// SessionID, when set, resumes the agent's previous conversation for
+	// this worktree (claude -p --resume) instead of starting cold — the
+	// round inherits the prior context and its warm provider prompt cache.
+	// Empty starts a fresh session; agents without resume support (opencode,
+	// amp) ignore it.
+	SessionID string
 }
 
 // maxAgentOutput bounds the agent text and chain-of-thought each carried in
@@ -75,6 +84,10 @@ const maxAgentOutput = 16 * 1024
 type AgentRunResult struct {
 	Text     string
 	Thinking string
+	// SessionID identifies the agent conversation the round ran in, so the
+	// next round can resume it (see AgentRunInput.SessionID). Empty when the
+	// agent does not report one.
+	SessionID string
 }
 
 // TestResult reports the outcome of a native test run. A failing suite is
@@ -104,6 +117,13 @@ type ReviewInput struct {
 	// Agent, set by `run -cli/--cli`, overrides the worker's agent for
 	// this run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
 	Agent string
+	// SessionID, when set, resumes the reviewer's previous conversation
+	// (claude -p --resume) so a re-review verifies its earlier findings
+	// with the prior context and warm prompt cache instead of starting
+	// cold. Each reviewer role (code review, test review) chains its own
+	// session; empty starts a fresh one. Agents without resume support
+	// (opencode, amp) ignore it.
+	SessionID string
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -116,6 +136,10 @@ type ReviewResult struct {
 	Approved        bool
 	NeedsMaintainer bool
 	Comments        string
+	// SessionID identifies the reviewer conversation the round ran in, so
+	// the next round of the same review role can resume it (see
+	// ReviewInput.SessionID). Empty when the agent reports none.
+	SessionID string
 }
 
 // Branch name prefixes: feat/ marks in-flight runs (always cleaned up, along
@@ -219,16 +243,29 @@ func validatePathSegment(s string) error {
 // runGit runs a git command and returns its combined output, wrapping any
 // failure with the command line and output for diagnostics.
 func runGit(ctx context.Context, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput()
-	if err != nil {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	setProcessGroup(cmd)
+	defer killGroup(cmd)
+	out, err := cmd.CombinedOutput()
+	if err != nil && !isWaitDelay(err) {
 		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
 	}
 	return string(out), nil
 }
 
+// pipeDrainDelay bounds how long Cmd.Wait keeps waiting once the command has
+// exited or been killed: a descendant that escaped the process group (setsid)
+// can inherit and hold the output pipes, and without this deadline the copy
+// goroutines block on it forever — leaking the whole activity goroutine past
+// every Temporal timeout.
+const pipeDrainDelay = 5 * time.Second
+
 // setProcessGroup puts the subprocess in its own process group and arranges
 // for the whole group to be SIGKILLed on context cancellation, so a timeout
-// cannot orphan the subprocess's children.
+// cannot orphan the subprocess's children; pipeDrainDelay keeps Wait from
+// hanging on a descendant that slipped out of the group with the pipes.
+// Callers pair it with killGroup, which sweeps the group when the round
+// finishes (see killGroup for why cancellation alone is not enough).
 func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
@@ -237,6 +274,30 @@ func setProcessGroup(cmd *exec.Cmd) {
 		}
 		return nil
 	}
+	cmd.WaitDelay = pipeDrainDelay
+}
+
+// killGroup SIGKILLs the command's whole process group and is deferred at
+// every spawn site so the round leaves no descendants behind, however the
+// child exited. Cancellation-only killing is not enough: a child that dies
+// or exits on its own — a crashed jail, a test runner that backgrounded
+// workers and quit — leaves its children running in the group, orphaned.
+// After the direct child is gone the sweep is harmless: the group is empty
+// (ESRCH) or holds only descendants, and the pid-recycling window between
+// Wait returning and this kill is nanoseconds.
+func killGroup(cmd *exec.Cmd) {
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+// isWaitDelay reports whether err is exec.ErrWaitDelay, which Wait returns
+// only when the child itself exited successfully but a leftover descendant
+// was still holding the output pipes when WaitDelay expired. That is a
+// success for the round — the collected output stands and killGroup sweeps
+// the descendant — not a failure.
+func isWaitDelay(err error) bool {
+	return errors.Is(err, exec.ErrWaitDelay)
 }
 
 // cleanWorktree removes all traces of a worktree from the repository: the
@@ -395,15 +456,101 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 	}
 }
 
+// agentConcurrency reads the worker-level cap on concurrent jailed-agent
+// rounds, exported at worker startup from config max_concurrent_agent_runs
+// (DAEDALUS_MAX_CONCURRENT_AGENT_RUNS). Unset, malformed, or non-positive
+// values fall back to the config default.
+func agentConcurrency() int {
+	if v := os.Getenv("DAEDALUS_MAX_CONCURRENT_AGENT_RUNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return config.DefaultMaxConcurrentAgentRuns
+}
+
+// agentLimiter is the process-wide semaphore bounding concurrent jailed
+// rounds (agent and reviewer alike — both hit the provider). All of a
+// worker's workflows share it: concurrent cold agent sessions compete for
+// one provider account, so queuing extras until a slot frees runs every
+// round faster than running them all at once.
+var (
+	limiterOnce sync.Once
+	limiter     chan struct{}
+)
+
+func agentLimiter() chan struct{} {
+	limiterOnce.Do(func() {
+		limiter = make(chan struct{}, agentConcurrency())
+	})
+	return limiter
+}
+
+// heartbeatInterval is how often a jailed round heartbeats while it waits
+// for a semaphore slot or runs. Heartbeats make Temporal's history show a
+// long round as alive (without them, a round thinking for forty minutes is
+// indistinguishable from a hung one in the UI) and would feed a future
+// HeartbeatTimeout; the interval is far below any plausible timeout.
+const heartbeatInterval = 30 * time.Second
+
+// slotWaitTimeout bounds how long a jailed round queues for a concurrency
+// slot before reporting ErrAgentSlotsBusy. It sits well under the narrowest
+// round's StartToClose (the reviewer's 15 minutes): while queued the round
+// produces nothing, so letting the wait run to the budget's end would
+// surface as a plain timeout the workflow would count against its timeout
+// streak and answer with a continuation prompt for work that never started.
+// A var (not a const) so tests can shorten it.
+var slotWaitTimeout = 5 * time.Minute
+
+// heartbeatLoop records activity heartbeats every heartbeatInterval until
+// done closes or ctx ends. Outside a real activity context (unit tests
+// invoke activities directly) the SDK panics by design; like activityLogger,
+// the panic is recovered away.
+func heartbeatLoop(ctx context.Context, done <-chan struct{}) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			func() {
+				defer func() { recover() }()
+				activity.RecordHeartbeat(ctx)
+			}()
+		}
+	}
+}
+
 // runJailed runs one autonomous agent invocation inside an ai-jail sandbox
 // rooted at the worktree. agent names the jailed CLI to run — a `run
 // -cli/--cli` override, empty for the worker's DAEDALUS_AGENT default.
 // agentArgs are appended to the agent's fixed argument set before its
 // headless flags. The prompt travels via stdin, not argv: argv is visible
 // in `ps` and per-argument size limits would make large review prompts
-// (which embed the full diff) fail the run.
+// (which embed the full diff) fail the run. While waiting for a concurrency
+// slot and while the agent runs, the round heartbeats so Temporal history
+// shows liveness; the slot wait itself is bounded by slotWaitTimeout so a
+// queued round cannot burn its whole StartToClose budget without the agent
+// ever launching.
 func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
 	selected, headless, _ := jailedAgentCLI(agent)
+	lim := agentLimiter()
+	hbDone := make(chan struct{})
+	defer close(hbDone)
+	go heartbeatLoop(ctx, hbDone)
+	wait := time.NewTimer(slotWaitTimeout)
+	defer wait.Stop()
+	select {
+	case lim <- struct{}{}:
+		defer func() { <-lim }()
+	case <-wait.C:
+		return jailResult{}, fmt.Errorf("%w: no slot freed within %s", ErrAgentSlotsBusy, slotWaitTimeout)
+	case <-ctx.Done():
+		return jailResult{}, fmt.Errorf("agent slot: %w", ctx.Err())
+	}
 	args := []string{"--worktree", "--network"}
 	// amp's host login state (~/.config/amp) is not among ai-jail's
 	// agent-state dirs and AMP_API_KEY is not in its default env allowlist,
@@ -420,19 +567,20 @@ func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArg
 	args = append(args, agentArgs...)
 	args = append(args, headless...)
 	cmd := exec.CommandContext(ctx, "ai-jail", args...)
+	setProcessGroup(cmd)
+	defer killGroup(cmd)
 	cmd.Dir = worktreePath
 	// os.Environ() carries the provider settings the worker exported from
 	// config.yaml or inherited; pass them through as-is.
 	cmd.Env = os.Environ()
 	cmd.Stdin = strings.NewReader(prompt)
-	setProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	res := jailResult{Stdout: stdout.String(), Stderr: stderr.String()}
-	if err != nil {
+	if err != nil && !isWaitDelay(err) {
 		if out := res.Stdout + res.Stderr; matchesAny(out, apiExhaustionMarkers) {
 			return res, fmt.Errorf("%w: %w: %s", ErrAPIExhausted, err, truncateTail(out, 1024))
 		}
@@ -456,6 +604,15 @@ var apiExhaustionMarkers = []string{
 // API is still exhausted past that. Either way the work is preserved on
 // the aborted/ branch and the run is resumable via `daedalus continue`.
 var ErrAPIExhausted = errors.New("agent api exhausted or unavailable")
+
+// ErrAgentSlotsBusy marks a jailed round that queued for a concurrency
+// slot past slotWaitTimeout and gave up without launching the agent. The
+// workflow answers it like the quota heartbeat, not like a timeout: back
+// off briefly and re-queue the same round unchanged — a timeout would be
+// miscounted against the streak and answered with a continuation prompt
+// for partial work that never happened. Its text deliberately avoids every
+// apiExhaustionMarker so isAPIExhaustion cannot claim it.
+var ErrAgentSlotsBusy = errors.New("all jailed-agent slots busy")
 
 // matchesAny reports whether s contains any marker, case-insensitively.
 func matchesAny(s string, markers []string) bool {
@@ -489,25 +646,34 @@ func activityLogger(ctx context.Context) (l log.Logger) {
 // --verbose) is blocked for claude for now: ai-jail's flag guard rejects
 // --verbose after the command by prefix match, even behind --.
 func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
-	_, _, agentArgs := jailedAgentCLI(input.Agent)
+	agent, _, agentArgs := jailedAgentCLI(input.Agent)
+	// A session id from a previous round resumes that conversation instead
+	// of starting cold — the round inherits the prior context and the
+	// provider's warm prompt cache for it. Only claude supports --resume;
+	// opencode and amp ignore the field and start fresh.
+	if input.SessionID != "" && agent == "claude" {
+		agentArgs = append([]string{"--resume", input.SessionID}, agentArgs...)
+	}
+	start := time.Now()
 	res, err := runJailed(ctx, input.Agent, input.WorktreePath, input.Prompt, agentArgs...)
 	if err != nil {
 		return AgentRunResult{}, err
 	}
-	thinking, text := parseAgentStream(res.Stdout)
+	thinking, text, session := parseAgentStream(res.Stdout)
 	if text == "" {
 		// Not json/stream-json (a CLI without the flag, or a parse miss):
 		// keep whatever the agent did print rather than an empty result.
 		text = res.Stdout
 	}
 	logger := activityLogger(ctx)
-	logger.Info("Agent run completed", "Stdout", res.Stdout)
+	logger.Info("Agent run completed", "Stdout", res.Stdout, "Duration", time.Since(start).Round(time.Second))
 	if res.Stderr != "" {
 		logger.Info("Agent run stderr", "Stderr", res.Stderr)
 	}
 	return AgentRunResult{
-		Text:     truncateTail(text, maxAgentOutput),
-		Thinking: truncateTail(thinking, maxAgentOutput),
+		Text:      truncateTail(text, maxAgentOutput),
+		Thinking:  truncateTail(thinking, maxAgentOutput),
+		SessionID: session,
 	}, nil
 }
 
@@ -516,9 +682,13 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 // text in Result); stream-json additionally emits assistant messages with
 // content blocks (thinking, text).
 type streamMessage struct {
-	Type    string `json:"type"`
-	Result  string `json:"result"`
-	Message struct {
+	Type   string `json:"type"`
+	Result string `json:"result"`
+	// SessionID is the conversation id claude reports on every event of a
+	// run (and the json format's result object carries); resuming a later
+	// round with it continues the same conversation.
+	SessionID string `json:"session_id"`
+	Message   struct {
 		Content []struct {
 			Type     string `json:"type"`
 			Thinking string `json:"thinking"`
@@ -527,14 +697,19 @@ type streamMessage struct {
 	} `json:"message"`
 }
 
-// parseAgentStream extracts the agent's chain of thought and visible text
-// from json or stream-json output. Non-JSON or uninteresting lines are
-// skipped — the stream also carries system/init and delta events.
-func parseAgentStream(stdout string) (thinking, text string) {
+// parseAgentStream extracts the agent's chain of thought, visible text, and
+// conversation session id from json or stream-json output. Non-JSON or
+// uninteresting lines are skipped — the stream also carries system/init and
+// delta events. The session id is whatever the last event carrying one
+// reported (they all agree within a run; a resumed run keeps its id).
+func parseAgentStream(stdout string) (thinking, text, session string) {
 	for line := range strings.SplitSeq(stdout, "\n") {
 		var m streamMessage
 		if json.Unmarshal([]byte(line), &m) != nil {
 			continue
+		}
+		if m.SessionID != "" {
+			session = m.SessionID
 		}
 		switch m.Type {
 		case "assistant":
@@ -555,14 +730,17 @@ func parseAgentStream(stdout string) (thinking, text string) {
 			}
 		}
 	}
-	return thinking, text
+	return thinking, text, session
 }
 
 // RunJailedReviewerActivity has a jailed reviewer agent review the current
 // state of the worktree and return a machine-readable verdict. The diff (and,
 // when provided, the latest test output) is collected inside the activity, so
 // large payloads stay out of workflow history; only the verdict travels on.
-// The verdict is parsed from stdout alone.
+// The reviewer runs with the same structured output mode as the implementing
+// agent, so its conversation id comes back for later rounds to resume; the
+// verdict is parsed from the agent's visible text, falling back to raw stdout
+// for a CLI that printed plain text.
 func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewResult, error) {
 	diff, err := stagedDiff(ctx, input.WorktreePath)
 	if err != nil {
@@ -572,14 +750,32 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	res, err := runJailed(ctx, input.Agent, input.WorktreePath, prompt)
+	agent, _, agentArgs := jailedAgentCLI(input.Agent)
+	// A session id from a previous round of the same review role resumes
+	// that conversation — the re-review verifies its earlier findings with
+	// the prior context instead of re-deriving them cold. Only claude
+	// supports --resume; opencode and amp start fresh.
+	if input.SessionID != "" && agent == "claude" {
+		agentArgs = append([]string{"--resume", input.SessionID}, agentArgs...)
+	}
+	start := time.Now()
+	res, err := runJailed(ctx, input.Agent, input.WorktreePath, prompt, agentArgs...)
 	if err != nil {
 		return ReviewResult{}, fmt.Errorf("review run: %w", err)
 	}
+	logger := activityLogger(ctx)
+	logger.Info("Reviewer run completed", "Duration", time.Since(start).Round(time.Second))
 	if res.Stderr != "" {
-		activityLogger(ctx).Info("Reviewer stderr", "Stderr", res.Stderr)
+		logger.Info("Reviewer stderr", "Stderr", res.Stderr)
 	}
-	return parseReviewVerdict(res.Stdout), nil
+	_, text, session := parseAgentStream(res.Stdout)
+	if text == "" {
+		// Plain-text CLI (or a parse miss): the whole stdout is the review.
+		text = res.Stdout
+	}
+	verdict := parseReviewVerdict(text)
+	verdict.SessionID = session
+	return verdict, nil
 }
 
 // stagedDiff returns the full diff of the worktree against HEAD, including
@@ -691,13 +887,14 @@ func RunNativeTestsActivity(ctx context.Context, worktreePath, agent string) (Te
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = worktreePath
 	setProcessGroup(cmd)
+	defer killGroup(cmd)
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	res := TestResult{Command: strings.Join(argv, " ")}
 	err = cmd.Run()
-	if err != nil {
+	if err != nil && !isWaitDelay(err) {
 		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
 			return TestResult{}, fmt.Errorf("run tests (%s): %w", res.Command, err)
 		}
@@ -803,7 +1000,7 @@ func discoverTestCommand(ctx context.Context, worktreePath, agent string) ([]str
 	if err != nil {
 		return nil, fmt.Errorf("discover test command: %w", err)
 	}
-	_, text := parseAgentStream(res.Stdout)
+	_, text, _ := parseAgentStream(res.Stdout)
 	cmd := firstCommandLine(text)
 	if cmd == "" {
 		return nil, fmt.Errorf("no test command found for %s — declare one in .daedalus.yaml (tests: <command>)", worktreePath)
