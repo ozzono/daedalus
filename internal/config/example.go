@@ -30,6 +30,15 @@ agent: claude
 # this prefix.
 branch_prefix: daedalus
 
+# Name this deployment's worker daemon is managed under: the daemon-dir
+# pid/log/config-record files are keyed by it, and "daedalus worker restart
+# <id>" addresses it from any directory. Independent of
+# temporal.task_queue — two workers may share one queue under different
+# ids, each with its own config (e.g. a rotated API key). Empty (the
+# default) means the task queue names the worker, so a single-queue
+# deployment needs no id.
+worker_id: ""
+
 # Ceiling for one execution of the repo's native test suite (a Go
 # duration string). Test-command discovery and the suite itself share this
 # budget, so it is wider than the 15-minute ceiling the other activities

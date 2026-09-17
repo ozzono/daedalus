@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -196,6 +197,47 @@ func TestAgentEnvOmitsEmpty(t *testing.T) {
 
 // TestLoadBranchPrefix pins that a configured prefix loads through and an
 // unusable one fails at config load, before any run starts.
+func TestWorkerName(t *testing.T) {
+	// An explicit worker_id names the worker, independently of the queue.
+	cfg, err := Load(writeConfig(t, `
+worker_id: arete
+temporal:
+  task_queue: q7
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.WorkerName(); got != "arete" {
+		t.Errorf("WorkerName() = %q, want arete (the worker id, not the queue)", got)
+	}
+
+	// Without one, the task queue names the worker — the single-queue
+	// default keeps working with no id to set.
+	cfg, err = Load(writeConfig(t, "temporal:\n  task_queue: arete\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.WorkerName(); got != "arete" {
+		t.Errorf("WorkerName() = %q, want arete (the task queue)", got)
+	}
+}
+
+func TestLoadWorkerID(t *testing.T) {
+	// Load rejects ids that cannot key the daemon-dir file names — the same
+	// error shape as the other Load-time validations.
+	for _, id := range []string{"../evil", "a/b", "a\\b", "a b", ".\t.", "-", ".", ".."} {
+		_, err := Load(writeConfig(t, "worker_id: "+strconv.Quote(id)+"\n"))
+		if err == nil || !strings.Contains(err.Error(), "worker id") {
+			t.Errorf("Load(worker_id %q) err = %v, want a worker-id rejection", id, err)
+		}
+	}
+	for _, id := range []string{"", "arete", "worker.2", "a-b_c"} {
+		if _, err := Load(writeConfig(t, "worker_id: "+strconv.Quote(id)+"\n")); err != nil {
+			t.Errorf("Load(worker_id %q): %v, want accepted", id, err)
+		}
+	}
+}
+
 func TestLoadBranchPrefix(t *testing.T) {
 	cfg, err := Load(writeConfig(t, "branch_prefix: team/ship\n"))
 	if err != nil {
@@ -264,7 +306,8 @@ func TestExampleYAML(t *testing.T) {
 	}
 	if cfg.Agent != DefaultAgent || cfg.BranchPrefix != DefaultBranchPrefix ||
 		cfg.Temporal.Host != DefaultTemporalHost ||
-		cfg.Temporal.UIPort != DefaultTemporalUIPort || cfg.Temporal.TaskQueue != DefaultTaskQueue {
+		cfg.Temporal.UIPort != DefaultTemporalUIPort || cfg.Temporal.TaskQueue != DefaultTaskQueue ||
+		cfg.WorkerID != "" {
 		t.Errorf("ExampleYAML values = %+v, want the documented defaults", cfg)
 	}
 	if cfg.Anthropic.URL != "" || cfg.Anthropic.Key != "" || cfg.Anthropic.Model != "" ||
