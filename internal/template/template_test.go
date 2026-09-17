@@ -83,7 +83,7 @@ func TestTests(t *testing.T) {
 	want := "Write, fix, or improve the test suite covering the change in this repository.\n\n" +
 		"Changes in this round are test-scoped: write only test code and leave the implementation as-is — its current behavior is the contract the tests verify. If a test exposes an implementation bug, say so in your reply rather than changing the implementation.\n\n" +
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only test code, and ignore anything already differing in the worktree that this round did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
-		"While iterating you may run only the tests you are working on, but know that the pipeline's final gate runs the COMPLETE test suite, not a subset — do not consider the round done until the full suite passes.\n\n" +
+		"While iterating, run only the tests covering the change — the test packages or files the change touched — never the full suite. Full-suite testing belongs to the pipeline's own gate and to the maintainer, not to you: consider the round done when the tests covering the change pass.\n\n" +
 		"Bug policy — every bug you find, in the tests or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. A bug in the tests you are writing is in scope: fix it. Everything else — implementation bugs the tests expose included — is documented only, never fixed here; report what you found in your reply.\n\n" +
 		"Keep it lazy and minimal: test observable behavior, not implementation details. Cover the change's behavior, edge cases, and error paths with the fewest tests that genuinely verify them — no redundant happy-path duplicates, no speculative tests, no over-mocking."
 	if got != want {
@@ -93,9 +93,9 @@ func TestTests(t *testing.T) {
 
 func TestTestsFix(t *testing.T) {
 	const failed = "Tests failed with output:\n\n--- FAIL: TestBoom\n\n" +
-		"Fix the tests so they pass. Find the root cause first: if the tests assert implementation details, fix the tests; if the code is wrong, fix the code — shortest working change wins, and nothing else. Remember the final gate runs the COMPLETE test suite: verify the whole suite passes, not just the cases that were failing. Git writes are forbidden in this sandbox — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: change only what the failure demands; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail — is unrelated, leave it untouched and ignore it."
+		"Fix the tests so they pass. Find the root cause first: if the tests assert implementation details, fix the tests; if the code is wrong, fix the code — shortest working change wins, and nothing else. Full-suite testing belongs to the pipeline's gate and the maintainer: verify only that the tests in the packages or files this round's change touched pass; failures elsewhere in the suite are not yours — report them in your reply instead of chasing them. Git writes are forbidden in this sandbox — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: change only what the failure demands; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail — is unrelated, leave it untouched and ignore it."
 	const review = "Test review feedback:\n\ncover the error path\n\n" +
-		"Address the review comments. Changes stay test-scoped: touch only test code; if a comment seems to require an implementation change, say so in your reply instead of making it. Git writes are forbidden in this sandbox — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: address only the comments about the tests; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail — is unrelated, leave it untouched and ignore it. Keep it lazy and minimal: the fewest tests that genuinely verify the behavior the comments name — no redundant or speculative tests, no over-mocking. Remember the final gate runs the COMPLETE test suite, not just the tests under discussion."
+		"Address the review comments. Changes stay test-scoped: touch only test code; if a comment seems to require an implementation change, say so in your reply instead of making it. Git writes are forbidden in this sandbox — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: address only the comments about the tests; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail — is unrelated, leave it untouched and ignore it. Keep it lazy and minimal: the fewest tests that genuinely verify the behavior the comments name — no redundant or speculative tests, no over-mocking. Full-suite testing belongs to the pipeline's gate and the maintainer: judge and verify only the test packages and files the change touched."
 
 	tests := []struct {
 		name               string
@@ -171,6 +171,9 @@ func TestReviewWithTestLogs(t *testing.T) {
 	}
 	if !strings.Contains(got, "Only a bug in the tests under review is a finding") {
 		t.Error("test review should carry the test-scoped bug policy")
+	}
+	if !strings.Contains(got, "Your scope is the test packages and files the change touched") {
+		t.Error("test review should scope the reviewer to the changed test packages and files")
 	}
 	if strings.Contains(got, "do not block approval") {
 		t.Error("test review must not carry the dev-review bug policy")
