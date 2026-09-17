@@ -50,6 +50,14 @@ tests_timeout: 30m
 # legitimately run long, so this is wider than the fixed 15-minute
 # StartToClose the other activities use.
 agent_run_timeout: 45m
+# How many jailed-agent rounds may run at once on this worker; further
+# rounds queue until a slot frees (heartbeating while they wait).
+# Concurrent cold agent sessions share one provider account's throughput,
+# so unbounded parallelism — many workflows on one task queue — slows
+# every run. Rounds also chain into one conversation per run (resuming
+# the previous round's session), so this mostly bounds how many runs
+# explore a repo cold at the same time.
+max_concurrent_agent_runs: 2
 
 temporal:
   # Temporal frontend address. 7233 is Temporal's own default, so a plain

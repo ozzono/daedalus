@@ -62,6 +62,14 @@ const maxConsecutiveTimeouts = 3
 // round unchanged.
 const quotaHeartbeatInterval = time.Hour
 
+// slotBackoffInterval is how long a run sleeps before re-queueing a round
+// that gave up waiting for an agent concurrency slot
+// (activities.ErrAgentSlotsBusy). Unlike the quota heartbeat it is
+// uncapped: a slot frees whenever any running round ends, and every round
+// is itself bounded by its StartToClose, so backing off cannot wedge a
+// healthy run — a cap would fail legitimately queued ones.
+const slotBackoffInterval = time.Minute
+
 // maxQuotaHeartbeats caps the hourly retries; once the API is still
 // exhausted after this many heartbeats the run parks itself for a
 // maintainer restart instead of failing.
@@ -203,17 +211,35 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// on instead of starting over. Any completed round resets the
 	// streak.
 	consecutiveTimeouts := 0
-	runAgent := func(prompt string, stage string) error {
+	// Four role-scoped sessions chain a run's rounds, each separate from the
+	// others: the dev agent (implement + fix rounds), the dev reviewer (code
+	// reviews), the test agent (tests + test-fix rounds), and the test
+	// reviewer (test reviews). Within a role each round resumes the previous
+	// one, inheriting its context and the provider's warm prompt cache; the
+	// roles stay separate so, in particular, the test agent writes against
+	// the reviewed diff with fresh eyes rather than the implementer's
+	// framing, and one reviewer's findings never anchor the other's. Sessions
+	// do not cross workflow runs — a continued run starts fresh against its
+	// preserved work.
+	devSession, testSession := "", ""
+	runAgent := func(prompt string, stage string, session *string) error {
+		// One per-call fallback when a resumed round fails outright (e.g. the
+		// session no longer exists under the jail's state dir): retry the
+		// round fresh rather than failing the whole run over a lost
+		// conversation.
+		freshFallback := false
 		for {
 			var result activities.AgentRunResult
 			err := workflow.ExecuteActivity(agentCtx, activities.RunJailedClaudeActivity, activities.AgentRunInput{
 				WorktreePath: worktree.WorktreePath,
 				Prompt:       prompt,
 				Agent:        input.Agent,
+				SessionID:    *session,
 			}).Get(ctx, &result)
 			if err == nil {
 				consecutiveTimeouts = 0
 				quotaHeartbeats = 0
+				*session = result.SessionID
 				logger.Info("Agent run completed", "Stage", stage,
 					"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
 				return nil
@@ -224,7 +250,25 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				}
 				continue
 			}
+			if isSlotWait(err) {
+				// The round never launched — re-queue it unchanged, do not
+				// count it against the timeout streak (whose continuation
+				// prompt would fabricate partial work).
+				logger.Warn("All jailed-agent slots busy; backing off before re-queuing the round",
+					"Stage", stage, "Backoff", slotBackoffInterval)
+				if serr := workflow.Sleep(ctx, slotBackoffInterval); serr != nil {
+					return fmt.Errorf("slot backoff sleep (stage %q): %w", stage, serr)
+				}
+				continue
+			}
 			if !temporal.IsTimeoutError(err) {
+				if *session != "" && !freshFallback {
+					freshFallback = true
+					logger.Warn("Resumed agent round failed; retrying the round with a fresh session",
+						"Stage", stage, "Error", err)
+					*session = ""
+					continue
+				}
 				return err
 			}
 			consecutiveTimeouts++
@@ -247,7 +291,10 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// Reviewer timeouts retry the same round unchanged — there is no
 	// partial work to continue, the verdict simply never arrived.
 	reviewTimeouts := 0
-	review := func(focus, testLogs string, testsInScope bool) (activities.ReviewResult, error) {
+	devReviewSession, testReviewSession := "", ""
+	review := func(focus, testLogs string, testsInScope bool, session *string) (activities.ReviewResult, error) {
+		// Same lost-session fallback as the agent rounds: one fresh retry.
+		freshFallback := false
 		for {
 			var result activities.ReviewResult
 			err := workflow.ExecuteActivity(ctx, activities.RunJailedReviewerActivity, activities.ReviewInput{
@@ -256,10 +303,12 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				TestLogs:     testLogs,
 				TestsInScope: testsInScope,
 				Agent:        input.Agent,
+				SessionID:    *session,
 			}).Get(ctx, &result)
 			if err == nil {
 				reviewTimeouts = 0
 				quotaHeartbeats = 0
+				*session = result.SessionID
 				return result, nil
 			}
 			if isAPIExhaustion(err) {
@@ -268,7 +317,24 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				}
 				continue
 			}
+			if isSlotWait(err) {
+				// Same re-queue as the agent rounds: the reviewer never
+				// launched, so the focus is retried as-is.
+				logger.Warn("All jailed-agent slots busy; backing off before re-queuing the review",
+					"Focus", focus, "Backoff", slotBackoffInterval)
+				if serr := workflow.Sleep(ctx, slotBackoffInterval); serr != nil {
+					return result, fmt.Errorf("slot backoff sleep (review %q): %w", focus, serr)
+				}
+				continue
+			}
 			if !temporal.IsTimeoutError(err) {
+				if *session != "" && !freshFallback {
+					freshFallback = true
+					logger.Warn("Resumed reviewer round failed; retrying the review with a fresh session",
+						"Focus", focus, "Error", err)
+					*session = ""
+					continue
+				}
 				return result, err
 			}
 			reviewTimeouts++
@@ -293,11 +359,11 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("build implement prompt: %w", err)
 	}
-	if err := runAgent(initialPrompt, "implement"); err != nil {
+	if err := runAgent(initialPrompt, "implement", &devSession); err != nil {
 		return "", fmt.Errorf("initial agent run: %w", err)
 	}
 	for {
-		verdict, err := review("the implementation", "", false)
+		verdict, err := review("the implementation", "", false, &devReviewSession)
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
 		}
@@ -319,7 +385,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			logger.Info("Operator guidance received, folding into fix prompt")
 			fixPrompt = g + "\n\n" + fixPrompt
 		}
-		if err := runAgent(fixPrompt, "implement-fix"); err != nil {
+		if err := runAgent(fixPrompt, "implement-fix", &devSession); err != nil {
 			return "", fmt.Errorf("agent run after code review: %w", err)
 		}
 	}
@@ -330,7 +396,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)
 	}
-	if err := runAgent(testsPrompt, "tests"); err != nil {
+	if err := runAgent(testsPrompt, "tests", &testSession); err != nil {
 		return "", fmt.Errorf("test-phase agent run: %w", err)
 	}
 	// The native suite gets a wider ceiling than the shared 15 minutes:
@@ -349,6 +415,16 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		var result activities.TestResult
 		if err := workflow.ExecuteActivity(testsCtx, activities.RunNativeTestsActivity,
 			worktree.WorktreePath, input.Agent).Get(ctx, &result); err != nil {
+			if isSlotWait(err) {
+				// Test-command discovery queues on the same semaphore as
+				// every other jailed round and can give up on it too.
+				logger.Warn("All jailed-agent slots busy; backing off before re-queuing the suite",
+					"Backoff", slotBackoffInterval)
+				if serr := workflow.Sleep(ctx, slotBackoffInterval); serr != nil {
+					return "", fmt.Errorf("run tests: %w", serr)
+				}
+				continue
+			}
 			if isAPIExhaustion(err) {
 				// Test-command discovery runs a jailed agent round, so the
 				// suite activity can hit the provider cap too.
@@ -375,7 +451,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			// provider was reachable for it.
 			quotaHeartbeats = 0
 		}
-		verdict, err := review("the test suite", result.Logs, true)
+		verdict, err := review("the test suite", result.Logs, true, &testReviewSession)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
@@ -398,7 +474,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			logger.Info("Operator guidance received, folding into fix prompt")
 			testFix = g + "\n\n" + testFix
 		}
-		if err := runAgent(testFix, "tests-fix"); err != nil {
+		if err := runAgent(testFix, "tests-fix", &testSession); err != nil {
 			return "", fmt.Errorf("test-fix agent run: %w", err)
 		}
 	}
@@ -453,4 +529,14 @@ func testFixPrompt(result activities.TestResult, verdict activities.ReviewResult
 // discovery), so a plain substring match covers every case.
 func isAPIExhaustion(err error) bool {
 	return err != nil && strings.Contains(err.Error(), activities.ErrAPIExhausted.Error())
+}
+
+// isSlotWait reports whether err is the activities' ErrAgentSlotsBusy — a
+// round that queued past the bounded slot wait and gave up without
+// launching the agent. Same boundary note as isAPIExhaustion: the
+// activities wrap the sentinel with %w (runJailed directly, the reviewer
+// and test-command-discovery paths nested), so a substring match covers
+// every case.
+func isSlotWait(err error) bool {
+	return err != nil && strings.Contains(err.Error(), activities.ErrAgentSlotsBusy.Error())
 }

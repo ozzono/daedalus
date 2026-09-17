@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/ozzono/daedalus/internal/config"
 )
 
 // stubCall records one invocation of a stubbed binary: its working directory,
@@ -91,6 +96,89 @@ func readCalls(t *testing.T, log string) []stubCall {
 		}
 	}
 	return calls
+}
+
+// TestSetProcessGroup pins the child-process containment: own process group
+// (so a cancel kills the whole tree, not just the direct child), a Cancel
+// hook, and a WaitDelay bound (so a descendant that escaped the group with
+// the output pipes cannot hang Wait forever).
+func TestSetProcessGroup(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "true")
+	setProcessGroup(cmd)
+	if !cmd.SysProcAttr.Setpgid {
+		t.Error("Setpgid = false, want the child in its own process group")
+	}
+	if cmd.Cancel == nil {
+		t.Error("Cancel = nil, want a group-kill cancel hook")
+	}
+	if cmd.WaitDelay != pipeDrainDelay {
+		t.Errorf("WaitDelay = %v, want %v", cmd.WaitDelay, pipeDrainDelay)
+	}
+}
+
+// TestRunJailedSweepsDescendantsAfterCleanExit pins the post-round sweep: a
+// signalsPermitted reports whether this process may signal its own children.
+// Sandboxed environments may forbid kill(2) outright (EPERM on signal-0
+// probes of fresh children), which makes any group-sweep verification
+// impossible — the sweep's own SIGKILL bounces off the same restriction.
+func signalsPermitted() bool {
+	// Short-lived even when the cleanup kill bounces (signal-forbidding
+	// sandboxes deny it too), so a skip costs a second, not the child's
+	// full lifetime.
+	cmd := exec.Command("sleep", "1")
+	if err := cmd.Start(); err != nil {
+		return false
+	}
+	defer func() {
+		_ = syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
+		_, _ = cmd.Process.Wait()
+	}()
+	return syscall.Kill(cmd.Process.Pid, 0) == nil
+}
+
+// TestRunJailedSweepsDescendantsAfterCleanExit pins the post-round sweep: a
+// child that exits cleanly while leaving a same-group descendant running
+// (a crashed jail, a test runner that backgrounded workers) must not orphan
+// it — the round kills the whole group once the child is gone. The
+// descendant inherits and holds the output pipes, so this also pins that
+// the round still succeeds (ErrWaitDelay is a success) with the output
+// printed before the child exited. Liveness is probed via a heartbeat file
+// the descendant appends to, not kill(pid, 0) — signal permissions vary
+// between environments, file growth does not.
+func TestRunJailedSweepsDescendantsAfterCleanExit(t *testing.T) {
+	if !signalsPermitted() {
+		t.Skip("environment forbids signals; the group sweep cannot be verified here")
+	}
+	newStubLog(t)
+	beat := os.Getenv("STUB_LOG") + ".beat"
+	// The stub backgrounds a heartbeat loop (same process group, outlives
+	// the stub's clean exit, holds the pipes open) and exits 0.
+	stubBin(t, "ai-jail", `while true; do echo x >> "`+beat+`"; sleep 0.1; done &
+echo done; exit 0`)
+
+	res, err := runJailed(context.Background(), "", t.TempDir(), "do things")
+	if err != nil {
+		t.Fatalf("runJailed: %v", err)
+	}
+	if res.Stdout != "done\n" {
+		t.Errorf("Stdout = %q, want the child's pre-exit output despite the pipe-holding descendant", res.Stdout)
+	}
+
+	size := func() int64 {
+		info, err := os.Stat(beat)
+		if err != nil {
+			t.Fatalf("stat heartbeat file: %v", err)
+		}
+		return info.Size()
+	}
+	// killGroup runs before runJailed returns; give the dead loop a moment
+	// to prove it stays dead, then require the heartbeat to have stopped.
+	before := size()
+	time.Sleep(1 * time.Second)
+	if after := size(); after != before {
+		t.Errorf("descendant heartbeat still growing after the round ended (%d -> %d bytes): the group sweep missed it",
+			before, after)
+	}
 }
 
 func fakeHome(t *testing.T) string {
@@ -459,6 +547,154 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 	}
 }
 
+// TestRunJailedClaudeActivityResume pins the session-continuity path: a set
+// SessionID makes the claude round resume that conversation (--resume before
+// the headless flags, after the agent's own flags), and the reported
+// session_id flows back through AgentRunResult for the next round.
+func TestRunJailedClaudeActivityResume(t *testing.T) {
+	log := newStubLog(t)
+	script := `printf '%s\n' '{"type":"result","subtype":"success","result":"resumed work","session_id":"sess-7"}'; exit 0`
+	stubBin(t, "ai-jail", script)
+
+	result, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "address the review comments",
+		SessionID:    "sess-7",
+	})
+	if err != nil {
+		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+	if result.Text != "resumed work" {
+		t.Errorf("result.Text = %q, want %q", result.Text, "resumed work")
+	}
+	if result.SessionID != "sess-7" {
+		t.Errorf("result.SessionID = %q, want %q", result.SessionID, "sess-7")
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("ai-jail called %d times, want 1", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{
+		"--worktree",
+		"--network",
+		"--",
+		"claude",
+		"--resume",
+		"sess-7",
+		"--output-format",
+		"json",
+		"-p",
+		"--dangerously-skip-permissions",
+	}, "ai-jail")
+}
+
+// TestRunJailedClaudeActivityResumeOtherAgents pins that opencode and amp
+// rounds ignore a set SessionID: neither CLI takes --resume here, so the
+// round must start fresh rather than pass an unknown flag.
+func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
+	for _, agent := range []string{"opencode", "amp"} {
+		t.Run(agent, func(t *testing.T) {
+			log := newStubLog(t)
+			stubBin(t, "ai-jail", "echo OUTPUT; exit 0")
+			t.Setenv("DAEDALUS_AGENT", agent)
+
+			_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+				WorktreePath: t.TempDir(),
+				Prompt:       "fix the bug",
+				SessionID:    "sess-7",
+			})
+			if err != nil {
+				t.Fatalf("RunJailedClaudeActivity: %v", err)
+			}
+			calls := readCalls(t, log)
+			if len(calls) != 1 {
+				t.Fatalf("ai-jail called %d times, want 1", len(calls))
+			}
+			if contains(calls[0].Args, "--resume") || contains(calls[0].Args, "sess-7") {
+				t.Errorf("%s round passed resume state: %v", agent, calls[0].Args)
+			}
+		})
+	}
+}
+
+// TestAgentConcurrency pins the env parsing behind the concurrency cap:
+// positive values pass through; unset, malformed, and non-positive values
+// fall back to the config default.
+func TestAgentConcurrency(t *testing.T) {
+	cases := []struct {
+		env  string
+		set  bool
+		want int
+	}{
+		{"", false, config.DefaultMaxConcurrentAgentRuns},
+		{"1", true, 1},
+		{"4", true, 4},
+		{"not-a-number", true, config.DefaultMaxConcurrentAgentRuns},
+		{"0", true, config.DefaultMaxConcurrentAgentRuns},
+		{"-3", true, config.DefaultMaxConcurrentAgentRuns},
+	}
+	for _, tc := range cases {
+		if tc.set {
+			t.Setenv("DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", tc.env)
+		} else {
+			t.Setenv("DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", "")
+		}
+		if got := agentConcurrency(); got != tc.want {
+			t.Errorf("agentConcurrency() with env %q = %d, want %d", tc.env, got, tc.want)
+		}
+	}
+}
+
+// TestRunJailedSlotWaitBounded pins the bounded slot wait: a round queued
+// behind a full limiter gives up after slotWaitTimeout with
+// ErrAgentSlotsBusy — never by burning its StartToClose budget — and the
+// agent is not launched at all.
+func TestRunJailedSlotWaitBounded(t *testing.T) {
+	old := slotWaitTimeout
+	slotWaitTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { slotWaitTimeout = old })
+
+	// Occupy every slot the process-wide limiter has. agentLimiter is a
+	// sync.Once, so the cap is whatever the first caller in this test
+	// binary initialized; cap(lim) is the truth either way.
+	lim := agentLimiter()
+	for i := 0; i < cap(lim); i++ {
+		lim <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < cap(lim); i++ {
+			<-lim
+		}
+	})
+
+	// The stub would record a call if the bound failed and the round
+	// launched; the assertions below catch that via the error text.
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", "echo SHOULD-NOT-RUN; exit 0")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := runJailed(context.Background(), "", t.TempDir(), "do things")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrAgentSlotsBusy) {
+			t.Fatalf("runJailed error = %v, want ErrAgentSlotsBusy", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runJailed did not give up within the bounded slot wait")
+	}
+	// The stub log only exists once ai-jail has run at all; absent is the
+	// expected zero-call outcome.
+	if _, err := os.Stat(log); err == nil {
+		if calls := readCalls(t, log); len(calls) != 0 {
+			t.Fatalf("ai-jail ran while no slot was free: %d call(s)", len(calls))
+		}
+	}
+}
+
 // TestRunJailedClaudeActivityOpenCode pins the opencode path: DAEDALUS_AGENT
 // switches the jailed CLI, the headless flags replace claude's, no
 // stream-json is requested, and the plain output is taken as-is.
@@ -664,14 +900,19 @@ func TestRunJailedClaudeActivityStreamJSON(t *testing.T) {
 }
 
 // TestParseAgentStreamJSONFormat pins the --output-format json path: the
-// single result object's Result field becomes the text.
+// single result object's Result field becomes the text and its session_id
+// is reported for later rounds to resume.
 func TestParseAgentStreamJSONFormat(t *testing.T) {
-	thinking, text := parseAgentStream(`{"type":"result","subtype":"success","result":"did the change"}`)
+	thinking, text, session := parseAgentStream(
+		`{"type":"result","subtype":"success","result":"did the change","session_id":"abc123"}`)
 	if thinking != "" {
 		t.Errorf("thinking = %q, want empty", thinking)
 	}
 	if text != "did the change" {
 		t.Errorf("text = %q, want %q", text, "did the change")
+	}
+	if session != "abc123" {
+		t.Errorf("session = %q, want %q", session, "abc123")
 	}
 }
 
@@ -681,12 +922,15 @@ func TestParseAgentStreamNoise(t *testing.T) {
 	stdout := "not json at all\n" +
 		`{"type":"stream_event","event":{"type":"content_block_delta"}}` + "\n" +
 		`{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}` + "\n"
-	thinking, text := parseAgentStream(stdout)
+	thinking, text, session := parseAgentStream(stdout)
 	if thinking != "" {
 		t.Errorf("thinking = %q, want empty", thinking)
 	}
 	if text != "ok" {
 		t.Errorf("text = %q, want %q", text, "ok")
+	}
+	if session != "" {
+		t.Errorf("session = %q, want empty (no event carried one)", session)
 	}
 }
 
@@ -853,6 +1097,54 @@ func TestRunJailedReviewerActivityStderrNoise(t *testing.T) {
 	if res.Comments != "Fine." {
 		t.Errorf("Comments = %q, want %q", res.Comments, "Fine.")
 	}
+}
+
+// TestRunJailedReviewerActivityResume pins the reviewer's session continuity:
+// a set SessionID resumes the prior review conversation (--resume before the
+// headless flags), the reviewer runs with the structured output mode (so the
+// verdict is parsed from the json result's text), and the session_id comes
+// back on the verdict for the next round of the same role.
+func TestRunJailedReviewerActivityResume(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+	script := `printf '%s\n' '{"type":"result","subtype":"success","result":"Addressed.\nAPPROVED","session_id":"rev-9"}'; exit 0`
+	stubBin(t, "ai-jail", script)
+
+	res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+		WorktreePath: t.TempDir(),
+		Focus:        "the implementation",
+		SessionID:    "rev-9",
+	})
+	if err != nil {
+		t.Fatalf("RunJailedReviewerActivity: %v", err)
+	}
+	if !res.Approved {
+		t.Error("Approved = false, want true (verdict parsed from the json result text)")
+	}
+	if res.Comments != "Addressed." {
+		t.Errorf("Comments = %q, want %q", res.Comments, "Addressed.")
+	}
+	if res.SessionID != "rev-9" {
+		t.Errorf("SessionID = %q, want %q", res.SessionID, "rev-9")
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 3 {
+		t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+	}
+	assertArgs(t, calls[2].Args, []string{
+		"--worktree",
+		"--network",
+		"--",
+		"claude",
+		"--resume",
+		"rev-9",
+		"--output-format",
+		"json",
+		"-p",
+		"--dangerously-skip-permissions",
+	}, "ai-jail")
 }
 
 func TestFinalizeWorktreeActivity(t *testing.T) {
