@@ -43,6 +43,14 @@ const (
 	// Wider than the shared activity ceiling because agent rounds
 	// legitimately run long (whole-repo analyses, slow builds).
 	DefaultAgentRunTimeout = 45 * time.Minute
+	// DefaultCleanupTimeout bounds one CleanupWorktreeActivity — committing
+	// the aborted snapshot, unregistering the worktree, and removing its
+	// directory — when config cleanup_timeout is unset. Wider than the
+	// shared 15-minute activity ceiling: removing a large worktree (a
+	// build tree can hold hundreds of thousands of files) is filesystem-
+	// bound work that has burned the full 15 minutes in practice, and a
+	// timed-out cleanup risks losing the aborted-work snapshot.
+	DefaultCleanupTimeout = 30 * time.Minute
 	// DefaultMaxConcurrentAgentRuns caps how many jailed-agent rounds run at
 	// once on this worker when config max_concurrent_agent_runs is unset.
 	// Concurrent cold sessions share one provider account's throughput, so
@@ -117,6 +125,11 @@ type Config struct {
 	// or review (RunJailedClaudeActivity). A time.ParseDuration string
 	// in YAML ("45m"); DefaultAgentRunTimeout when unset.
 	AgentRunTimeout time.Duration `yaml:"agent_run_timeout"`
+	// CleanupTimeout bounds one CleanupWorktreeActivity: committing the
+	// aborted-work snapshot, unregistering the worktree, and removing its
+	// directory. A time.ParseDuration string in YAML ("15m");
+	// DefaultCleanupTimeout when unset.
+	CleanupTimeout time.Duration `yaml:"cleanup_timeout"`
 	// MaxConcurrentAgentRuns caps how many jailed-agent rounds run at once
 	// on this worker; further rounds queue until a slot frees. Concurrent
 	// cold agent sessions share one provider account, so unbounded
@@ -233,6 +246,9 @@ func Load(path string) (Config, error) {
 	if c.AgentRunTimeout < 0 {
 		return c, fmt.Errorf("config %s: agent_run_timeout: must not be negative", path)
 	}
+	if c.CleanupTimeout < 0 {
+		return c, fmt.Errorf("config %s: cleanup_timeout: must not be negative", path)
+	}
 	if c.MaxConcurrentAgentRuns < 0 {
 		return c, fmt.Errorf("config %s: max_concurrent_agent_runs: must not be negative", path)
 	}
@@ -300,6 +316,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.AgentRunTimeout == 0 {
 		c.AgentRunTimeout = DefaultAgentRunTimeout
+	}
+	if c.CleanupTimeout == 0 {
+		c.CleanupTimeout = DefaultCleanupTimeout
 	}
 	if c.MaxConcurrentAgentRuns == 0 {
 		c.MaxConcurrentAgentRuns = DefaultMaxConcurrentAgentRuns

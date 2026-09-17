@@ -117,6 +117,26 @@ func TestLoadAgentRunTimeout(t *testing.T) {
 	}
 }
 
+// TestLoadCleanupTimeout pins the cleanup_timeout parsing: duration strings
+// load, unset falls back to the default, and a negative value is rejected
+// up front rather than silently widening the ceiling downstream.
+func TestLoadCleanupTimeout(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "cleanup_timeout: 30m\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.CleanupTimeout != 30*time.Minute {
+		t.Errorf("CleanupTimeout = %v, want 30m", cfg.CleanupTimeout)
+	}
+	if cfg, err := Load(writeConfig(t, "")); err != nil || cfg.CleanupTimeout != DefaultCleanupTimeout {
+		t.Errorf("unset CleanupTimeout = %v (err %v), want %v", cfg.CleanupTimeout, err, DefaultCleanupTimeout)
+	}
+	_, err = Load(writeConfig(t, "cleanup_timeout: -1m\n"))
+	if err == nil || !strings.Contains(err.Error(), "cleanup_timeout") {
+		t.Fatalf("want cleanup_timeout error, got %v", err)
+	}
+}
+
 // TestLoadMaxConcurrentAgentRuns pins the max_concurrent_agent_runs parsing:
 // an explicit value loads, and a negative value is rejected up front rather
 // than becoming a zero-capacity (permanently stuck) semaphore downstream.

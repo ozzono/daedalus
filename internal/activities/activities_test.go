@@ -496,6 +496,165 @@ func TestRunJailedAPIExhaustion(t *testing.T) {
 	}
 }
 
+// TestRunJailedKilledClassifiedByWaitStatus pins that a process death by
+// signal is classified from the wait status, ahead of any output-text
+// marker: a killed round that printed exhaustion phrases mid-run must not
+// park the run in the quota heartbeat, and the classified error must carry
+// no output — agent text must not be able to forge or bury the verdict.
+func TestRunJailedKilledClassifiedByWaitStatus(t *testing.T) {
+	newStubLog(t)
+	stubBin(t, "ai-jail", `echo 'usage limit reached, 429'; kill -9 $$`)
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if err == nil {
+		t.Fatal("want error when the agent is killed")
+	}
+	if !errors.Is(err, ErrAgentKilled) {
+		t.Errorf("error %v should wrap ErrAgentKilled", err)
+	}
+	if errors.Is(err, ErrAPIExhausted) {
+		t.Errorf("signal death must outrank output-text exhaustion markers: %v", err)
+	}
+	if strings.Contains(err.Error(), "usage limit reached") {
+		t.Errorf("classified kill error must not embed agent output: %q", err)
+	}
+}
+
+// TestRunJailedKillMarkerInOutputNotForged is the flip side: a round that
+// merely *prints* the kill sentinel's text and fails normally must not be
+// classified as killed — the classification comes from the wait status,
+// never from output.
+func TestRunJailedKillMarkerInOutputNotForged(t *testing.T) {
+	newStubLog(t)
+	stubBin(t, "ai-jail", "echo '"+ErrAgentKilled.Error()+" (quoted in a log)'; exit 1")
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if err == nil {
+		t.Fatal("want error from the failing agent")
+	}
+	if errors.Is(err, ErrAgentKilled) {
+		t.Errorf("output text must not forge a kill classification: %v", err)
+	}
+	if !strings.Contains(err.Error(), ErrAgentKilled.Error()+" (quoted in a log)") {
+		t.Errorf("generic failure should still carry the output: %q", err)
+	}
+}
+
+// TestReferencesPath pins the straggler matcher's boundary rule: the
+// per-issue worktree path matches itself, its files, and argument
+// boundaries — never a longer sibling (issue-4 vs issue-42) or a word that
+// merely contains the path as a substring.
+func TestReferencesPath(t *testing.T) {
+	const wt = "/wt/arete/issue-4"
+	cases := []struct {
+		argv string
+		want bool
+	}{
+		{wt, true},
+		{"vim " + wt, true},
+		{"vim " + wt + "/sub/dir/file.go", true},
+		{"tail -f " + wt + "/log", true},
+		{`grep "` + wt + `" -r .`, true},
+		{"/wt/arete/issue-42", false},                       // sibling: longer id
+		{"/wt/arete/issue-42/sub", false},                   // sibling's file
+		{"vim /wt/arete/issue-4xyz", false},                 // path inside a longer word
+		{"echo /wt/arete/issue-4-and-more", false},          // path prefix of a longer token
+		{"flutter test", false},                             // no reference at all
+		{"/backup/copy-of" + wt, true}, // pinned as-is: the matcher has an end boundary but
+		// no start boundary, so a path merely *ending* with the worktree
+		// string (a copy filed under another root) still matches —
+		// contrived given home-anchored worktree paths, but that is the
+		// current semantics, not an accident of this table.
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := referencesPath(c.argv, wt); got != c.want {
+			t.Errorf("referencesPath(%q, %q) = %v, want %v", c.argv, wt, got, c.want)
+		}
+	}
+}
+
+// TestCleanupPreserveRecoversFromStaleIndexLock pins that a stale
+// index.lock — the state a killed round's git leaves behind — is swept and
+// staging retried, instead of wedging every later cleanup of the issue.
+func TestCleanupPreserveRecoversFromStaleIndexLock(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(t.TempDir(), "index.lock")
+	if err := os.WriteFile(lock, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	counter := filepath.Join(t.TempDir(), "adds")
+	// argv: -C <wt> <sub> …; add fails exactly once (the lock), then the
+	// retry after the sweep succeeds. rev-parse hands back the lock's
+	// path so the sweep can remove it.
+	stubBin(t, "git", `case "$3" in
+  rev-parse) printf '%s\n' "`+lock+`"; exit 0 ;;
+  add) n=$(cat "`+counter+`" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "`+counter+`"; [ "$n" -gt 1 ] && exit 0; exit 1 ;;
+esac
+exit 0`)
+
+	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:   "/repo",
+		TaskQueue:  "daedalus",
+		IssueID:    "42",
+		BranchName: "feat/issue-42-7",
+	}); err != nil {
+		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+
+	var adds int
+	for _, c := range readCalls(t, log) {
+		if len(c.Args) >= 4 && c.Args[2] == "add" {
+			adds++
+		}
+	}
+	if adds != 2 {
+		t.Fatalf("git add called %d times, want 2 (locked, then retried after sweep)", adds)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Errorf("stale index.lock should be removed (stat err = %v)", err)
+	}
+}
+
+// TestCleanupPreserveRenameFallback pins that a rename failure with
+// nothing at stake (detached HEAD, or the old aborted ref survived its
+// best-effort delete) falls back to pointing the aborted ref at HEAD — the
+// commit holds the work — instead of wedging the issue's cleanup.
+func TestCleanupPreserveRenameFallback(t *testing.T) {
+	home := fakeHome(t)
+	newStubLog(t)
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// argv: -C <path> branch <flag> …; every rename (-m) fails, forcing
+	// the -f fallback.
+	stubBin(t, "git", `case "$3" in
+  branch) [ "$4" = "-m" ] && exit 1 ;;
+esac
+exit 0`)
+
+	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:   "/repo",
+		TaskQueue:  "daedalus",
+		IssueID:    "42",
+		BranchName: "feat/issue-42-7",
+	}); err != nil {
+		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+}
+
 func TestRunJailedClaudeActivity(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "echo AGENT-OUTPUT; exit 0")
