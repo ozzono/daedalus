@@ -499,6 +499,37 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 	}
 }
 
+// TestRunJailedClaudeActivityAgentOverride pins the -cli precedence: a run
+// whose Agent is set (run -cli/--cli) picks the jailed CLI over the worker's
+// DAEDALUS_AGENT — here the worker runs claude while the run asks for
+// opencode, and opencode's headless flag set is what reaches ai-jail.
+func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", "echo OPENCODE-OUTPUT; exit 0")
+	t.Setenv("DAEDALUS_AGENT", "claude")
+
+	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "fix the bug",
+		Agent:        "opencode",
+	}); err != nil {
+		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("ai-jail called %d times, want 1", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{
+		"--worktree",
+		"--network",
+		"--",
+		"opencode",
+		"run",
+		"--auto",
+	}, "ai-jail")
+}
+
 // TestRunJailedClaudeActivityAmp pins the amp path: DAEDALUS_AGENT switches
 // to amp's headless flags and --stream-json-thinking output mode (whose
 // events parse like claude's), and a set AMP_API_KEY reaches the jail via
@@ -770,6 +801,38 @@ exit 0`)
 	}
 }
 
+// TestRunJailedReviewerActivityAgentOverride pins the reviewer-side -cli
+// plumbing: ReviewInput.Agent picks the jailed CLI for the review round too,
+// over the worker's DAEDALUS_AGENT.
+func TestRunJailedReviewerActivityAgentOverride(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+	stubBin(t, "ai-jail", `printf 'Looks good.\nAPPROVED\n'; exit 0`)
+	t.Setenv("DAEDALUS_AGENT", "claude")
+
+	if _, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+		WorktreePath: t.TempDir(),
+		Focus:        "the implementation",
+		Agent:        "opencode",
+	}); err != nil {
+		t.Fatalf("RunJailedReviewerActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 3 {
+		t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+	}
+	assertArgs(t, calls[2].Args, []string{
+		"--worktree",
+		"--network",
+		"--",
+		"opencode",
+		"run",
+		"--auto",
+	}, "review jail")
+}
+
 // TestRunJailedReviewerActivityStderrNoise pins the stdout-only verdict rule:
 // stderr written after a genuine APPROVED must not flip the verdict.
 func TestRunJailedReviewerActivityStderrNoise(t *testing.T) {
@@ -999,7 +1062,7 @@ func TestNativeTestsDeclaredCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := RunNativeTestsActivity(context.Background(), wt)
+	result, err := RunNativeTestsActivity(context.Background(), wt, "")
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
@@ -1027,7 +1090,7 @@ func TestNativeTestsMakefileTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := RunNativeTestsActivity(context.Background(), wt)
+	result, err := RunNativeTestsActivity(context.Background(), wt, "")
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
@@ -1062,7 +1125,7 @@ func TestNativeTestsAIDiscovery(t *testing.T) {
 		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test-ui test-api"}'; exit 0`)
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 
-	result, err := RunNativeTestsActivity(context.Background(), t.TempDir())
+	result, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
@@ -1076,6 +1139,34 @@ func TestNativeTestsAIDiscovery(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("called %d times, want 2 (discovery + test run)", len(calls))
 	}
+}
+
+// TestNativeTestsAIDiscoveryAgentOverride pins that the run's -cli selection
+// reaches the discovery round too: with no static markers, the discovery jail
+// runs the overridden agent — not the worker's DAEDALUS_AGENT claude.
+func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "ai-jail",
+		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test"}'; exit 0`)
+	stubBin(t, "sh", "echo 'suite green'; exit 0")
+	t.Setenv("DAEDALUS_AGENT", "claude")
+
+	if _, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "opencode"); err != nil {
+		t.Fatalf("RunNativeTestsActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 2 {
+		t.Fatalf("called %d times, want 2 (discovery + test run)", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{
+		"--worktree",
+		"--network",
+		"--",
+		"opencode",
+		"run",
+		"--auto",
+	}, "discovery jail")
 }
 
 // TestFirstCommandLine pins the reply hygiene: fences and backticks are
@@ -1104,7 +1195,7 @@ func TestRunNativeTestsActivityPass(t *testing.T) {
 	stubBin(t, "go", "echo 'ok all packages'; exit 0")
 
 	worktree := goWorktree(t)
-	result, err := RunNativeTestsActivity(context.Background(), worktree)
+	result, err := RunNativeTestsActivity(context.Background(), worktree, "")
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
@@ -1129,7 +1220,7 @@ func TestRunNativeTestsActivityFail(t *testing.T) {
 	newStubLog(t)
 	stubBin(t, "go", "echo 'FAIL: TestBoom'; exit 1")
 
-	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t))
+	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t), "")
 	if err != nil {
 		t.Fatalf("test failure must not be a system error, got %v", err)
 	}
@@ -1147,7 +1238,7 @@ func TestRunNativeTestsActivityTruncates(t *testing.T) {
 	newStubLog(t)
 	stubBin(t, "go", `head -c 100000 /dev/zero | tr '\0' 'x'; echo 'FAIL: at the end'; exit 1`)
 
-	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t))
+	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t), "")
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
@@ -1176,7 +1267,7 @@ func TestRunNativeTestsActivitySystemError(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t))
+	result, err := RunNativeTestsActivity(context.Background(), goWorktree(t), "")
 	if err == nil {
 		t.Fatal("want system error when go cannot be executed")
 	}

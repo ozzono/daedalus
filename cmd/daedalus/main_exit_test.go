@@ -26,9 +26,10 @@ func TestMain(m *testing.M) {
 	if args := os.Getenv(reexecEnv); args != "" {
 		os.Args = append([]string{"daedalus"}, strings.Split(args, "\x1f")...)
 		main()
-		// main() exits nonzero on every failure path; a return means exit 0,
-		// which is itself the asserted contract for the success-path test
-		// (TestMainWorkerStatus).
+		// Every runMainIn path routed here asserts exit 1: main() exits
+		// nonzero on each of them, so this os.Exit(0) line is never reached
+		// by a test's child. A child returning from main() would surface as
+		// an exit-0 mismatch in that test, not a silently passing one.
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
@@ -203,17 +204,28 @@ func TestMainRunAppendReadTaskFileError(t *testing.T) {
 	}
 }
 
-// TestMainWorkerStatus covers loadConfig's success path end to end: with a
-// valid config the subcommand loads it and prints the worker's status and log
-// path, exiting 0 — offline, since workerStatus only reads the pid file.
-func TestMainWorkerStatus(t *testing.T) {
+// TestMainWorkerStatusRejectsConfig pins the -c rejection's exit contract in
+// a subprocess for `worker status`, the other record-driven worker command:
+// usageFail's shape (diagnostic, blank line, usage text) and exit 1 —
+// asserted on a path that fails in parseFlags, before the real daemon dir is
+// ever read, so the live workers in /tmp/daedalus are never touched. The
+// command's success path (record-driven, no config) is covered in-process by
+// TestMainWorkerStatusNeedsNoConfig.
+func TestMainWorkerStatusRejectsConfig(t *testing.T) {
 	cfg := validConfig(t)
+
 	stdout, stderr, code := runMainIn(t, "", "-c", cfg, "worker", "status")
-	if code != 0 {
-		t.Errorf("daedalus worker status exit code = %d, want 0 (stderr %q)", code, stderr)
+	if code != 1 {
+		t.Errorf("daedalus -c <config> worker status exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stdout, "worker") || !strings.Contains(stdout, "log:") {
-		t.Errorf("worker status output = %q, want the status line and log path", stdout)
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty", stdout)
+	}
+	if !strings.HasPrefix(stderr, "-c/--config does not apply to worker restart all, restart <worker>, or worker status\n\n") {
+		t.Errorf("stderr should start with the rejection and a blank line, got %q", stderr)
+	}
+	if !strings.HasSuffix(stderr, usage) {
+		t.Errorf("stderr should end with the usage text, got %q", stderr)
 	}
 }
 

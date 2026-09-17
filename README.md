@@ -117,6 +117,9 @@ up.
    `daedalus worker restart all` restarts every worker on record, each
    with its own config, in one call — records alone, no config needed
    (an explicit `-c` is rejected there; it would have no effect).
+   `daedalus worker status` lists every worker on record — plus any live
+   stray running without one, shown as "(no config record)" — queue,
+   running pid, config record, and log path.
 
 4. **Trigger a pipeline** (third terminal):
 
@@ -139,6 +142,14 @@ up.
 
    ```sh
    daedalus run -f issue-42.md /path/to/repo 42
+   ```
+
+   `-cli/--cli <agent>` overrides the config's jailed agent (`claude`,
+   `opencode`, `amp`) for this run — the selection travels with the run, so
+   it applies on whichever worker serves the task queue:
+
+   ```sh
+   daedalus run -cli amp /path/to/repo 42 "Add a /health endpoint."
    ```
 
 `run` prints the Workflow ID (`daedalus-issue-42`) and Run ID, then blocks
@@ -187,7 +198,7 @@ work from any directory; `daedalus init` writes a fully commented
 
 | Field                 | Default            | Purpose                              |
 | --------------------- | ------------------ | ------------------------------------ |
-| `agent`               | `claude`           | Jailed agent CLI: `claude`, `opencode`, or `amp` (`worker -cli/--cli` overrides per worker) |
+| `agent`               | `claude`           | Jailed agent CLI: `claude`, `opencode`, or `amp` (`run -cli/--cli` overrides per run) |
 | `branch_prefix`       | `daedalus`         | Prefix for preserved branches (`<prefix>/issue-<id>-<ts>`); `run -p/--prefix` overrides per run |
 | `temporal.host`       | `127.0.0.1:7233`   | Temporal frontend address            |
 | `temporal.ui_port`    | `8233`             | Temporal UI port (shown at startup)  |
@@ -288,6 +299,10 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   run of the same issue.
 
 ## Development
+
+Known open bugs live in `backlog/bugs/`. Notably: from a directory where no
+config resolves, argument errors are masked by `load config: no config
+found` (config resolution runs before per-command argument validation).
 
 Run the test suite:
 

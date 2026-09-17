@@ -36,6 +36,10 @@ type PipelineInput struct {
 	// folded into the opening prompt.
 	BaseBranch    string
 	PriorFeedback string
+	// Agent, set by `run -cli/--cli`, overrides the config's jailed agent
+	// for this run; empty — a run whose input predates the field, replayed
+	// by a newer worker — falls back to the worker's DAEDALUS_AGENT.
+	Agent string
 	// TestTimeout bounds one execution of the native test suite (config
 	// tests_timeout). Zero — a run whose input predates the field, replayed
 	// by a newer worker — falls back to config.DefaultTestsTimeout.
@@ -205,6 +209,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			err := workflow.ExecuteActivity(agentCtx, activities.RunJailedClaudeActivity, activities.AgentRunInput{
 				WorktreePath: worktree.WorktreePath,
 				Prompt:       prompt,
+				Agent:        input.Agent,
 			}).Get(ctx, &result)
 			if err == nil {
 				consecutiveTimeouts = 0
@@ -250,6 +255,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				Focus:        focus,
 				TestLogs:     testLogs,
 				TestsInScope: testsInScope,
+				Agent:        input.Agent,
 			}).Get(ctx, &result)
 			if err == nil {
 				reviewTimeouts = 0
@@ -341,7 +347,8 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	})
 	for {
 		var result activities.TestResult
-		if err := workflow.ExecuteActivity(testsCtx, activities.RunNativeTestsActivity, worktree.WorktreePath).Get(ctx, &result); err != nil {
+		if err := workflow.ExecuteActivity(testsCtx, activities.RunNativeTestsActivity,
+			worktree.WorktreePath, input.Agent).Get(ctx, &result); err != nil {
 			if isAPIExhaustion(err) {
 				// Test-command discovery runs a jailed agent round, so the
 				// suite activity can hit the provider cap too.

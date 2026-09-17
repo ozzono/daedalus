@@ -122,20 +122,20 @@ func TestParseFlagsPrefix(t *testing.T) {
 	}
 }
 
-// TestParseFlagsCLI covers both spellings of the worker agent flag, that an
+// TestParseFlagsCLI covers both spellings of the run agent flag, that an
 // unknown agent is rejected at parse time (with the same error Load would
-// give), and that -cli is refused outside `worker`.
+// give), and that -cli is refused outside a fresh `run`: the worker no longer
+// takes it (the selection travels with the run, not the worker), and append
+// mode targets a pipeline whose agent is already fixed.
 func TestParseFlagsCLI(t *testing.T) {
-	// wantRest is always ["worker", action]: parseFlags strips only
-	// the flags, leaving the subcommand and its action in place.
 	for _, c := range []struct {
 		args     []string
 		want     string
 		wantRest []string
 	}{
-		{[]string{"worker", "start", "-cli", "amp"}, "amp", []string{"worker", "start"}},
-		{[]string{"worker", "--cli", "opencode", "restart"}, "opencode", []string{"worker", "restart"}},
-		{[]string{"worker", "--cli=amp", "foreground"}, "amp", []string{"worker", "foreground"}},
+		{[]string{"run", "-cli", "amp", "/repo", "42", "do it"}, "amp", []string{"run", "/repo", "42", "do it"}},
+		{[]string{"run", "--cli", "opencode", "/repo", "42", "do it"}, "opencode", []string{"run", "/repo", "42", "do it"}},
+		{[]string{"--cli=amp", "run", "/repo", "42", "do it"}, "amp", []string{"run", "/repo", "42", "do it"}},
 	} {
 		f, rest, err := parseFlags(c.args)
 		if err != nil {
@@ -150,18 +150,23 @@ func TestParseFlagsCLI(t *testing.T) {
 		}
 	}
 
-	if _, _, err := parseFlags([]string{"worker", "-cli"}); err == nil {
+	if _, _, err := parseFlags([]string{"run", "-cli"}); err == nil {
 		t.Error("-cli without a value should error")
 	}
-	// The override must fail here, not at worker startup.
-	if _, _, err := parseFlags([]string{"worker", "-cli", "cursor"}); err == nil ||
+	// The override must fail here, not at pipeline start.
+	if _, _, err := parseFlags([]string{"run", "-cli", "cursor", "/repo", "42", "do it"}); err == nil ||
 		!strings.Contains(err.Error(), "unknown agent") {
 		t.Errorf("parseFlags(-cli cursor) err = %v, want an unknown-agent rejection", err)
 	}
-	// -cli names a worker option; elsewhere it would be silently ignored.
-	if _, _, err := parseFlags([]string{"run", "-cli", "amp", "/repo", "42", "do it"}); err == nil ||
-		!strings.Contains(err.Error(), "only applies to worker") {
-		t.Errorf("parseFlags(run -cli) err = %v, want a -cli-outside-worker rejection", err)
+	// -cli names a run option; the worker would silently ignore it.
+	if _, _, err := parseFlags([]string{"worker", "start", "-cli", "amp"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to run") {
+		t.Errorf("parseFlags(worker -cli) err = %v, want a -cli-outside-run rejection", err)
+	}
+	// Append mode targets a pipeline whose agent is already fixed.
+	if _, _, err := parseFlags([]string{"run", "-a", "wf-1", "-cli", "amp", "steer it"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to run") {
+		t.Errorf("parseFlags(run -a -cli) err = %v, want a -cli-in-append-mode rejection", err)
 	}
 }
 
