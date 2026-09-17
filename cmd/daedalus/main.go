@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,14 +78,11 @@ Usage:
       on every restart. "restart <worker>" restarts that one worker from
       its recorded config — re-read from disk, so edits apply — from any
       directory; "restart all" does every worker on record. Both work from
-      records alone (-c and -cli are rejected there — they would have no
-      effect). status reports pid and log path.
+      records alone (-c is rejected there — it would have no effect).
+      status lists every worker on record — plus any live stray running
+      without one, shown as "(no config record)" — worker name, running
+      pid, config record, and log path (-c rejected there too).
       foreground runs attached to this terminal.
-      -cli/--cli <agent> overrides the config's agent (claude, opencode,
-      amp) for this worker: the jailed agent runs in the worker process,
-      so the selection is a worker-start-time setting, not a per-run one.
-      On a plain restart the override still applies, on top of whatever
-      config the restart resolves to.
       anthropic.key is optional — if unset, the jailed agent authenticates
       through the worker's inherited environment or its own login.
   daedalus [-c config.yaml] list [max]
@@ -92,7 +90,7 @@ Usage:
       newest first: session id, status, last interaction datetime (close
       time once closed, start time while running). Defaults to the 10 most
       recent; pass a larger max to list more.
-  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] <repo-path> <issue-id> "<prompt>"
+  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] <repo-path> <issue-id> "<prompt>"
       Start a pipeline for an issue. -w selects the workflow
       (default: feature-dev; available: ` + workflowNames() + `).
       The "<prompt>" argument is the full task description; pass
@@ -101,6 +99,9 @@ Usage:
       -p/--prefix names the preserved branch <prefix>/issue-<id>-<timestamp>
       for this run, overriding the config's branch_prefix (the issue part of
       the name stays as given).
+      -cli/--cli <agent> overrides the config's agent (claude, opencode,
+      amp) for this run: the selection travels with the run's workflow
+      input, so it applies on whichever worker serves the queue.
       -d/--detach starts the pipeline and returns immediately instead of
       blocking until it finishes; "daedalus attach" reconnects later.
   daedalus [-c config.yaml] run -a <workflow-id> "<prompt>"
@@ -132,7 +133,7 @@ Configuration is read from the first of ./config.yaml and
 latter makes the CLI work from any directory. See config-example.yaml for
 all fields and their defaults:
   agent                Jailed agent CLI: claude, opencode, or amp (default
-                       claude; worker -cli/--cli overrides per worker)
+                       claude; run -cli/--cli overrides per run)
   branch_prefix        Prefix for preserved branches, <prefix>/issue-<id>-<ts>
                        (default daedalus; run -p/--prefix overrides per run)
   worker_id            Name the worker daemon is managed under: keys the
@@ -164,16 +165,16 @@ func main() {
 	}
 
 	// Every subcommand except the no-config ones (help, version, init, and
-	// the record-driven restarts — `worker restart all` and
-	// `worker restart <name>`, which read only the recorded per-worker
-	// configs) loads a configuration; resolve its location once, up front,
-	// so the subcommand — and the daemon `worker start` re-executes — agree
-	// on it wherever the CLI is invoked from.
+	// the record-driven worker commands — `worker restart all`, `worker
+	// restart <name>`, and `worker status`, which read only the recorded
+	// per-worker configs) loads a configuration; resolve its location once,
+	// up front, so the subcommand — and the daemon `worker start`
+	// re-executes — agree on it wherever the CLI is invoked from.
 	_, restartNamed := isRestartNamed(args)
 	switch {
 	case args[0] == "-h", args[0] == "--help", args[0] == "help",
 		args[0] == "-v", args[0] == "--version", args[0] == "init",
-		isRestartAll(args), restartNamed:
+		isRestartAll(args), restartNamed, isWorkerStatus(args):
 	default:
 		path, err := resolveConfigPath(configPath.configPath)
 		if err != nil {
@@ -226,21 +227,17 @@ func main() {
 		} else if len(args) > 2 {
 			usageFail("worker takes at most one action")
 		}
-		// The record-driven restarts (`restart all`, `restart <name>`) work
-		// purely from the recorded per-worker configs and must not depend on
-		// whatever the invoking directory resolves to; every other action
-		// needs the CLI's config.
+		// The record-driven worker commands (`restart all`, `restart
+		// <name>`, `status`) work purely from the recorded per-worker
+		// configs and must not depend on whatever the invoking directory
+		// resolves to; every other action needs the CLI's config.
 		var cfg config.Config
-		if !(action == "restart" && (all || restartName != "")) {
+		if !(action == "restart" && (all || restartName != "")) && action != "status" {
 			cfg = loadConfig(configPath.configPath)
-			// -cli/--cli overrides the config's agent for this worker.
-			if configPath.agentCLI != "" {
-				cfg.Agent = configPath.agentCLI
-			}
 		}
 		switch action {
 		case "start":
-			if err := workerStart(cfg, configPath.configPath, configPath.agentCLI); err != nil {
+			if err := workerStart(cfg, configPath.configPath); err != nil {
 				fail("worker start", err)
 			}
 		case "stop":
@@ -248,7 +245,9 @@ func main() {
 				fail("worker stop", err)
 			}
 		case "status":
-			workerStatus(cfg)
+			if err := workerStatusAll(); err != nil {
+				fail("worker status", err)
+			}
 		case "restart":
 			switch {
 			case all:
@@ -260,7 +259,7 @@ func main() {
 					fail("worker restart", err)
 				}
 			default:
-				if err := workerRestart(cfg, configPath.configPath, configPath.agentCLI); err != nil {
+				if err := workerRestart(cfg, configPath.configPath); err != nil {
 					fail("worker restart", err)
 				}
 			}
@@ -304,7 +303,7 @@ func main() {
 				usageFail("%v", err)
 			}
 			err = startPipeline(cfg, configPath.workflow, args[1], args[2], prompt, configPath.detach,
-				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix))
+				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI)
 			if err != nil {
 				fail("run", err)
 			}
@@ -384,9 +383,9 @@ type flags struct {
 	// appendID, set via -a/--append on `run`, targets an already-running
 	// pipeline instead of starting a new one.
 	appendID string
-	// agentCLI, set via -cli/--cli on `worker`, overrides the config's
-	// agent for that worker: the jailed agent runs in the worker process,
-	// so the selection is a worker-start-time setting, not a per-run one.
+	// agentCLI, set via -cli/--cli on `run`, overrides the config's agent
+	// for that run: the selection travels with the run's workflow input, so
+	// it applies on whichever worker serves the queue.
 	agentCLI string
 }
 
@@ -483,24 +482,20 @@ parse:
 	if f.branchPrefix != "" && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
 		return f, nil, errors.New("-p/--prefix only applies to run")
 	}
-	// Likewise -cli/--cli: the jailed agent selection takes effect in the
-	// worker process, so only `worker` (whose daemon child re-receives the
-	// flag) can honor it.
-	if f.agentCLI != "" && len(rest) > 0 && rest[0] != "worker" {
-		return f, nil, errors.New("-cli/--cli only applies to worker")
+	// Likewise -cli/--cli: the agent selection travels with a run's
+	// workflow input, so only a fresh `run` can honor it — append mode
+	// targets a pipeline whose agent is already fixed.
+	if f.agentCLI != "" && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
+		return f, nil, errors.New("-cli/--cli only applies to run")
 	}
-	// The record-driven restarts (`worker restart all`, `worker restart
-	// <name>`) work from the recorded configs alone; an explicit -c there is
-	// silently ignored by every step — reject it instead of accepting an
-	// option the subcommand never uses. -cli too: every restarted worker
-	// keeps its recorded config's agent.
+	// The record-driven worker commands (`worker restart all`, `worker
+	// restart <name>`, `worker status`) work from the recorded configs
+	// alone; an explicit -c there is silently ignored by every step —
+	// reject it instead of accepting an option the subcommand never uses.
 	_, restartNamed := isRestartNamed(rest)
-	recordDriven := isRestartAll(rest) || restartNamed
+	recordDriven := isRestartAll(rest) || restartNamed || isWorkerStatus(rest)
 	if f.configSet && recordDriven {
-		return f, nil, errors.New("-c/--config does not apply to worker restart all or restart <worker>")
-	}
-	if f.agentCLI != "" && recordDriven {
-		return f, nil, errors.New("-cli/--cli does not apply to worker restart all or restart <worker>")
+		return f, nil, errors.New("-c/--config does not apply to worker restart all, restart <worker>, or worker status")
 	}
 	return f, rest, nil
 }
@@ -637,8 +632,8 @@ func recordedConfigPath(name string) string {
 }
 
 // isRestartAll reports whether args spell out `worker restart all` (or its
-// --all spelling; -a is taken by run's --append) — the one invocation whose
-// behavior is record-driven end to end, needing no config of its own.
+// --all spelling; -a is taken by run's --append) — one of the invocations
+// whose behavior is record-driven end to end, needing no config of its own.
 func isRestartAll(args []string) bool {
 	return len(args) == 3 && args[0] == "worker" && args[1] == "restart" &&
 		(args[2] == "all" || args[2] == "--all")
@@ -654,12 +649,25 @@ func isRestartNamed(args []string) (string, bool) {
 	return "", false
 }
 
+// isWorkerStatus reports whether args spell out `worker status` — the other
+// record-driven invocation: it lists workers from the per-worker records,
+// needing no config of its own.
+func isWorkerStatus(args []string) bool {
+	return len(args) == 2 && args[0] == "worker" && args[1] == "status"
+}
+
 // recordedWorkers lists the worker names with a config record on file,
 // sorted — the roster of workers this deployment has started, running or
-// not. A worker's name is its config worker_id, else its task queue.
+// not. A worker's name is its config worker_id, else its task queue. A
+// missing daemon directory is simply nothing on record, not an error: on a
+// fresh machine the caller's "start one first" diagnostic says more than a
+// ReadDir failure would.
 func recordedWorkers() ([]string, error) {
 	entries, err := os.ReadDir(daemonDir)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("read %s: %w", daemonDir, err)
 	}
 	var names []string
@@ -677,7 +685,7 @@ func recordedWorkers() ([]string, error) {
 // workerStart launches the worker as a detached daemon: it re-executes
 // itself with `worker foreground`, redirected into the per-queue log, in
 // its own session so the terminal is released immediately.
-func workerStart(cfg config.Config, configPath, agentOverride string) error {
+func workerStart(cfg config.Config, configPath string) error {
 	pidFile, logFile, confFile := daemonPaths(cfg.WorkerName())
 	if pid, ok := readLivePid(pidFile); ok {
 		return fmt.Errorf("already running (pid %d) — use 'daedalus worker restart' or 'stop'", pid)
@@ -708,11 +716,6 @@ func workerStart(cfg config.Config, configPath, agentOverride string) error {
 	// daemon the record no longer describes.
 	if err := os.WriteFile(confFile, []byte(configPath), 0o644); err != nil {
 		return fmt.Errorf("write config record %s: %w", confFile, err)
-	}
-	// Forward a -cli override so the daemon runs the agent the operator
-	// selected; without it the child would fall back to the config's.
-	if agentOverride != "" {
-		childArgs = append(childArgs, "-cli", agentOverride)
 	}
 	cmd := exec.Command(self, childArgs...)
 	cmd.Env = append(os.Environ(), daemonEnv+"=1")
@@ -776,11 +779,11 @@ func workerStop(cfg config.Config) error {
 // settings, and its worker name (worker_id, else task queue) picks the
 // worker. To restart a worker with its recorded config instead, from any
 // directory, address it by name: `worker restart <id>`.
-func workerRestart(cfg config.Config, cliConfigPath, agentOverride string) error {
+func workerRestart(cfg config.Config, cliConfigPath string) error {
 	if err := workerStop(cfg); err != nil {
 		return err
 	}
-	return workerStart(cfg, cliConfigPath, agentOverride)
+	return workerStart(cfg, cliConfigPath)
 }
 
 // workerRestartNamed restarts the worker on record under name — the
@@ -805,7 +808,7 @@ func workerRestartNamed(name string) error {
 	if got := cfg.WorkerName(); got != name {
 		return fmt.Errorf("recorded config %s now names worker %q — restart it as %q instead", recorded, got, got)
 	}
-	return workerRestart(cfg, recorded, "")
+	return workerRestart(cfg, recorded)
 }
 
 // workerRestartAll restarts every worker with a config record on file — the
@@ -874,15 +877,41 @@ func runningUnrecordedWorkers(onRecord map[string]bool) []string {
 	return live
 }
 
-// workerStatus reports whether the daemon is running and where it logs.
-func workerStatus(cfg config.Config) {
-	pidFile, logFile, _ := daemonPaths(cfg.WorkerName())
-	if pid, ok := readLivePid(pidFile); ok {
-		fmt.Printf("worker running (pid %d)\n  log: %s\n", pid, logFile)
-		return
+// workerStatusAll lists every worker this deployment has on record — plus
+// any live stray running without one — with its running pid, the config it
+// was started with, and its log path. Record-driven like `restart all`, so
+// it reports the whole roster, not just the worker the invoking directory
+// happens to resolve to.
+func workerStatusAll() error {
+	names, err := recordedWorkers()
+	if err != nil {
+		return err
 	}
-	fmt.Println("worker not running")
-	fmt.Printf("  log: %s\n", logFile)
+	onRecord := make(map[string]bool, len(names))
+	for _, name := range names {
+		onRecord[name] = true
+	}
+	names = append(names, runningUnrecordedWorkers(onRecord)...)
+	if len(names) == 0 {
+		fmt.Printf("no workers on record in %s — start one first\n", daemonDir)
+		return nil
+	}
+	sort.Strings(names)
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "WORKER\tSTATE\tCONFIG\tLOG")
+	for _, name := range names {
+		pidFile, logFile, _ := daemonPaths(name)
+		state := "not running"
+		if pid, ok := readLivePid(pidFile); ok {
+			state = fmt.Sprintf("running (pid %d)", pid)
+		}
+		conf := recordedConfigPath(name)
+		if conf == "" {
+			conf = "(no config record)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", name, state, conf, logFile)
+	}
+	return w.Flush()
 }
 
 // readLivePid returns the pid recorded in the pid file when the file exists
@@ -971,9 +1000,11 @@ func runWorker(cfg config.Config) error {
 }
 
 // startPipeline triggers the named workflow for the given issue on the
-// configured task queue. branchPrefix names the run's preserved branch.
-// Unless detach is set, it then blocks until the pipeline finishes.
-func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix string) error {
+// configured task queue. branchPrefix names the run's preserved branch;
+// agent, when set by -cli/--cli, overrides the config's jailed agent for
+// this run. Unless detach is set, it then blocks until the pipeline
+// finishes.
+func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string) error {
 	workflowFn, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
@@ -1003,6 +1034,7 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		IssueID:         issueID,
 		Prompt:          prompt,
 		BranchPrefix:    branchPrefix,
+		Agent:           agent,
 		TestTimeout:     cfg.TestsTimeout,
 		AgentRunTimeout: cfg.AgentRunTimeout,
 	})
@@ -1112,7 +1144,10 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		Prompt:    prompt,
 		// A pre-branch-prefix run (empty in its recorded history) resolves
 		// like a fresh run: through the operator's current config.
-		BranchPrefix:    resolveBranchPrefix(prev.BranchPrefix, cfg.BranchPrefix),
+		BranchPrefix: resolveBranchPrefix(prev.BranchPrefix, cfg.BranchPrefix),
+		// The continued run keeps the agent the aborted attempt ran with —
+		// a pre-field attempt's empty value falls back to the worker's.
+		Agent:           prev.Agent,
 		TestTimeout:     cfg.TestsTimeout,
 		AgentRunTimeout: cfg.AgentRunTimeout,
 		BaseBranch:      base,

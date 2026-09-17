@@ -124,7 +124,7 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
 	rev.record()
 
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
@@ -182,6 +182,63 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowAgentTravelsToEveryRound pins the -cli plumbing: a
+// run started with Agent set carries it into every jailed round — the agent
+// rounds, both review phases, and the native-suite activity (whose discovery
+// fallback runs a jailed agent too) — so the override applies on whichever
+// worker serves the queue, and the worker's own DAEDALUS_AGENT is never
+// consulted for the run.
+func TestFeatureDevWorkflowAgentTravelsToEveryRound(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	var suiteAgents []string
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			// argv shape: (ctx, worktreePath, agent) — the trailing string.
+			if n := len(args); n > 0 {
+				if agent, ok := args.Get(n - 1).(string); ok {
+					suiteAgents = append(suiteAgents, agent)
+				}
+			}
+		}).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.Agent = "amp"
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	for i, input := range rec.inputs {
+		if input.Agent != "amp" {
+			t.Errorf("agent round %d Agent = %q, want amp", i, input.Agent)
+		}
+	}
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (implement + tests)", len(rec.inputs))
+	}
+	for i, input := range rev.inputs {
+		if input.Agent != "amp" {
+			t.Errorf("review round %d Agent = %q, want amp", i, input.Agent)
+		}
+	}
+	if len(suiteAgents) != 1 || suiteAgents[0] != "amp" {
+		t.Errorf("suite activity agent args = %v, want one amp", suiteAgents)
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowGuidanceSignal pins the guide path: a "guide" signal
 // sent mid-run is folded into the next agent fix prompt, ahead of the review
 // comments.
@@ -218,7 +275,7 @@ func TestFeatureDevWorkflowGuidanceSignal(t *testing.T) {
 			return activities.ReviewResult{Approved: true}, nil
 		})
 
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
 		Return("daedalus/issue-42-2", nil).Once()
@@ -268,7 +325,7 @@ func TestFeatureDevWorkflowContinued(t *testing.T) {
 	rec.record()
 	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
 		Return(activities.ReviewResult{Approved: true}, nil)
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil)
 	var finalized, cleanedUp activities.WorktreeInput
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
@@ -341,7 +398,7 @@ func TestFeatureDevWorkflowCodeReviewLoop(t *testing.T) {
 	}}
 	rev.record()
 
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
@@ -383,9 +440,9 @@ func TestFeatureDevWorkflowTestLoopFeedback(t *testing.T) {
 	}}
 	rev.record()
 
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: false, Logs: "--- FAIL: TestBoom\nboom"}, nil).Once()
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
@@ -503,7 +560,7 @@ func TestFeatureDevWorkflowTestActivityError(t *testing.T) {
 	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
 	rev.record()
 
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{}, errTestsStub).Once()
 
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
@@ -592,7 +649,7 @@ func TestFeatureDevWorkflowAgentTimeoutRecovers(t *testing.T) {
 		})
 	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
 	rev.record()
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
 		Return("daedalus/issue-42-1", nil).Once()
@@ -658,8 +715,8 @@ func TestFeatureDevWorkflowTestsTimeoutRecovers(t *testing.T) {
 	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
 	rev.record()
 	var suiteCalls int
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
-		Return(func(ctx context.Context, path string) (activities.TestResult, error) {
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, path, agent string) (activities.TestResult, error) {
 			suiteCalls++
 			if suiteCalls == 1 {
 				return activities.TestResult{}, errTimeoutStub
@@ -702,7 +759,7 @@ func TestFeatureDevWorkflowReviewerTimeoutRetries(t *testing.T) {
 			}
 			return activities.ReviewResult{Approved: true}, nil
 		})
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
 		Return("daedalus/issue-42-1", nil).Once()
@@ -755,7 +812,7 @@ func TestFeatureDevWorkflowQuotaHeartbeatRecovers(t *testing.T) {
 
 	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
 	rev.record()
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
 		Return("daedalus/issue-42-1", nil).Once()
@@ -879,7 +936,7 @@ func TestFeatureDevWorkflowReviewerQuotaHeartbeatRecovers(t *testing.T) {
 			return activities.ReviewResult{Approved: true}, nil
 		})
 
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
 		Return("daedalus/issue-42-1", nil).Once()
@@ -910,8 +967,8 @@ func TestFeatureDevWorkflowTestsQuotaHeartbeatRecovers(t *testing.T) {
 	rev.record()
 
 	var suiteCalls int
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
-		Return(func(ctx context.Context, path string) (activities.TestResult, error) {
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, path, agent string) (activities.TestResult, error) {
 			suiteCalls++
 			if suiteCalls == 1 {
 				return activities.TestResult{}, errQuotaStub
@@ -962,8 +1019,8 @@ func TestFeatureDevWorkflowQuotaHeartbeatResetsOnRedSuite(t *testing.T) {
 		})
 
 	var suiteCalls int
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
-		Return(func(ctx context.Context, path string) (activities.TestResult, error) {
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, path, agent string) (activities.TestResult, error) {
 			suiteCalls++
 			if suiteCalls == 1 {
 				return activities.TestResult{}, errQuotaStub
@@ -1061,7 +1118,7 @@ func TestFeatureDevWorkflowTestReviewNeedsMaintainerParks(t *testing.T) {
 	}}
 	rev.record()
 
-	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
 		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
 

@@ -127,16 +127,24 @@ func TestRecordedWorkers(t *testing.T) {
 	if _, err := recordedWorkers(); err == nil || !strings.Contains(err.Error(), "read") {
 		t.Errorf("recordedWorkers(unreadable dir) err = %v, want a read failure", err)
 	}
+
+	// A missing daemon dir is a fresh machine: nothing on record, not an
+	// error — the callers' "start one first" diagnostic says more than a
+	// ReadDir failure would.
+	daemonDir = filepath.Join(t.TempDir(), "gone")
+	if got, err := recordedWorkers(); err != nil || len(got) != 0 {
+		t.Errorf("recordedWorkers(missing dir) = (%v, %v), want an empty roster and no error", got, err)
+	}
 }
 
-// TestParseFlagsRecordDrivenRestartConfig pins the -c/-cli rejections: an
-// explicit -c/--config alongside the record-driven restarts (`worker
-// restart all`, either spelling and either side of the subcommand, and
-// `worker restart <name>`) is refused, while the same flag on a plain
-// restart still parses — the rejection is scoped to the invocations that
-// never use the config.
+// TestParseFlagsRecordDrivenRestartConfig pins the -c rejection: an
+// explicit -c/--config alongside the record-driven worker commands —
+// `worker restart all` (either spelling, either side of the subcommand),
+// `worker restart <name>`, and `worker status` — is refused, while the
+// same flag on a plain restart still parses — the rejection is scoped to
+// the invocations that never use the config.
 func TestParseFlagsRecordDrivenRestartConfig(t *testing.T) {
-	const rejection = "-c/--config does not apply to worker restart all or restart <worker>"
+	const rejection = "-c/--config does not apply to worker restart all, restart <worker>, or worker status"
 	for _, c := range []struct {
 		name    string
 		args    []string
@@ -165,6 +173,16 @@ func TestParseFlagsRecordDrivenRestartConfig(t *testing.T) {
 		{
 			name:    "flag after restart <worker>",
 			args:    []string{"worker", "restart", "arete", "--config=cfg.yaml"},
+			wantErr: rejection,
+		},
+		{
+			name:    "-c before worker status",
+			args:    []string{"-c", "cfg.yaml", "worker", "status"},
+			wantErr: rejection,
+		},
+		{
+			name:    "worker status with a trailing --config=",
+			args:    []string{"worker", "status", "--config=cfg.yaml"},
 			wantErr: rejection,
 		},
 		{
@@ -228,7 +246,7 @@ func TestWorkerRestartUsesCLIConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		return captureStdout(t, func() {
-			if err := workerRestart(cfg, cliCfg, ""); err != nil {
+			if err := workerRestart(cfg, cliCfg); err != nil {
 				t.Errorf("workerRestart: %v", err)
 			}
 		})
@@ -479,10 +497,11 @@ func TestMainRestartAllNeedsNoConfig(t *testing.T) {
 // a subprocess: usageFail's shape (diagnostic, blank line, usage text) and
 // exit 1 — asserted only on paths that fail before the real daemon dir is
 // ever read, so the live workers in /tmp/daedalus are never touched. The
-// same rejection covers the record-driven `restart <worker>`.
+// same rejection covers the record-driven `restart <worker>`; `worker
+// status` has its own pin in TestMainWorkerStatusRejectsConfig.
 func TestMainRestartAllRejectsConfig(t *testing.T) {
 	cfg := validConfig(t)
-	const rejection = "-c/--config does not apply to worker restart all or restart <worker>"
+	const rejection = "-c/--config does not apply to worker restart all, restart <worker>, or worker status"
 
 	stdout, stderr, code := runMainIn(t, "", "-c", cfg, "worker", "restart", "all")
 	if code != 1 {

@@ -59,6 +59,9 @@ type WorktreeOutput struct {
 type AgentRunInput struct {
 	WorktreePath string
 	Prompt       string
+	// Agent, set by `run -cli/--cli`, overrides the worker's agent for this
+	// run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
+	Agent string
 }
 
 // maxAgentOutput bounds the agent text and chain-of-thought each carried in
@@ -98,6 +101,9 @@ type ReviewInput struct {
 	// this review: false in phase 1 (code review — coverage is a later
 	// phase's concern), true in phase 2 (the test-suite review).
 	TestsInScope bool
+	// Agent, set by `run -cli/--cli`, overrides the worker's agent for
+	// this run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
+	Agent string
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -359,11 +365,16 @@ type jailResult struct {
 // jailedAgentCLI returns the jailed agent CLI, its headless flags, and the
 // output-mode flags for full agent rounds. The selection (config.yaml
 // `agent`, default claude) travels via the worker's environment like the
-// provider settings: DAEDALUS_AGENT, exported at worker startup. All three
-// CLIs read the prompt from piped stdin; each headless flag set approves
-// every tool call, which is only safe inside the jail.
-func jailedAgentCLI() (agent string, headless, output []string) {
-	switch os.Getenv("DAEDALUS_AGENT") {
+// provider settings: DAEDALUS_AGENT, exported at worker startup. A run
+// started with `run -cli/--cli` overrides it per run — agent wins over the
+// environment here; empty means no override. All three CLIs read the prompt
+// from piped stdin; each headless flag set approves every tool call, which
+// is only safe inside the jail.
+func jailedAgentCLI(agent string) (selected string, headless, output []string) {
+	if agent == "" {
+		agent = os.Getenv("DAEDALUS_AGENT")
+	}
+	switch agent {
 	case "opencode":
 		// opencode reads the prompt from piped stdin just like claude -p;
 		// --auto approves everything not explicitly denied. Plain text
@@ -385,25 +396,27 @@ func jailedAgentCLI() (agent string, headless, output []string) {
 }
 
 // runJailed runs one autonomous agent invocation inside an ai-jail sandbox
-// rooted at the worktree. agentArgs are appended to the agent's fixed
-// argument set before its headless flags. The prompt travels via stdin, not
-// argv: argv is visible in `ps` and per-argument size limits would make
-// large review prompts (which embed the full diff) fail the run.
-func runJailed(ctx context.Context, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
-	agent, headless, _ := jailedAgentCLI()
+// rooted at the worktree. agent names the jailed CLI to run — a `run
+// -cli/--cli` override, empty for the worker's DAEDALUS_AGENT default.
+// agentArgs are appended to the agent's fixed argument set before its
+// headless flags. The prompt travels via stdin, not argv: argv is visible
+// in `ps` and per-argument size limits would make large review prompts
+// (which embed the full diff) fail the run.
+func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
+	selected, headless, _ := jailedAgentCLI(agent)
 	args := []string{"--worktree", "--network"}
 	// amp's host login state (~/.config/amp) is not among ai-jail's
 	// agent-state dirs and AMP_API_KEY is not in its default env allowlist,
 	// so neither documented auth route reaches the jailed child on a stock
 	// jail. --env copies the value from this process's environment (set
 	// below), making the key route work without operator jail config.
-	if agent == "amp" && os.Getenv("AMP_API_KEY") != "" {
+	if selected == "amp" && os.Getenv("AMP_API_KEY") != "" {
 		args = append(args, "--env", "AMP_API_KEY")
 	}
 	// "--" ends ai-jail's own flags: everything after it is the jailed
 	// command, verbatim — otherwise ai-jail rejects child flags that
 	// resemble its own (e.g. claude's --verbose) as misplaced.
-	args = append(args, "--", agent)
+	args = append(args, "--", selected)
 	args = append(args, agentArgs...)
 	args = append(args, headless...)
 	cmd := exec.CommandContext(ctx, "ai-jail", args...)
@@ -476,8 +489,8 @@ func activityLogger(ctx context.Context) (l log.Logger) {
 // --verbose) is blocked for claude for now: ai-jail's flag guard rejects
 // --verbose after the command by prefix match, even behind --.
 func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
-	_, _, agentArgs := jailedAgentCLI()
-	res, err := runJailed(ctx, input.WorktreePath, input.Prompt, agentArgs...)
+	_, _, agentArgs := jailedAgentCLI(input.Agent)
+	res, err := runJailed(ctx, input.Agent, input.WorktreePath, input.Prompt, agentArgs...)
 	if err != nil {
 		return AgentRunResult{}, err
 	}
@@ -559,7 +572,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	res, err := runJailed(ctx, input.WorktreePath, prompt)
+	res, err := runJailed(ctx, input.Agent, input.WorktreePath, prompt)
 	if err != nil {
 		return ReviewResult{}, fmt.Errorf("review run: %w", err)
 	}
@@ -666,10 +679,12 @@ func truncateTail(s string, max int) string {
 // worktree, whatever that suite is: the command is resolved per repo — a
 // `.daedalus.yaml` declaration first, then static detection, then an
 // AI discovery round for repos nothing recognizes (see nativeTestCommand).
-// A non-zero exit is a test failure (Passed=false); any other error (e.g. no
-// test binary on PATH) is a system error.
-func RunNativeTestsActivity(ctx context.Context, worktreePath string) (TestResult, error) {
-	argv, err := nativeTestCommand(ctx, worktreePath)
+// The agent names the run's -cli/--cli override, used only by the discovery
+// round; empty falls back to the worker's DAEDALUS_AGENT. A non-zero exit
+// is a test failure (Passed=false); any other error (e.g. no test binary on
+// PATH) is a system error.
+func RunNativeTestsActivity(ctx context.Context, worktreePath, agent string) (TestResult, error) {
+	argv, err := nativeTestCommand(ctx, worktreePath, agent)
 	if err != nil {
 		return TestResult{}, err
 	}
@@ -700,14 +715,17 @@ func RunNativeTestsActivity(ctx context.Context, worktreePath string) (TestResul
 //     script, pytest config) and Makefile test-ui/test-api targets;
 //  3. an AI discovery round — a short jailed agent run that answers with
 //     the command — for repositories none of the above recognize.
-func nativeTestCommand(ctx context.Context, worktreePath string) ([]string, error) {
+//
+// agent is the run's -cli/--cli override, honored by the discovery round
+// alone; empty falls back to the worker's DAEDALUS_AGENT.
+func nativeTestCommand(ctx context.Context, worktreePath, agent string) ([]string, error) {
 	if declared, ok := declaredTestCommand(worktreePath); ok {
 		return []string{"sh", "-c", declared}, nil
 	}
 	if argv, ok := detectedTestCommand(worktreePath); ok {
 		return argv, nil
 	}
-	return discoverTestCommand(ctx, worktreePath)
+	return discoverTestCommand(ctx, worktreePath, agent)
 }
 
 // declaredTestCommand reads the repo-owned test declaration.
@@ -776,9 +794,10 @@ func makefileHasTarget(mk, target string) bool {
 }
 
 // discoverTestCommand asks a short jailed agent run for the repository's
-// test entrypoint — the general, AI-led fallback.
-func discoverTestCommand(ctx context.Context, worktreePath string) ([]string, error) {
-	res, err := runJailed(ctx, worktreePath,
+// test entrypoint — the general, AI-led fallback. agent is the run's
+// -cli/--cli override, empty for the worker's default.
+func discoverTestCommand(ctx context.Context, worktreePath, agent string) ([]string, error) {
+	res, err := runJailed(ctx, agent, worktreePath,
 		"Inspect this repository and determine the exact shell command that runs its full test suite. "+
 			"Reply with ONLY that command on a single line — no explanation, no code fences.")
 	if err != nil {
