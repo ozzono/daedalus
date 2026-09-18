@@ -80,6 +80,12 @@ func TestWorkerStatusAll(t *testing.T) {
 		if !strings.Contains(out, "(no config record)") {
 			t.Errorf("status output %q should mark the live stray's missing record", out)
 		}
+		// The stray's API column must read n/a, not "config error": the
+		// placeholder is display text for the CONFIG column only, never a
+		// config path for providerStatus to load.
+		if strings.Contains(out, "config error") {
+			t.Errorf("status output %q should report n/a for the missing record, not \"config error\"", out)
+		}
 		// The merged roster runs sorted. The stray deliberately sorts before
 		// both records: recordedWorkers yields [b, z] and the stray appends
 		// as [a], so without workerStatusAll's own merge sort the

@@ -82,6 +82,12 @@ anthropic:
   key: ""
   # Model for the jailed agent; empty means the agent's own default.
   model: ""
+  # Small/fast model for tiny prompts (session-title generation and the
+  # like), exported as ANTHROPIC_DEFAULT_HAIKU_MODEL — the var the jailed
+  # claude reads for its small/fast model. "worker status" also probes the
+  # provider with it (falling back to model) when set. Unrelated to the
+  # workflow layer's quota heartbeats. Empty means the agent's own default.
+  heartbeat_model: ""
   # API request timeout for the jailed agent, in milliseconds, exported as
   # API_TIMEOUT_MS. Agent rounds run long — builds, whole-repo analyses — so
   # the default is generous: 3000000 = 50 minutes. Zero/unset falls back to
@@ -96,3 +102,21 @@ openai:
   url: ""
   key: ""
   model: ""
+
+# Secondary provider for automatic failover — fully independent of the
+# primary: the url/key/model may point at a different vendor's
+# anthropic-compatible endpoint, sharing nothing with the anthropic:
+# section above. When a jailed round fails with the primary API exhausted
+# (429 quota), the worker retries the round once against these values and
+# keeps using them until the primary's quota window resets (parsed from
+# the provider's reset message when present, else 20m/40m/60m escalating
+# holds).
+# Absent, or enabled: false, disables failover; an enabled fallback needs
+# url, key, and model. Values travel the same env-only channel as the
+# primary's.
+fallback:
+  enabled: false
+  url: ""
+  key: ""
+  model: ""
+  heartbeat_model: ""

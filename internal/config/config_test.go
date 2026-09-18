@@ -165,11 +165,18 @@ anthropic:
   url: https://proxy.example
   key: sk-ant-test
   model: claude-opus-5
+  heartbeat_model: claude-haiku-test
   timeout_ms: 60000
 openai:
   url: https://oa.example/v1
   key: sk-oa-test
   model: gpt-test
+fallback:
+  enabled: true
+  url: https://backup.example
+  key: sk-backup-test
+  model: glm-backup
+  heartbeat_model: glm-backup-air
 tests_timeout: 45m
 agent_run_timeout: 30m
 `))
@@ -210,13 +217,63 @@ agent_run_timeout: 30m
 		"ANTHROPIC_BASE_URL=https://proxy.example",
 		"ANTHROPIC_API_KEY=sk-ant-test",
 		"ANTHROPIC_MODEL=claude-opus-5",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-test",
 		"API_TIMEOUT_MS=60000",
 		"OPENAI_BASE_URL=https://oa.example/v1",
 		"OPENAI_API_KEY=sk-oa-test",
 		"OPENAI_MODEL=gpt-test",
+		"DAEDALUS_FALLBACK_BASE_URL=https://backup.example",
+		"DAEDALUS_FALLBACK_API_KEY=sk-backup-test",
+		"DAEDALUS_FALLBACK_MODEL=glm-backup",
+		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL=glm-backup-air",
 	}
 	if !slices.Equal(env, want) {
 		t.Errorf("AgentEnv() = %v, want %v", env, want)
+	}
+	if !cfg.Fallback.Active() {
+		t.Error("Fallback.Active() = false, want true for enabled fallback")
+	}
+}
+
+// TestFallbackInactiveOmitted pins that a disabled or absent fallback
+// contributes nothing to AgentEnv — the worker only arms failover when the
+// config explicitly enables it.
+func TestFallbackInactiveOmitted(t *testing.T) {
+	for name, doc := range map[string]string{
+		"absent":  "",
+		"disabled": "fallback:\n  enabled: false\n  url: https://backup.example\n  key: k\n  model: m\n",
+	} {
+		cfg, err := Load(writeConfig(t, doc))
+		if err != nil {
+			t.Fatalf("%s: Load: %v", name, err)
+		}
+		if cfg.Fallback.Active() {
+			t.Errorf("%s: Fallback.Active() = true, want false", name)
+		}
+		for _, kv := range cfg.AgentEnv() {
+			if strings.HasPrefix(kv, "DAEDALUS_FALLBACK_") {
+				t.Errorf("%s: AgentEnv() leaked %q from inactive fallback", name, kv)
+			}
+		}
+	}
+}
+
+// TestLoadFallbackValidation pins that an enabled fallback missing its
+// url/key/model fails at config load, before any worker arms failover on
+// half-configured values.
+func TestLoadFallbackValidation(t *testing.T) {
+	for _, doc := range []string{
+		"fallback:\n  enabled: true\n",
+		"fallback:\n  enabled: true\n  url: https://backup.example\n",
+		"fallback:\n  enabled: true\n  url: https://backup.example\n  key: k\n",
+	} {
+		_, err := Load(writeConfig(t, doc))
+		if err == nil {
+			t.Fatalf("Load accepted incomplete fallback %q", doc)
+		}
+		if !strings.Contains(err.Error(), "fallback: enabled fallback needs url, key, and model") {
+			t.Errorf("Load(%q) error = %v, want fallback validation message", doc, err)
+		}
 	}
 }
 

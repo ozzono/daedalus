@@ -73,17 +73,47 @@ type TemporalConfig struct {
 
 // AnthropicConfig configures the jailed agent's Anthropic backend. The
 // values are injected into the agent's environment (ANTHROPIC_BASE_URL,
-// ANTHROPIC_API_KEY, ANTHROPIC_MODEL, API_TIMEOUT_MS); the key is required
-// for the worker.
+// ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_DEFAULT_HAIKU_MODEL,
+// API_TIMEOUT_MS); the key is required for the worker.
 type AnthropicConfig struct {
 	URL   string `yaml:"url"`
 	Key   string `yaml:"key"`
 	Model string `yaml:"model"`
+	// HeartbeatModel is a small/fast model for tiny prompts (session-title
+	// generation and the like), exported as ANTHROPIC_DEFAULT_HAIKU_MODEL —
+	// the var the jailed claude reads for its small/fast model selection.
+	// Unrelated to the workflow layer's quota heartbeats despite the name.
+	// Empty means the agent's own default; `worker status` probes with it
+	// (falling back to Model) when set.
+	HeartbeatModel string `yaml:"heartbeat_model"`
 	// TimeoutMS bounds the agent's API requests, exported as API_TIMEOUT_MS.
 	// Zero (unset) defaults to DefaultAnthropicTimeoutMS — unlike the string
 	// fields there is no "inherit the environment" escape hatch: the jailed
 	// agent gets an explicit ceiling either way.
 	TimeoutMS int `yaml:"timeout_ms"`
+}
+
+// FallbackConfig is a fully independent secondary provider: its url/key/
+// model need have nothing in common with the primary (a different vendor's
+// anthropic-compatible endpoint is fine). When enabled and a jailed round
+// fails with the primary's API exhausted (429 quota), the worker retries
+// the round once against these values and keeps using them until the
+// primary's quota window resets. Values travel the same env-only channel
+// as the primary's (DAEDALUS_FALLBACK_* — never workflow history, activity
+// inputs, argv, or logs).
+type FallbackConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	URL     string `yaml:"url"`
+	Key     string `yaml:"key"`
+	Model   string `yaml:"model"`
+	// HeartbeatModel mirrors AnthropicConfig.HeartbeatModel for fallback
+	// rounds; empty falls back to Model, then to the agent's default.
+	HeartbeatModel string `yaml:"heartbeat_model"`
+}
+
+// Active reports whether the fallback is configured for use.
+func (f FallbackConfig) Active() bool {
+	return f.Enabled
 }
 
 // OpenAIConfig is injected into the jailed agent's environment as
@@ -139,6 +169,9 @@ type Config struct {
 	Temporal               TemporalConfig  `yaml:"temporal"`
 	Anthropic              AnthropicConfig `yaml:"anthropic"`
 	OpenAI                 OpenAIConfig    `yaml:"openai"`
+	// Fallback is the independent secondary provider failover uses when
+	// the primary is API-exhausted. Inactive unless Enabled.
+	Fallback FallbackConfig `yaml:"fallback"`
 }
 
 // agents lists the accepted config Agent values. amp authenticates through
@@ -212,11 +245,42 @@ func (c Config) AgentEnv() []string {
 	add("ANTHROPIC_BASE_URL", c.Anthropic.URL)
 	add("ANTHROPIC_API_KEY", c.Anthropic.Key)
 	add("ANTHROPIC_MODEL", c.Anthropic.Model)
+	add("ANTHROPIC_DEFAULT_HAIKU_MODEL", c.Anthropic.HeartbeatModel)
 	add("API_TIMEOUT_MS", strconv.Itoa(c.Anthropic.TimeoutMS))
 	add("OPENAI_BASE_URL", c.OpenAI.URL)
 	add("OPENAI_API_KEY", c.OpenAI.Key)
 	add("OPENAI_MODEL", c.OpenAI.Model)
+	if f := c.Fallback; f.Active() {
+		add("DAEDALUS_FALLBACK_BASE_URL", f.URL)
+		add("DAEDALUS_FALLBACK_API_KEY", f.Key)
+		add("DAEDALUS_FALLBACK_MODEL", f.Model)
+		add("DAEDALUS_FALLBACK_HEARTBEAT_MODEL", f.HeartbeatModel)
+	}
 	return env
+}
+
+// ProviderEnvVars lists every environment variable daedalus derives from
+// the config's provider sections — the single source of truth for what a
+// spawned worker daemon must NOT inherit from the invoking shell. worker
+// start scrubs these from the daemon's inherited environment so the
+// recorded config file is the only way provider values reach the daemon:
+// a stale export in the operator's terminal can never win over a rotated
+// config. Foreground runs keep the inherit semantics (see AgentEnv).
+func ProviderEnvVars() []string {
+	return []string{
+		"ANTHROPIC_BASE_URL",
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"API_TIMEOUT_MS",
+		"OPENAI_BASE_URL",
+		"OPENAI_API_KEY",
+		"OPENAI_MODEL",
+		"DAEDALUS_FALLBACK_BASE_URL",
+		"DAEDALUS_FALLBACK_API_KEY",
+		"DAEDALUS_FALLBACK_MODEL",
+		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
+	}
 }
 
 // Load reads the YAML configuration at path and applies defaults for every
@@ -251,6 +315,11 @@ func Load(path string) (Config, error) {
 	}
 	if c.MaxConcurrentAgentRuns < 0 {
 		return c, fmt.Errorf("config %s: max_concurrent_agent_runs: must not be negative", path)
+	}
+	if f := c.Fallback; f.Active() {
+		if f.URL == "" || f.Key == "" || f.Model == "" {
+			return c, fmt.Errorf("config %s: fallback: enabled fallback needs url, key, and model", path)
+		}
 	}
 	return c, nil
 }
