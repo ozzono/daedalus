@@ -677,17 +677,63 @@ func heartbeatLoop(ctx context.Context, done <-chan struct{}) {
 }
 
 // runJailed runs one autonomous agent invocation inside an ai-jail sandbox
-// rooted at the worktree. agent names the jailed CLI to run — a `run
-// -cli/--cli` override, empty for the worker's DAEDALUS_AGENT default.
-// agentArgs are appended to the agent's fixed argument set before its
-// headless flags. The prompt travels via stdin, not argv: argv is visible
-// in `ps` and per-argument size limits would make large review prompts
-// (which embed the full diff) fail the run. While waiting for a concurrency
-// slot and while the agent runs, the round heartbeats so Temporal history
-// shows liveness; the slot wait itself is bounded by slotWaitTimeout so a
-// queued round cannot burn its whole StartToClose budget without the agent
-// ever launching.
+// rooted at the worktree, with provider failover (see providerAvailability):
+// the round runs on the primary provider unless it is in a dry hold, in
+// which case the fallback provider serves it, and a round that fails with
+// the primary's quota exhausted is retried once on the fallback immediately
+// rather than waiting out the workflow's hourly sleep. agent names the
+// jailed CLI to run — a `run -cli/--cli` override, empty for the worker's
+// DAEDALUS_AGENT default. agentArgs are appended to the agent's fixed
+// argument set before its headless flags. The prompt travels via stdin,
+// not argv: argv is visible in `ps` and per-argument size limits would make
+// large review prompts (which embed the full diff) fail the run. While
+// waiting for a concurrency slot and while the agent runs, the round
+// heartbeats so Temporal history shows liveness; the slot wait itself is
+// bounded by slotWaitTimeout so a queued round cannot burn its whole
+// StartToClose budget without the agent ever launching.
 func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
+	env, side := selectProvider()
+	if env == nil {
+		return jailResult{}, fmt.Errorf("%w: primary and fallback providers are both in dry holds", ErrAPIExhausted)
+	}
+	res, err := runJailedRound(ctx, env, agent, worktreePath, prompt, agentArgs...)
+	if err == nil || !errors.Is(err, ErrAPIExhausted) {
+		return res, err
+	}
+	logger := activityLogger(ctx)
+	until := markProviderDry(side, err.Error())
+	logger.Info("provider api exhausted", "side", side, "dryUntil", until.Format(time.RFC3339))
+	if other, otherSide := otherProviderEnv(side); other != nil {
+		// Only spend the retry when the activity budget can fit another
+		// full round: a fallback round truncated at the deadline would die
+		// to our own context kill and masquerade as ErrAgentKilled.
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < fallbackRetryFloor {
+			logger.Info("skipping fallback retry: activity budget nearly spent", "side", otherSide)
+			return res, err
+		}
+		logger.Info("failing round over to fallback provider", "side", otherSide)
+		res2, err2 := runJailedRound(ctx, other, agent, worktreePath, prompt, agentArgs...)
+		if err2 == nil {
+			return res2, nil
+		}
+		if !errors.Is(err2, ErrAPIExhausted) {
+			// A fallback round that died any other way (killed, slots
+			// busy) must not overwrite the primary's exhaustion
+			// classification: the workflow answers those differently
+			// (continuation prompts, re-queues), and the fact that
+			// matters downstream is that the primary is dry.
+			return res, err
+		}
+		until2 := markProviderDry(otherSide, err2.Error())
+		logger.Info("fallback provider api exhausted too", "side", otherSide, "dryUntil", until2.Format(time.RFC3339))
+		return res2, err2
+	}
+	return res, err
+}
+
+// runJailedRound is runJailed's single invocation against one provider's
+// environment.
+func runJailedRound(ctx context.Context, env []string, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
 	selected, headless, _ := jailedAgentCLI(agent)
 	lim := agentLimiter()
 	hbDone := make(chan struct{})
@@ -722,9 +768,10 @@ func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArg
 	setProcessGroup(cmd)
 	defer killGroup(cmd)
 	cmd.Dir = worktreePath
-	// os.Environ() carries the provider settings the worker exported from
-	// config.yaml or inherited; pass them through as-is.
-	cmd.Env = os.Environ()
+	// env carries the provider settings the worker exported from
+	// config.yaml (primary, or the fallback overrides for a failover
+	// round); everything else passes through from os.Environ().
+	cmd.Env = env
 	cmd.Stdin = strings.NewReader(prompt)
 
 	var stdout, stderr bytes.Buffer

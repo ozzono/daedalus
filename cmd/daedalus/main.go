@@ -25,6 +25,7 @@ import (
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/provider"
 	"github.com/ozzono/daedalus/internal/version"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
@@ -146,9 +147,18 @@ all fields and their defaults:
   anthropic.url        Anthropic API base URL       (default https://api.anthropic.com)
   anthropic.key        Anthropic API key            (optional — skipped if unset)
   anthropic.model      Model for the jailed agent   (agent default if unset)
+  anthropic.heartbeat_model Small/fast model for tiny prompts, exported as
+                       ANTHROPIC_DEFAULT_HAIKU_MODEL and used by the
+                       "worker status" probe        (agent default if unset)
   anthropic.timeout_ms Agent API timeout in ms, exported as API_TIMEOUT_MS
                        (default 3000000 = 50 minutes)
   openai.url/key/model Optional OpenAI settings injected into the agent environment
+  fallback.enabled/url/key/model/heartbeat_model
+                       Independent secondary provider: when a jailed round
+                       fails with the primary's quota exhausted, the worker
+                       retries it on the fallback and keeps using it until
+                       the primary recovers (reset stamp parsed when the
+                       provider emits one, else 20m/40m/60m holds, 5h cap)
 
 For a local Temporal dev server matching the defaults:
   temporal server start-dev
@@ -685,6 +695,30 @@ func recordedWorkers() ([]string, error) {
 // workerStart launches the worker as a detached daemon: it re-executes
 // itself with `worker foreground`, redirected into the per-queue log, in
 // its own session so the terminal is released immediately.
+// envWithoutProviderVars drops every config-derived provider variable (see
+// config.ProviderEnvVars) from an inherited environment. The spawned daemon
+// gets provider values only from the config file it loads — runWorker
+// re-exports them — so a stale export in the invoking shell (e.g. an old
+// ANTHROPIC_API_KEY) can never win over a rotated config. Manual
+// `worker foreground` runs keep the inherit semantics: this scrub applies
+// only to the detached daemon.
+func envWithoutProviderVars(environ []string) []string {
+	names := config.ProviderEnvVars()
+	scrub := make(map[string]bool, len(names))
+	for _, name := range names {
+		scrub[name] = true
+	}
+	var out []string
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if scrub[name] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 func workerStart(cfg config.Config, configPath string) error {
 	pidFile, logFile, confFile := daemonPaths(cfg.WorkerName())
 	if pid, ok := readLivePid(pidFile); ok {
@@ -718,7 +752,7 @@ func workerStart(cfg config.Config, configPath string) error {
 		return fmt.Errorf("write config record %s: %w", confFile, err)
 	}
 	cmd := exec.Command(self, childArgs...)
-	cmd.Env = append(os.Environ(), daemonEnv+"=1")
+	cmd.Env = append(envWithoutProviderVars(os.Environ()), daemonEnv+"=1")
 	cmd.Stdout = log
 	cmd.Stderr = log
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from the terminal
@@ -898,7 +932,7 @@ func workerStatusAll() error {
 	}
 	sort.Strings(names)
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "WORKER\tSTATE\tCONFIG\tLOG")
+	fmt.Fprintln(w, "WORKER\tSTATE\tAPI\tCONFIG\tLOG")
 	for _, name := range names {
 		pidFile, logFile, _ := daemonPaths(name)
 		state := "not running"
@@ -906,12 +940,63 @@ func workerStatusAll() error {
 			state = fmt.Sprintf("running (pid %d)", pid)
 		}
 		conf := recordedConfigPath(name)
+		shown := conf
 		if conf == "" {
-			conf = "(no config record)"
+			shown = "(no config record)"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", name, state, conf, logFile)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", name, state, providerStatus(conf), shown, logFile)
 	}
 	return w.Flush()
+}
+
+// providerStatus live-probes the provider a worker's recorded config
+// names, so a row answers "will this worker's next round reach the API?"
+// The main provider is probed; when it is not ok and the config arms a
+// fallback, the fallback is probed too and reported as the active one —
+// mirroring the worker's own failover choice. Values that cannot be
+// determined (no record, unloadable config, provider not fully
+// configured) are reported as such rather than as failures.
+func providerStatus(confPath string) string {
+	if confPath == "" {
+		return "n/a (no config record)"
+	}
+	cfg, err := config.Load(confPath)
+	if err != nil {
+		return "config error"
+	}
+	if cfg.Anthropic.URL == "" || cfg.Anthropic.Key == "" {
+		return "n/a (provider not configured)"
+	}
+	spec := provider.Spec{
+		URL:   cfg.Anthropic.URL,
+		Key:   cfg.Anthropic.Key,
+		Model: heartbeatOrDefault(cfg.Anthropic.HeartbeatModel, cfg.Anthropic.Model),
+		Style: provider.StyleAnthropic,
+	}
+	main := provider.Probe(context.Background(), spec)
+	if !cfg.Fallback.Active() || main.OK {
+		return main.Detail
+	}
+	fb := provider.Probe(context.Background(), provider.Spec{
+		URL:   cfg.Fallback.URL,
+		Key:   cfg.Fallback.Key,
+		Model: heartbeatOrDefault(cfg.Fallback.HeartbeatModel, cfg.Fallback.Model),
+		Style: provider.StyleAnthropic,
+	})
+	active := "fallback"
+	if !fb.OK {
+		active = "none"
+	}
+	return fmt.Sprintf("main: %s → fallback: %s [active: %s]", main.Detail, fb.Detail, active)
+}
+
+// heartbeatOrDefault picks the model a cheap request should name: the
+// heartbeat (small/fast) model when configured, else the main model.
+func heartbeatOrDefault(heartbeat, main string) string {
+	if heartbeat != "" {
+		return heartbeat
+	}
+	return main
 }
 
 // readLivePid returns the pid recorded in the pid file when the file exists
