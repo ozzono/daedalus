@@ -3,14 +3,20 @@ package activities
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"go.temporal.io/sdk/log"
 
 	"github.com/ozzono/daedalus/internal/config"
 )
@@ -561,12 +567,12 @@ func TestReferencesPath(t *testing.T) {
 		{"vim " + wt + "/sub/dir/file.go", true},
 		{"tail -f " + wt + "/log", true},
 		{`grep "` + wt + `" -r .`, true},
-		{"/wt/arete/issue-42", false},                       // sibling: longer id
-		{"/wt/arete/issue-42/sub", false},                   // sibling's file
-		{"vim /wt/arete/issue-4xyz", false},                 // path inside a longer word
-		{"echo /wt/arete/issue-4-and-more", false},          // path prefix of a longer token
-		{"flutter test", false},                             // no reference at all
-		{"/backup/copy-of" + wt, true}, // pinned as-is: the matcher has an end boundary but
+		{"/wt/arete/issue-42", false},              // sibling: longer id
+		{"/wt/arete/issue-42/sub", false},          // sibling's file
+		{"vim /wt/arete/issue-4xyz", false},        // path inside a longer word
+		{"echo /wt/arete/issue-4-and-more", false}, // path prefix of a longer token
+		{"flutter test", false},                    // no reference at all
+		{"/backup/copy-of" + wt, true},             // pinned as-is: the matcher has an end boundary but
 		// no start boundary, so a path merely *ending* with the worktree
 		// string (a copy filed under another root) still matches —
 		// contrived given home-anchored worktree paths, but that is the
@@ -652,6 +658,185 @@ exit 0`)
 		BranchName: "feat/issue-42-7",
 	}); err != nil {
 		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+}
+
+// TestCleanupPreserveFailureAbortsBeforeDeletion pins the ordering
+// guarantee "deletion must never outrun preservation": a staging failure
+// (retry already exhausted, no stale lock to sweep) or a commit failure
+// that is not a clean "nothing to commit" tree aborts the cleanup before
+// any removal step — no `worktree remove`, no prune, and the worktree
+// directory itself is left on disk — so unsaved work survives for the next
+// run instead of being deleted.
+func TestCleanupPreserveFailureAbortsBeforeDeletion(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitStub string
+		wantErr string
+	}{
+		{
+			name: "stage failure",
+			// add fails and rev-parse reports no lock (empty output), so
+			// there is nothing to sweep and no retry: a genuine failure.
+			gitStub: `case "$3" in
+  add) exit 1 ;;
+esac
+exit 0`,
+			wantErr: "preserve aborted work (stage)",
+		},
+		{
+			name: "commit failure",
+			// The commit fails with output that is not "nothing to
+			// commit": the work was not saved. (The commit subcommand sits
+			// at $7, behind the two -c identity flags.)
+			gitStub: `case "$3" in
+  -c) [ "$7" = commit ] && { echo 'error: unable to write object'; exit 1; } ;;
+esac
+exit 0`,
+			wantErr: "preserve aborted work (commit)",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := fakeHome(t)
+			log := newStubLog(t)
+			worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			stubBin(t, "git", c.gitStub)
+
+			err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+				RepoPath:   "/repo",
+				TaskQueue:  "daedalus",
+				IssueID:    "42",
+				BranchName: "feat/issue-42-7",
+			})
+			if err == nil {
+				t.Fatal("want cleanup to abort when preservation fails")
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("error %q should name the failed preserve step %q", err, c.wantErr)
+			}
+			for _, call := range readCalls(t, log) {
+				if len(call.Args) >= 3 && call.Args[2] == "worktree" {
+					t.Errorf("removal ran despite failed preservation: %v", call.Args)
+				}
+			}
+			if _, err := os.Stat(worktreePath); err != nil {
+				t.Errorf("worktree dir must survive a failed preservation (stat err = %v)", err)
+			}
+		})
+	}
+}
+
+// TestCleanupPreserveToleratesNothingToCommit pins the one commit failure
+// that is not an abort: a clean tree ("nothing to commit") holds no work to
+// lose, so preservation proceeds — the rename still runs and the cleanup
+// completes, removing the worktree directory.
+func TestCleanupPreserveToleratesNothingToCommit(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	// The commit subcommand sits at $7, behind the two -c identity flags.
+	stubBin(t, "git", `case "$3" in
+  -c) [ "$7" = commit ] && { echo 'nothing to commit, working tree clean'; exit 1; } ;;
+esac
+exit 0`)
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:   "/repo",
+		TaskQueue:  "daedalus",
+		IssueID:    "42",
+		BranchName: "feat/issue-42-7",
+	}); err != nil {
+		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+	var renamed bool
+	for _, call := range readCalls(t, log) {
+		if contains(call.Args, "aborted/issue-42") && contains(call.Args, "-m") {
+			renamed = true
+		}
+	}
+	if !renamed {
+		t.Errorf("clean tree should still be renamed to the aborted branch")
+	}
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Errorf("worktree dir should be removed after cleanup (stat err = %v)", err)
+	}
+}
+
+// TestStragglersInClassifiesTableEntries pins which processes the sweep
+// targets: of a stubbed ps table, exactly those whose command line
+// references the worktree at a path boundary — never a longer sibling's
+// path, a longer word around the path, or processes elsewhere entirely.
+func TestStragglersInClassifiesTableEntries(t *testing.T) {
+	newStubLog(t)
+	wt := t.TempDir()
+	stubBin(t, "ps", `printf '%s\n' \
+" 111 /bin/sh `+wt+`/repo/tool --watch" \
+" 112 `+wt+`/repo/tool" \
+" 12345 tail -f `+wt+`2/build.log" \
+" 12346 vim /backup/copy`+wt+`x" \
+" 12347 make -C /elsewhere" \
+" not-a-pid command `+wt+`"`)
+
+	lines, pids := stragglersIn(log.NewStructuredLogger(
+		slog.New(slog.NewTextHandler(io.Discard, nil))), wt)
+
+	if len(pids) != 2 || pids[0] != 111 || pids[1] != 112 {
+		t.Errorf("pids = %v, want [111 112] (the watcher and the bare worktree command)", pids)
+	}
+	if len(lines) != len(pids) {
+		t.Errorf("lines (%d) and pids (%d) should stay paired", len(lines), len(pids))
+	}
+}
+
+// TestKillWorktreeStragglersSweepsReferencingProcesses pins the sweep's
+// observable effect: a live process whose command line references the
+// worktree path is SIGKILLed — a real one, listed by a stubbed ps table
+// (the real ps is not usable from every environment the tests run in).
+func TestKillWorktreeStragglersSweepsReferencingProcesses(t *testing.T) {
+	if !signalsPermitted() {
+		t.Skip("environment forbids signals; the sweep's kill cannot be verified here")
+	}
+	newStubLog(t)
+	wt := t.TempDir()
+	// A real, disposable process for the sweep to kill.
+	straggler := exec.Command("/bin/sleep", "60")
+	if err := straggler.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := straggler.Process.Pid
+	// Death is observed through the wait status, not kill(pid, 0): an
+	// unreaped child stays a zombie and the probe keeps succeeding long
+	// after the SIGKILL landed. reap waits the child exactly once on
+	// every path (assertion, timeout, and cleanup).
+	waited := make(chan error, 1)
+	var reapOnce sync.Once
+	reap := func() {
+		reapOnce.Do(func() { waited <- straggler.Wait() })
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		reap()
+	})
+	stubBin(t, "ps", `printf '%s\n' " `+strconv.Itoa(pid)+` /bin/sh `+wt+`/repo/tool --watch"`)
+
+	killWorktreeStragglers(log.NewStructuredLogger(
+		slog.New(slog.NewTextHandler(io.Discard, nil))), wt)
+
+	go reap()
+	select {
+	case err := <-waited:
+		if sig := deathSignal(err); sig == "" {
+			t.Errorf("straggler %d did not die to a signal (wait err: %v)", pid, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("straggler %d still alive after the sweep", pid)
 	}
 }
 
