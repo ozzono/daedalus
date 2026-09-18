@@ -11,10 +11,12 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/api/enums/v1"
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/template"
 )
 
@@ -1028,6 +1030,100 @@ func TestFeatureDevWorkflowKillWordsWithoutSentinelFailNormally(t *testing.T) {
 		t.Errorf("near-miss text diverted into kill recovery: %v", err)
 	}
 	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowKillOutranksExhaustion pins the classification
+// order on the workflow side: an error carrying both the kill sentinel and
+// exhaustion text routes to kill recovery — a continuation prompt that
+// resumes from partial work — instead of parking the round in the quota
+// heartbeat, which would re-queue the same prompt unchanged.
+func TestFeatureDevWorkflowKillOutranksExhaustion(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var prompts []string
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					prompts = append(prompts, in.Prompt)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			if calls == 1 {
+				return activities.AgentRunResult{}, fmt.Errorf(
+					"%w: %w", errKilledStub, activities.ErrAPIExhausted)
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(prompts) < 2 || prompts[1] == prompts[0] {
+		t.Fatalf("round must be re-prompted as a continuation, prompts recorded: %d", len(prompts))
+	}
+	if !strings.Contains(prompts[1], "killed mid-round") {
+		t.Errorf("kill+exhaustion error did not route to kill recovery; retry prompt: %q", prompts[1])
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowCleanupTimeoutWiring pins that the deferred cleanup
+// runs under its own ceiling: the configured CleanupTimeout reaches the
+// activity as its StartToCloseTimeout, and a zero (a run started by an
+// older worker, replayed without the field) falls back to
+// config.DefaultCleanupTimeout.
+func TestFeatureDevWorkflowCleanupTimeoutWiring(t *testing.T) {
+	cases := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"configured", 7 * time.Minute, 7 * time.Minute},
+		{"zero falls back to default", 0, config.DefaultCleanupTimeout},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			var got time.Duration
+			env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+				Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+			rec := &agentRecorder{env: env}
+			rec.record()
+			rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+			rev.record()
+			env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+				Return(activities.TestResult{Passed: true, Logs: "ok"}, nil).Once()
+			env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+				Return("daedalus/issue-42-1", nil).Once()
+			env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+				Run(func(args mock.Arguments) {
+					got = activity.GetInfo(args.Get(0).(context.Context)).StartToCloseTimeout
+				}).
+				Return(nil).Once()
+			in := baseInput()
+			in.CleanupTimeout = c.in
+			env.ExecuteWorkflow(FeatureDevWorkflow, in)
+			if err := env.GetWorkflowError(); err != nil {
+				t.Fatalf("workflow error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("cleanup StartToCloseTimeout = %v, want %v", got, c.want)
+			}
+			env.AssertExpectations(t)
+		})
+	}
 }
 
 // TestFeatureDevWorkflowTestsTimeoutRecovers pins that a timed-out native
