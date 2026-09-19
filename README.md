@@ -14,7 +14,12 @@ and runs two review-gated loops inside it: a jailed agent —
 [opencode](https://opencode.ai), or [Amp](https://ampcode.com) — implements the change
 while a jailed reviewer approves the code; the agent then writes the test
 suite while the reviewer — and the repository's own test suite — approve the
-tests. Each loop runs until its reviewer approves. Temporal provides durable
+tests. Each loop runs until its reviewer approves. When the test reviewer
+finds the work needs an implementation change rather than a test change —
+on its own finding or on the tester's report, relayed to it — it verdicts
+REBUILD: the finding goes back to the implementation loop with a tight,
+finding-only prompt, and the test loop (both sessions' context intact)
+resumes once the code reviewer approves again. Temporal provides durable
 execution: every step is auditable and survives worker restarts, and a run
 that dies (crash, cancellation) or parks itself — provider quota exhausted
 past its hourly heartbeats, or a reviewer halt on an impossible task —
@@ -42,6 +47,14 @@ flowchart TD
     P2_IMPL --> P2_TEST
     P2_TEST --> P2_REV
     P2_REV -- "test output + comments<br/>(until APPROVED & green)" --> P2_IMPL
+
+    %% REBUILD: the test reviewer can send an implementation-level finding
+    %% back through the dev cycle. After the code reviewer approves the
+    %% rebuild, flow resumes at the suite re-run — no fresh test-agent
+    %% round (the rebuild never touches test files); both sessions'
+    %% context stays intact.
+    P2_REV -- "REBUILD<br/>(implementation change needed)" --> P1_IMPL
+    P1_REV -- "APPROVED after REBUILD" --> P2_TEST
 
     P2_REV -- "APPROVED & green" --> CLEAN
 
@@ -119,7 +132,9 @@ up.
    (an explicit `-c` is rejected there; it would have no effect).
    `daedalus worker status` lists every worker on record — plus any live
    stray running without one, shown as "(no config record)" — queue,
-   running pid, config record, and log path.
+   running pid, a live provider API probe, the repo path each worker's
+   queue is currently executing ("idle" when none), config record, and log
+   path.
 
 4. **Trigger a pipeline** (third terminal):
 
@@ -207,6 +222,8 @@ work from any directory; `daedalus init` writes a fully commented
 | `anthropic.key`       | `""` (optional)    | API key for the jailed agent; if unset, the agent authenticates via the worker's inherited environment or its own login |
 | `anthropic.model`     | `""` (agent default) | Model for the jailed agent         |
 | `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself |
+| `fallback.enabled/url/key/model/heartbeat_model` | `enabled: false` | Independent secondary provider: when a jailed round fails with the primary's quota exhausted, the worker retries it on the fallback until the primary recovers |
+| `fallback.type`       | `anthropic`        | Fallback wire style: `anthropic` or `openai`; governs the `worker status` probe and which env failover values travel on. A round's wire is chosen by the agent (claude dials `ANTHROPIC_*`), so `openai` serves only agents that dial `OPENAI_BASE_URL` |
 
 Provider settings that are set are exported into the worker's environment
 at startup and injected into the jailed agent's process environment; unset
@@ -230,13 +247,18 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   suite passes. Review rounds are intentionally **unbounded** — the workflow
   ends only on approval, with every round durable and auditable.
 - **Reviewer protocol**: the reviewer sees the diff of the worktree (plus
-  the latest test output in phase 2) and must end its response with a final
-  line `APPROVED`, `CHANGES_REQUESTED`, or `NEEDS_MAINTAINER`. The last
-  parks the run for a maintainer restart — used when the task as stated
-  cannot be completed by editing files in the worktree, so an impossible
-  task cannot loop forever. Anything else — including a malformed response —
-  counts as changes requested, with the full output fed back to the
-  implementing agent.
+  the latest test output and the test agent's latest reply in phase 2) and
+  must end its response with a final line `APPROVED`, `CHANGES_REQUESTED`,
+  `REBUILD` (phase 2 only), or `NEEDS_MAINTAINER`. The last parks the run
+  for a maintainer restart — used when the task as stated cannot be
+  completed by editing files in the worktree, so an impossible task cannot
+  loop forever. `REBUILD` is the test reviewer's verdict for a finding the
+  test-only agent cannot apply: an implementation-level defect — relayed by
+  the tester or found by the reviewer — routes back through the
+  implementation ↔ code-review cycle, and the test loop resumes once the
+  code reviewer approves again. Anything else — including a malformed
+  response — counts as changes requested, with the full output fed back to
+  the implementing agent.
 - **The repo's own test suite**, whatever it is: the test command is
   resolved per repository — a `tests:` declaration in `.daedalus.yaml` wins;
   otherwise marker files are detected (`go.mod` → `go test ./...`,
@@ -314,6 +336,15 @@ Tests are hermetic: subprocess-backed activities are exercised against stub
 `git`/`go`/`ai-jail` executables installed on a temporary `PATH`, and the
 workflow is tested in Temporal's in-process `TestWorkflowEnvironment` with
 mocked activities — no server, network, or API key needed.
+
+> ✅ **Previously a known exception (fixed):** `internal/activities` was not
+> hermetic against the invoking shell — with `DAEDALUS_FALLBACK_*` exported
+> (as a real worker environment has), the armed ambient fallback plus dry
+> holds left in the package-global failover state failed ~19 jailed-round
+> tests with "both providers in dry holds". The package's `TestMain` now
+> scrubs those vars (tests needing a fallback arm one explicitly), and the
+> whole package passes in any invoking environment
+> (see `backlog/bugs/ambient-fallback-env-breaks-legacy-failover-test.md`).
 
 Releases are git tags. CI runs the suite on every PR and master push — a PR
 must carry exactly one release label (`patch`, `minor`, or `major`) before it

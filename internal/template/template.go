@@ -83,14 +83,24 @@ func TestsFix(testLogs, comments string) (string, error) {
 // Review builds the reviewer prompt for either loop. The verdict protocol at
 // the end of the template is the contract parseReviewVerdict in
 // internal/activities relies on: the reviewer's final non-empty line must be
-// exactly APPROVED or CHANGES_REQUESTED. testLogs is optional; when empty the
-// test-output section is left out entirely. testsInScope switches the
-// template's phase: the code reviewer (phase 1) is told test coverage is out
-// of scope — tests get their own reviewed phase — while the test reviewer
-// (phase 2) judges the suite itself.
-func Review(focus, diff, testLogs string, testsInScope bool) (string, error) {
+// exactly APPROVED or CHANGES_REQUESTED (or, in the test review, REBUILD).
+// testLogs is optional; when empty the test-output section is left out
+// entirely. testsInScope switches the template's phase: the code reviewer
+// (phase 1) is told test coverage is out of scope — tests get their own
+// reviewed phase — while the test reviewer (phase 2) judges the suite itself
+// and alone carries the REBUILD verdict. agentReply, when set, quotes the
+// test agent's latest reply for the test reviewer to weigh.
+func Review(focus, diff, testLogs string, testsInScope bool, agentReply string) (string, error) {
 	return render("review", struct {
-		Focus, Diff, TestLogs string
-		TestsInScope          bool
-	}{focus, diff, testLogs, testsInScope})
+		Focus, Diff, TestLogs, AgentReply string
+		TestsInScope                      bool
+	}{focus, diff, testLogs, agentReply, testsInScope})
+}
+
+// Rebuild feeds a test-review REBUILD finding back to the implementing
+// agent: a tight, finding-only prompt — the change was already code- and
+// test-reviewed once, so the template fences the agent against reworking
+// anything the finding does not demand.
+func Rebuild(finding string) (string, error) {
+	return render("rebuild", struct{ Finding string }{finding})
 }

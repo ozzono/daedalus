@@ -114,8 +114,15 @@ openai:
 # Absent, or enabled: false, disables failover; an enabled fallback needs
 # url, key, and model. Values travel the same env-only channel as the
 # primary's.
+# type selects the endpoint's wire style: anthropic (the default — an
+# Anthropic-compatible endpoint) or openai (an OpenAI-compatible
+# chat-completions endpoint). It governs the "worker status" probe and
+# which environment vars failover values travel on. A jailed round's wire
+# is chosen by the agent itself — claude dials ANTHROPIC_*, so an
+# openai-style fallback serves only agents that dial OPENAI_BASE_URL.
 fallback:
   enabled: false
+  type: anthropic
   url: ""
   key: ""
   model: ""

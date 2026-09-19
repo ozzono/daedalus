@@ -57,7 +57,24 @@ const (
 	// unbounded parallelism slows every run; queued rounds wait for a slot
 	// (heartbeating while they do) and then run at full speed.
 	DefaultMaxConcurrentAgentRuns = 2
+	// DefaultFallbackType is the fallback provider's wire style when its
+	// type field is unset.
+	DefaultFallbackType = FallbackTypeAnthropic
 )
+
+// Fallback wire styles accepted by the config's fallback.type.
+const (
+	// FallbackTypeAnthropic is an Anthropic-compatible endpoint.
+	FallbackTypeAnthropic = "anthropic"
+	// FallbackTypeOpenAI is an OpenAI-compatible chat-completions endpoint.
+	// Caveat: a jailed round's wire is chosen by the agent, not by daedalus
+	// — an openai-style fallback serves only agents that themselves dial
+	// OPENAI_BASE_URL (claude dials ANTHROPIC_*, so it cannot).
+	FallbackTypeOpenAI = "openai"
+)
+
+// fallbackTypes lists the accepted fallback wire styles.
+var fallbackTypes = []string{FallbackTypeAnthropic, FallbackTypeOpenAI}
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
 type TemporalConfig struct {
@@ -102,10 +119,18 @@ type AnthropicConfig struct {
 // as the primary's (DAEDALUS_FALLBACK_* — never workflow history, activity
 // inputs, argv, or logs).
 type FallbackConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	URL     string `yaml:"url"`
-	Key     string `yaml:"key"`
-	Model   string `yaml:"model"`
+	Enabled bool `yaml:"enabled"`
+	// Type selects the fallback's wire style: "anthropic" (the default —
+	// an Anthropic-compatible endpoint) or "openai" (an OpenAI-compatible
+	// chat-completions endpoint). It governs how the worker status probe
+	// questions the fallback and which vars failover values travel on. A
+	// jailed round's wire is chosen by the agent itself: an openai-style
+	// fallback serves only agents that dial OPENAI_BASE_URL — claude dials
+	// ANTHROPIC_* and cannot use it. Empty loads as the default.
+	Type  string `yaml:"type"`
+	URL   string `yaml:"url"`
+	Key   string `yaml:"key"`
+	Model string `yaml:"model"`
 	// HeartbeatModel mirrors AnthropicConfig.HeartbeatModel for fallback
 	// rounds; empty falls back to Model, then to the agent's default.
 	HeartbeatModel string `yaml:"heartbeat_model"`
@@ -251,6 +276,12 @@ func (c Config) AgentEnv() []string {
 	add("OPENAI_API_KEY", c.OpenAI.Key)
 	add("OPENAI_MODEL", c.OpenAI.Model)
 	if f := c.Fallback; f.Active() {
+		// Type travels only as an override: failover treats every value
+		// but "openai" as the anthropic default, so the default is not
+		// exported (unset means "use the default", like every other field).
+		if f.Type != DefaultFallbackType {
+			add("DAEDALUS_FALLBACK_TYPE", f.Type)
+		}
 		add("DAEDALUS_FALLBACK_BASE_URL", f.URL)
 		add("DAEDALUS_FALLBACK_API_KEY", f.Key)
 		add("DAEDALUS_FALLBACK_MODEL", f.Model)
@@ -276,6 +307,7 @@ func ProviderEnvVars() []string {
 		"OPENAI_BASE_URL",
 		"OPENAI_API_KEY",
 		"OPENAI_MODEL",
+		"DAEDALUS_FALLBACK_TYPE",
 		"DAEDALUS_FALLBACK_BASE_URL",
 		"DAEDALUS_FALLBACK_API_KEY",
 		"DAEDALUS_FALLBACK_MODEL",
@@ -320,6 +352,10 @@ func Load(path string) (Config, error) {
 		if f.URL == "" || f.Key == "" || f.Model == "" {
 			return c, fmt.Errorf("config %s: fallback: enabled fallback needs url, key, and model", path)
 		}
+	}
+	if !slices.Contains(fallbackTypes, c.Fallback.Type) {
+		return c, fmt.Errorf("config %s: fallback: unknown type %q (available: %s)",
+			path, c.Fallback.Type, strings.Join(fallbackTypes, ", "))
 	}
 	return c, nil
 }
@@ -391,6 +427,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxConcurrentAgentRuns == 0 {
 		c.MaxConcurrentAgentRuns = DefaultMaxConcurrentAgentRuns
+	}
+	if c.Fallback.Type == "" {
+		c.Fallback.Type = DefaultFallbackType
 	}
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
@@ -239,7 +238,10 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// do not cross workflow runs — a continued run starts fresh against its
 	// preserved work.
 	devSession, testSession := "", ""
-	runAgent := func(prompt string, stage string, session *string) error {
+	// runAgent runs one agent round in the given role's session, resuming
+	// it when set, and returns the round's result — its reply text is what
+	// the test phase relays to its reviewer.
+	runAgent := func(prompt string, stage string, session *string) (activities.AgentRunResult, error) {
 		// One per-call fallback when a resumed round fails outright (e.g. the
 		// session no longer exists under the jail's state dir): retry the
 		// round fresh rather than failing the whole run over a lost
@@ -259,7 +261,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				*session = result.SessionID
 				logger.Info("Agent run completed", "Stage", stage,
 					"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
-				return nil
+				return result, nil
 			}
 			// The kill classification runs first: its marker is
 			// wait-status-derived in the worker (ErrAgentKilled), while
@@ -269,7 +271,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			killed := isAgentKilled(err)
 			if !killed && isAPIExhaustion(err) {
 				if herr := heartbeat(err, stage); herr != nil {
-					return herr
+					return activities.AgentRunResult{}, herr
 				}
 				continue
 			}
@@ -280,7 +282,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				logger.Warn("All jailed-agent slots busy; backing off before re-queuing the round",
 					"Stage", stage, "Backoff", slotBackoffInterval)
 				if serr := workflow.Sleep(ctx, slotBackoffInterval); serr != nil {
-					return fmt.Errorf("slot backoff sleep (stage %q): %w", stage, serr)
+					return activities.AgentRunResult{}, fmt.Errorf("slot backoff sleep (stage %q): %w", stage, serr)
 				}
 				continue
 			}
@@ -300,7 +302,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 					*session = ""
 					continue
 				}
-				return err
+				return activities.AgentRunResult{}, err
 			}
 			consecutiveTimeouts++
 			cutoff := fmt.Sprintf(
@@ -313,21 +315,23 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				"Stage", stage, "ConsecutiveTimeouts", consecutiveTimeouts,
 				"AgentRunTimeout", agentTimeout, "Killed", killed)
 			if consecutiveTimeouts >= maxConsecutiveTimeouts {
-				return fmt.Errorf("agent run cut off %d rounds in a row (stage %q): %w",
+				return activities.AgentRunResult{}, fmt.Errorf("agent run cut off %d rounds in a row (stage %q): %w",
 					consecutiveTimeouts, stage, err)
 			}
 			followUp, ferr := template.Continue(prompt, cutoff)
 			if ferr != nil {
-				return fmt.Errorf("build timeout-continuation prompt (stage %q): %w", stage, ferr)
+				return activities.AgentRunResult{}, fmt.Errorf("build timeout-continuation prompt (stage %q): %w", stage, ferr)
 			}
 			prompt = followUp
 		}
 	}
 	// Reviewer timeouts retry the same round unchanged — there is no
-	// partial work to continue, the verdict simply never arrived.
+	// partial work to continue, the verdict simply never arrived. agentReply
+	// quotes the test agent's latest reply for the test reviewer (empty in
+	// phase 1).
 	reviewTimeouts := 0
 	devReviewSession, testReviewSession := "", ""
-	review := func(focus, testLogs string, testsInScope bool, session *string) (activities.ReviewResult, error) {
+	review := func(focus, testLogs string, testsInScope bool, agentReply string, session *string) (activities.ReviewResult, error) {
 		// Same lost-session fallback as the agent rounds: one fresh retry.
 		freshFallback := false
 		for {
@@ -337,6 +341,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				Focus:        focus,
 				TestLogs:     testLogs,
 				TestsInScope: testsInScope,
+				AgentReply:   agentReply,
 				Agent:        input.Agent,
 				SessionID:    *session,
 			}).Get(ctx, &result)
@@ -386,6 +391,55 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		}
 	}
 
+	// codeReviewLoop runs implementation ↔ code-review rounds until the
+	// code reviewer approves, parking on NEEDS_MAINTAINER. Both the first
+	// pass and a test-phase REBUILD land here, so the rebuild re-enters the
+	// same reviewer conversation instead of starting cold.
+	codeReviewLoop := func() error {
+		for {
+			verdict, err := review("the implementation", "", false, "", &devReviewSession)
+			if err != nil {
+				return fmt.Errorf("code review: %w", err)
+			}
+			if verdict.NeedsMaintainer {
+				logger.Info("Code review halted the run for maintainer input")
+				return fmt.Errorf("%w: code review halted the run — the task cannot be completed as stated: %s",
+					ErrAwaitingMaintainer, verdict.Comments)
+			}
+			if verdict.Approved {
+				logger.Info("Code review approved")
+				return nil
+			}
+			logger.Info("Code review requested changes")
+			fixPrompt, err := template.ImplementFix(verdict.Comments)
+			if err != nil {
+				return fmt.Errorf("build implement-fix prompt: %w", err)
+			}
+			if g := drainGuidance(); g != "" {
+				logger.Info("Operator guidance received, folding into fix prompt")
+				fixPrompt = g + "\n\n" + fixPrompt
+			}
+			if _, err := runAgent(fixPrompt, "implement-fix", &devSession); err != nil {
+				return fmt.Errorf("agent run after code review: %w", err)
+			}
+		}
+	}
+
+	// rebuild routes a test-review REBUILD finding back through the dev
+	// cycle: a tight, finding-only prompt into the dev session, then code
+	// review until approved. The test loop resumes afterwards with its own
+	// sessions intact.
+	rebuild := func(finding string) error {
+		prompt, err := template.Rebuild(finding)
+		if err != nil {
+			return fmt.Errorf("build rebuild prompt: %w", err)
+		}
+		if _, err := runAgent(prompt, "rebuild", &devSession); err != nil {
+			return fmt.Errorf("rebuild agent run: %w", err)
+		}
+		return codeReviewLoop()
+	}
+
 	// Phase 1: implementation ↔ code review, until the reviewer approves.
 	// A continued run opens on the aborted attempt's preserved work.
 	var initialPrompt string
@@ -398,44 +452,24 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("build implement prompt: %w", err)
 	}
-	if err := runAgent(initialPrompt, "implement", &devSession); err != nil {
+	if _, err := runAgent(initialPrompt, "implement", &devSession); err != nil {
 		return "", fmt.Errorf("initial agent run: %w", err)
 	}
-	for {
-		verdict, err := review("the implementation", "", false, &devReviewSession)
-		if err != nil {
-			return "", fmt.Errorf("code review: %w", err)
-		}
-		if verdict.NeedsMaintainer {
-			logger.Info("Code review halted the run for maintainer input")
-			return "", fmt.Errorf("%w: code review halted the run — the task cannot be completed as stated: %s",
-				ErrAwaitingMaintainer, truncateParkComments(verdict.Comments))
-		}
-		if verdict.Approved {
-			logger.Info("Code review approved")
-			break
-		}
-		logger.Info("Code review requested changes")
-		fixPrompt, err := template.ImplementFix(verdict.Comments)
-		if err != nil {
-			return "", fmt.Errorf("build implement-fix prompt: %w", err)
-		}
-		if g := drainGuidance(); g != "" {
-			logger.Info("Operator guidance received, folding into fix prompt")
-			fixPrompt = g + "\n\n" + fixPrompt
-		}
-		if err := runAgent(fixPrompt, "implement-fix", &devSession); err != nil {
-			return "", fmt.Errorf("agent run after code review: %w", err)
-		}
+	if err := codeReviewLoop(); err != nil {
+		return "", err
 	}
 
 	// Phase 2: tests ↔ test review, until the reviewer approves AND the
-	// native suite passes.
+	// native suite passes. The tester's latest reply travels to its
+	// reviewer, which alone can verdict REBUILD — routing an
+	// implementation-level finding back through the dev cycle (above)
+	// before the test loop resumes with both sessions intact.
 	testsPrompt, err := template.Tests()
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)
 	}
-	if err := runAgent(testsPrompt, "tests", &testSession); err != nil {
+	testerReply, err := runAgent(testsPrompt, "tests", &testSession)
+	if err != nil {
 		return "", fmt.Errorf("test-phase agent run: %w", err)
 	}
 	// The native suite gets a wider ceiling than the shared 15 minutes:
@@ -490,14 +524,21 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			// provider was reachable for it.
 			quotaHeartbeats = 0
 		}
-		verdict, err := review("the test suite", result.Logs, true, &testReviewSession)
+		verdict, err := review("the test suite", result.Logs, true, testerReply.Text, &testReviewSession)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
 		if verdict.NeedsMaintainer {
 			logger.Info("Test review halted the run for maintainer input")
 			return "", fmt.Errorf("%w: test review halted the run — the task cannot be completed as stated: %s",
-				ErrAwaitingMaintainer, truncateParkComments(verdict.Comments))
+				ErrAwaitingMaintainer, verdict.Comments)
+		}
+		if verdict.Rebuild {
+			logger.Info("Test review requested a rebuild; returning to the dev cycle")
+			if err := rebuild(verdict.Comments); err != nil {
+				return "", err
+			}
+			continue
 		}
 		if result.Passed && verdict.Approved {
 			logger.Info("Tests pass and test review approved")
@@ -513,30 +554,12 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			logger.Info("Operator guidance received, folding into fix prompt")
 			testFix = g + "\n\n" + testFix
 		}
-		if err := runAgent(testFix, "tests-fix", &testSession); err != nil {
+		fixResult, err := runAgent(testFix, "tests-fix", &testSession)
+		if err != nil {
 			return "", fmt.Errorf("test-fix agent run: %w", err)
 		}
+		testerReply = fixResult
 	}
-}
-
-// maxParkCommentBytes bounds the reviewer comments embedded in a park
-// error — same ceiling as the exhaustion excerpt on the activity side.
-// The full text already travels in the history's activity result (where
-// `continue` reads it from), so the failure event needs only enough to
-// identify the halt, not a second full copy.
-const maxParkCommentBytes = 1024
-
-// truncateParkComments bounds s to its first maxParkCommentBytes bytes
-// (keeping whole UTF-8 runes) with a truncation marker.
-func truncateParkComments(s string) string {
-	if len(s) <= maxParkCommentBytes {
-		return s
-	}
-	cut := maxParkCommentBytes
-	for cut < len(s) && !utf8.RuneStart(s[cut]) {
-		cut++
-	}
-	return s[:cut] + "\n[... review comments truncated ...]"
 }
 
 // testFixPrompt builds the phase-2 fix prompt from whatever failed: test

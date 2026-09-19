@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/api/enums/v1"
@@ -1736,38 +1735,157 @@ func TestFeatureDevWorkflowTestReviewNeedsMaintainerParks(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
-// TestTruncateParkComments pins the park-error excerpt rule: short comments
-// pass through untouched, long ones are cut at the byte cap on a whole-rune
-// boundary and marked as truncated.
-func TestTruncateParkComments(t *testing.T) {
-	const marker = "\n[... review comments truncated ...]"
+// TestFeatureDevWorkflowTestReviewRebuildLoopsThroughDevCycle pins the
+// REBUILD loop-back: a test-review REBUILD verdict routes the finding back
+// through the dev cycle — a tight, finding-only prompt into the dev
+// session, then code review — and the test loop resumes with its reviewer
+// session intact, re-running the suite before approval is possible.
+func TestFeatureDevWorkflowTestReviewRebuildLoopsThroughDevCycle(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 
-	exact := strings.Repeat("a", maxParkCommentBytes)
-	if got := truncateParkComments(exact); got != exact {
-		t.Errorf("input at the cap should pass through, got %q-ish (len %d)", got[:32], len(got))
+	rec := &agentRecorder{env: env, result: activities.AgentRunResult{Text: "stub agent output", SessionID: "dev-sess"}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: true, SessionID: "code-sess"},                                          // phase 1 code review
+		{Rebuild: true, Comments: "handler drops the error path", SessionID: "test-sess"}, // rebuild verdict
+		{Approved: true, SessionID: "code-sess"},                                          // code review after the rebuild
+		{Approved: true, SessionID: "test-sess"},                                          // test review after the rebuild
+	}}
+	rev.record()
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
 	}
 
-	long := strings.Repeat("a", maxParkCommentBytes+50)
-	got := truncateParkComments(long)
-	if want := strings.Repeat("a", maxParkCommentBytes) + marker; got != want {
-		t.Errorf("ASCII truncation: got %d bytes, want cap+marker (%d bytes)", len(got), len(want))
+	// Agent rounds: implement, tests, rebuild — no tests-fix round, the
+	// resumed test review approves the passing suite directly.
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement + tests + rebuild)", len(rec.inputs))
+	}
+	rebuildPrompt := rec.inputs[2].Prompt
+	if !strings.Contains(rebuildPrompt, "handler drops the error path") {
+		t.Errorf("rebuild prompt %q should carry the finding", rebuildPrompt)
+	}
+	if implPrompt, err := template.Implement("implement the feature"); err != nil || strings.Contains(rebuildPrompt, implPrompt) {
+		t.Errorf("rebuild prompt %q should be tight-context, not replay the implement prompt (%v)", rebuildPrompt, err)
+	}
+	if rec.inputs[2].SessionID != "dev-sess" {
+		t.Errorf("rebuild round SessionID = %q, want the dev session resumed", rec.inputs[2].SessionID)
 	}
 
-	// The byte cap lands mid-rune (each € is three bytes): the cut must
-	// slide forward to a whole rune, never emitting half of one.
-	runes := strings.Repeat("€", 342) + strings.Repeat("a", 10) // 1026 + 10 bytes
-	got = truncateParkComments(runes)
-	if want := strings.Repeat("€", 342) + marker; got != want {
-		t.Errorf("multibyte truncation: got %d bytes (valid=%v), want 342 whole runes + marker",
-			len(got), utf8.ValidString(got))
+	// Reviewer rounds: code review, test review (rebuild), code review on
+	// the rebuild, test review on the resumed loop — each role resuming its
+	// own session, and the tester's reply relayed to the test reviewer only.
+	if len(rev.inputs) != 4 {
+		t.Fatalf("reviewer ran %d times, want 4 (code + test + code + test)", len(rev.inputs))
 	}
+	if rev.inputs[1].AgentReply == "" {
+		t.Error("test review should carry the tester's latest reply")
+	}
+	if rev.inputs[2].AgentReply != "" || rev.inputs[2].TestsInScope {
+		t.Error("the rebuild's code review must not carry the tester relay")
+	}
+	if rev.inputs[2].SessionID != "code-sess" {
+		t.Errorf("post-rebuild code review SessionID = %q, want the code-review session resumed", rev.inputs[2].SessionID)
+	}
+	if rev.inputs[3].SessionID != "test-sess" {
+		t.Errorf("resumed test review SessionID = %q, want the test-review session resumed", rev.inputs[3].SessionID)
+	}
+	env.AssertExpectations(t)
+}
 
-	// The cap lands exactly on a rune boundary: no slide, the multibyte
-	// tail is simply dropped.
-	boundary := strings.Repeat("a", maxParkCommentBytes) + "€€"
-	got = truncateParkComments(boundary)
-	if want := strings.Repeat("a", maxParkCommentBytes) + marker; got != want {
-		t.Errorf("rune-boundary truncation: got %d bytes, want cap+marker (%d bytes)",
-			len(got), len(want))
+// TestFeatureDevWorkflowTesterReplyRelayedToReview pins the tester→reviewer
+// leg of the rebuild path: the test reviewer's input carries the tester's
+// latest reply across both fix rounds, so the reviewer — not the tester —
+// decides on a REBUILD; the code review's input never does.
+func TestFeatureDevWorkflowTesterReplyRelayedToReview(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env, result: activities.AgentRunResult{Text: "the handler fix is outside my test-only scope"}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: true}, // phase 1 code review
+		{Approved: false, Comments: "name the helper"}, // test review requests changes
+		{Approved: true}, // test review approves
+	}}
+	rev.record()
+
+	env.OnActivity(activities.RunNativeTestsActivity, mock.Anything, mock.Anything, mock.Anything).
+		Return(activities.TestResult{Passed: true, Logs: "ok"}, nil)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
 	}
+	if len(rev.inputs) != 3 {
+		t.Fatalf("reviewer ran %d times, want 3 (code + test + test)", len(rev.inputs))
+	}
+	if rev.inputs[0].AgentReply != "" {
+		t.Errorf("code review AgentReply = %q, want empty outside the test phase", rev.inputs[0].AgentReply)
+	}
+	for i := 1; i < len(rev.inputs); i++ {
+		if rev.inputs[i].AgentReply != "the handler fix is outside my test-only scope" {
+			t.Errorf("test review %d AgentReply = %q, want the tester's latest reply relayed", i, rev.inputs[i].AgentReply)
+		}
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowParkErrorCarriesFullComments pins the untruncated
+// park error: reviewer comments reach the workflow failure message whole,
+// however long — the maintainer reads the halt reason in full from the
+// failure, so no excerpt stands in for the text and no truncation marker
+// may appear.
+func TestFeatureDevWorkflowParkErrorCarriesFullComments(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	// Well past the byte cap the park message once enforced, so this fails
+	// exclusively if truncation sneaks back in.
+	comments := strings.Repeat("the layout must stay columnar. ", 64)
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{NeedsMaintainer: true, Comments: comments},
+	}}
+	rev.record()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from a NEEDS_MAINTAINER verdict")
+	}
+	if !strings.Contains(err.Error(), comments) {
+		t.Errorf("park error should carry the reviewer comments in full, got %q", err)
+	}
+	const marker = "[... review comments truncated ...]"
+	if strings.Contains(err.Error(), marker) {
+		t.Errorf("park error should not truncate the reviewer comments, got %q", err)
+	}
+	env.AssertExpectations(t)
 }

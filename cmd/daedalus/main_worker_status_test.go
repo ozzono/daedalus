@@ -58,7 +58,7 @@ func TestWorkerStatusAll(t *testing.T) {
 			}
 		})
 
-		for _, want := range []string{"WORKER", "STATE", "CONFIG", "LOG"} {
+		for _, want := range []string{"WORKER", "STATE", "API", "CONFIG", "CODE PATH", "LOG"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("status output %q should carry the %s column header", out, want)
 			}
@@ -96,6 +96,20 @@ func TestWorkerStatusAll(t *testing.T) {
 			t.Errorf("status output %q should list workers a, b, z sorted (indexes %d, %d, %d)", out, ia, ib, iz)
 		}
 	})
+}
+
+// TestWorkerCodePathLadder pins workerCodePath's display-text ladder for
+// the cases decidable without a Temporal round trip: no config record, and
+// an unloadable config. Everything past config.Load (dial, query, history)
+// degrades to "temporal unreachable"/"idle" in the row and is exercised
+// only live.
+func TestWorkerCodePathLadder(t *testing.T) {
+	if got := workerCodePath(""); got != "n/a (no config record)" {
+		t.Errorf("workerCodePath(no record) = %q, want the n/a placeholder", got)
+	}
+	if got := workerCodePath(filepath.Join(t.TempDir(), "gone.yaml")); got != "config error" {
+		t.Errorf("workerCodePath(missing config) = %q, want \"config error\"", got)
+	}
 }
 
 // TestMainWorkerStatusNeedsNoConfig pins the dispatch wiring in-process:

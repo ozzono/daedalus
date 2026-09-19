@@ -240,7 +240,7 @@ agent_run_timeout: 30m
 // config explicitly enables it.
 func TestFallbackInactiveOmitted(t *testing.T) {
 	for name, doc := range map[string]string{
-		"absent":  "",
+		"absent":   "",
 		"disabled": "fallback:\n  enabled: false\n  url: https://backup.example\n  key: k\n  model: m\n",
 	} {
 		cfg, err := Load(writeConfig(t, doc))
@@ -273,6 +273,64 @@ func TestLoadFallbackValidation(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "fallback: enabled fallback needs url, key, and model") {
 			t.Errorf("Load(%q) error = %v, want fallback validation message", doc, err)
+		}
+	}
+}
+
+// TestLoadFallbackType pins the fallback.type parsing: absent loads as the
+// anthropic default, both accepted styles load through, and an unknown
+// style is rejected at load with the accepted choices named — before any
+// worker arms failover on a wire style nothing speaks.
+func TestLoadFallbackType(t *testing.T) {
+	cfg, err := Load(writeConfig(t, ""))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Fallback.Type != DefaultFallbackType {
+		t.Errorf("Fallback.Type = %q, want the default %q", cfg.Fallback.Type, DefaultFallbackType)
+	}
+
+	for _, typ := range fallbackTypes {
+		cfg, err := Load(writeConfig(t, "fallback:\n  type: "+typ+"\n"))
+		if err != nil {
+			t.Fatalf("Load(fallback.type: %s): %v", typ, err)
+		}
+		if cfg.Fallback.Type != typ {
+			t.Errorf("Fallback.Type = %q, want %q", cfg.Fallback.Type, typ)
+		}
+	}
+
+	_, err = Load(writeConfig(t, "fallback:\n  type: azure\n"))
+	if err == nil || !strings.Contains(err.Error(), `unknown type "azure"`) {
+		t.Fatalf("want unknown-fallback-type error, got %v", err)
+	}
+}
+
+// TestAgentEnvFallbackTypeOverride pins that the fallback's wire style
+// travels to the worker only as an override: an openai fallback exports
+// DAEDALUS_FALLBACK_TYPE=openai, while the anthropic default — absent or
+// explicit — exports nothing, so unset means "use the default" like every
+// other field.
+func TestAgentEnvFallbackTypeOverride(t *testing.T) {
+	const doc = "fallback:\n  enabled: true\n  url: https://backup.example\n  key: sk-backup\n  model: glm-backup\n"
+
+	cfg, err := Load(writeConfig(t, doc+"  type: openai\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !slices.Contains(cfg.AgentEnv(), "DAEDALUS_FALLBACK_TYPE=openai") {
+		t.Errorf("AgentEnv() = %v, want DAEDALUS_FALLBACK_TYPE=openai for an openai fallback", cfg.AgentEnv())
+	}
+
+	for name, typ := range map[string]string{"absent": "", "explicit anthropic": "  type: anthropic\n"} {
+		cfg, err := Load(writeConfig(t, doc+typ))
+		if err != nil {
+			t.Fatalf("%s: Load: %v", name, err)
+		}
+		for _, kv := range cfg.AgentEnv() {
+			if strings.HasPrefix(kv, "DAEDALUS_FALLBACK_TYPE") {
+				t.Errorf("%s: AgentEnv() leaked %q; the default must not be exported", name, kv)
+			}
 		}
 	}
 }

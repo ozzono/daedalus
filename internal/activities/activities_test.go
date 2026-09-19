@@ -1290,15 +1290,18 @@ func TestParseReviewVerdict(t *testing.T) {
 		out             string
 		approved        bool
 		needsMaintainer bool
+		rebuild         bool
 		comments        string
 	}{
-		{"approved", "Looks good.\nAPPROVED\n", true, false, "Looks good."},
-		{"changes requested", "Do X.\nCHANGES_REQUESTED", false, false, "Do X."},
-		{"needs maintainer", "Need a secret.\nNEEDS_MAINTAINER", false, true, "Need a secret."},
-		{"trailing blank lines", "fine\nAPPROVED\n\n\n", true, false, "fine"},
-		{"no marker keeps whole output", "the error path is untested", false, false, "the error path is untested"},
-		{"lowercase is not approved", "fine\napproved", false, false, "fine\napproved"},
-		{"lowercase is not a maintainer halt", "fine\nneeds_maintainer", false, false, "fine\nneeds_maintainer"},
+		{"approved", "Looks good.\nAPPROVED\n", true, false, false, "Looks good."},
+		{"changes requested", "Do X.\nCHANGES_REQUESTED", false, false, false, "Do X."},
+		{"needs maintainer", "Need a secret.\nNEEDS_MAINTAINER", false, true, false, "Need a secret."},
+		{"rebuild", "handler drops the error path.\nREBUILD", false, false, true, "handler drops the error path."},
+		{"trailing blank lines", "fine\nAPPROVED\n\n\n", true, false, false, "fine"},
+		{"no marker keeps whole output", "the error path is untested", false, false, false, "the error path is untested"},
+		{"lowercase is not approved", "fine\napproved", false, false, false, "fine\napproved"},
+		{"lowercase is not a maintainer halt", "fine\nneeds_maintainer", false, false, false, "fine\nneeds_maintainer"},
+		{"lowercase is not a rebuild", "fine\nrebuild", false, false, false, "fine\nrebuild"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1308,6 +1311,9 @@ func TestParseReviewVerdict(t *testing.T) {
 			}
 			if got.NeedsMaintainer != tc.needsMaintainer {
 				t.Errorf("NeedsMaintainer = %v, want %v", got.NeedsMaintainer, tc.needsMaintainer)
+			}
+			if got.Rebuild != tc.rebuild {
+				t.Errorf("Rebuild = %v, want %v", got.Rebuild, tc.rebuild)
 			}
 			if got.Comments != tc.comments {
 				t.Errorf("Comments = %q, want %q", got.Comments, tc.comments)

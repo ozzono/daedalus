@@ -60,109 +60,231 @@ var workflowRegistry = map[string]any{
 	"feature-dev": workflows.FeatureDevWorkflow,
 }
 
-var usage = `Daedalus — a local, sandboxed AI developer agent control plane.
+var usage = `Daedalus — A local, sandboxed AI developer agent control plane.
 
-Usage:
-  daedalus -v, --version        Print the version and exit.
-  daedalus init
-      Write config-example.yaml in the current directory: every field with
-      its default value, fully commented. Copy it to config.yaml and edit.
-  daedalus [-c config.yaml] worker [start|stop|status|restart|foreground]
-      Run the Temporal worker hosting the pipelines. The default action,
-      start, runs it as a detached daemon: logs append to
-      /tmp/daedalus/worker-<name>.log (pruned to the past week), the pid
-      lives in /tmp/daedalus/worker-<name>.pid — one daemon per worker
-      name, the config's worker_id or else its task_queue. stop drains it
-      gracefully (SIGTERM). restart is stop + start with the config the
-      restart is invoked with, re-read from disk, so values changed since
-      the worker was started (a rotated API key, a new model) take effect
-      on every restart. "restart <worker>" restarts that one worker from
-      its recorded config — re-read from disk, so edits apply — from any
-      directory; "restart all" does every worker on record. Both work from
-      records alone (-c is rejected there — it would have no effect).
-      status lists every worker on record — plus any live stray running
-      without one, shown as "(no config record)" — worker name, running
-      pid, config record, and log path (-c rejected there too).
-      foreground runs attached to this terminal.
-      anthropic.key is optional — if unset, the jailed agent authenticates
-      through the worker's inherited environment or its own login.
-  daedalus [-c config.yaml] list [max]
-      List past and current sessions (pipeline runs) on this task queue,
-      newest first: session id, status, last interaction datetime (close
-      time once closed, start time while running). Defaults to the 10 most
-      recent; pass a larger max to list more.
+USAGE
+  daedalus [global-flags] <command> [subcommand|arguments] [flags]
+
+WORKFLOW COMMANDS
+  run         Start an implementation pipeline for an issue
+  continue    Resume a closed, failed, or parked session
+  guide       Send operator instructions to a running pipeline
+  attach      Reconnect to an in-flight or completed pipeline
+  list        Display past and current sessions on the task queue
+
+WORKER COMMANDS
+  worker      Manage the Temporal worker daemon (start, stop, status, restart, foreground)
+
+UTILITY COMMANDS
+  init        Generate a fully commented config-example.yaml file
+  version     Print the version and exit
+
+GLOBAL FLAGS
+  -c, --config <path>   Path to config file (./config.yaml, else ~/.config/daedalus/config.yaml)
+  -v, --version         Print version and exit
+  -h, --help            Show this help message
+
+EXAMPLES
+  $ daedalus run ./my-repo 42 "Add /health endpoint"
+  $ daedalus run -cli amp -f prompt.md ./my-repo 101
+  $ daedalus guide daedalus-issue-42 "Focus on the database migration first"
+  $ daedalus worker restart all
+
+Use "daedalus <command> --help" for detailed information about a command.
+`
+
+// commandHelp holds the per-command help screens behind
+// "daedalus <command> --help": the argument, flag, and edge-case detail
+// the root screen deliberately omits (progressive disclosure). The init
+// screen also carries the configuration reference table.
+var commandHelp = map[string]string{
+	"run": `daedalus run — start an implementation pipeline for an issue.
+
+USAGE
   daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] <repo-path> <issue-id> "<prompt>"
-      Start a pipeline for an issue. -w selects the workflow
-      (default: feature-dev; available: ` + workflowNames() + `).
-      The "<prompt>" argument is the full task description; pass
-      -f/--file <path> to read it from a file instead — either the
-      argument or the file, never both.
-      -p/--prefix names the preserved branch <prefix>/issue-<id>-<timestamp>
-      for this run, overriding the config's branch_prefix (the issue part of
-      the name stays as given).
-      -cli/--cli <agent> overrides the config's agent (claude, opencode,
-      amp) for this run: the selection travels with the run's workflow
-      input, so it applies on whichever worker serves the queue.
-      -d/--detach starts the pipeline and returns immediately instead of
-      blocking until it finishes; "daedalus attach" reconnects later.
-  daedalus [-c config.yaml] run -a <workflow-id> "<prompt>"
-      Append instructions to a pipeline that is already running instead of
-      starting a new run: the prompt is folded into the agent's next fix
-      round (same as "daedalus guide"); -f/--file works here too.
-      -d has no effect in append mode, and -p is rejected there: the run
-      keeps the branch prefix it started with.
-  daedalus [-c config.yaml] guide <workflow-id> "<message>"
-      Send operator guidance to a running pipeline: the message is folded
-      into the agent's next fix prompt, steering a stuck review loop
-      without restarting the run.
+  daedalus [-c config.yaml] run -a <workflow-id> ["<prompt>"]   (append mode)
+
+ARGUMENTS
+  <repo-path>    Path to the repository the pipeline works in.
+  <issue-id>     Issue identifier: scopes the session's workflow id and branch.
+  "<prompt>"     The full task description. Pass -f/--file <path> to read it
+                 from a file instead — either the argument or the file, never both.
+
+FLAGS
+  -w, --workflow <name>   Workflow to run (default: feature-dev; available: ` + workflowNames() + `).
+  -d, --detach            Start the pipeline and return immediately instead of
+                          blocking until it finishes; "daedalus attach" reconnects.
+  -p, --prefix <prefix>   Name this run's preserved branch
+                          <prefix>/issue-<id>-<timestamp>, overriding the config's
+                          branch_prefix (the issue part of the name stays as given).
+                          Fresh runs only — rejected in append mode.
+  -cli, --cli <agent>     Jailed agent for this run: claude, opencode, or amp.
+                          Overrides the config's agent; travels with the run's
+                          workflow input, so it applies on whichever worker serves
+                          the queue. Fresh runs only — rejected in append mode.
+  -f, --file <path>       Read the task description from a file.
+  -a, --append <id>       Append mode: target an already-running pipeline instead
+                          of starting a new run — the prompt is folded into the
+                          agent's next fix round (same as "daedalus guide").
+                          -f works here too; -d has no effect and -p is rejected:
+                          the run keeps the branch prefix it started with.
+
+EXAMPLES
+  $ daedalus run ./my-repo 42 "Add /health endpoint"
+  $ daedalus run -d ./my-repo 43 "Refactor the config loader"
+  $ daedalus run -cli amp -f prompt.md ./my-repo 101
+  $ daedalus run -a daedalus-issue-42 "Also cover the migration in tests"
+
+The printed workflow id (<task-queue>-issue-<id>) is what "attach", "guide",
+and "continue" address (also visible in "temporal workflow list").
+`,
+	"continue": `daedalus continue — resume a closed session under a new prompt.
+
+USAGE
   daedalus [-c config.yaml] continue <workflow-id> "<prompt>"
-      Resume a closed session (canceled, failed, or parked — an
-      API-exhaustion halt past its hourly heartbeats, or a reviewer
-      NEEDS_MAINTAINER halt on an impossible task) under a new prompt: the
-      aborted attempt's work, preserved on its aborted/ branch, becomes
-      the new run's starting point, and that attempt's last review
-      feedback is folded into the opening prompt. -d works here too; -p
-      does not — the continued run keeps the original run's branch prefix.
+
+Resume a closed session (canceled, failed, or parked — an API-exhaustion
+halt past its hourly heartbeats, or a reviewer NEEDS_MAINTAINER halt on an
+impossible task): the aborted attempt's work, preserved on its aborted/
+branch, becomes the new run's starting point, and that attempt's last
+review feedback is folded into the opening prompt.
+
+FLAGS
+  -d, --detach   Start the continued run and return immediately.
+
+-p/--prefix does not apply: the continued run keeps the original run's
+branch prefix.
+
+EXAMPLE
+  $ daedalus continue daedalus-issue-42 "Retry, but split the migration in two"
+`,
+	"guide": `daedalus guide — send operator guidance to a running pipeline.
+
+USAGE
+  daedalus [-c config.yaml] guide <workflow-id> "<message>"
+
+The message is folded into the agent's next fix prompt, steering a stuck
+review loop without restarting the run.
+
+EXAMPLE
+  $ daedalus guide daedalus-issue-42 "Focus on the database migration first"
+`,
+	"attach": `daedalus attach — reconnect to a pipeline and report its outcome.
+
+USAGE
   daedalus [-c config.yaml] attach <workflow-id>
-      Reattach to a running (or already finished) pipeline, block until it
-      finishes, and report the outcome — the other half of "run -d".
-      <workflow-id> is the identifier printed by "run" (also visible in
-      "temporal workflow list").
+
+Reattach to a running (or already finished) pipeline, block until it
+finishes, and report the outcome — the other half of "run -d".
+<workflow-id> is the identifier printed by "run" (also visible in
+"temporal workflow list").
+
+EXAMPLE
+  $ daedalus attach daedalus-issue-42
+`,
+	"list": `daedalus list — display past and current sessions on the task queue.
+
+USAGE
+  daedalus [-c config.yaml] list [max]
+
+List past and current sessions (pipeline runs) on this task queue, newest
+first: session id, status, last interaction datetime (close time once
+closed, start time while running). Defaults to the 10 most recent; pass a
+larger max to list more.
+
+EXAMPLE
+  $ daedalus list 25
+`,
+	"worker": `daedalus worker — manage the Temporal worker daemon.
+
+USAGE
+  daedalus [-c config.yaml] worker [start|stop|status|restart|foreground]
+
+ACTIONS
+  start         (default) Run the worker as a detached daemon: logs append to
+                /tmp/daedalus/worker-<name>.log (pruned to the past week), the
+                pid lives in /tmp/daedalus/worker-<name>.pid — one daemon per
+                worker name (the config's worker_id, else its task_queue).
+  stop          Drain the daemon gracefully (SIGTERM).
+  restart       Stop + start with the config the restart is invoked with, re-read
+                from disk, so values changed since the worker was started (a
+                rotated API key, a new model) take effect on every restart.
+  status        List every worker on record — plus any live stray running without
+                one, shown as "(no config record)" — with worker name, running
+                pid, live API probe, config record, and log path.
+  foreground    Run attached to this terminal — the daemon child's mode, and the
+                way to debug a worker that will not start.
+
+RESTART TARGETS
+  restart               The worker the invoking directory's config names.
+  restart <worker>      That one worker, from its recorded config, from any directory.
+  restart all | --all   Every worker on record, each with its own recorded config.
+
+"restart <worker>", "restart all", and "status" work from records alone:
+-c/--config is rejected there — it would have no effect.
+
+anthropic.key is optional — if unset, the jailed agent authenticates through
+the worker's inherited environment or its own login.
+
+For a local Temporal dev server matching the defaults: temporal server start-dev
+`,
+	"init": `daedalus init — generate a fully commented config-example.yaml.
+
+Writes config-example.yaml in the current directory: every field with its
+default value, fully commented. Copy it to config.yaml and edit. Refuses to
+overwrite an existing file.
 
 Configuration is read from the first of ./config.yaml and
-~/.config/daedalus/config.yaml (-c/--config to override the path); the
-latter makes the CLI work from any directory. See config-example.yaml for
-all fields and their defaults:
-  agent                Jailed agent CLI: claude, opencode, or amp (default
-                       claude; run -cli/--cli overrides per run)
-  branch_prefix        Prefix for preserved branches, <prefix>/issue-<id>-<ts>
-                       (default daedalus; run -p/--prefix overrides per run)
-  worker_id            Name the worker daemon is managed under: keys the
-                       pid/log/config-record files and names the target of
-                       "worker restart <id>" (default: the task queue)
-  temporal.host        Temporal frontend address   (default 127.0.0.1:7233)
-  temporal.ui_port     Temporal UI port, shown at worker startup (default 8233)
-  temporal.task_queue  routing key; distinct projects or flows sharing one
-                       Temporal server use distinct queues (default daedalus)
-  anthropic.url        Anthropic API base URL       (default https://api.anthropic.com)
-  anthropic.key        Anthropic API key            (optional — skipped if unset)
-  anthropic.model      Model for the jailed agent   (agent default if unset)
-  anthropic.heartbeat_model Small/fast model for tiny prompts, exported as
-                       ANTHROPIC_DEFAULT_HAIKU_MODEL and used by the
-                       "worker status" probe        (agent default if unset)
-  anthropic.timeout_ms Agent API timeout in ms, exported as API_TIMEOUT_MS
-                       (default 3000000 = 50 minutes)
-  openai.url/key/model Optional OpenAI settings injected into the agent environment
-  fallback.enabled/url/key/model/heartbeat_model
-                       Independent secondary provider: when a jailed round
-                       fails with the primary's quota exhausted, the worker
-                       retries it on the fallback and keeps using it until
-                       the primary recovers (reset stamp parsed when the
-                       provider emits one, else 20m/40m/60m holds, 5h cap)
+~/.config/daedalus/config.yaml (-c/--config overrides the path); the latter
+makes the CLI work from any directory.
 
-For a local Temporal dev server matching the defaults:
-  temporal server start-dev
-`
+CONFIGURATION REFERENCE
+  agent                 Jailed agent CLI: claude, opencode, or amp
+                        (default claude; run -cli/--cli overrides per run)
+  branch_prefix         Prefix for preserved branches, <prefix>/issue-<id>-<ts>
+                        (default daedalus; run -p/--prefix overrides per run)
+  worker_id             Name the worker daemon is managed under: keys the
+                        pid/log/config-record files and names the target of
+                        "worker restart <id>" (default: the task queue)
+  tests_timeout         Ceiling for one execution of the repo's native test
+                        suite (default 30m)
+  agent_run_timeout     Ceiling for one jailed-agent round (default 45m)
+  cleanup_timeout       Ceiling for one worktree cleanup (default 30m)
+  max_concurrent_agent_runs
+                        Jailed-agent rounds this worker runs at once; further
+                        rounds queue (default 2)
+  temporal.host         Temporal frontend address (default 127.0.0.1:7233)
+  temporal.ui_port      Temporal UI port, shown at worker startup (default 8233)
+  temporal.task_queue   Routing key; distinct projects or flows sharing one
+                        Temporal server use distinct queues (default daedalus)
+  anthropic.url         Anthropic API base URL (default https://api.anthropic.com)
+  anthropic.key         Anthropic API key (optional — skipped if unset)
+  anthropic.model       Model for the jailed agent (agent default if unset)
+  anthropic.heartbeat_model
+                        Small/fast model for tiny prompts, exported as
+                        ANTHROPIC_DEFAULT_HAIKU_MODEL and used by the
+                        "worker status" probe (agent default if unset)
+  anthropic.timeout_ms  Agent API timeout in ms, exported as API_TIMEOUT_MS
+                        (default 3000000 = 50 minutes)
+  openai.url/key/model  Optional OpenAI settings injected into the agent
+                        environment
+  fallback.enabled/url/key/model/heartbeat_model
+                        Independent secondary provider: when a jailed round
+                        fails with the primary's quota exhausted, the worker
+                        retries it on the fallback and keeps using it until
+                        the primary recovers (reset stamp parsed when the
+                        provider emits one, else 20m/40m/60m holds, 5h cap)
+  fallback.type         Fallback wire style: anthropic (default) or openai;
+                        governs the status probe and failover env. A round's
+                        wire is chosen by the agent (claude dials ANTHROPIC_*),
+                        so openai serves only agents dialing OPENAI_BASE_URL
+`,
+	"version": `daedalus version — print the CLI version.
+
+USAGE
+  daedalus version | daedalus -v | daedalus --version
+`,
+}
 
 func main() {
 	configPath, args, err := parseFlags(os.Args[1:])
@@ -174,6 +296,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// "daedalus <command> --help" (and -h/help): the command's detailed
+	// help screen. Checked before config resolution so help works even
+	// where no config can be found.
+	if len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") {
+		if h, ok := commandHelp[args[0]]; ok {
+			fmt.Print(h)
+			return
+		}
+	}
+
 	// Every subcommand except the no-config ones (help, version, init, and
 	// the record-driven worker commands — `worker restart all`, `worker
 	// restart <name>`, and `worker status`, which read only the recorded
@@ -183,7 +315,7 @@ func main() {
 	_, restartNamed := isRestartNamed(args)
 	switch {
 	case args[0] == "-h", args[0] == "--help", args[0] == "help",
-		args[0] == "-v", args[0] == "--version", args[0] == "init",
+		args[0] == "-v", args[0] == "--version", args[0] == "version", args[0] == "init",
 		isRestartAll(args), restartNamed, isWorkerStatus(args):
 	default:
 		path, err := resolveConfigPath(configPath.configPath)
@@ -196,7 +328,7 @@ func main() {
 	switch args[0] {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
-	case "-v", "--version":
+	case "-v", "--version", "version":
 		fmt.Println(version.String())
 	case "init":
 		if err := writeExampleConfig("."); err != nil {
@@ -913,9 +1045,9 @@ func runningUnrecordedWorkers(onRecord map[string]bool) []string {
 
 // workerStatusAll lists every worker this deployment has on record — plus
 // any live stray running without one — with its running pid, the config it
-// was started with, and its log path. Record-driven like `restart all`, so
-// it reports the whole roster, not just the worker the invoking directory
-// happens to resolve to.
+// was started with, the code path its task queue is currently working, and
+// its log path. Record-driven like `restart all`, so it reports the whole
+// roster, not just the worker the invoking directory happens to resolve to.
 func workerStatusAll() error {
 	names, err := recordedWorkers()
 	if err != nil {
@@ -932,7 +1064,7 @@ func workerStatusAll() error {
 	}
 	sort.Strings(names)
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "WORKER\tSTATE\tAPI\tCONFIG\tLOG")
+	fmt.Fprintln(w, "WORKER\tSTATE\tAPI\tCONFIG\tCODE PATH\tLOG")
 	for _, name := range names {
 		pidFile, logFile, _ := daemonPaths(name)
 		state := "not running"
@@ -944,9 +1076,53 @@ func workerStatusAll() error {
 		if conf == "" {
 			shown = "(no config record)"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", name, state, providerStatus(conf), shown, logFile)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", name, state, providerStatus(conf), shown, workerCodePath(conf), logFile)
 	}
 	return w.Flush()
+}
+
+// workerCodePath reports the code a worker is reading to accomplish its
+// current task: the repo path of every pipeline run currently executing on
+// the worker's task queue, decoded from each run's history input (the same
+// walk `continue` uses to recover a run's original input). "idle" when the
+// queue has no running run. As in providerStatus, values that cannot be
+// determined are reported as display text rather than failures, so one
+// unreachable dependency never hides the rest of the roster.
+func workerCodePath(confPath string) string {
+	if confPath == "" {
+		return "n/a (no config record)"
+	}
+	cfg, err := config.Load(confPath)
+	if err != nil {
+		return "config error"
+	}
+	c, err := newClient(cfg)
+	if err != nil {
+		return "temporal unreachable"
+	}
+	defer c.Close()
+	resp, err := c.ListWorkflow(context.Background(), &workflowservice.ListWorkflowExecutionsRequest{
+		Namespace: "default",
+		PageSize:  10,
+		Query:     fmt.Sprintf("TaskQueue = '%s' AND ExecutionStatus = 'Running'", cfg.Temporal.TaskQueue),
+	})
+	if err != nil {
+		return "temporal unreachable"
+	}
+	var paths []string
+	seen := make(map[string]bool, len(resp.GetExecutions()))
+	for _, info := range resp.GetExecutions() {
+		prev, _, err := readPriorRun(c, info.GetExecution().GetWorkflowId())
+		if err != nil || prev.RepoPath == "" || seen[prev.RepoPath] {
+			continue
+		}
+		seen[prev.RepoPath] = true
+		paths = append(paths, prev.RepoPath)
+	}
+	if len(paths) == 0 {
+		return "idle"
+	}
+	return strings.Join(paths, ", ")
 }
 
 // providerStatus live-probes the provider a worker's recorded config
@@ -977,11 +1153,18 @@ func providerStatus(confPath string) string {
 	if !cfg.Fallback.Active() || main.OK {
 		return main.Detail
 	}
+	// The fallback's type picks its probe's wire style, matching what
+	// failover rounds speak; anthropic is the default (also for a Type
+	// built without Load, which cannot happen here but costs nothing).
+	style := provider.StyleAnthropic
+	if cfg.Fallback.Type == config.FallbackTypeOpenAI {
+		style = provider.StyleOpenAI
+	}
 	fb := provider.Probe(context.Background(), provider.Spec{
 		URL:   cfg.Fallback.URL,
 		Key:   cfg.Fallback.Key,
 		Model: heartbeatOrDefault(cfg.Fallback.HeartbeatModel, cfg.Fallback.Model),
-		Style: provider.StyleAnthropic,
+		Style: style,
 	})
 	active := "fallback"
 	if !fb.OK {

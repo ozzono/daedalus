@@ -17,7 +17,18 @@ Tests are out of scope for this review. The test suite is written and reviewed i
 Bug policy — every bug you find, in the diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. If it is in scope for this review, make it a finding and request changes. If it is out of scope, do not block approval over it — record it and add an alert about it in the docs.
 {{else}}
 Your scope is the test packages and files the change touched — the diff above shows them. Full-suite testing belongs to the pipeline's gate and the maintainer: coverage or failures elsewhere in the suite are not findings — do not request changes over them; name them in your comments instead.
+{{if .AgentReply}}
+
+The test agent's latest reply:
+
+{{.AgentReply}}
+
+It may report that the fix the work needs is an implementation change its test-only scope forbids, and ask you to trigger a rebuild. Verify the claim against the code; if it holds — or you find such an implementation defect yourself — verdict REBUILD (below). If the fix belongs in the tests, request changes as usual and say why the report is wrong.
+{{end}}
 
 Bug policy — every bug you find, in the diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. Only a bug in the tests under review is a finding and grounds for changes; implementation bugs are documented and named in your comments, never blocking.
 {{end}}
 End your response with a final line containing exactly APPROVED if it is acceptable as-is, CHANGES_REQUESTED if changes are required, or NEEDS_MAINTAINER if the task as stated cannot be completed by editing files in this worktree alone — contradictory or impossible requirements, a missing dependency or resource outside the worktree, a constraint only a human can lift. NEEDS_MAINTAINER stops the pipeline and waits for the maintainer: use it whenever you have good reason to believe the implementing agent can never satisfy what you would otherwise request — an endless fix loop is a worse outcome than a halt — but never as an escape from ordinary hard work that is merely difficult. Above the verdict line, state exactly what the maintainer must decide, provide, or relax. Put all review comments above that final line.
+{{if .TestsInScope}}
+A fourth verdict exists in this phase only: end with exactly REBUILD when the change the work needs is an implementation change rather than a test change — an implementation defect the test-only agent cannot fix within its scope. REBUILD sends the finding back to the implementation cycle, which re-enters this test phase once it approves; state the finding precisely above the verdict line, because the rebuilding agent sees only what you write there — it is the entire handoff.
+{{end}}

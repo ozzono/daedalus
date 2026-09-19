@@ -114,6 +114,11 @@ type ReviewInput struct {
 	// this review: false in phase 1 (code review — coverage is a later
 	// phase's concern), true in phase 2 (the test-suite review).
 	TestsInScope bool
+	// AgentReply, when set, quotes the test agent's latest reply for the
+	// test reviewer: the agent may report that the fix the work needs is
+	// an implementation change its test-only scope forbids — the claim the
+	// reviewer weighs (and may act on with a Rebuild verdict) or rejects.
+	AgentReply string
 	// Agent, set by `run -cli/--cli`, overrides the worker's agent for
 	// this run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
 	Agent string
@@ -135,7 +140,15 @@ type ReviewInput struct {
 type ReviewResult struct {
 	Approved        bool
 	NeedsMaintainer bool
-	Comments        string
+	// Rebuild marks the fourth verdict, REBUILD (test review only): the
+	// change the work needs is an implementation change rather than a test
+	// change — outside the test phase's edit scope. The workflow routes the
+	// finding back through the implementation ↔ code-review cycle and
+	// resumes the test phase once it approves again.
+	Rebuild bool
+	// Comments holds everything the reviewer wrote above its verdict line,
+	// to be fed back to the implementing agent.
+	Comments string
 	// SessionID identifies the reviewer conversation the round ran in, so
 	// the next round of the same review role can resume it (see
 	// ReviewInput.SessionID). Empty when the agent reports none.
@@ -1036,7 +1049,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	prompt, err := template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope)
+	prompt, err := template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -1119,10 +1132,12 @@ func FinalizeWorktreeActivity(ctx context.Context, input WorktreeInput) (string,
 
 // parseReviewVerdict extracts the verdict from reviewer output: the last
 // non-empty line decides. APPROVED approves; NEEDS_MAINTAINER parks the run
-// for a maintainer; CHANGES_REQUESTED (or any other unrecognized line,
-// including a missing marker) counts as changes requested, with everything
-// above the verdict line — or the whole output, when no marker was found —
-// as the comments to feed back to the implementing agent.
+// for a maintainer; REBUILD (offered only to the test reviewer) routes the
+// finding back to the implementation cycle; CHANGES_REQUESTED (or any other
+// unrecognized line, including a missing marker) counts as changes
+// requested, with everything above the verdict line — or the whole output,
+// when no marker was found — as the comments to feed back to the
+// implementing agent.
 func parseReviewVerdict(out string) ReviewResult {
 	lines := strings.Split(out, "\n")
 	for i, raw := range slices.Backward(lines) {
@@ -1130,10 +1145,12 @@ func parseReviewVerdict(out string) ReviewResult {
 		if line == "" {
 			continue
 		}
-		if line == "APPROVED" || line == "CHANGES_REQUESTED" || line == "NEEDS_MAINTAINER" {
+		switch line {
+		case "APPROVED", "CHANGES_REQUESTED", "NEEDS_MAINTAINER", "REBUILD":
 			return ReviewResult{
 				Approved:        line == "APPROVED",
 				NeedsMaintainer: line == "NEEDS_MAINTAINER",
+				Rebuild:         line == "REBUILD",
 				Comments:        strings.TrimSpace(strings.Join(lines[:i], "\n")),
 			}
 		}

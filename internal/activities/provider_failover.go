@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/provider"
 )
 
@@ -151,11 +152,22 @@ func markProviderDry(side providerSide, roundOutput string) time.Time {
 }
 
 // fallbackEnv builds a round's environment for the fallback provider: the
-// worker environment with the primary's anthropic settings overridden by
-// the fallback's, and the small/fast model set to the fallback's heartbeat
-// model — falling back to its main model, or cleared entirely when
-// neither is set so the agent's own default applies.
+// worker environment with the primary's provider settings overridden by
+// the fallback's. The fallback's type picks the vars its values travel
+// on: an openai-style fallback sets OPENAI_BASE_URL/OPENAI_API_KEY/
+// OPENAI_MODEL (leaving the primary's ANTHROPIC_* untouched — so it serves
+// only agents that dial OPENAI_BASE_URL; claude keeps dialing the primary
+// and cannot use it); the anthropic default overrides
+// ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY/ANTHROPIC_MODEL and sets the
+// small/fast model to the fallback's heartbeat model — falling back to its
+// main model, or cleared entirely when neither is set so the agent's own
+// default applies.
 func fallbackEnv() []string {
+	if os.Getenv("DAEDALUS_FALLBACK_TYPE") == config.FallbackTypeOpenAI {
+		env := setEnvVar(os.Environ(), "OPENAI_BASE_URL", os.Getenv("DAEDALUS_FALLBACK_BASE_URL"))
+		env = setEnvVar(env, "OPENAI_API_KEY", os.Getenv("DAEDALUS_FALLBACK_API_KEY"))
+		return setEnvVar(env, "OPENAI_MODEL", os.Getenv("DAEDALUS_FALLBACK_MODEL"))
+	}
 	hb := os.Getenv("DAEDALUS_FALLBACK_HEARTBEAT_MODEL")
 	if hb == "" {
 		hb = os.Getenv("DAEDALUS_FALLBACK_MODEL")

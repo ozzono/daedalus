@@ -177,6 +177,50 @@ func TestProviderStatus(t *testing.T) {
 		}
 	})
 
+	t.Run("openai-type fallback probes the chat-completions wire", func(t *testing.T) {
+		main := providerServer(t, 429, `rate limited`)
+		var path, auth string
+		fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path, auth = r.URL.Path, r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(fb.Close)
+		extra := "fallback:\n  enabled: true\n  type: openai\n  url: " + fb.URL + "\n  key: fb\n  model: fbm\n"
+		got := providerStatus(writeProviderConfig(t, main, "k", extra))
+		if !strings.Contains(got, "fallback: ok (http 200)") || !strings.Contains(got, "[active: fallback]") {
+			t.Errorf("providerStatus = %q, want the openai fallback reported active", got)
+		}
+		if path != "/chat/completions" {
+			t.Errorf("fallback probe path = %q, want /chat/completions", path)
+		}
+		if auth != "Bearer fb" {
+			t.Errorf("fallback probe auth = %q, want the Bearer scheme with the fallback key", auth)
+		}
+	})
+
+	t.Run("default fallback probes the anthropic wire", func(t *testing.T) {
+		main := providerServer(t, 429, `rate limited`)
+		var path, key string
+		fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path, key = r.URL.Path, r.Header.Get("x-api-key")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(fb.Close)
+		// No type field: the anthropic default must pick the probe's wire.
+		extra := "fallback:\n  enabled: true\n  url: " + fb.URL + "\n  key: fb\n  model: fbm\n"
+		if got := providerStatus(writeProviderConfig(t, main, "k", extra)); !strings.Contains(got, "fallback: ok (http 200)") {
+			t.Errorf("providerStatus = %q, want the fallback reported ok", got)
+		}
+		if path != "/v1/messages" {
+			t.Errorf("fallback probe path = %q, want /v1/messages", path)
+		}
+		if key != "fb" {
+			t.Errorf("fallback probe x-api-key = %q, want the fallback key", key)
+		}
+	})
+
 	t.Run("disabled fallback probes main only", func(t *testing.T) {
 		main := providerServer(t, 429, `rate limited`)
 		fallback := providerServer(t, 200, `{}`)
