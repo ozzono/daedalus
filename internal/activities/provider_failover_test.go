@@ -4,10 +4,35 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ozzono/daedalus/internal/config"
 )
+
+// TestMain scrubs the ambient fallback environment once for the whole
+// package. A real worker shell exports DAEDALUS_FALLBACK_* (runWorker
+// sets them from config.yaml's fallback section), which arms failover for
+// every jailed-round test — and combined with the dry holds the
+// exhaustion tests leave in the package-global providerState, fails
+// unrelated tests with "both providers in dry holds". With the vars
+// unset, fallbackConfigured() is false package-wide and poisoned holds
+// are inert; tests that need a fallback arm one explicitly (armFallback
+// or t.Setenv).
+func TestMain(m *testing.M) {
+	for _, name := range []string{
+		"DAEDALUS_FALLBACK_TYPE",
+		"DAEDALUS_FALLBACK_BASE_URL",
+		"DAEDALUS_FALLBACK_API_KEY",
+		"DAEDALUS_FALLBACK_MODEL",
+		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
+	} {
+		os.Unsetenv(name)
+	}
+	os.Exit(m.Run())
+}
 
 // resetProviderState clears the per-worker failover state around a test so
 // one test's holds cannot leak into another's.
@@ -378,6 +403,55 @@ func TestOtherProviderEnvFallbackSide(t *testing.T) {
 			t.Errorf("otherProviderEnv(sideFallback) = env:%v side:%s, want nil with the side unchanged", env, side)
 		}
 	})
+}
+
+// TestFallbackEnvOpenAITypeSetsOpenAIVars pins the openai wire style: the
+// fallback's values travel on OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL,
+// replacing any inherited OpenAI settings, while the primary's ANTHROPIC_*
+// settings are left untouched (and the heartbeat override does not apply)
+// — so an openai-style fallback serves only agents that dial
+// OPENAI_BASE_URL; claude keeps dialing the primary.
+func TestFallbackEnvOpenAITypeSetsOpenAIVars(t *testing.T) {
+	t.Setenv("DAEDALUS_FALLBACK_TYPE", config.FallbackTypeOpenAI)
+	t.Setenv("DAEDALUS_FALLBACK_BASE_URL", "https://backup.example")
+	t.Setenv("DAEDALUS_FALLBACK_API_KEY", "sk-backup")
+	t.Setenv("DAEDALUS_FALLBACK_MODEL", "glm-backup")
+	t.Setenv("DAEDALUS_FALLBACK_HEARTBEAT_MODEL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://primary.example")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-primary")
+	t.Setenv("ANTHROPIC_MODEL", "claude-opus-5")
+	t.Setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "primary-air")
+	t.Setenv("OPENAI_API_KEY", "stale-oa")
+
+	env := fallbackEnv()
+	for _, want := range []string{
+		"OPENAI_BASE_URL=https://backup.example",
+		"OPENAI_API_KEY=sk-backup",
+		"OPENAI_MODEL=glm-backup",
+		"ANTHROPIC_BASE_URL=https://primary.example",
+		"ANTHROPIC_API_KEY=sk-primary",
+		"ANTHROPIC_MODEL=claude-opus-5",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL=primary-air",
+	} {
+		if !slices.Contains(env, want) {
+			t.Errorf("fallback env missing %q (env: %v)", want, env)
+		}
+	}
+	// setEnvVar must replace in place, never append: execve/getenv hand
+	// the agent the first occurrence, so an appended fix-up would leave
+	// the stale inherited value silently in effect while this test's
+	// Contains assertions still pass.
+	for _, name := range []string{"OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"} {
+		count := 0
+		for _, kv := range env {
+			if n, _, ok := cutEnv(kv); ok && n == name {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("fallback env carries %s %d times, want exactly 1 (in-place replacement)", name, count)
+		}
+	}
 }
 
 // envValue returns the value of name in an env slice, "" when absent.

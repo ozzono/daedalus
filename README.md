@@ -207,6 +207,8 @@ work from any directory; `daedalus init` writes a fully commented
 | `anthropic.key`       | `""` (optional)    | API key for the jailed agent; if unset, the agent authenticates via the worker's inherited environment or its own login |
 | `anthropic.model`     | `""` (agent default) | Model for the jailed agent         |
 | `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself |
+| `fallback.enabled/url/key/model/heartbeat_model` | `enabled: false` | Independent secondary provider: when a jailed round fails with the primary's quota exhausted, the worker retries it on the fallback until the primary recovers |
+| `fallback.type`       | `anthropic`        | Fallback wire style: `anthropic` or `openai`; governs the `worker status` probe and which env failover values travel on. A round's wire is chosen by the agent (claude dials `ANTHROPIC_*`), so `openai` serves only agents that dial `OPENAI_BASE_URL` |
 
 Provider settings that are set are exported into the worker's environment
 at startup and injected into the jailed agent's process environment; unset
@@ -314,6 +316,15 @@ Tests are hermetic: subprocess-backed activities are exercised against stub
 `git`/`go`/`ai-jail` executables installed on a temporary `PATH`, and the
 workflow is tested in Temporal's in-process `TestWorkflowEnvironment` with
 mocked activities — no server, network, or API key needed.
+
+> ✅ **Previously a known exception (fixed):** `internal/activities` was not
+> hermetic against the invoking shell — with `DAEDALUS_FALLBACK_*` exported
+> (as a real worker environment has), the armed ambient fallback plus dry
+> holds left in the package-global failover state failed ~19 jailed-round
+> tests with "both providers in dry holds". The package's `TestMain` now
+> scrubs those vars (tests needing a fallback arm one explicitly), and the
+> whole package passes in any invoking environment
+> (see `backlog/bugs/ambient-fallback-env-breaks-legacy-failover-test.md`).
 
 Releases are git tags. CI runs the suite on every PR and master push — a PR
 must carry exactly one release label (`patch`, `minor`, or `major`) before it
