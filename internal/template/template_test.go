@@ -121,7 +121,7 @@ func TestTestsFix(t *testing.T) {
 }
 
 func TestReview(t *testing.T) {
-	got, err := Review("the implementation", "M foo.go", "", false)
+	got, err := Review("the implementation", "M foo.go", "", false, "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestReview(t *testing.T) {
 }
 
 func TestReviewWithTestLogs(t *testing.T) {
-	got, err := Review("the test suite", "A foo_test.go", "--- FAIL: TestBoom", true)
+	got, err := Review("the test suite", "A foo_test.go", "--- FAIL: TestBoom", true, "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -177,5 +177,54 @@ func TestReviewWithTestLogs(t *testing.T) {
 	}
 	if strings.Contains(got, "do not block approval") {
 		t.Error("test review must not carry the dev-review bug policy")
+	}
+	if !strings.Contains(got, "A fourth verdict exists in this phase only") {
+		t.Error("test review should document the REBUILD verdict")
+	}
+}
+
+// TestReviewWithAgentReply pins the tester-relay section: only the test
+// review carries the test agent's latest reply, and it frames the relay as
+// a request the reviewer verifies rather than obeys.
+func TestReviewWithAgentReply(t *testing.T) {
+	got, err := Review("the test suite", "A foo_test.go", "", true, "the handler fix is outside my test-only scope — please rebuild")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !strings.Contains(got, "The test agent's latest reply:\n\nthe handler fix is outside my test-only scope — please rebuild") {
+		t.Errorf("Review = %q, want the quoted agent reply section", got)
+	}
+	if !strings.Contains(got, "verdict REBUILD (below)") {
+		t.Errorf("Review = %q, want the relay framing that lets the reviewer trigger the rebuild", got)
+	}
+
+	phase1, err := Review("the implementation", "M foo.go", "", false, "please rebuild")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if strings.Contains(phase1, "The test agent's latest reply") {
+		t.Error("code review must not carry the agent-relay section")
+	}
+	if strings.Contains(phase1, "REBUILD") {
+		t.Error("code review must not offer the REBUILD verdict")
+	}
+}
+
+// TestRebuild pins the tight-context rebuild prompt: the finding is the
+// payload, and the prompt fences the agent against rework — approved
+// decisions stay untouched and test files stay out of bounds.
+func TestRebuild(t *testing.T) {
+	got, err := Rebuild("handler drops the error path")
+	if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if !strings.Contains(got, "REBUILD — the test phase's review found that the work needs an implementation change:\n\nhandler drops the error path") {
+		t.Errorf("Rebuild = %q, want the finding as the payload", got)
+	}
+	if !strings.Contains(got, "Change only what the finding demands") {
+		t.Error("Rebuild should fence against rework of approved decisions")
+	}
+	if !strings.Contains(got, "never touch the test files") {
+		t.Error("Rebuild should keep test files out of the rebuild scope")
 	}
 }

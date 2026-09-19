@@ -14,7 +14,12 @@ and runs two review-gated loops inside it: a jailed agent —
 [opencode](https://opencode.ai), or [Amp](https://ampcode.com) — implements the change
 while a jailed reviewer approves the code; the agent then writes the test
 suite while the reviewer — and the repository's own test suite — approve the
-tests. Each loop runs until its reviewer approves. Temporal provides durable
+tests. Each loop runs until its reviewer approves. When the test reviewer
+finds the work needs an implementation change rather than a test change —
+on its own finding or on the tester's report, relayed to it — it verdicts
+REBUILD: the finding goes back to the implementation loop with a tight,
+finding-only prompt, and the test loop (both sessions' context intact)
+resumes once the code reviewer approves again. Temporal provides durable
 execution: every step is auditable and survives worker restarts, and a run
 that dies (crash, cancellation) or parks itself — provider quota exhausted
 past its hourly heartbeats, or a reviewer halt on an impossible task —
@@ -42,6 +47,11 @@ flowchart TD
     P2_IMPL --> P2_TEST
     P2_TEST --> P2_REV
     P2_REV -- "test output + comments<br/>(until APPROVED & green)" --> P2_IMPL
+
+    %% REBUILD: the test reviewer can send an implementation-level finding
+    %% back through the dev cycle; after the code reviewer approves again,
+    %% the existing APPROVED edge resumes the test loop (sessions intact).
+    P2_REV -- "REBUILD<br/>(implementation change needed)" --> P1_IMPL
 
     P2_REV -- "APPROVED & green" --> CLEAN
 

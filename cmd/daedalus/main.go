@@ -77,7 +77,7 @@ WORKER COMMANDS
 
 UTILITY COMMANDS
   init        Generate a fully commented config-example.yaml file
-  version     Display CLI version and build details
+  version     Print the version and exit
 
 GLOBAL FLAGS
   -c, --config <path>   Path to config file (./config.yaml, else ~/.config/daedalus/config.yaml)
@@ -279,7 +279,7 @@ CONFIGURATION REFERENCE
                         wire is chosen by the agent (claude dials ANTHROPIC_*),
                         so openai serves only agents dialing OPENAI_BASE_URL
 `,
-	"version": `daedalus version — display CLI version and build details.
+	"version": `daedalus version — print the CLI version.
 
 USAGE
   daedalus version | daedalus -v | daedalus --version
@@ -1045,9 +1045,9 @@ func runningUnrecordedWorkers(onRecord map[string]bool) []string {
 
 // workerStatusAll lists every worker this deployment has on record — plus
 // any live stray running without one — with its running pid, the config it
-// was started with, and its log path. Record-driven like `restart all`, so
-// it reports the whole roster, not just the worker the invoking directory
-// happens to resolve to.
+// was started with, the code path its task queue is currently working, and
+// its log path. Record-driven like `restart all`, so it reports the whole
+// roster, not just the worker the invoking directory happens to resolve to.
 func workerStatusAll() error {
 	names, err := recordedWorkers()
 	if err != nil {
@@ -1064,7 +1064,7 @@ func workerStatusAll() error {
 	}
 	sort.Strings(names)
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "WORKER\tSTATE\tAPI\tCONFIG\tLOG")
+	fmt.Fprintln(w, "WORKER\tSTATE\tAPI\tCONFIG\tCODE PATH\tLOG")
 	for _, name := range names {
 		pidFile, logFile, _ := daemonPaths(name)
 		state := "not running"
@@ -1076,9 +1076,53 @@ func workerStatusAll() error {
 		if conf == "" {
 			shown = "(no config record)"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", name, state, providerStatus(conf), shown, logFile)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", name, state, providerStatus(conf), shown, workerCodePath(conf), logFile)
 	}
 	return w.Flush()
+}
+
+// workerCodePath reports the code a worker is reading to accomplish its
+// current task: the repo path of every pipeline run currently executing on
+// the worker's task queue, decoded from each run's history input (the same
+// walk `continue` uses to recover a run's original input). "idle" when the
+// queue has no running run. As in providerStatus, values that cannot be
+// determined are reported as display text rather than failures, so one
+// unreachable dependency never hides the rest of the roster.
+func workerCodePath(confPath string) string {
+	if confPath == "" {
+		return "n/a (no config record)"
+	}
+	cfg, err := config.Load(confPath)
+	if err != nil {
+		return "config error"
+	}
+	c, err := newClient(cfg)
+	if err != nil {
+		return "temporal unreachable"
+	}
+	defer c.Close()
+	resp, err := c.ListWorkflow(context.Background(), &workflowservice.ListWorkflowExecutionsRequest{
+		Namespace: "default",
+		PageSize:  10,
+		Query:     fmt.Sprintf("TaskQueue = '%s' AND ExecutionStatus = 'Running'", cfg.Temporal.TaskQueue),
+	})
+	if err != nil {
+		return "temporal unreachable"
+	}
+	var paths []string
+	seen := make(map[string]bool, len(resp.GetExecutions()))
+	for _, info := range resp.GetExecutions() {
+		prev, _, err := readPriorRun(c, info.GetExecution().GetWorkflowId())
+		if err != nil || prev.RepoPath == "" || seen[prev.RepoPath] {
+			continue
+		}
+		seen[prev.RepoPath] = true
+		paths = append(paths, prev.RepoPath)
+	}
+	if len(paths) == 0 {
+		return "idle"
+	}
+	return strings.Join(paths, ", ")
 }
 
 // providerStatus live-probes the provider a worker's recorded config

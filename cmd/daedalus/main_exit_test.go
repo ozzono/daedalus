@@ -300,3 +300,21 @@ func TestMainVersionSubcommand(t *testing.T) {
 		t.Errorf("daedalus version printed %q, want %q", stdout, want)
 	}
 }
+
+// TestVersionHelpMatchesDispatch pins the version help wording to the
+// dispatch's actual contract: `daedalus version` prints exactly one token
+// (version.String()), so neither the root usage nor the command help may
+// promise anything the dispatch does not emit. The named regression is the
+// "and build details" claim that no test guarded for five review rounds and
+// that halted daedalus-issue-cli-option-help; if you change the dispatch's
+// output, change the help here in the same commit.
+func TestVersionHelpMatchesDispatch(t *testing.T) {
+	for name, doc := range map[string]string{"root usage": usage, "version help": commandHelp["version"]} {
+		if strings.Contains(doc, "build detail") {
+			t.Errorf("the %s promises \"build details\", but the dispatch prints only version.String() — docs contradict behavior", name)
+		}
+	}
+	if want := "print the CLI version"; !strings.Contains(commandHelp["version"], want) {
+		t.Errorf("version help %q should describe the one-token contract (%q)", commandHelp["version"], want)
+	}
+}
