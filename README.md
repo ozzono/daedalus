@@ -49,9 +49,12 @@ flowchart TD
     P2_REV -- "test output + comments<br/>(until APPROVED & green)" --> P2_IMPL
 
     %% REBUILD: the test reviewer can send an implementation-level finding
-    %% back through the dev cycle; after the code reviewer approves again,
-    %% the existing APPROVED edge resumes the test loop (sessions intact).
+    %% back through the dev cycle. After the code reviewer approves the
+    %% rebuild, flow resumes at the suite re-run — no fresh test-agent
+    %% round (the rebuild never touches test files); both sessions'
+    %% context stays intact.
     P2_REV -- "REBUILD<br/>(implementation change needed)" --> P1_IMPL
+    P1_REV -- "APPROVED after REBUILD" --> P2_TEST
 
     P2_REV -- "APPROVED & green" --> CLEAN
 
@@ -129,7 +132,9 @@ up.
    (an explicit `-c` is rejected there; it would have no effect).
    `daedalus worker status` lists every worker on record — plus any live
    stray running without one, shown as "(no config record)" — queue,
-   running pid, config record, and log path.
+   running pid, a live provider API probe, the repo path each worker's
+   queue is currently executing ("idle" when none), config record, and log
+   path.
 
 4. **Trigger a pipeline** (third terminal):
 
@@ -242,13 +247,18 @@ worktrees live under `~/.daedalus/worktrees/<queue>/issue-<id>`. Re-running
   suite passes. Review rounds are intentionally **unbounded** — the workflow
   ends only on approval, with every round durable and auditable.
 - **Reviewer protocol**: the reviewer sees the diff of the worktree (plus
-  the latest test output in phase 2) and must end its response with a final
-  line `APPROVED`, `CHANGES_REQUESTED`, or `NEEDS_MAINTAINER`. The last
-  parks the run for a maintainer restart — used when the task as stated
-  cannot be completed by editing files in the worktree, so an impossible
-  task cannot loop forever. Anything else — including a malformed response —
-  counts as changes requested, with the full output fed back to the
-  implementing agent.
+  the latest test output and the test agent's latest reply in phase 2) and
+  must end its response with a final line `APPROVED`, `CHANGES_REQUESTED`,
+  `REBUILD` (phase 2 only), or `NEEDS_MAINTAINER`. The last parks the run
+  for a maintainer restart — used when the task as stated cannot be
+  completed by editing files in the worktree, so an impossible task cannot
+  loop forever. `REBUILD` is the test reviewer's verdict for a finding the
+  test-only agent cannot apply: an implementation-level defect — relayed by
+  the tester or found by the reviewer — routes back through the
+  implementation ↔ code-review cycle, and the test loop resumes once the
+  code reviewer approves again. Anything else — including a malformed
+  response — counts as changes requested, with the full output fed back to
+  the implementing agent.
 - **The repo's own test suite**, whatever it is: the test command is
   resolved per repository — a `tests:` declaration in `.daedalus.yaml` wins;
   otherwise marker files are detected (`go.mod` → `go test ./...`,

@@ -14,4 +14,4 @@ test-coverage:
 	@echo "coverage.out written; run 'go tool cover -html=coverage.out' for a browser view"
 
 tasks:
-	@ls /tmp/daedalus/instructions|grep md
+	@tree -f -i /tmp/daedalus/daedalus/instructions|grep md
