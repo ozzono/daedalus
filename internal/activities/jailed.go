@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,8 +72,11 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// JSON lines in pi's own schema (session header, message_end,
 		// usage on message_update) — a parser branch of its own
 		// (parsePiStream), unlike amp whose events reuse claude's.
-		// Auth rides the provider env vars (ANTHROPIC_API_KEY,
-		// OPENAI_API_KEY, ...) the worker already exports. Probing
+		// Auth rides the provider env vars (ANTHROPIC_API_KEY, ...) the
+		// worker already exports — except the openai section, whose env
+		// vars pi only half-reads (key yes, base URL no): those rounds are
+		// bridged through the host's ~/.pi/agent/models.json per round
+		// instead (stagePiProvider in runJailedRound). Probing
 		// ai-jail with a fake pi verified that the pi preset bridges ~/.pi
 		// into the jail read-write, so pi's host auth.json really does
 		// take priority over these env vars for the same provider (pi's
@@ -453,6 +457,24 @@ func runJailedRound(ctx context.Context, env []string, role SessionRole, agent, 
 	// resemble its own (e.g. claude's --verbose) as misplaced.
 	args = append(args, "--", selected)
 	args = append(args, agentArgs...)
+	// pi ignores the base-URL env vars entirely (only OPENAI_API_KEY reaches
+	// its built-in openai provider — the 401-to-api.openai.com of
+	// 2026-09-26), so a pi round served by the openai section needs the
+	// section bridged into pi's own provider config: stagePiProvider
+	// rewrites the daedalus-owned entry in the host's
+	// ~/.pi/agent/models.json (rw-mounted by the jail's pi preset) and
+	// returns the --model flag selecting it. Failover rides the same bridge
+	// only for openai-type fallbacks — an anthropic-type fallback has no
+	// pi channel at all (pi reads no ANTHROPIC_BASE_URL), so the round
+	// stays pinned to the primary's staged entry (see
+	// backlog/bugs/pi-anthropic-fallback-unserveable.md).
+	if selected == "pi" {
+		modelArgs, err := stagePiProvider(env)
+		if err != nil {
+			return jailResult{}, err
+		}
+		args = append(args, modelArgs...)
+	}
 	// aider takes its prompt via --message-file, not stdin — it has no
 	// read-the-prompt-from-stdin mode (--message-file - is undocumented),
 	// and --message would put the prompt in argv, visible in `ps` and
@@ -749,11 +771,15 @@ type aiderSampler struct {
 
 // samplerFromEnv parses the DAEDALUS_* sampler exports out of the round
 // env. An export is only written when its config field is set, so an
-// absent (or stale hand-set malformed) var simply stays nil.
+// absent (or stale hand-set malformed) var simply stays nil. Non-finite
+// values (e.g. the stale-ambient DAEDALUS_TOP_P=nan class) are rejected
+// like any other malformed var — mirroring Config.validate, which the env
+// channel bypasses — so they can never reach a staged file and blow up
+// json.Marshal (pi) or render as a junk YAML float (aider).
 func samplerFromEnv(env []string) aiderSampler {
 	parse := func(name string) *float64 {
 		v, err := strconv.ParseFloat(envLookup(env, name), 64)
-		if err != nil {
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 			return nil
 		}
 		return &v
