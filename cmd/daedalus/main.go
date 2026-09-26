@@ -10,12 +10,23 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/version"
 )
 
 func main() {
+	// The hidden completion probe is answered before anything else: its
+	// words are not real arguments (flags among them are candidates, not
+	// options to parse), and it must never load a config or print anything
+	// but its candidates — one per line, exit 0.
+	if len(os.Args) > 1 && os.Args[1] == "__complete" {
+		for _, c := range complete(os.Args[2:]) {
+			fmt.Println(c)
+		}
+		return
+	}
 	configPath, args, err := parseFlags(os.Args[1:])
 	if err != nil {
 		usageFail("%v", err)
@@ -36,17 +47,17 @@ func main() {
 	}
 
 	// Every subcommand except the no-config ones (help, version, init,
-	// report, the record-driven worker commands — `worker restart all`,
-	// `worker restart <name>`, and `worker status`, which read only the
-	// recorded per-worker configs — and `log`, which reads a file by name
-	// alone) loads a configuration; resolve its location once, up front, so
-	// the subcommand — and the daemon `worker start` re-executes — agree on
-	// it wherever the CLI is invoked from.
+	// report, completion, the record-driven worker commands — `worker
+	// restart all`, `worker restart <name>`, and `worker status`, which
+	// read only the recorded per-worker configs — and `log`, which reads a
+	// file by name alone) loads a configuration; resolve its location once,
+	// up front, so the subcommand — and the daemon `worker start`
+	// re-executes — agree on it wherever the CLI is invoked from.
 	_, restartNamed := isRestartNamed(args)
 	switch {
 	case args[0] == "-h", args[0] == "--help", args[0] == "help",
 		args[0] == "-v", args[0] == "--version", args[0] == "version", args[0] == "init",
-		args[0] == "report", args[0] == "log",
+		args[0] == "report", args[0] == "log", args[0] == "completion",
 		isRestartAll(args), restartNamed, isWorkerStatus(args):
 	default:
 		// A fresh `run <repo-path>` prefers the repo's own project-local
@@ -185,7 +196,7 @@ func main() {
 				os.Remove(pidFile)
 			}
 		default:
-			usageFail("unknown worker action %q (start, stop, status, restart, wakeup, foreground)", action)
+			usageFail("unknown worker action %q (%s)", action, strings.Join(workerActions, ", "))
 		}
 	case "run":
 		cfg := loadConfig(configPath.configPath)
@@ -272,6 +283,15 @@ func main() {
 			return
 		}
 		runTaskLog(args[1], configPath.status)
+	case "completion":
+		// daedalus completion bash|zsh — print the tab-completion installer
+		// script for the named shell, for eval-ing into a shell rc: the
+		// script calls the __complete probe, so it self-updates with the
+		// binary and daedalus writes no files of its own.
+		if len(args) != 2 || (args[1] != "bash" && args[1] != "zsh") {
+			usageFail("completion takes bash or zsh")
+		}
+		fmt.Print(completionScript(args[1]))
 	case "report":
 		if err := runReport(configPath.configPath, args[1:]); err != nil {
 			fail("report", err)

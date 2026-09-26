@@ -24,6 +24,7 @@ UTILITY COMMANDS
   config      Print the active configuration (resolved path + every field)
   report      Summarize AI provider usage (cost, tokens, time) and worker slots
   version     Print the version and exit
+  completion  Print the bash or zsh tab-completion script (eval into your rc)
 
 GLOBAL FLAGS
   -c, --config <path>   Path to config file (./config.yaml, ./.daedalus/config.yaml, or ~/.config/daedalus/config.yaml)
@@ -43,7 +44,10 @@ Use "daedalus <command> --help" for detailed information about a command.
 // commandHelp holds the per-command help screens behind
 // "daedalus <command> --help": the argument, flag, and edge-case detail
 // the root screen deliberately omits (progressive disclosure). The init
-// screen also carries the configuration reference table.
+// screen also carries the configuration reference table. Every dispatch
+// command carries an entry here, and the shell completion (completion.go)
+// reads the keys as its command list — a new command is help-screened and
+// completed from this one table.
 var commandHelp = map[string]string{
 	"run": `daedalus run — start an implementation pipeline for an issue.
 
@@ -514,5 +518,24 @@ EXAMPLE
 
 USAGE
   daedalus version | daedalus -v | daedalus --version
+`,
+	"completion": `daedalus completion — print a shell tab-completion script.
+
+USAGE
+  daedalus completion bash|zsh
+
+Prints the tab-completion installer for the named shell. The whole install
+is one eval in a shell rc (daedalus writes no files):
+
+  eval "$(daedalus completion bash)"     # in .bashrc
+  eval "$(daedalus completion zsh)"      # in .zshrc
+
+On every tab press the script asks the hidden "daedalus __complete" probe
+what can come next — commands, worker actions, worker restart targets, and
+flags — and falls back to the shell's own file completion when the probe
+answers nothing (which serves -f/--file values and paths). The candidate
+logic lives in the binary the script calls, so an installed script
+self-updates with it: a command or flag added to daedalus is completed
+without reinstalling anything.
 `,
 }

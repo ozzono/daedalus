@@ -412,15 +412,6 @@ Tests are hermetic: subprocess-backed activities are exercised against stub
 workflow is tested in Temporal's in-process `TestWorkflowEnvironment` with
 mocked activities — no server, network, or API key needed.
 
-> ✅ **Previously a known exception (fixed):** `internal/activities` was not
-> hermetic against the invoking shell — with `DAEDALUS_FALLBACK_*` exported
-> (as a real worker environment has), the armed ambient fallback plus dry
-> holds left in the package-global failover state failed ~19 jailed-round
-> tests with "both providers in dry holds". The package's `TestMain` now
-> scrubs those vars (tests needing a fallback arm one explicitly), and the
-> whole package passes in any invoking environment
-> (see `backlog/bugs/ambient-fallback-env-breaks-legacy-failover-test.md`).
-
 Releases are git tags. CI runs the suite on every PR and master push — a PR
 must carry exactly one release label (`patch`, `minor`, or `major`) before it
 can merge. After a green master push, CI tags the merged code with the next
