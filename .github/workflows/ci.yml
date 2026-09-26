@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    # labeled/unlabeled so the release-label check re-runs when labels change
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # First, blocking check: a PR must declare a release level before it can be
+  # approved or merged — either a branch prefix (patch/minor/major/...) or,
+  # failing that, exactly one release label of the same names. Add "CI /
+  # release-label" as a required status check in branch protection (dragged
+  # to the top of the list) to enforce it on approval and merge.
+  release-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a release level (branch prefix, else label)
+        # no-op on master pushes: the step is skipped and the job succeeds,
+        # so the downstream needs chain is not broken
+        if: github.event_name == 'pull_request'
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # The branch prefix is the default signal; the label is the fallback.
+          case "$BRANCH" in
+            patch/*|minor/*|major/*)
+              echo "release level from branch prefix: ${BRANCH%%/*}"
+              exit 0
+              ;;
+          esac
+          matches=$(printf '%s' "$LABELS" | jq -r '.[] | select(. == "patch" or . == "minor" or . == "major")')
+          count=$(printf '%s' "$matches" | grep -c . || true)
+          case "$count" in
+            1) echo "release label: $matches" ;;
+            0) echo "no release level on this PR — name the branch patch/*, minor/* or major/*, or add exactly one of those labels" >&2; exit 1 ;;
+            *) echo "multiple release labels on this PR — keep exactly one of: patch, minor, major" >&2; exit 1 ;;
+          esac
+
+  test:
+    needs: release-label
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.coverage.outputs.pct }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: Measure coverage
+        id: coverage
+        run: |
+          pct=$(go tool cover -func=coverage.out | awk '$1 == "total:" { sub(/%$/, "", $3); print $3 }')
+          [[ -n "$pct" ]] || { echo "no total: line in coverage output" >&2; exit 1; }
+          echo "total coverage: $pct%"
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+
+  # After master is green: tag the tested code with the next version. The
+  # bump level is the merged PR's branch prefix (patch/minor/major), falling
+  # back to its release label (patch for a push that is not a PR merge).
+  # Only tags are pushed — master is protected
+  # and receives no release commits — and the bot's GITHUB_TOKEN push never
+  # triggers workflows, so the loop does not feed itself.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
+    permissions:
+      contents: write
+      pull-requests: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # A re-run of a run that already tagged this merge has nothing to do.
+          if existing=$(git tag --points-at HEAD); [[ -n "$existing" ]]; then
+            echo "HEAD already tagged ($existing) — nothing to release"
+            exit 0
+          fi
+
+          # The bump level is the merged PR's branch prefix, falling back to
+          # its release label; a push that is not a PR merge (or declares
+          # neither — pre-protection merges) releases as a patch.
+          level=patch
+          subject=$(git log -1 --format=%s)
+          pr=$(printf '%s\n' "$subject" | grep -oE '#[0-9]+' | head -1 | tr -d '#') || true
+          if [[ -n "$pr" ]]; then
+            branch=$(gh api "repos/${{ github.repository }}/pulls/$pr" --jq .head.ref) || branch=""
+            case "$branch" in
+              patch/*|minor/*|major/*)
+                level=${branch%%/*}
+                ;;
+              *)
+                label=$(gh api "repos/${{ github.repository }}/pulls/$pr" \
+                  --jq '.labels[].name | select(. == "patch" or . == "minor" or . == "major")' | head -1) || true
+                [[ -z "$label" ]] || level=$label
+                ;;
+            esac
+          fi
+          echo "bump level: $level"
+
+          bump() {
+            local v=$1 major minor patch
+            [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+              echo "invalid latest tag '$v' (expected vX.Y.Z)" >&2; exit 1;
+            }
+            IFS='.' read -r major minor patch <<<"$v"
+            case "$level" in
+              major) echo "$((major + 1)).0.0" ;;
+              minor) echo "$major.$((minor + 1)).0" ;;
+              *)     echo "$major.$minor.$((patch + 1))" ;;
+            esac
+          }
+
+          # Retry loop: a concurrent release of another merge may claim the
+          # computed tag name first — re-fetch and recompute rather than fail.
+          for attempt in 1 2 3; do
+            git fetch --tags origin
+            latest=$(git tag --list 'v*' | sed 's/^v//' | sort -V | tail -1)
+            latest=${latest:-0.0.0}
+            new=$(bump "$latest")
+            echo "attempt $attempt: latest v$latest -> tagging v$new"
+            git tag "v$new"
+            if git push origin "refs/tags/v$new"; then
+              # A bare tag does not render on the Releases page — publish a
+              # release for it. Idempotent: a re-run skips an existing one.
+              if ! gh release view "v$new" >/dev/null 2>&1; then
+                gh release create "v$new" --generate-notes --latest
+              fi
+              exit 0
+            fi
+            git tag -d "v$new" >/dev/null
+          done
+          echo "could not claim a tag name after 3 attempts — re-run this job" >&2
+          exit 1
+      - name: Update coverage badge
+        env:
+          COVERAGE: ${{ needs.test.outputs.coverage }}
+        run: |
+          set -euo pipefail
+          [[ -n "$COVERAGE" ]] || { echo "coverage output from the test job is empty" >&2; exit 1; }
+          git fetch origin badges 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/badges; then
+            git checkout -B badges origin/badges
+          else
+            git checkout --orphan badges
+          fi
+          # -f: on a fresh orphan branch every file is a staged add (no HEAD),
+          # so git rm refuses to discard them without it. Nothing is lost —
+          # the content is already committed on master.
+          git rm -rfq --ignore-unmatch .
+
+          color=$(awk -v p="$COVERAGE" 'BEGIN { print (p >= 80) ? "brightgreen" : (p >= 60) ? "yellow" : "red" }')
+          mkdir badges
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$COVERAGE" "$color" > badges/coverage.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add badges
+          if git diff --cached --quiet; then
+            echo "coverage unchanged — badge not updated"
+          else
+            git commit -m "coverage: $COVERAGE%"
+            # The badge is fully generated, so losing a race with a concurrent
+            # master merge is fine — take the branch rather than fail the run.
+            git push --force-with-lease origin badges
+          fi

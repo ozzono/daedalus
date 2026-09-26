@@ -1,0 +1,11 @@
+bin/
+
+.ai-jail
+.aider*
+config.yaml
+.mirror/
+.gocache/
+.gomodcache/
+backlog/
+
+coverage.out

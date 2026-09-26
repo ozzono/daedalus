@@ -1,0 +1,5 @@
+Test review feedback:
+
+{{.Comments}}
+
+Address the review comments. Changes stay test-scoped: touch only test code; if a comment seems to require an implementation change, say so in your reply instead of making it. Never make a test pass by removing, skipping, obfuscating, or tweaking it: test changes follow code changes — a test changes only because the behavior it verifies legitimately changed, never to force a pass. Git writes are forbidden in this sandbox — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: address only the comments about the tests; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail — is unrelated, leave it untouched and ignore it. Keep it lazy and minimal: the fewest tests that genuinely verify the behavior the comments name — no redundant or speculative tests, no over-mocking. Full-suite testing belongs to the pipeline's gate and the maintainer: judge and verify only the test packages and files the change touched.
