@@ -439,7 +439,7 @@ func TestReadTaskFileGlob(t *testing.T) {
 // help must work where no config can be found. An unknown command gets no
 // such screen: it falls through to the unknown-subcommand rejection.
 func TestMainCommandHelp(t *testing.T) {
-	for _, cmd := range []string{"run", "continue", "guide", "attach", "list", "log", "wipe", "worker", "init", "config", "version"} {
+	for _, cmd := range []string{"run", "continue", "guide", "attach", "list", "log", "wipe", "worker", "init", "config", "version", "completion"} {
 		for _, spelling := range []string{"--help", "-h", "help"} {
 			stdout, stderr, code := runMainIn(t, "", cmd, spelling)
 			if code != 0 {

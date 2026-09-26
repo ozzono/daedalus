@@ -59,6 +59,12 @@ func recordedConfigPath(name string) string {
 	return path
 }
 
+// workerActions lists the `worker` subcommands, in the order the unknown-
+// action diagnostic names them. It is the shared source of that diagnostic
+// (main.go's worker dispatch) and the shell completion's candidates, so a
+// new action is dispatched, diagnosed, and completed from one list.
+var workerActions = []string{"start", "stop", "status", "restart", "wakeup", "foreground"}
+
 // isRestartAll reports whether args spell out `worker restart all` (or its
 // --all spelling; -a is taken by run's --append) — one of the invocations
 // whose behavior is record-driven end to end, needing no config of its own.

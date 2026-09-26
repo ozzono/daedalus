@@ -87,6 +87,41 @@ type flags struct {
 	yes bool
 }
 
+// flagSpec is one command-line flag: its semantic name (value-taking flags
+// switch on it in set below, booleans map to their field directly) and
+// whether it takes a value.
+type flagSpec struct {
+	name  string
+	value bool
+}
+
+// flagTable maps every accepted flag spelling to its spec — the single
+// source read by both parseFlags and the shell completion's candidates
+// (completion.go), so a flag added once is parsed and completed. Long
+// spellings also accept the "--name=" value form.
+var flagTable = map[string]flagSpec{
+	"-c":         {name: "config", value: true},
+	"--config":   {name: "config", value: true},
+	"-w":         {name: "workflow", value: true},
+	"--workflow": {name: "workflow", value: true},
+	"-f":         {name: "file", value: true},
+	"--file":     {name: "file", value: true},
+	"-a":         {name: "append", value: true},
+	"--append":   {name: "append", value: true},
+	"-p":         {name: "prefix", value: true},
+	"--prefix":   {name: "prefix", value: true},
+	"-cli":       {name: "cli", value: true},
+	"--cli":      {name: "cli", value: true},
+	"-t":         {name: "type", value: true},
+	"--type":     {name: "type", value: true},
+	"-d":         {name: "detach"},
+	"--detach":   {name: "detach"},
+	"--yes":      {name: "yes"},
+	"--status":   {name: "status"},
+	"-cot":       {name: "cot"},
+	"--cot":      {name: "cot"},
+}
+
 // parseFlags extracts -c/--config and -w/--workflow (which may appear
 // anywhere) from args and returns them plus the remaining subcommand
 // arguments.
@@ -133,63 +168,46 @@ parse:
 			rest = append(rest, args[i+1:]...)
 			break parse
 		}
-		var name string
-		var value string
-		switch {
-		case a == "-c" || a == "--config" || a == "-w" || a == "--workflow" || a == "-f" || a == "--file" || a == "-a" || a == "--append" || a == "-p" || a == "--prefix" || a == "-cli" || a == "--cli" || a == "-t" || a == "--type":
-			if i+1 >= len(args) {
-				return f, nil, fmt.Errorf("%s requires a value", a)
+		// Every accepted spelling is in flagTable: an exact match first,
+		// then the "--name=" value form of a long value flag. Anything
+		// else is positional.
+		spec, known := flagTable[a]
+		hasEq, eqValue := false, ""
+		if !known && strings.HasPrefix(a, "--") {
+			if eq := strings.IndexByte(a, '='); eq > 0 {
+				if s, ok := flagTable[a[:eq]]; ok && s.value {
+					spec, known = s, true
+					hasEq, eqValue = true, a[eq+1:]
+				}
 			}
-			i++
-			switch a {
-			case "-c", "--config":
-				name = "config"
-			case "-f", "--file":
-				name = "file"
-			case "-a", "--append":
-				name = "append"
-			case "-p", "--prefix":
-				name = "prefix"
-			case "-cli", "--cli":
-				name = "cli"
-			case "-t", "--type":
-				name = "type"
-			default:
-				name = "workflow"
-			}
-			value = args[i]
-		case strings.HasPrefix(a, "--config="):
-			name, value = "config", strings.TrimPrefix(a, "--config=")
-		case strings.HasPrefix(a, "--file="):
-			name, value = "file", strings.TrimPrefix(a, "--file=")
-		case strings.HasPrefix(a, "--append="):
-			name, value = "append", strings.TrimPrefix(a, "--append=")
-		case strings.HasPrefix(a, "--prefix="):
-			name, value = "prefix", strings.TrimPrefix(a, "--prefix=")
-		case strings.HasPrefix(a, "--cli="):
-			name, value = "cli", strings.TrimPrefix(a, "--cli=")
-		case strings.HasPrefix(a, "--type="):
-			name, value = "type", strings.TrimPrefix(a, "--type=")
-		case a == "-d" || a == "--detach":
-			f.detach = true
-			continue
-		case a == "--yes":
-			f.yes = true
-			continue
-		case a == "--status":
-			f.status = true
-			continue
-		case a == "-cot" || a == "--cot":
-			f.cot = true
-			continue
-		case strings.HasPrefix(a, "--workflow="):
-			name, value = "workflow", strings.TrimPrefix(a, "--workflow=")
-		default:
+		}
+		if !known {
 			rest = append(rest, a)
 			continue
 		}
-		if err := set(name, value); err != nil {
-			return f, nil, err
+		if spec.value {
+			value := eqValue
+			if !hasEq {
+				if i+1 >= len(args) {
+					return f, nil, fmt.Errorf("%s requires a value", a)
+				}
+				i++
+				value = args[i]
+			}
+			if err := set(spec.name, value); err != nil {
+				return f, nil, err
+			}
+			continue
+		}
+		switch spec.name {
+		case "detach":
+			f.detach = true
+		case "yes":
+			f.yes = true
+		case "status":
+			f.status = true
+		case "cot":
+			f.cot = true
 		}
 	}
 	// -p/--prefix only means anything on a fresh `run`; reject it elsewhere —
