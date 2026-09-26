@@ -374,6 +374,16 @@ var ErrNoSuite = errors.New("no test suite exists in this repository")
 // test entrypoint — the general, AI-led fallback. agent is the run's
 // -cli/--cli override, empty for the worker's default.
 func discoverTestCommand(ctx context.Context, worktreePath, agent string) ([]string, error) {
+	// Snapshot the reply channel before the round: chat.history.md lives in
+	// the repo-writable worktree, so a repo-planted file must not forge the
+	// reply (backlog/bugs/aider-history-plant-forge). Only bytes appended
+	// after the snapshot are accepted below; mid-round tampering degrades
+	// to model trust, the same level as the stdout fallback.
+	histPath := filepath.Join(worktreePath, ".daedalus-aider", "chat.history.md")
+	var histLen int64
+	if st, err := os.Stat(histPath); err == nil {
+		histLen = st.Size()
+	}
 	res, err := runJailed(ctx, agent, worktreePath,
 		"Inspect this repository and determine the exact shell command that runs its full test suite. "+
 			"The suite may be make test, go test ./..., flutter test, npm test, pytest, cargo test, mvn test, "+
@@ -390,9 +400,24 @@ func discoverTestCommand(ctx context.Context, worktreePath, agent string) ([]str
 	// JSON session header to firstCommandLine as the "test command").
 	selected, _, _ := jailedAgentCLI(agent)
 	_, text, _, _ := parseRoundOutput(selected, res.Stdout)
+	if text == "" && selected == "aider" {
+		// Aider's raw stdout is all banner chrome, and its command-shaped
+		// lines ("Aider v0.86.2") sit above the reply and win the shape
+		// scan — turning a correct NONE reply into `sh -c 'Aider v0.86.2'`
+		// (wa-termo 2026-09-26). Take the reply from aider's own
+		// chat-history file instead, which records it chrome-free — but
+		// only from the bytes this round appended (see the snapshot above),
+		// so a repo-planted history cannot forge the reply.
+		if hist, err := os.ReadFile(histPath); err == nil && int64(len(hist)) > histLen {
+			text = lastAiderReply(string(hist[histLen:]))
+		}
+	}
 	if text == "" {
-		// Plain-text CLI (opencode, aider) or a parse miss: the raw stdout
-		// is the reply.
+		// Plain-text CLI without a history file (opencode, or an older
+		// aider run) or a parse miss: the raw stdout is the reply.
+		// ponytail: opencode keeps the stdout fallback — no reply channel
+		// is wired for it, so letter-initial chrome could still shadow its
+		// reply here.
 		text = res.Stdout
 	}
 	cmd := firstCommandLine(text)
@@ -431,6 +456,28 @@ func firstCommandLine(text string) string {
 		}
 	}
 	return ""
+}
+
+// lastAiderReply extracts the model's most recent reply from aider's
+// chat-history markdown: the text after the last `#### <prompt>` heading,
+// with the `> …` chrome lines (banner echo, the `Tokens:` tally) dropped.
+// The file accumulates one heading + reply pair per round, so scanning to
+// the last heading yields the latest round's answer. Format per the
+// aider-probe sample of 2026-09-25 (v0.86.2); an unparsable file yields "".
+func lastAiderReply(history string) string {
+	var reply []string
+	inReply := false
+	for line := range strings.SplitSeq(history, "\n") {
+		if strings.HasPrefix(line, "#### ") {
+			reply, inReply = nil, true
+			continue
+		}
+		if !inReply || strings.HasPrefix(line, ">") {
+			continue
+		}
+		reply = append(reply, line)
+	}
+	return strings.TrimSpace(strings.Join(reply, "\n"))
 }
 
 // commandShaped reports whether a candidate line can plausibly be a shell
