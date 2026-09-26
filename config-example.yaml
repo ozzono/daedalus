@@ -7,12 +7,19 @@
 # authenticates via AMP_API_KEY in the worker's environment, passed into
 # the jail when set; amp's own host login does not reach the jail, and the
 # anthropic/openai sections below do not apply to it), pi (Earendil's pi —
-# authenticates via the provider env vars below; its host
+# authenticates via the provider env vars below, except the openai
+# section which pi only half-reads over env (key yes, base URL no) and
+# which is therefore staged into ~/.pi/agent/models.json per round — see
+# the openai section; its host
 # ~/.pi/agent/auth.json is bridged into the jail read-write and takes
 # priority over them, so a stale host login wins — keep it clean or
 # aligned), or aider (authenticates via the provider env vars below; the
 # jail masks the repo's .env to empty, so .env files cannot override
-# inside jailed rounds).
+# inside jailed rounds). opencode alert: neither the openai nor the
+# anthropic base-URL env vars reach it (source-verified 2026-09-26) — its
+# endpoints come from its own catalog/config files, which daedalus does
+# not bridge, so self-hosted endpoints need operator-side opencode.json
+# work (see backlog/bugs/pi-opencode-openai-section-unbridged.md).
 agent: claude
 
 # Thinking toggle for the jailed agents, independent of slim: defaults to
@@ -93,6 +100,10 @@ cleanup_timeout: 30m
 # every run. Rounds also chain into one conversation per run (resuming
 # the previous round's session), so this mostly bounds how many runs
 # explore a repo cold at the same time. slim: true forces this to 1.
+# This worker-level semaphore is the only concurrency limit on the pi
+# path: pi runs one process per round with no internal concurrent-session
+# or rate knob of its own (source-verified 2026-09-26), and the slot-wait
+# behavior is identical to aider/claude rounds.
 max_concurrent_agent_runs: 2
 # Slim mode for limited self-hosted models (small context window, low max
 # output tokens) on the aider and pi agents. When true: this worker runs a
@@ -140,20 +151,30 @@ temporal:
 # wired lever, so the agent proceeds silently on its default (never an
 # error):
 #
-#   knob               claude    aider          opencode  pi        amp
-#   -----------------  --------  -------------  --------  --------  ---------
-#   context_tokens     env       staged file    ignored   ignored   ignored
-#   max_output_tokens  env       staged file    ignored   ignored   ignored
-#   thinking: false    env       argv           ignored   argv      ignored
-#   stream on/off      —         argv           ignored   ignored   ignored
-#   samplers (openai)  (n/a)     staged file    ignored   ignored   (n/a)
+#   knob               claude    aider          opencode    pi            amp
+#   -----------------  --------  -------------  ----------  ------------  ---------
+#   context_tokens     env       staged file    ignored     staged file*  ignored
+#   max_output_tokens  env       staged file    ignored     staged file*  ignored
+#   thinking: false    env       argv           ignored     argv          ignored
+#   stream on/off      —         argv           ignored     ignored       ignored
+#   samplers (openai)  (n/a)     staged file    ignored     staged file*  (n/a)
+#   timeout_ms         env       (unprobed)     (unprobed)  ignored       (unprobed)
 #
 # Lever detail: claude env = CLAUDE_CODE_MAX_CONTEXT_TOKENS (window) and
 # MAX_THINKING_TOKENS=0 (thinking) and CLAUDE_CODE_MAX_OUTPUT_TOKENS
 # (completion cap). aider's staged file = the model metadata and settings daedalus
 # stages into .daedalus-aider/ (window input side, output cap, sampler
 # params); aider argv = --thinking-tokens 0 and --stream/--no-stream (the
-# stream toggle). pi argv = --thinking off.
+# stream toggle). pi argv = --thinking off. pi's staged file (*) = the
+# provider entry daedalus stages into the host's ~/.pi/agent/models.json
+# for rounds served by the openai section (model contextWindow/maxTokens
+# and samplingParams; see the openai section below) — outside those rounds
+# pi has no route for these knobs and ignores them. pi ignores
+# API_TIMEOUT_MS entirely (source-verified 2026-09-26 — pi's own timeout
+# channels live in settings.json, not env vars). pi's samplers ride
+# samplingParams as top-level OpenAI-completions request params with no
+# litellm layer in between, so top_k/min_p reach only backends that accept
+# non-standard OpenAI params.
 # amp is unprobed: no lever assumed until someone probes one.
 
 anthropic:
@@ -181,18 +202,21 @@ anthropic:
   timeout_ms: 3000000
   # Context window for the jailed agent's model, in tokens. When set, it
   # exports as CLAUDE_CODE_MAX_CONTEXT_TOKENS (which jailed claude honors
-  # for its compaction/budget math) and replaces the input side of the
-  # model metadata staged for aider rounds; opencode, pi, and amp ignore
-  # it (opencode's only mechanism is a config-file pointer whose
+  # for its compaction/budget math), replaces the input side of the
+  # model metadata staged for aider rounds, and lands as contextWindow on
+  # the model entry staged for openai-served pi rounds; opencode and amp
+  # ignore it (opencode's only mechanism is a config-file pointer whose
   # precedence against a repo-committed opencode.json was never probed).
   # Zero/unset means each agent's own default.
   context_tokens: 0
   # Completion cap for the jailed agent's rounds, in tokens. When set, it
   # replaces both sides of the 8k constant in the model metadata staged
   # for aider rounds (the metadata's max_output_tokens and
-  # extra_params.max_tokens) and claude's round env gains
+  # extra_params.max_tokens), claude's round env gains
   # CLAUDE_CODE_MAX_OUTPUT_TOKENS (the var claude 2.1.283's own error text
-  # names for its request-level max_tokens override). opencode/pi/amp have
+  # names for its request-level max_tokens override), and it lands as
+  # maxTokens on the model entry staged for openai-served pi rounds.
+  # opencode/amp have
   # no wired route. Zero/unset keeps aider's 8192 constant and every other
   # agent's API default.
   max_output_tokens: 0
@@ -206,7 +230,19 @@ openai:
   # model with "--model openai/<model>" (the openai/ prefix is what routes
   # aider's litellm layer to the custom endpoint instead of
   # api.openai.com) and stages model metadata sized for self-hosted models
-  # into the worktree's .daedalus-aider/ scratch dir. Same rule as
+  # into the worktree's .daedalus-aider/ scratch dir. A pi round consumes
+  # it too: pi honors OPENAI_API_KEY but has no base-URL env channel (a
+  # key alone would silently dial api.openai.com), so the worker stages
+  # the section as a provider entry in the host's ~/.pi/agent/models.json
+  # and selects the model with "--model daedalus-openai/<model>" — the
+  # entry carries the base URL, an ${OPENAI_API_KEY} template (the key
+  # value itself never lands on disk), and the model with the window/output
+  # cap and sampler knobs below; an openai section without url or without
+  # model fails a pi round before launch rather than let it dial the cloud
+  # default. The guard keys on the exported env vars, not on this section:
+  # a foreground run inherits the invoking shell, so an ambient
+  # OPENAI_API_KEY with no OPENAI_BASE_URL/OPENAI_MODEL fails pi rounds
+  # the same way — unset it or export a full section. Same rule as
   # anthropic.url: empty = inherit the environment.
   url: ""
   key: ""
@@ -216,15 +252,17 @@ openai:
   # whenever url above is set). Zero/unset falls back to anthropic's
   # timeout value, so a ceiling always applies; set it explicitly for
   # self-hosted endpoints whose litellm would otherwise apply only ~600s
-  # on its own.
+  # on its own. pi ignores the exported var (see the lever table above);
+  # its own request-timeout channel is settings.json, outside this file.
   timeout_ms: 0
   # Sampler knobs for rounds served by this section — sampler behavior is
   # a property of the backend behind url, shared by every agent that dials
-  # it. Consumed today only by aider's staged model settings: top_p,
+  # it. Consumed today by aider's staged model settings (top_p,
   # presence_penalty, and repetition_penalty as standard litellm params,
-  # top_k and min_p under extra_body (litellm's syntax for params it does
-  # not map natively). pi's passthrough is unprobed, so pi ignores these
-  # until probed; claude and amp are out of scope. Zero/unset means the
+  # top_k and min_p under extra_body — litellm's syntax for params it does
+  # not map natively) and by pi's staged models.json entry (all five as
+  # top-level OpenAI-completions request params, sent straight to url).
+  # claude and amp are out of scope. Zero/unset means the
   # field is omitted from the request entirely — never sent as a default,
   # so the backend's own sampler values stand (an explicit 0 above is
   # therefore the same as unset).
@@ -255,6 +293,12 @@ openai:
 # which environment vars failover values travel on. A jailed round's wire
 # is chosen by the agent itself — claude dials ANTHROPIC_*, so an
 # openai-style fallback serves only agents that dial OPENAI_BASE_URL.
+# pi can only be failed over by an openai-type fallback (an anthropic-type
+# one has no pi channel at all — pi reads no ANTHROPIC_BASE_URL); with an
+# anthropic-type fallback a pi round stays pinned to the primary's staged
+# endpoint and its "failure" is benched against the fallback side without
+# the fallback ever serving it (see
+# backlog/bugs/pi-anthropic-fallback-unserveable.md).
 fallback:
   enabled: false
   type: anthropic

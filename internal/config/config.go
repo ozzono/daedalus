@@ -458,10 +458,14 @@ func (c Config) RenderYAML() (string, error) {
 // when set; amp's host login does not reach the jail) — the anthropic/openai
 // config sections do not apply to it. pi and aider authenticate through the
 // provider env vars the worker already exports (ANTHROPIC_API_KEY,
-// OPENAI_API_KEY, ...) with two caveats: pi also reads ~/.pi/agent/auth.json,
+// OPENAI_API_KEY, ...) with three caveats: pi also reads ~/.pi/agent/auth.json,
 // which the jail's pi preset bridges in read-write (probe-verified — see
 // jailedAgentCLI) and which takes priority over the env vars for the same
-// provider, so a stale host /login wins; and aider's dotenv load uses
+// provider, so a stale host /login wins; pi honors the openai section's key
+// env var but no base-URL env var, so openai-served pi rounds are bridged
+// through a staged ~/.pi/agent/models.json provider entry instead
+// (stagePiProvider — an openai section missing url or model fails the round
+// before it can silently dial api.openai.com); and aider's dotenv load uses
 // override=True, but the jail masks the repo's .env to empty, so inside
 // jailed rounds the config-derived exports stand. Which wire a round dials
 // is chosen by the agent's selected model, not by daedalus — see
