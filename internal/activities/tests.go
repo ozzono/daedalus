@@ -364,79 +364,160 @@ func makefileHasTarget(mk, target string) bool {
 }
 
 // ErrNoSuite is the sentinel discovery returns when the repository has no
-// test suite at all: the AI round answered NONE, meaning nothing can be red
-// — a greenfield repo is not a red baseline. The preflight gate treats it
-// as a vacuous pass; flows that need a suite to gate on surface it as the
-// run error it is there.
+// test suite at all: the AI round answered NONE, or every discovery
+// candidate failed the existence probe (a fabricated runner is treated as
+// suite-less, never as red), meaning nothing can be red — a greenfield repo
+// is not a red baseline. The preflight gate treats it as a vacuous pass;
+// flows that need a suite to gate on surface it as the run error it is
+// there.
 var ErrNoSuite = errors.New("no test suite exists in this repository")
 
 // discoverTestCommand asks a short jailed agent run for the repository's
 // test entrypoint — the general, AI-led fallback. agent is the run's
 // -cli/--cli override, empty for the worker's default.
+//
+// A model — small ones especially — treats a list of example commands as
+// the answer menu and parrots the first entry on a suite-less repo
+// (wa-termo 2026-09-26: `make test` answered for a repo with no Makefile),
+// parking the run as an opaque red baseline indistinguishable from a real
+// one. The prompt therefore carries a verification contract instead of
+// example commands, and every candidate is probed before it is trusted
+// (probeTestCommand): a failed probe buys one re-discovery round, then the
+// verdict degrades to NONE — a repo whose declared runner cannot be
+// verified to exist is suite-less (ErrNoSuite, vacuous gate pass), never
+// red. A passing probe never swallows a real red baseline: suite execution
+// still decides at the gate.
 func discoverTestCommand(ctx context.Context, worktreePath, agent string) ([]string, error) {
-	// Snapshot the reply channel before the round: chat.history.md lives in
-	// the repo-writable worktree, so a repo-planted file must not forge the
-	// reply (backlog/bugs/aider-history-plant-forge). Only bytes appended
-	// after the snapshot are accepted below; mid-round tampering degrades
-	// to model trust, the same level as the stdout fallback.
-	histPath := filepath.Join(worktreePath, ".daedalus-aider", "chat.history.md")
-	var histLen int64
-	if st, err := os.Stat(histPath); err == nil {
-		histLen = st.Size()
-	}
-	res, err := runJailed(ctx, agent, worktreePath,
-		"Inspect this repository and determine the exact shell command that runs its full test suite. "+
-			"The suite may be make test, go test ./..., flutter test, npm test, pytest, cargo test, mvn test, "+
-			"or any other language's standard runner — inspect build files and CI config to determine it. "+
-			"Reply with EXACTLY one line: either that command, or the single word NONE if the repository "+
-			"has no test suite. No explanation, no code fences.")
-	if err != nil {
-		return nil, fmt.Errorf("discover test command: %w", err)
-	}
-	// The round spawns through jailedAgentCLI, which resolves the worker's
-	// DAEDALUS_AGENT default — the parse must dispatch on the same
-	// resolved CLI, not the raw override (empty means the default, and a
-	// pi-default worker would otherwise be parsed as claude and feed a
-	// JSON session header to firstCommandLine as the "test command").
-	selected, _, _ := jailedAgentCLI(agent)
-	_, text, _, _ := parseRoundOutput(selected, res.Stdout)
-	if text == "" && selected == "aider" {
-		// Aider's raw stdout is all banner chrome, and its command-shaped
-		// lines ("Aider v0.86.2") sit above the reply and win the shape
-		// scan — turning a correct NONE reply into `sh -c 'Aider v0.86.2'`
-		// (wa-termo 2026-09-26). Take the reply from aider's own
-		// chat-history file instead, which records it chrome-free — but
-		// only from the bytes this round appended (see the snapshot above),
-		// so a repo-planted history cannot forge the reply.
-		if hist, err := os.ReadFile(histPath); err == nil && int64(len(hist)) > histLen {
-			text = lastAiderReply(string(hist[histLen:]))
+	for attempt := 0; attempt < 2; attempt++ {
+		// Snapshot the reply channel before each round: chat.history.md lives in
+		// the repo-writable worktree, so a repo-planted file must not forge the
+		// reply (backlog/bugs/aider-history-plant-forge). Only bytes appended
+		// after the snapshot are accepted below; mid-round tampering degrades
+		// to model trust, the same level as the stdout fallback. The snapshot
+		// is per-round: the history accumulates across a probe retry too.
+		histPath := filepath.Join(worktreePath, ".daedalus-aider", "chat.history.md")
+		var histLen int64
+		if st, err := os.Stat(histPath); err == nil {
+			histLen = st.Size()
 		}
+		res, err := runJailed(ctx, agent, worktreePath,
+			"Inspect this repository and determine the exact shell command that runs its full test suite. "+
+				"Before answering, verify the entrypoint actually exists in this repository — inspect the build "+
+				"files (Makefile, package.json, go.mod, pyproject.toml, Cargo.toml, pom.xml, build.gradle) and "+
+				"the CI config for a test target or script. If no test suite exists, or you cannot verify one, "+
+				"reply the single word NONE. Never guess and never copy an example: a command you cannot verify "+
+				"is worse than NONE. Reply with EXACTLY one line: either that command, or the single word NONE. "+
+				"No explanation, no code fences.")
+		if err != nil {
+			return nil, fmt.Errorf("discover test command: %w", err)
+		}
+		// The round spawns through jailedAgentCLI, which resolves the worker's
+		// DAEDALUS_AGENT default — the parse must dispatch on the same
+		// resolved CLI, not the raw override (empty means the default, and a
+		// pi-default worker would otherwise be parsed as claude and feed a
+		// JSON session header to firstCommandLine as the "test command").
+		selected, _, _ := jailedAgentCLI(agent)
+		_, text, _, _ := parseRoundOutput(selected, res.Stdout)
+		if text == "" && selected == "aider" {
+			// Aider's raw stdout is all banner chrome, and its command-shaped
+			// lines ("Aider v0.86.2") sit above the reply and win the shape
+			// scan — turning a correct NONE reply into `sh -c 'Aider v0.86.2'`
+			// (wa-termo 2026-09-26). Take the reply from aider's own
+			// chat-history file instead, which records it chrome-free — but
+			// only from the bytes this round appended (see the snapshot above),
+			// so a repo-planted history cannot forge the reply.
+			if hist, err := os.ReadFile(histPath); err == nil && int64(len(hist)) > histLen {
+				text = lastAiderReply(string(hist[histLen:]))
+			}
+		}
+		if text == "" {
+			// Plain-text CLI without a history file (opencode, or an older
+			// aider run) or a parse miss: the raw stdout is the reply.
+			// ponytail: opencode keeps the stdout fallback — no reply channel
+			// is wired for it, so letter-initial chrome could still shadow its
+			// reply here.
+			text = res.Stdout
+		}
+		cmd := firstCommandLine(text)
+		if cmd == "" {
+			return nil, fmt.Errorf("no test command found for %s — declare one in .daedalus.yaml (tests: <command>)", worktreePath)
+		}
+		// The NONE verdict travels as one word, but models routinely dress it
+		// ("NONE.", "NONE — no test suite"): match the first word with
+		// sentence punctuation trimmed, so a dressed NONE never becomes the
+		// suite command. No real test runner is named "none", so the
+		// liberality is safe.
+		none := cmd
+		if i := strings.IndexAny(none, " \t"); i >= 0 {
+			none = none[:i]
+		}
+		if strings.EqualFold(strings.Trim(none, ".,;:!?\"'`"), "NONE") {
+			return nil, ErrNoSuite
+		}
+		if !probeTestCommand(ctx, worktreePath, cmd) {
+			// The declared runner or target does not exist — fabrication,
+			// not a red suite. One re-discovery round, then NONE.
+			activityLogger(ctx).Info("Discovery probe failed",
+				"Attempt", attempt+1, "Command", cmd, "Worktree", worktreePath)
+			continue
+		}
+		return []string{"sh", "-c", cmd}, nil
 	}
-	if text == "" {
-		// Plain-text CLI without a history file (opencode, or an older
-		// aider run) or a parse miss: the raw stdout is the reply.
-		// ponytail: opencode keeps the stdout fallback — no reply channel
-		// is wired for it, so letter-initial chrome could still shadow its
-		// reply here.
-		text = res.Stdout
+	// Both rounds answered with a runner that does not exist: the
+	// declaration was fabricated, and the repo is treated as suite-less —
+	// never gated on a command nothing can run.
+	return nil, ErrNoSuite
+}
+
+// probeTestCommand verifies a discovery candidate against the repository
+// cheaply: a `make …` candidate is dry-run probed (`make -n` inserted
+// before its original arguments, so -C dir, -f file, variable assignments,
+// and multi-target forms resolve the same rules the real run would), every
+// other candidate by resolving its runner from the worktree the way a
+// shell would (`command -v` for bare names, an executability check for
+// paths). False means the declared runner or target does not exist — a
+// discovery error (fabrication), not a suite failure, so the caller
+// retries the round rather than gating on it.
+//
+// The probe does run repo-controlled code once: `make -n` expands
+// parse-time `$(shell …)` calls in the Makefile, and a make candidate
+// whose runner is itself a repo-owned file named make executes that file
+// directly — so a planted repo can execute shell even for a candidate
+// that is then rejected (probe-fail → NONE runs no suite). ponytail: the
+// probe runs unjailed on the host, mirroring RunTestSuiteActivity's
+// unjailed `sh -c` suite execution — the only delta is that
+// rejected-candidate window, which is why the probe is not jail-wrapped.
+// Expansion-led candidates ("$RUN_ALL", "$(make test)") probe as
+// nonexistent and degrade to the safe-side retry, never to a wrong gate.
+func probeTestCommand(ctx context.Context, worktreePath, cmd string) bool {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return false
 	}
-	cmd := firstCommandLine(text)
-	if cmd == "" {
-		return nil, fmt.Errorf("no test command found for %s — declare one in .daedalus.yaml (tests: <command>)", worktreePath)
+	if filepath.Base(fields[0]) == "make" {
+		probe := exec.CommandContext(ctx, fields[0], append([]string{"-n"}, fields[1:]...)...)
+		probe.Dir = worktreePath
+		return probe.Run() == nil
 	}
-	// The NONE verdict travels as one word, but models routinely dress it
-	// ("NONE.", "NONE — no test suite"): match the first word with
-	// sentence punctuation trimmed, so a dressed NONE never becomes the
-	// suite command. No real test runner is named "none", so the
-	// liberality is safe.
-	none := cmd
-	if i := strings.IndexAny(none, " \t"); i >= 0 {
-		none = none[:i]
+	return commandExists(ctx, worktreePath, fields[0])
+}
+
+// commandExists resolves runner from dir the way a shell would: a PATH
+// lookup for bare names, an executability check for paths — with a
+// leading ~ expanded against $HOME first, since the suite's own `sh -c`
+// performs tilde expansion and a literal probe would declare a valid
+// ~/bin/run-tests suite-less; the mode bit is still required explicitly
+// (dash's `command -v` accepts a non-executable explicit path, rc=0), so
+// a runner that lost its +x is a real "Permission denied" baseline and
+// fails here.
+func commandExists(ctx context.Context, dir, runner string) bool {
+	script := `command -v "$1"`
+	if strings.ContainsRune(runner, '/') {
+		script = `case "$1" in "~"*) p="$HOME${1#?}";; *) p="$1";; esac; [ -x "$p" ]`
 	}
-	if strings.EqualFold(strings.Trim(none, ".,;:!?\"'`"), "NONE") {
-		return nil, ErrNoSuite
-	}
-	return []string{"sh", "-c", cmd}, nil
+	probe := exec.CommandContext(ctx, "sh", "-c", script, "sh", runner)
+	probe.Dir = dir
+	return probe.Run() == nil
 }
 
 // firstCommandLine extracts a single-line command from an agent reply: the

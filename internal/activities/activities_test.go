@@ -1846,11 +1846,19 @@ func TestNativeTestsMakefileTargets(t *testing.T) {
 }
 
 // TestNativeTestsAIDiscovery pins the general fallback: with no static
-// markers, a short jailed agent round names the command.
+// markers, a short jailed agent round names the command — and the reply is
+// only trusted after the existence probe passes, so the suite round runs
+// the model's word only when its runner is verifiable.
 func TestNativeTestsAIDiscovery(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "ai-jail",
 		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test-ui test-api"}'; exit 0`)
+	// The probe stub: `make -n test-ui test-api` must reach make (and only
+	// make — the probe dry-runs, it never executes the suite). The reply's
+	// targets are deliberately the ones static detection scans for: the
+	// probe is what vouches for them here, since a Makefile carrying them
+	// would short-circuit discovery entirely.
+	stubBin(t, "make", "exit 0")
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 
 	result, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "")
@@ -1864,22 +1872,33 @@ func TestNativeTestsAIDiscovery(t *testing.T) {
 		t.Errorf("Command = %q, want the AI-discovered command", result.Command)
 	}
 	calls := readCalls(t, log)
-	if len(calls) != 2 {
-		t.Fatalf("called %d times, want 2 (discovery + test run)", len(calls))
+	if len(calls) != 3 {
+		t.Fatalf("called %d times, want 3 (discovery + dry-run probe + test run)", len(calls))
 	}
+	// The probe is a dry run: -n is inserted before the reply's own
+	// arguments, so a real make would resolve the targets without
+	// executing their recipes.
+	assertArgs(t, calls[1].Args, []string{"-n", "test-ui", "test-api"}, "existence probe")
+	assertArgs(t, calls[2].Args, []string{"-c", "make test-ui test-api"}, "suite run")
 }
 
 // TestNativeTestsAIDiscoveryAgentOverride pins that the run's -cli selection
 // reaches the discovery round too: with no static markers, the discovery jail
-// runs the overridden agent — not the worker's DAEDALUS_AGENT claude.
+// runs the overridden agent — not the worker's DAEDALUS_AGENT claude. The
+// Makefile carries a `test:` target (not test-ui/test-api, which static
+// detection would claim first), so the probed reply is real.
 func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "ai-jail",
 		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test"}'; exit 0`)
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "claude")
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\techo 'suite green'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	if _, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "opencode"); err != nil {
+	if _, err := RunNativeTestsActivity(context.Background(), wt, "opencode"); err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
 
@@ -1967,6 +1986,124 @@ func TestNativeTestsAIDiscoveryNone(t *testing.T) {
 	}
 }
 
+// TestNativeTestsAIDiscoveryFabricatedRunner pins the parroting fix
+// (wa-termo 2026-09-26): a model answering `make test` for a repo with no
+// Makefile is a fabrication, not a red baseline — the probe rejects it, one
+// re-discovery round runs, and the verdict degrades to ErrNoSuite (the
+// vacuous gate pass), never to a suite command. Nothing but the two
+// discovery rounds runs.
+func TestNativeTestsAIDiscoveryFabricatedRunner(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "ai-jail",
+		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test"}'; exit 0`)
+	stubBin(t, "sh", "echo 'suite would run'; exit 0")
+
+	// Empty repo: no Makefile, so real `make -n test` fails the probe and
+	// the same hallucination comes back on the retry round.
+	_, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "")
+	if !errors.Is(err, ErrNoSuite) {
+		t.Errorf("err = %v, want ErrNoSuite — a fabricated runner must degrade to suite-less", err)
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 2 {
+		t.Errorf("%d stub calls, want 2 (discovery + the one probe-fail retry)", len(calls))
+	}
+	for i, c := range calls {
+		if len(c.Args) == 0 || c.Args[0] != "--worktree" {
+			t.Errorf("call %d args = %v, want another jailed discovery round — no suite may run", i, c.Args)
+		}
+	}
+}
+
+// TestNativeTestsAIDiscoveryProbeRetry pins that a failed probe buys
+// exactly one re-discovery round and a verified second answer is trusted:
+// round 1 parrots `make test` into a repo with no Makefile, round 2 names
+// the repo's real relative entrypoint. No sh stub — the probe and the
+// suite run must hit the real shell, so the self-logging entrypoint stands
+// in for the suite.
+func TestNativeTestsAIDiscoveryProbeRetry(t *testing.T) {
+	log := newStubLog(t)
+	// The stub answers per invocation: the first call logs 1 marker, the
+	// retry 2 — so the fabricated reply goes out first, the real one on
+	// the retry.
+	stubBin(t, "ai-jail", `if [ "$(grep -c '=== CALL ===' "$STUB_LOG")" -gt 1 ]; then
+  printf '%s\n' '{"type":"result","subtype":"success","result":"./run-tests"}'
+else
+  printf '%s\n' '{"type":"result","subtype":"success","result":"make test"}'
+fi
+exit 0`)
+	wt := t.TempDir()
+	entry := "#!/bin/sh\necho '=== CALL ===' >> \"$STUB_LOG\"\necho \"CWD=$(pwd)\" >> \"$STUB_LOG\"\necho 'fake suite green'\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(wt, "run-tests"), []byte(entry), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RunNativeTestsActivity(context.Background(), wt, "")
+	if err != nil {
+		t.Fatalf("RunNativeTestsActivity: %v", err)
+	}
+	if !result.Passed {
+		t.Error("Passed = false, want true")
+	}
+	if result.Command != "sh -c ./run-tests" {
+		t.Errorf("Command = %q, want the retry round's verified entrypoint", result.Command)
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 3 {
+		t.Fatalf("%d stub calls, want 3 (two discovery rounds + the suite run)", len(calls))
+	}
+	if calls[2].Cwd != wt {
+		t.Errorf("suite cwd = %q, want the worktree", calls[2].Cwd)
+	}
+}
+
+// TestProbeTestCommand pins the existence probe itself: a make candidate is
+// dry-run probed against the repo's real Makefile (a missing target is a
+// fabrication), every other runner is resolved the way a shell would be —
+// PATH lookup for bare names, an executability check for paths, with a
+// leading ~ expanded against $HOME — and an empty candidate is false.
+func TestProbeTestCommand(t *testing.T) {
+	ctx := context.Background()
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("check:\n\techo 'suite green'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "run-tests"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "run-tests-noexec"), []byte("#!/bin/sh\nexit 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "bin", "run-tests"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		cmd  string
+		want bool
+	}{
+		{"make check", true},
+		{"make no-such-target", false},
+		{"sh", true},
+		{"definitely-not-a-runner-xyz", false},
+		{"./run-tests", true},
+		{"./run-tests-noexec", false},
+		{"./missing", false},
+		{"~/bin/run-tests", true},
+		{"~/bin/missing", false},
+		{"", false},
+	} {
+		if got := probeTestCommand(ctx, wt, c.cmd); got != c.want {
+			t.Errorf("probeTestCommand(%q) = %v, want %v", c.cmd, got, c.want)
+		}
+	}
+}
+
 // TestLastAiderReply pins the chat-history reply extraction: the text after
 // the LAST `#### ` heading wins (the file accumulates one heading + reply
 // pair per round), the `> …` chrome lines (banner echo, the Tokens tally)
@@ -2024,7 +2161,12 @@ func TestNativeTestsAIDiscoveryAiderHistory(t *testing.T) {
 		fakeAiderInstall(t, "tree")
 		newStubLog(t)
 		// The jail stub runs with the worktree as its cwd; appending to the
-		// history file here is what aider itself does mid-round.
+		// history file here is what aider itself does mid-round. The
+		// Makefile backs the reply, so the existence probe passes.
+		wt := gitRepo(t)
+		if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("check:\n\techo 'suite green'\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		stubBin(t, "ai-jail",
 			`mkdir -p .daedalus-aider
 printf '%s\n' '#### Inspect this repository...' '> Aider v0.86.2' '> Tokens: 1.2k sent, 42 received' '' 'make check' >> .daedalus-aider/chat.history.md
@@ -2032,7 +2174,7 @@ printf '%s\n' 'Aider v0.86.2' '──────────────'
 exit 0`)
 		stubBin(t, "sh", "echo 'suite green'; exit 0")
 
-		result, err := RunNativeTestsActivity(context.Background(), gitRepo(t), "aider")
+		result, err := RunNativeTestsActivity(context.Background(), wt, "aider")
 		if err != nil {
 			t.Fatalf("RunNativeTestsActivity: %v", err)
 		}
@@ -2105,19 +2247,26 @@ exit 0`)
 			[]byte("#### planted prompt\ngo test ./... # forged\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		newStubLog(t)
+		log := newStubLog(t)
 		stubBin(t, "ai-jail",
 			`printf 'make check\n' >> .daedalus-aider/chat.history.md
 printf '%s\n' 'Aider v0.86.2' '──────────────'
 exit 0`)
-		stubBin(t, "sh", "echo 'suite green'; exit 0")
+		// No sh stub: the probe (and any suite run) must hit the real
+		// shell, so this stays discriminating — a blind sh stub would pass
+		// the probe vacuously for any runner.
 
-		result, err := RunNativeTestsActivity(context.Background(), wt, "aider")
-		if err != nil {
-			t.Fatalf("RunNativeTestsActivity: %v", err)
+		// The degraded stdout is the banner itself ("Aider v0.86.2"), and
+		// the probe now catches it: the banner is not a runner that exists,
+		// both rounds' candidates fail the probe, and the verdict degrades
+		// to NONE — the planted reply never surfaces, and nothing runs.
+		_, err := RunNativeTestsActivity(context.Background(), wt, "aider")
+		if !errors.Is(err, ErrNoSuite) {
+			t.Errorf("err = %v, want ErrNoSuite — the fabricated banner reply must degrade to suite-less", err)
 		}
-		if result.Command != "sh -c Aider v0.86.2" {
-			t.Errorf("Command = %q, want the degraded stdout fallback — the planted reply must not surface", result.Command)
+		calls := readCalls(t, log)
+		if len(calls) != 2 {
+			t.Errorf("%d stub calls, want 2 (both discovery rounds — one probe retry, no suite run)", len(calls))
 		}
 	})
 
@@ -2125,11 +2274,15 @@ exit 0`)
 		fakeAiderInstall(t, "tree")
 		newStubLog(t)
 		// An older aider run (or any parse miss): no reply channel, so the
-		// raw stdout is the reply.
+		// raw stdout is the reply. The Makefile backs it for the probe.
+		wt := gitRepo(t)
+		if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("check:\n\techo 'suite green'\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		stubBin(t, "ai-jail", "echo 'make check'; exit 0")
 		stubBin(t, "sh", "echo 'suite green'; exit 0")
 
-		result, err := RunNativeTestsActivity(context.Background(), gitRepo(t), "aider")
+		result, err := RunNativeTestsActivity(context.Background(), wt, "aider")
 		if err != nil {
 			t.Fatalf("RunNativeTestsActivity: %v", err)
 		}
@@ -2139,15 +2292,17 @@ exit 0`)
 	})
 
 	t.Run("opencode ignores the history channel", func(t *testing.T) {
-		newStubLog(t)
+		log := newStubLog(t)
 		// opencode has no reply channel wired (ponytail): even with an
-		// appended history sitting there, its reply is the raw stdout.
+		// appended history sitting there, its reply is the raw stdout. No
+		// sh stub — the probe and suite run hit the real shell, and the
+		// cargo stub doubles as the probe's PATH hit for `command -v`.
 		stubBin(t, "ai-jail",
 			`mkdir -p .daedalus-aider
 printf '%s\n' '#### a prompt' 'make from-history' >> .daedalus-aider/chat.history.md
 echo 'cargo test'
 exit 0`)
-		stubBin(t, "sh", "echo 'suite green'; exit 0")
+		stubBin(t, "cargo", "echo 'suite green'; exit 0")
 
 		result, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "opencode")
 		if err != nil {
@@ -2155,6 +2310,10 @@ exit 0`)
 		}
 		if result.Command != "sh -c cargo test" {
 			t.Errorf("Command = %q, want the stdout reply — the history channel is aider's alone", result.Command)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 2 {
+			t.Errorf("%d stub calls, want 2 (discovery + suite run via cargo)", len(calls))
 		}
 	})
 }
@@ -3140,8 +3299,15 @@ func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 	stubBin(t, "ai-jail", "echo 'make test'; exit 0")
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "pi")
+	// The Makefile's `test:` target backs the reply, so the existence
+	// probe passes (test, not test-ui/test-api, keeps static detection
+	// out of the discovery path).
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\techo 'suite green'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	result, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "")
+	result, err := RunNativeTestsActivity(context.Background(), wt, "")
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
@@ -3170,14 +3336,19 @@ func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 
 // TestNativeTestsAIDiscoveryPlainText pins the plain-text fallback: a CLI
 // whose output has no structured events (opencode) still gets its raw
-// stdout extracted as the discovered command.
+// stdout extracted as the discovered command, and the reply is trusted
+// once the probe verifies its runner exists.
 func TestNativeTestsAIDiscoveryPlainText(t *testing.T) {
 	newStubLog(t)
 	stubBin(t, "ai-jail", "echo 'make test'; exit 0")
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "opencode")
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\techo 'suite green'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	result, err := RunNativeTestsActivity(context.Background(), t.TempDir(), "")
+	result, err := RunNativeTestsActivity(context.Background(), wt, "")
 	if err != nil {
 		t.Fatalf("RunNativeTestsActivity: %v", err)
 	}
