@@ -136,10 +136,20 @@ max_concurrent_agent_runs: 2
 # preset mounts ~/.pi read-write.
 slim: false
 # How many native test-suite executions may run at once on the test worker
-# (the shared "test" task queue); further suites queue until a slot frees
-# (heartbeating while they wait). Suites are CPU-bound host work, unlike
-# the provider-bound agent rounds above, so this cap is separate.
+# (the deployment's suite task queue); further suites queue until a slot
+# frees (heartbeating while they wait). Suites are CPU-bound host work,
+# unlike the provider-bound agent rounds above, so this cap is separate.
 max_concurrent_tests: 2
+# Where this deployment's native test suites execute. true (the default,
+# and the effect of leaving the key out) schedules them on the one
+# Temporal-wide "test" queue that every deployment's workers poll — any
+# deployment's worker can run any deployment's suite. false gives the
+# deployment its own derived queue ("<task_queue>-test") that only workers
+# started from this config schedule onto and poll, so a stale worker of
+# another deployment can no longer serve — or fail — this deployment's
+# suites; flip it and upgrade this deployment's daemons in the same pass,
+# or suites sit Scheduled with no poller on the new queue.
+shared_test_queue: true
 
 temporal:
   # Temporal frontend address. 7233 is Temporal's own default, so a plain

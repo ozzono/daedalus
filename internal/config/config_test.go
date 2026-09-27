@@ -1203,3 +1203,97 @@ func TestProviderEnvVarsIncludesBugDir(t *testing.T) {
 		t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), BugDirEnv)
 	}
 }
+
+// TestLoadSharedTestQueue pins the shared_test_queue toggle's pointer
+// semantics: an absent key and an explicit true both report the
+// fleet-shared routing — the historical behavior, and what a config from
+// before the knob means — and only an explicit false opts this
+// deployment's suites onto its own derived queue.
+func TestLoadSharedTestQueue(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"absent", "", true},
+		{"explicit true", "shared_test_queue: true\n", true},
+		{"explicit false", "shared_test_queue: false\n", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, c.yaml))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := cfg.SharesTestQueue(); got != c.want {
+				t.Errorf("SharesTestQueue() = %v (SharedTestQueue = %v), want %v", got, cfg.SharedTestQueue, c.want)
+			}
+		})
+	}
+}
+
+// TestDerivedSuiteQueueName pins TestQueueFor's naming: the deployment's
+// main task queue plus the "-test" suffix — the name the "-test"-suffix
+// validation (TestLoadRejectsTestSuffixQueue) must keep out of the main
+// queue namespace.
+func TestDerivedSuiteQueueName(t *testing.T) {
+	for queue, want := range map[string]string{
+		DefaultTaskQueue: DefaultTaskQueue + "-test",
+		"q7":             "q7-test",
+	} {
+		if got := TestQueueFor(queue); got != want {
+			t.Errorf("TestQueueFor(%q) = %q, want %q", queue, got, want)
+		}
+	}
+}
+
+// TestLoadRejectsTestSuffixQueue pins the derived-queue collision gate: a
+// main queue carrying the "-test" suffix would derive a suite queue
+// colliding with the stem name's deployment, so it is rejected at load
+// with the collision named, while names merely containing "test" as a
+// substring or prefix stay legal.
+func TestLoadRejectsTestSuffixQueue(t *testing.T) {
+	_, err := Load(writeConfig(t, "temporal:\n  task_queue: dev-test\n"))
+	if err == nil || !strings.Contains(err.Error(), "-test") || !strings.Contains(err.Error(), "dev") {
+		t.Fatalf("Load(task_queue: dev-test) err = %v, want a -test-suffix rejection naming the derivation", err)
+	}
+	for _, q := range []string{"dev-testing", "test-dev", "attest"} {
+		if _, err := Load(writeConfig(t, "temporal:\n  task_queue: "+q+"\n")); err != nil {
+			t.Errorf("Load(task_queue: %s): %v, want accepted", q, err)
+		}
+	}
+}
+
+// TestRenderYAMLSharedTestQueue pins the toggle's `daedalus config` render:
+// an explicit opt-out prints verbatim and parses back to the same
+// opt-out. The comparison checks the effective value rather than struct
+// equality: two separately parsed Configs carrying an explicit false hold
+// distinct *bool pointers, so == would report them unequal (the
+// pointer-field wart in Config's comparability), while the round trip's
+// contract is about the values.
+func TestRenderYAMLSharedTestQueue(t *testing.T) {
+	raw, err := LoadRaw(writeConfig(t, "tests_timeout: 45m\nagent_run_timeout: 30m\nreview_timeout: 15m\ncleanup_timeout: 5m\nshared_test_queue: false\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	if !strings.Contains(out, "shared_test_queue: false") {
+		t.Errorf("RenderYAML output is missing the explicit opt-out:\n%s", out)
+	}
+	// Round-trip through Load, the way `daedalus config` consumers would.
+	// The doc pins every duration: the render of an unset duration is a
+	// bare 0, which Load's time.Duration decode rejects outright (filed
+	// separately), and the round trip here must not stand on that bug.
+	back, err := Load(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("Load(RenderYAML output): %v\n%s", err, out)
+	}
+	if back.SharedTestQueue == nil || *back.SharedTestQueue {
+		t.Errorf("round-trip SharedTestQueue = %v, want an explicit false", back.SharedTestQueue)
+	}
+	if back.SharesTestQueue() {
+		t.Error("round-trip SharesTestQueue() = true, want false")
+	}
+}

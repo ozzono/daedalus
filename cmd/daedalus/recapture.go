@@ -47,8 +47,8 @@ type stuckAttempt struct {
 	runID      string
 	activityID string
 	// queue is the attempt's own task queue (its activity options'), which
-	// may differ from the scanned workflow's queue — suites run on the
-	// shared test queue.
+	// may differ from the scanned workflow's queue — suites run on a
+	// suite queue (shared "test" or the derived "<queue>-test").
 	queue string
 	// identity is the dead worker's SDK identity (pid@host@…), named in
 	// the alerts and in the failure that unsticks the attempt.
@@ -144,7 +144,8 @@ func recaptureStuckTasks() error {
 // dead worker leaves mid-round), or one never dispatched while nothing
 // polls that queue at all (a daemon that died or was never started). Each
 // attempt is judged against ITS activity options' task queue — suites run
-// on the shared test queue, so the workflow's queue is the wrong reference
+// on a suite queue (shared "test" or the derived "<queue>-test"), so the
+// workflow's queue is the wrong reference
 // in any multi-daemon deployment. The server must populate
 // activity_options.task_queue: an attempt whose queue cannot be read is
 // undecidable and skipped, never judged against the workflow's queue —
@@ -262,8 +263,9 @@ func forEachRunningWorkflow(ctx context.Context, c client.Client, queue string, 
 // has no live poller at all (its daemon is dead or zombied) — also
 // restart the live recorded worker, or start one from the most recent
 // record when none is live. The restart is deliberately conditional: a
-// live untyped daemon polls both its workflow queue and the shared test
-// queue (activities.TestTaskQueue, which no config record names) — a daemon
+// live untyped daemon polls its workflow queue and the deployment's suite
+// queue (the shared "test" or the derived "<queue>-test" — none of the two
+// config records names it) — a daemon
 // started with -t dev or -t test polls only one, but the untyped daemon a
 // recapture brings back is a superset, so when any poller exists on the
 // attempt's own queue the rescheduled rounds are already served and

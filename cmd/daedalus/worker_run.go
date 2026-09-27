@@ -171,14 +171,24 @@ func runWorker(cfg config.Config, workerType string) error {
 		workers = append(workers, w)
 	}
 
-	// The test worker serves the dedicated test queue: it runs only the
-	// suite activities — dumb command runners needing no provider
-	// environment — so this host's suites share one queue and one
+	// The test worker serves this deployment's suite queue: it runs only
+	// the suite activities — dumb command runners needing no provider
+	// environment — so this deployment's suites share one queue and one
 	// max_concurrent_tests budget, whatever workers created them. The
 	// repro-first gate belongs here too: it runs the suite command in a
-	// throwaway base checkout.
+	// throwaway base checkout. With shared_test_queue off, the queue is
+	// this deployment's own derived "<queue>-test": its suites are then
+	// schedulable only by workers started from this config, so restarting
+	// this deployment's daemon is sufficient to change which binary
+	// executes them (a stale worker of any other deployment can no longer
+	// pick them up). With sharing on — the default — it is the Temporal-
+	// wide "test" queue, preserving fleet-wide suite borrowing.
 	if wantsTestWorker(workerType) {
-		tw := worker.New(c, activities.TestTaskQueue, opts)
+		suiteQueue := config.ReservedTestTaskQueue
+		if !cfg.SharesTestQueue() {
+			suiteQueue = config.TestQueueFor(cfg.Temporal.TaskQueue)
+		}
+		tw := worker.New(c, suiteQueue, opts)
 		tw.RegisterActivity(activities.RunTestSuiteActivity)
 		tw.RegisterActivity(activities.ReproFirstGateActivity)
 		workers = append(workers, tw)
