@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.temporal.io/sdk/testsuite"
 )
 
 // useTaskLogDir points TaskLogDir at a fresh temp dir for the test's
@@ -156,18 +158,87 @@ func TestWriteTaskLogRejectsBadID(t *testing.T) {
 	}
 }
 
+// appendTaskLogProbeActivity is a test-only activity wrapping appendTaskLog,
+// so it can run inside a real activity context via the SDK's test
+// environment — the path-return contract only applies there.
+func appendTaskLogProbeActivity(ctx context.Context, event, body string) (string, error) {
+	return appendTaskLog(ctx, event, body), nil
+}
+
 // TestAppendTaskLogNoopOutsideActivity pins the unit-test contract of
 // appendTaskLog: outside a real activity context there is no workflow id, so
-// nothing is written and no file is created — activities invoked directly
-// from tests stay side-effect free.
+// nothing is written, no file is created, and it returns "" — activities
+// invoked directly from tests stay side-effect free and their callers get no
+// path to point at.
 func TestAppendTaskLogNoopOutsideActivity(t *testing.T) {
 	dir := useTaskLogDir(t)
-	appendTaskLog(context.Background(), "jailed claude round started: stage=dev worktree=/wt pgid=1", "")
+	if got := appendTaskLog(context.Background(), "jailed claude round started: stage=dev worktree=/wt pgid=1", ""); got != "" {
+		t.Errorf("appendTaskLog outside an activity context = %q, want \"\"", got)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != 0 {
 		t.Errorf("appendTaskLog outside an activity context created %v, want nothing", entries)
+	}
+}
+
+// TestAppendTaskLogReturnsPathInsideActivity pins the path-return contract
+// inside a real activity context: the returned path is the task log that was
+// just written — it resolves inside the configured dir, opens, and carries
+// the record (event and body).
+func TestAppendTaskLogReturnsPathInsideActivity(t *testing.T) {
+	dir := useTaskLogDir(t)
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(appendTaskLogProbeActivity)
+
+	v, err := env.ExecuteActivity(appendTaskLogProbeActivity,
+		"test suite exited after 5s: go test ./...", "out line")
+	if err != nil {
+		t.Fatalf("ExecuteActivity: %v", err)
+	}
+	var path string
+	if err := v.Get(&path); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if path == "" {
+		t.Fatal(`appendTaskLog returned "" inside an activity context, want the written log's path`)
+	}
+	if filepath.Dir(path) != dir {
+		t.Errorf("path %q is outside the configured dir %q", path, dir)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the returned path %q does not name a readable log: %v", path, err)
+	}
+	if got := string(data); !strings.Contains(got, "test suite exited after 5s") || !strings.Contains(got, "out line\n") {
+		t.Errorf("the task log at the returned path lacks the record: %q", got)
+	}
+}
+
+// TestAppendTaskLogFailedWriteReturnsEmpty pins the other half of the
+// path-return contract: a failed write returns "" — the returned path must
+// never name a file that lacks the record.
+func TestAppendTaskLogFailedWriteReturnsEmpty(t *testing.T) {
+	reset := TaskLogDir
+	t.Cleanup(func() { TaskLogDir = reset })
+	TaskLogDir = filepath.Join(t.TempDir(), "does-not-exist")
+
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(appendTaskLogProbeActivity)
+
+	v, err := env.ExecuteActivity(appendTaskLogProbeActivity, "test suite exited after 5s: go test ./...", "out line")
+	if err != nil {
+		t.Fatalf("ExecuteActivity: %v (a task-log write failure is best-effort, never an activity error)", err)
+	}
+	var path string
+	if err := v.Get(&path); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if path != "" {
+		t.Errorf("appendTaskLog on a failed write = %q, want \"\"", path)
 	}
 }

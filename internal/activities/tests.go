@@ -23,10 +23,13 @@ import (
 
 // TestResult reports the outcome of a native test run. A failing suite is
 // reported via Passed=false (not a system error) so the workflow can feed the
-// logs back to the agent. Logs are complete — no truncation anywhere in the
-// app; complete output is the contract for every agent-facing channel, so a
-// failing gate step's identity is always present in what a tests-fix round
-// delivers. Command records the entrypoint that ran — declared, detected, or
+// logs back to the agent. The complete output always reaches the run's task
+// log on the worker host before anything is bounded; Logs carries it complete
+// when it fits the transport, otherwise the tail plus a marker naming the
+// total size and the task-log path (the no-truncation contract governs
+// daedalus's channels — Temporal caps its payloads regardless of what we
+// send, and an over-limit payload fails its own upload, TMPRL1103).
+// Command records the entrypoint that ran — declared, detected, or
 // AI-discovered — for visibility in history.
 type TestResult struct {
 	Passed  bool
@@ -63,14 +66,17 @@ func RunNativeTestsActivity(ctx context.Context, worktreePath, agent string) (Te
 		return TestResult{}, fmt.Errorf("run tests (%s): %w", res.Command, err)
 	}
 	err = waitCommand(ctx, cmd)
+	// Task-log block before any bounding — same contract as
+	// RunTestSuiteActivity: the complete output reaches the record first.
+	logPath := appendTaskLog(ctx, fmt.Sprintf("native test run finished: %s", res.Command), out.String())
 	if err != nil && !isWaitDelay(err) {
 		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
 			return TestResult{}, fmt.Errorf("run tests (%s): %w", res.Command, err)
 		}
-		res.Passed, res.Logs = false, out.String()
+		res.Passed, res.Logs = false, boundedOutput(logPath, out.String())
 		return res, nil
 	}
-	res.Passed, res.Logs = true, out.String()
+	res.Passed, res.Logs = true, boundedOutput(logPath, out.String())
 	return res, nil
 }
 
@@ -136,14 +142,16 @@ func shellQuote(s string) string {
 
 // RunTestSuiteActivity executes a test suite command on the test task
 // queue. It is a dumb command runner: the command runs from ~ with a
-// `cd <worktree>` prefix, its combined output comes back complete and
-// verbatim, and it heartbeats throughout so a long suite shows as alive
-// rather than hung (and never trips anything but the workflow's
-// tests_timeout — the suite's runtime answers to that ceiling alone).
-// Concurrent suites are bounded by max_concurrent_tests; further suites
-// queue on the semaphore, heartbeating while they wait. A non-zero exit is
-// a test failure (Passed=false) with the output captured so far; any other
-// error (e.g. the shell itself missing) is a system error.
+// `cd <worktree>` prefix, and it heartbeats throughout so a long suite
+// shows as alive rather than hung (and never trips anything but the
+// workflow's tests_timeout — the suite's runtime answers to that ceiling
+// alone). The combined output lands complete in the run's task log; what
+// returns in the result or error carries it bounded when it exceeds the
+// transport limit (see boundedOutput). Concurrent suites are bounded by
+// max_concurrent_tests; further suites queue on the semaphore, heartbeating
+// while they wait. A non-zero exit is a test failure (Passed=false) with
+// the output captured so far; any other error (e.g. the shell itself
+// missing) is a system error.
 func RunTestSuiteActivity(ctx context.Context, input TestRunInput) (TestResult, error) {
 	if strings.TrimSpace(input.Command) == "" {
 		return TestResult{}, fmt.Errorf("empty test command for %s", input.WorktreePath)
@@ -207,24 +215,52 @@ func RunTestSuiteActivity(ctx context.Context, input TestRunInput) (TestResult, 
 	err = waitCommand(ctx, cmd)
 	logger.Info("Test suite finished", "Duration", time.Since(start).Round(time.Second))
 	// Task-log block: the full combined output — the full log is the
-	// point.
-	appendTaskLog(ctx, fmt.Sprintf("test suite exited after %s: %s",
+	// point. The path feeds the transport-bound copies below.
+	logPath := appendTaskLog(ctx, fmt.Sprintf("test suite exited after %s: %s",
 		time.Since(start).Round(time.Second), command), out.String())
 	if err != nil && !isWaitDelay(err) {
 		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
 			return TestResult{}, fmt.Errorf("run tests (%s): %w: %s",
-				res.Command, err, out.String())
+				res.Command, err, boundedOutput(logPath, out.String()))
 		}
 		// A failing suite is a red round, not a system error — and the
 		// output captured before the failure is the point: the fix loop
 		// digests it.
-		res.Passed, res.Logs = false, out.String()
+		res.Passed, res.Logs = false, boundedOutput(logPath, out.String())
 		res.Coverage = goTotalCoverage(ctx, profile)
 		return res, nil
 	}
-	res.Passed, res.Logs = true, out.String()
+	res.Passed, res.Logs = true, boundedOutput(logPath, out.String())
 	res.Coverage = goTotalCoverage(ctx, profile)
 	return res, nil
+}
+
+// testOutputTailLimit bounds suite output that travels through Temporal
+// payloads (activity results and errors — both are payloads under the same
+// server limits; an over-limit error fails its own upload with TMPRL1103,
+// arete-nested-config 2026-09-27). Sized well under any plausible server
+// blob-error limit (historically 2 MB).
+const testOutputTailLimit = 512 << 10 // 512 KiB
+
+// boundedOutput passes out through byte-identical when it fits the
+// transport limit; larger output becomes a marker line — total size, the
+// fact of the cut, and the task-log path holding the complete record —
+// followed by the final testOutputTailLimit bytes (a tail: the end of a
+// run is where failures live). logPath may be empty (no task log was
+// written); the marker then names the cut only. The complete output always
+// reaches the task log before anything is bounded, so the no-truncation
+// contract holds — only what fits Temporal's payload cap changes.
+func boundedOutput(logPath, out string) string {
+	if len(out) <= testOutputTailLimit {
+		return out
+	}
+	loc := ""
+	if logPath != "" {
+		loc = "; full output: " + logPath
+	}
+	marker := fmt.Sprintf("[daedalus: suite output exceeds the transport limit — %d bytes total; last %d bytes follow%s]\n",
+		len(out), testOutputTailLimit, loc)
+	return marker + out[len(out)-testOutputTailLimit:]
 }
 
 // goTotalCoverage reads the total statement coverage from a Go coverage
