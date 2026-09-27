@@ -3,12 +3,14 @@ package activities
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -2368,11 +2370,14 @@ func TestRunNativeTestsActivityFail(t *testing.T) {
 	}
 }
 
-// TestRunNativeTestsActivityCarriesFullLogs pins the no-truncation
-// contract: huge test output reaches the activity result complete — no
-// truncation marker, no byte bound — so a tests-fix round always digests
-// the whole failure, head and tail alike.
-func TestRunNativeTestsActivityCarriesFullLogs(t *testing.T) {
+// TestRunNativeTestsActivityCarriesUnderLimitLogsComplete pins that native
+// test output at or under the transport limit (testOutputTailLimit) reaches
+// the activity result complete — no truncation marker, no byte bound — so a
+// tests-fix round digests the whole failure, head and tail alike. Over-limit
+// output follows the other contract: boundedOutput reduces it to a marker
+// plus the tail, with the complete record already in the task log (pinned on
+// RunTestSuiteActivity and on boundedOutput directly).
+func TestRunNativeTestsActivityCarriesUnderLimitLogsComplete(t *testing.T) {
 	newStubLog(t)
 	stubBin(t, "go", `head -c 100000 /dev/zero | tr '\0' 'x'; echo 'FAIL: at the end'; exit 1`)
 
@@ -2701,6 +2706,172 @@ func TestRunTestSuiteActivity(t *testing.T) {
 			t.Fatalf("want empty-command error, got %v", err)
 		}
 	})
+}
+
+// hugeSuiteCommand returns a shell command whose combined output is a
+// HEAD-ONLY sentinel line, fill bytes of filler, and a failing tail line —
+// deterministic byte total, head and tail straddling the transport bound —
+// plus that total for marker assertions.
+func hugeSuiteCommand() (command string, head, tail string, total int) {
+	head, tail = "HEAD-ONLY-SENTINEL", "FAIL: at the end"
+	const fill = 600000
+	command = fmt.Sprintf("printf '%s\\n'; head -c %d /dev/zero | tr '\\0' 'y'; printf '\\n%s\\n'; exit 1", head, fill, tail)
+	total = len(head) + 1 + fill + 1 + len(tail) + 1
+	return command, head, tail, total
+}
+
+// TestBoundedOutput pins the transport-bounding contract at the function
+// level: output that fits the limit travels byte-identical; larger output
+// becomes a marker line — the true total size, the fact of the cut, and
+// (when one was written) the task-log path holding the complete record —
+// followed by exactly the final testOutputTailLimit bytes, so the end of
+// the run (where failures live) always survives.
+func TestBoundedOutput(t *testing.T) {
+	t.Run("fits the limit, travels complete", func(t *testing.T) {
+		out := strings.Repeat("x", testOutputTailLimit-1)
+		for _, path := range []string{"", "/tmp/daedalus/wf.log"} {
+			if got := boundedOutput(path, out); got != out {
+				t.Errorf("boundedOutput(%q) bounded output that fits the limit (got %d bytes, want %d, byte-identical)", path, len(got), len(out))
+			}
+		}
+	})
+
+	t.Run("exactly the limit, travels complete", func(t *testing.T) {
+		out := strings.Repeat("x", testOutputTailLimit)
+		if got := boundedOutput("/tmp/daedalus/wf.log", out); got != out {
+			t.Errorf("boundedOutput bounded output at exactly the limit (got %d bytes, want %d, byte-identical)", len(got), len(out))
+		}
+	})
+
+	t.Run("over the limit becomes marker plus tail", func(t *testing.T) {
+		head, tail := "HEAD-ONLY-SENTINEL\n", "FAIL: at the end\n"
+		out := head + strings.Repeat("y", testOutputTailLimit) + tail
+		got := boundedOutput("", out)
+		wantMarker := fmt.Sprintf("[daedalus: suite output exceeds the transport limit — %d bytes total; last %d bytes follow]\n",
+			len(out), testOutputTailLimit)
+		if !strings.HasPrefix(got, wantMarker) {
+			t.Errorf("marker = %q, want %q (true total, the cut, no path — none was written)", firstLine(got), wantMarker)
+		}
+		if got != wantMarker+out[len(out)-testOutputTailLimit:] {
+			t.Errorf("body after the marker is not the final %d bytes verbatim", testOutputTailLimit)
+		}
+		if strings.Contains(got, head) {
+			t.Error("bounded output carried the head; over-limit output must keep the tail, not the head")
+		}
+		if !strings.HasSuffix(got, tail) {
+			t.Error("bounded output lost the tail (where failures live)")
+		}
+	})
+
+	t.Run("over the limit names the task log", func(t *testing.T) {
+		out := strings.Repeat("y", testOutputTailLimit+10)
+		const path = "/tmp/daedalus/wf-1.log"
+		got := boundedOutput(path, out)
+		wantMarker := fmt.Sprintf("[daedalus: suite output exceeds the transport limit — %d bytes total; last %d bytes follow; full output: %s]\n",
+			len(out), testOutputTailLimit, path)
+		if !strings.HasPrefix(got, wantMarker) {
+			t.Errorf("marker = %q, want %q (naming the task log holding the complete record)", firstLine(got), wantMarker)
+		}
+		if !strings.HasSuffix(got, out[len(out)-testOutputTailLimit:]) {
+			t.Error("bounded output lost the tail")
+		}
+	})
+}
+
+// firstLine returns everything up to the first newline of s (all of s when
+// it has none), for readable assertions on bounded output.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// TestRunTestSuiteActivityHugeOutputTaskLogAndBoundedLogs pins the
+// payload-limit contract end to end, inside a real activity context: output
+// past the transport limit lands complete in the run's task log BEFORE the
+// result is bounded (the head the result loses must survive in the record),
+// while Logs carries the marker naming that exact path plus the final bytes
+// — a failing suite stays a red round, not a system error.
+func TestRunTestSuiteActivityHugeOutputTaskLogAndBoundedLogs(t *testing.T) {
+	dir := useTaskLogDir(t)
+	command, head, tail, total := hugeSuiteCommand()
+
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(RunTestSuiteActivity)
+	v, err := env.ExecuteActivity(RunTestSuiteActivity, TestRunInput{
+		WorktreePath: t.TempDir(),
+		Command:      command,
+	})
+	if err != nil {
+		t.Fatalf("a failing suite must not be a system error, got %v", err)
+	}
+	var res TestResult
+	if err := v.Get(&res); err != nil {
+		t.Fatalf("decode TestResult: %v", err)
+	}
+	if res.Passed {
+		t.Error("Passed = true, want false on non-zero exit")
+	}
+	if !strings.Contains(res.Logs, tail) {
+		t.Error("bounded logs lost the tail (where failures live)")
+	}
+	if strings.Contains(res.Logs, head) {
+		t.Error("logs carried over-limit output complete; want the bounded tail")
+	}
+	if !strings.Contains(res.Logs, fmt.Sprintf("%d bytes total", total)) {
+		t.Errorf("marker does not name the true output size %d: %q", total, firstLine(res.Logs))
+	}
+	m := regexp.MustCompile(`full output: ([^\]]+)\]`).FindStringSubmatch(res.Logs)
+	if m == nil {
+		t.Fatalf("marker does not name the task log: %q", firstLine(res.Logs))
+	}
+	if filepath.Dir(m[1]) != dir {
+		t.Errorf("marker names %q, outside the configured task-log dir %q", m[1], dir)
+	}
+	data, err := os.ReadFile(m[1])
+	if err != nil {
+		t.Fatalf("the path in the marker (%q) is not readable: %v", m[1], err)
+	}
+	record := string(data)
+	if !strings.Contains(record, head) || !strings.Contains(record, tail) {
+		t.Errorf("the task log lacks the complete record (head or tail missing): %d bytes", len(record))
+	}
+}
+
+// TestRunTestSuiteActivityHugeOutputNoTaskLog pins the unit-test path:
+// outside a real activity context no task log exists, so over-limit output
+// still bounds and the marker names the cut without naming any path — and
+// no task-log file appears.
+func TestRunTestSuiteActivityHugeOutputNoTaskLog(t *testing.T) {
+	dir := useTaskLogDir(t)
+	command, head, tail, _ := hugeSuiteCommand()
+
+	res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+		WorktreePath: t.TempDir(),
+		Command:      command,
+	})
+	if err != nil {
+		t.Fatalf("a failing suite must not be a system error, got %v", err)
+	}
+	if res.Passed {
+		t.Error("Passed = true, want false on non-zero exit")
+	}
+	if !strings.Contains(res.Logs, tail) || strings.Contains(res.Logs, head) {
+		t.Errorf("logs not bounded to the tail: %d bytes, head present = %v, tail present = %v",
+			len(res.Logs), strings.Contains(res.Logs, head), strings.Contains(res.Logs, tail))
+	}
+	if strings.Contains(res.Logs, "full output") {
+		t.Errorf("marker names a task log none was written: %q", firstLine(res.Logs))
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("a run outside an activity context created task logs %v", entries)
+	}
 }
 
 // TestTestConcurrency pins the env parsing behind the test-suite cap:

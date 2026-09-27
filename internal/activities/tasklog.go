@@ -28,18 +28,26 @@ func TaskLogPath(workflowID string) (string, error) {
 }
 
 // appendTaskLog writes one event block to the running task's log, pulling
-// the task identity from the activity context. Outside a real activity
-// context (unit tests invoke activities directly) it is a no-op.
-// Best-effort by design: the task log is an observability aid and must
-// never red a round, so a write failure is only logged.
-func appendTaskLog(ctx context.Context, event, body string) {
+// the task identity from the activity context, and returns the log file
+// path it wrote so callers can point at the complete record. Returns ""
+// outside a real activity context (unit tests invoke activities directly)
+// and on a failed write — the path must never name a file that lacks the
+// record. Best-effort by design: the task log is an observability aid and
+// must never red a round, so a write failure is only logged.
+func appendTaskLog(ctx context.Context, event, body string) string {
 	workflowID, runID := taskLogIdentity(ctx)
 	if workflowID == "" {
-		return
+		return ""
 	}
 	if err := writeTaskLog(workflowID, runID, event, body); err != nil {
 		activityLogger(ctx).Warn("task log write failed", "Error", err)
+		return ""
 	}
+	path, err := TaskLogPath(workflowID)
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 // taskLogIdentity returns the running activity's workflow id and run id,
