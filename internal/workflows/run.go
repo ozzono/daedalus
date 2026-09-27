@@ -81,6 +81,10 @@ type pipelineRun struct {
 	quotaHeartbeats     int
 	consecutiveTimeouts int
 	reviewTimeouts      int
+	// verdictlessReviews counts consecutive review rounds that completed
+	// without any verdict marker (see maxVerdictlessReviews). Only a
+	// review carrying a real verdict resets it.
+	verdictlessReviews int
 
 	devSession, testSession             string
 	devReviewSession, testReviewSession string
@@ -404,6 +408,28 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			r.reviewTimeouts = 0
 			r.quotaHeartbeats = 0
 			*session = result.SessionID
+			if result.NoVerdict {
+				r.verdictlessReviews++
+				// The reviewer's last non-empty line is what a fold and a
+				// formatting miss share as their only trace here; without
+				// it the workflow log cannot distinguish the two (full
+				// output is only in the task log). Recorded untruncated.
+				lastLine := ""
+				for _, raw := range strings.Split(result.Comments, "\n") {
+					if line := strings.TrimSpace(raw); line != "" {
+						lastLine = line
+					}
+				}
+				r.logger.Warn("Reviewer round ended without a verdict marker",
+					"Focus", focus, "ConsecutiveVerdictless", r.verdictlessReviews,
+					"Of", maxVerdictlessReviews, "LastLine", lastLine)
+				if r.verdictlessReviews >= maxVerdictlessReviews {
+					return result, r.park(fmt.Sprintf("reviewer exited without any verdict %d rounds in a row (focus %q; last line: %q) — either the reviewer's provider channel is folding before a verdict line (e.g. pi at its request timeout) or the review never emitted the exact marker line, and neither hypothesis is resolvable by the implementing agent",
+						r.verdictlessReviews, focus, lastLine))
+				}
+				return result, nil
+			}
+			r.verdictlessReviews = 0
 			return result, nil
 		}
 		// Same kill-first precedence as the agent rounds: a killed

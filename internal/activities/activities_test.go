@@ -1357,8 +1357,11 @@ func TestParseAgentStreamNoise(t *testing.T) {
 }
 
 // TestParseReviewVerdict pins the verdict protocol: the last non-empty line
-// decides, NEEDS_MAINTAINER parks for a maintainer, and anything not exactly
-// APPROVED counts as changes requested.
+// decides, NEEDS_MAINTAINER parks for a maintainer, anything not exactly
+// APPROVED counts as changes requested, and a missing marker is flagged as
+// NoVerdict — still a changes-requested round, but one the workflow counts
+// against its strike budget. A real marker (any verdict, including
+// CHANGES_REQUESTED) is never NoVerdict.
 func TestParseReviewVerdict(t *testing.T) {
 	cases := []struct {
 		name            string
@@ -1366,17 +1369,19 @@ func TestParseReviewVerdict(t *testing.T) {
 		approved        bool
 		needsMaintainer bool
 		rebuild         bool
+		noVerdict       bool
 		comments        string
 	}{
-		{"approved", "Looks good.\nAPPROVED\n", true, false, false, "Looks good."},
-		{"changes requested", "Do X.\nCHANGES_REQUESTED", false, false, false, "Do X."},
-		{"needs maintainer", "Need a secret.\nNEEDS_MAINTAINER", false, true, false, "Need a secret."},
-		{"rebuild", "handler drops the error path.\nREBUILD", false, false, true, "handler drops the error path."},
-		{"trailing blank lines", "fine\nAPPROVED\n\n\n", true, false, false, "fine"},
-		{"no marker keeps whole output", "the error path is untested", false, false, false, "the error path is untested"},
-		{"lowercase is not approved", "fine\napproved", false, false, false, "fine\napproved"},
-		{"lowercase is not a maintainer halt", "fine\nneeds_maintainer", false, false, false, "fine\nneeds_maintainer"},
-		{"lowercase is not a rebuild", "fine\nrebuild", false, false, false, "fine\nrebuild"},
+		{"approved", "Looks good.\nAPPROVED\n", true, false, false, false, "Looks good."},
+		{"changes requested", "Do X.\nCHANGES_REQUESTED", false, false, false, false, "Do X."},
+		{"needs maintainer", "Need a secret.\nNEEDS_MAINTAINER", false, true, false, false, "Need a secret."},
+		{"rebuild", "handler drops the error path.\nREBUILD", false, false, true, false, "handler drops the error path."},
+		{"trailing blank lines", "fine\nAPPROVED\n\n\n", true, false, false, false, "fine"},
+		{"no marker keeps whole output", "the error path is untested", false, false, false, true, "the error path is untested"},
+		{"lowercase is not approved", "fine\napproved", false, false, false, true, "fine\napproved"},
+		{"lowercase is not a maintainer halt", "fine\nneeds_maintainer", false, false, false, true, "fine\nneeds_maintainer"},
+		{"lowercase is not a rebuild", "fine\nrebuild", false, false, false, true, "fine\nrebuild"},
+		{"empty output is verdictless", "", false, false, false, true, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1389,6 +1394,9 @@ func TestParseReviewVerdict(t *testing.T) {
 			}
 			if got.Rebuild != tc.rebuild {
 				t.Errorf("Rebuild = %v, want %v", got.Rebuild, tc.rebuild)
+			}
+			if got.NoVerdict != tc.noVerdict {
+				t.Errorf("NoVerdict = %v, want %v", got.NoVerdict, tc.noVerdict)
 			}
 			if got.Comments != tc.comments {
 				t.Errorf("Comments = %q, want %q", got.Comments, tc.comments)

@@ -2167,6 +2167,120 @@ func TestFeatureDevWorkflowTestReviewNeedsMaintainerParks(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowVerdictlessReviewsPark pins the three-strike budget:
+// a marker-less review round still counts as changes requested — its
+// comments drive a fix round like any other — but three in a row park the
+// run instead of looping forever: a reviewer that never emits any verdict
+// line is failing infrastructure (e.g. pi folding every provider request at
+// its request timeout), not requesting changes. The park error names the
+// strike count and the round's last line, the only trace a fold leaves here.
+func TestFeatureDevWorkflowVerdictlessReviewsPark(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	verdictless := activities.ReviewResult{
+		Approved: false, NoVerdict: true,
+		Comments: "the request folded at the provider timeout\nError: stream ended before completion",
+	}
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{verdictless}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	// If the strike budget regresses, the repeating stub would feed this
+	// loop forever — bound the test so the regression fails fast instead
+	// of hanging until the go-test timeout.
+	env.SetTestTimeout(30 * time.Second)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from three verdictless review rounds in a row")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"without any verdict 3 rounds in a row",
+		"Error: stream ended before completion",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	// Two verdictless rounds each drove a fix round before the third parked
+	// the run — the changes-requested equivalence holds until the budget.
+	if len(rec.inputs) != 3 {
+		t.Errorf("agent ran %d times, want 3 (implement plus two fix rounds; none after the park)", len(rec.inputs))
+	}
+	if len(rev.inputs) != 3 {
+		t.Errorf("reviewer ran %d times, want 3", len(rev.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowVerdictResetsVerdictlessStreak pins the reset: only
+// a review carrying a real verdict marker restarts the strike budget. Two
+// marker-less rounds followed by a markered changes-requested round must
+// absorb two more marker-less rounds after it — the run completes instead
+// of parking at what would be strike three without the reset.
+func TestFeatureDevWorkflowVerdictResetsVerdictlessStreak(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	verdictless := activities.ReviewResult{
+		Approved: false, NoVerdict: true,
+		Comments: "connection reset by peer",
+	}
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		verdictless,
+		verdictless,
+		{Approved: false, Comments: "rename foo to bar"},
+		verdictless,
+		{Approved: true},
+	}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-5", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	// implement, one fix per non-approving round (NV, NV, CHANGES_REQUESTED,
+	// NV), then the test phase — the run survived streaks of two around the
+	// markered round instead of parking at three consecutive.
+	if len(rec.inputs) != 6 {
+		t.Errorf("agent ran %d times, want 6 (implement, four fix rounds, tests)", len(rec.inputs))
+	}
+	if len(rev.inputs) != 6 {
+		t.Errorf("reviewer ran %d times, want 6 (five code rounds, test review)", len(rev.inputs))
+	}
+	// A marker-less round is still a changes-requested round: its comments
+	// reach the implementing agent like any other review's.
+	if !strings.Contains(rec.inputs[1].Prompt, "connection reset by peer") {
+		t.Errorf("fix prompt after a verdictless round = %q, want the round's comments relayed", rec.inputs[1].Prompt)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-5" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowTestReviewRebuildLoopsThroughDevCycle pins the
 // REBUILD loop-back: a test-review REBUILD verdict routes the finding back
 // through the dev cycle — a tight, finding-only prompt into the dev
