@@ -244,7 +244,10 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // unrecognized line, including a missing marker) counts as changes
 // requested, with everything above the verdict line — or the whole output,
 // when no marker was found — as the comments to feed back to the
-// implementing agent.
+// implementing agent. A missing marker additionally reports NoVerdict, so
+// the workflow can count marker-less exits against its strike budget; a
+// marker-less round is still a changes-requested round (the contract above
+// is unchanged), just a distinctly-counted one.
 func parseReviewVerdict(out string) ReviewResult {
 	lines := strings.Split(out, "\n")
 	for i, raw := range slices.Backward(lines) {
@@ -263,5 +266,5 @@ func parseReviewVerdict(out string) ReviewResult {
 		}
 		break
 	}
-	return ReviewResult{Approved: false, Comments: strings.TrimSpace(out)}
+	return ReviewResult{Approved: false, NoVerdict: true, Comments: strings.TrimSpace(out)}
 }

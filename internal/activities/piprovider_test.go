@@ -558,3 +558,303 @@ func TestPiRoundStagesProvider(t *testing.T) {
 		}
 	})
 }
+
+// piSettingsPath returns the staged retry-timeout path under a test home.
+func piSettingsPath(home string) string {
+	return filepath.Join(home, ".pi", "agent", "settings.json")
+}
+
+// TestStagePiProviderStagesRetryTimeout pins the timeout bridge: a positive
+// API_TIMEOUT_MS export — the same ceiling every other agent gets as the
+// exported var — lands as retry.provider.timeoutMs in the host's
+// settings.json (pi's only request-timeout channel), and models.json is
+// still staged alongside it.
+func TestStagePiProviderStagesRetryTimeout(t *testing.T) {
+	home := piTestHome(t)
+	if _, err := stagePiProvider(piEnv(
+		"OPENAI_BASE_URL=http://localhost:11434/v1",
+		"OPENAI_MODEL=qwen",
+		"API_TIMEOUT_MS=900000",
+	)); err != nil {
+		t.Fatalf("stagePiProvider: %v", err)
+	}
+	data, err := os.ReadFile(piSettingsPath(home))
+	if err != nil {
+		t.Fatalf("read staged settings.json: %v", err)
+	}
+	var top struct {
+		Retry struct {
+			Provider struct {
+				TimeoutMS int `json:"timeoutMs"`
+			} `json:"provider"`
+		} `json:"retry"`
+	}
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatalf("parse staged settings.json: %v", err)
+	}
+	if top.Retry.Provider.TimeoutMS != 900000 {
+		t.Errorf("retry.provider.timeoutMs = %d, want 900000", top.Retry.Provider.TimeoutMS)
+	}
+	if entry := stagedPiProvider(t, home); entry.BaseURL != "http://localhost:11434/v1" {
+		t.Errorf("staged baseUrl = %q, want the models.json bridge unaffected", entry.BaseURL)
+	}
+}
+
+// TestStagePiProviderNoTimeoutExportStagesNoSettings pins the gate: the
+// timeout merge derives from the exported var, so an absent, malformed, or
+// non-positive value leaves pi's own 5-minute default standing — no
+// settings.json is created at all.
+func TestStagePiProviderNoTimeoutExportStagesNoSettings(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		env  []string
+	}{
+		{"absent export", piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1", "OPENAI_MODEL=qwen")},
+		{"malformed export", piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1", "OPENAI_MODEL=qwen",
+			"API_TIMEOUT_MS=abc")},
+		{"zero export", piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1", "OPENAI_MODEL=qwen",
+			"API_TIMEOUT_MS=0")},
+		{"negative export", piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1", "OPENAI_MODEL=qwen",
+			"API_TIMEOUT_MS=-5")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := piTestHome(t)
+			if _, err := stagePiProvider(c.env); err != nil {
+				t.Fatalf("stagePiProvider: %v", err)
+			}
+			if _, err := os.Stat(piSettingsPath(home)); !os.IsNotExist(err) {
+				t.Errorf("settings.json stat err = %v, want nothing staged", err)
+			}
+		})
+	}
+}
+
+// TestMergePiRetryTimeoutPreservesUserSettings pins the merge contract:
+// daedalus owns exactly retry.provider.timeoutMs — the host user's other
+// top-level settings, the rest of their retry block, and the rest of their
+// provider block survive verbatim, and a re-stage upserts the one key
+// instead of accumulating duplicates.
+func TestMergePiRetryTimeoutPreservesUserSettings(t *testing.T) {
+	home := piTestHome(t)
+	path := piSettingsPath(home)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"theme":"dark","retry":{"attempts":5,"provider":{"apiKey":"sk-user","timeoutMs":300000}}}`), 0o644); err != nil {
+		t.Fatalf("seed settings.json: %v", err)
+	}
+	if err := mergePiRetryTimeout(900000); err != nil {
+		t.Fatalf("mergePiRetryTimeout: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read merged settings.json: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		t.Fatalf("parse merged settings.json: %v", err)
+	}
+	if string(top["theme"]) != `"dark"` {
+		t.Errorf("theme = %s, want it preserved", top["theme"])
+	}
+	var retry map[string]json.RawMessage
+	if err := json.Unmarshal(top["retry"], &retry); err != nil {
+		t.Fatalf("parse retry: %v", err)
+	}
+	if string(retry["attempts"]) != `5` {
+		t.Errorf("retry.attempts = %s, want it preserved", retry["attempts"])
+	}
+	var provider map[string]json.RawMessage
+	if err := json.Unmarshal(retry["provider"], &provider); err != nil {
+		t.Fatalf("parse retry.provider: %v", err)
+	}
+	if string(provider["apiKey"]) != `"sk-user"` {
+		t.Errorf("retry.provider.apiKey = %s, want it preserved", provider["apiKey"])
+	}
+	if string(provider["timeoutMs"]) != `900000` {
+		t.Errorf("retry.provider.timeoutMs = %s, want the daedalus value to win", provider["timeoutMs"])
+	}
+
+	// A re-stage replaces the one owned key in place.
+	if err := mergePiRetryTimeout(600000); err != nil {
+		t.Fatalf("re-mergePiRetryTimeout: %v", err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reread merged settings.json: %v", err)
+	}
+	for _, key := range []string{`"apiKey"`, `"attempts"`, `"theme"`} {
+		if n := strings.Count(string(data), key); n != 1 {
+			t.Errorf("merged settings.json carries %q %d times, want exactly 1", key, n)
+		}
+	}
+	var recheck struct {
+		Retry struct {
+			Provider struct {
+				TimeoutMS int `json:"timeoutMs"`
+			} `json:"provider"`
+		} `json:"retry"`
+	}
+	if err := json.Unmarshal(data, &recheck); err != nil {
+		t.Fatalf("parse re-merged settings.json: %v", err)
+	}
+	if recheck.Retry.Provider.TimeoutMS != 600000 {
+		t.Errorf("retry.provider.timeoutMs = %d, want the re-stage value", recheck.Retry.Provider.TimeoutMS)
+	}
+}
+
+// TestMergePiRetryTimeoutFreshHost pins the no-file case: a host with no
+// settings.json at all gets one created carrying just the staged timeout —
+// the merge must not depend on a pre-existing file.
+func TestMergePiRetryTimeoutFreshHost(t *testing.T) {
+	home := piTestHome(t)
+	if err := mergePiRetryTimeout(900000); err != nil {
+		t.Fatalf("mergePiRetryTimeout: %v", err)
+	}
+	data, err := os.ReadFile(piSettingsPath(home))
+	if err != nil {
+		t.Fatalf("read staged settings.json: %v", err)
+	}
+	if !strings.Contains(string(data), `"timeoutMs": 900000`) {
+		t.Errorf("staged settings.json = %s, want the timeout key", data)
+	}
+}
+
+// TestMergePiRetryTimeoutRejectsJSONC pins the loud-failure case: settings.json
+// is parsed by pi with plain JSON.parse (unlike models.json), so a file with
+// comments is already broken for pi itself — the merge fails instead of
+// clobbering it, and the file stays untouched for the operator to fix.
+func TestMergePiRetryTimeoutRejectsJSONC(t *testing.T) {
+	home := piTestHome(t)
+	path := piSettingsPath(home)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	seed := "{\n// pi does not tolerate this either\n\"retry\": {}\n}"
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed settings.json: %v", err)
+	}
+	if err := mergePiRetryTimeout(900000); err == nil {
+		t.Fatal("mergePiRetryTimeout on a JSONC file = nil error, want a loud failure")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reread settings.json: %v", err)
+	}
+	if string(data) != seed {
+		t.Error("a rejected merge modified the unparseable settings.json; it must stay untouched")
+	}
+}
+
+// TestMergePiNullShapes pins the null tolerance pi's own JSON.parse accepts:
+// a whole-file null, a null retry block, and a null provider block in
+// settings.json — and their models.json counterparts — carry no user data,
+// so each merge treats it as empty and stages normally instead of panicking
+// on an assignment into the nil map the null unmarshals to. Dropping any of
+// the merge functions' nil guards panics these tests.
+func TestMergePiNullShapes(t *testing.T) {
+	entry := piProviderConfig{
+		Name: "Daedalus (openai section)", BaseURL: "http://localhost:11434/v1",
+		API: "openai-completions", APIKey: "none",
+		Models: []piModelConfig{{ID: "qwen"}},
+	}
+	assertStagedTimeout := func(t *testing.T, home string) {
+		t.Helper()
+		data, err := os.ReadFile(piSettingsPath(home))
+		if err != nil {
+			t.Fatalf("read staged settings.json: %v", err)
+		}
+		if !strings.Contains(string(data), `"timeoutMs": 900000`) {
+			t.Errorf("staged settings.json = %s, want the timeout key", data)
+		}
+	}
+
+	t.Run("settings.json whole-file null", func(t *testing.T) {
+		home := piTestHome(t)
+		path := piSettingsPath(home)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(`null`), 0o644); err != nil {
+			t.Fatalf("seed settings.json: %v", err)
+		}
+		if err := mergePiRetryTimeout(900000); err != nil {
+			t.Fatalf("mergePiRetryTimeout: %v", err)
+		}
+		assertStagedTimeout(t, home)
+	})
+
+	t.Run("settings.json null retry block", func(t *testing.T) {
+		home := piTestHome(t)
+		path := piSettingsPath(home)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(`{"retry": null}`), 0o644); err != nil {
+			t.Fatalf("seed settings.json: %v", err)
+		}
+		if err := mergePiRetryTimeout(900000); err != nil {
+			t.Fatalf("mergePiRetryTimeout: %v", err)
+		}
+		assertStagedTimeout(t, home)
+	})
+
+	t.Run("settings.json null provider block", func(t *testing.T) {
+		home := piTestHome(t)
+		path := piSettingsPath(home)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(`{"retry": {"provider": null}}`), 0o644); err != nil {
+			t.Fatalf("seed settings.json: %v", err)
+		}
+		if err := mergePiRetryTimeout(900000); err != nil {
+			t.Fatalf("mergePiRetryTimeout: %v", err)
+		}
+		assertStagedTimeout(t, home)
+	})
+
+	t.Run("models.json whole-file null", func(t *testing.T) {
+		home := piTestHome(t)
+		path := piModelsPath(home)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(`null`), 0o644); err != nil {
+			t.Fatalf("seed models.json: %v", err)
+		}
+		if err := mergePiModelsEntry(entry); err != nil {
+			t.Fatalf("mergePiModelsEntry: %v", err)
+		}
+		if got := stagedPiProvider(t, home); got.BaseURL != entry.BaseURL {
+			t.Errorf("staged entry = %+v, want the merged entry", got)
+		}
+	})
+
+	t.Run("models.json null providers preserves sibling", func(t *testing.T) {
+		home := piTestHome(t)
+		path := piModelsPath(home)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(`{"providers": null,"theme":"dark"}`), 0o644); err != nil {
+			t.Fatalf("seed models.json: %v", err)
+		}
+		if err := mergePiModelsEntry(entry); err != nil {
+			t.Fatalf("mergePiModelsEntry: %v", err)
+		}
+		// Null-merge-as-empty must clobber nothing: the null providers
+		// object is replaced by the staged entry, the sibling key survives.
+		top := readStagedPiModels(t, home)
+		if string(top["theme"]) != `"dark"` {
+			t.Errorf("theme = %s, want it preserved", top["theme"])
+		}
+		if got := stagedPiProvider(t, home); got.BaseURL != entry.BaseURL {
+			t.Errorf("staged entry = %+v, want the merged entry", got)
+		}
+	})
+}

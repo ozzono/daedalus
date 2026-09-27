@@ -130,6 +130,21 @@ func stagePiProvider(env []string) ([]string, error) {
 	if err := mergePiModelsEntry(entry); err != nil {
 		return nil, fmt.Errorf("stage pi provider entry: %w", err)
 	}
+	// pi folds a provider request at its own 5-minute default
+	// (retry.provider.timeoutMs, which defaults to httpIdleTimeoutMs) and
+	// reads no timeout env var, so API_TIMEOUT_MS alone never reaches it —
+	// at slow-model pace a legitimate reviewer turn outlives the default,
+	// pi's agent-level retries burn, and the round exits verdict-less. The
+	// bridge stages the same ceiling other agents get from the export into
+	// pi's own channel, so one config value bounds every CLI. Derived from
+	// the exported var (the serving section's timeout, per the AgentEnv
+	// invariant that a ceiling is always exported), so an absent or
+	// unparseable value leaves pi's default standing.
+	if n, err := strconv.Atoi(envLookup(env, "API_TIMEOUT_MS")); err == nil && n > 0 {
+		if err := mergePiRetryTimeout(n); err != nil {
+			return nil, fmt.Errorf("stage pi provider timeout: %w", err)
+		}
+	}
 	// provider/model splits on the FIRST slash (pi's findExactModelReference
 	// Match), so model ids containing slashes (huggingface-style refs) survive.
 	return []string{"--model", piProviderID + "/" + model}, nil
@@ -171,6 +186,12 @@ func mergePiModelsEntry(entry piProviderConfig) error {
 		if err := json.Unmarshal(data, &top); err != nil {
 			return fmt.Errorf("parse existing %s (pi also accepts JSON comments, which this merge cannot round-trip — move them out): %w", path, err)
 		}
+		// JSON null unmarshals into a map by setting it to nil, and pi's
+		// JSON.parse accepts a whole-file null — merge it as empty rather
+		// than panic on the assignment below.
+		if top == nil {
+			top = map[string]json.RawMessage{}
+		}
 	}
 	raw, err := json.Marshal(entry)
 	if err != nil {
@@ -181,23 +202,114 @@ func mergePiModelsEntry(entry piProviderConfig) error {
 		if err := json.Unmarshal(prev, &providers); err != nil {
 			return fmt.Errorf("parse providers object in %s: %w", path, err)
 		}
+		if providers == nil {
+			providers = map[string]json.RawMessage{}
+		}
 	}
 	providers[piProviderID] = raw
 	top["providers"], err = json.Marshal(providers)
 	if err != nil {
 		return err
 	}
+	return writePiAgentJSON("models.json", top)
+}
+
+// mergePiRetryTimeout upserts retry.provider.timeoutMs into the host's
+// ~/.pi/agent/settings.json — pi's only request-timeout channel (pi reads
+// no timeout env var, and its models.json provider entries carry no
+// timeoutMs it plumbs — source-verified 2026-09-27, references exist only
+// in interactive-TUI code). daedalus owns exactly that one key, derived
+// from the same config timeout other agents get as API_TIMEOUT_MS; the
+// merge is idempotent and preserves every other setting, including the
+// rest of any user retry block. If pi later plumbs timeoutMs on provider
+// entries, stage it there and retire this settings write.
+// ponytail: same un-locked read-modify-write ceiling as the models.json
+// merge — two concurrent pi rounds on one host can interleave this write;
+// the worst case is a round staging the other's timeoutMs variant (both
+// operator-configured values), never a missing or default one, since
+// write-then-rename is atomic.
+func mergePiRetryTimeout(timeoutMS int) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".pi", "agent", "settings.json")
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	top := map[string]json.RawMessage{}
+	if len(data) > 0 {
+		// Unlike models.json (comment-stripped on pi's side), pi parses
+		// settings.json with plain JSON.parse — a file with comments is
+		// already broken for pi itself; failing the merge loudly rather
+		// than clobbering it is the only correct posture either way.
+		if err := json.Unmarshal(data, &top); err != nil {
+			return fmt.Errorf("parse existing %s: %w", path, err)
+		}
+		// JSON null unmarshals into a map by setting it to nil, and pi's
+		// JSON.parse accepts null shapes (whole-file null, "retry": null,
+		// "provider": null) that carry no user data to clobber — merge
+		// each as empty rather than panic on the assignments below.
+		if top == nil {
+			top = map[string]json.RawMessage{}
+		}
+	}
+	retry := map[string]json.RawMessage{}
+	if prev, ok := top["retry"]; ok {
+		if err := json.Unmarshal(prev, &retry); err != nil {
+			return fmt.Errorf("parse retry object in %s: %w", path, err)
+		}
+		if retry == nil {
+			retry = map[string]json.RawMessage{}
+		}
+	}
+	provider := map[string]json.RawMessage{}
+	if prev, ok := retry["provider"]; ok {
+		if err := json.Unmarshal(prev, &provider); err != nil {
+			return fmt.Errorf("parse retry.provider object in %s: %w", path, err)
+		}
+		if provider == nil {
+			provider = map[string]json.RawMessage{}
+		}
+	}
+	provider["timeoutMs"], err = json.Marshal(timeoutMS)
+	if err != nil {
+		return err
+	}
+	retry["provider"], err = json.Marshal(provider)
+	if err != nil {
+		return err
+	}
+	top["retry"], err = json.Marshal(retry)
+	if err != nil {
+		return err
+	}
+	return writePiAgentJSON("settings.json", top)
+}
+
+// writePiAgentJSON atomically writes one file under the host's
+// ~/.pi/agent/ as indented JSON: write-then-rename keeps a mid-write crash
+// from leaving pi a truncated config, and the original mode is preserved
+// for an existing file.
+func writePiAgentJSON(name string, top map[string]json.RawMessage) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".pi", "agent", name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	out, err := json.MarshalIndent(top, "", "  ")
 	if err != nil {
 		return err
 	}
-	// Write-then-rename keeps a mid-write crash from leaving pi a truncated
-	// config; the original mode is preserved for an existing file.
 	mode := os.FileMode(0o644)
 	if info, err := os.Stat(path); err == nil {
 		mode = info.Mode().Perm()
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".models.json-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+name+"-*")
 	if err != nil {
 		return err
 	}
