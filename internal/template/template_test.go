@@ -41,7 +41,7 @@ func TestContinue(t *testing.T) {
 }
 
 func TestImplement(t *testing.T) {
-	got, err := Implement("add the feature")
+	got, err := Implement("add the feature", "")
 	if err != nil {
 		t.Fatalf("Implement: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestImplement(t *testing.T) {
 		"- Shortest working diff wins: one line before fifty, fewest files, no single-caller abstractions or pass-through wrappers.\n" +
 		"- Fix the root cause, not the symptom — one guard where all callers route through beats a guard per caller.\n" +
 		"- Never lazy about correctness: keep validation, error handling, edge cases, and cleanup intact. Mark a deliberate corner-cut with a `ponytail:` comment naming its ceiling.\n\n" +
-		"Bug policy — every bug you find, in your diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. If it is in scope for this task, fix it now as part of the change. If it is out of scope, leave the code untouched — record it and add an alert about it in the docs."
+		"Bug policy — every bug you find, in your diff or anywhere you looked, is recorded in Arete Memory, with out-of-scope bugs reported in your reply. If it is in scope for this task, fix it now as part of the change. If it is out of scope, leave the code untouched — record it and add an alert about it in the docs."
 	if got != want {
 		t.Errorf("Implement = %q, want %q", got, want)
 	}
@@ -76,7 +76,7 @@ func TestImplementFix(t *testing.T) {
 }
 
 func TestTests(t *testing.T) {
-	got, err := Tests()
+	got, err := Tests("")
 	if err != nil {
 		t.Fatalf("Tests: %v", err)
 	}
@@ -85,10 +85,71 @@ func TestTests(t *testing.T) {
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only test code, and ignore anything already differing in the worktree that this round did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
 		"While iterating, run only the tests covering the change — the test packages or files the change touched. Finish every round with the full suite: once the covering tests pass, run the whole suite, and the round is not done until it runs green — a known-red suite is not acceptable. Report the suite and its outcome in your reply: the pipeline runs the full suite again on the test worker and feeds that output to your reviewer, so your report is cross-checked, not taken on faith.\n\n" +
 		"Never buy a green suite by gaming the tests: removing, skipping, obfuscating, or tweaking tests so they pass is invalid. Test changes follow code changes — a test may change only because the behavior it verifies legitimately changed, never to force a pass. When a test is right and the code is wrong, leave both alone and say so in your reply; the reviewer routes the fix back to the implementation.\n\n" +
-		"Bug policy — every bug you find, in the tests or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. A bug in the tests you are writing is in scope: fix it. Everything else — implementation bugs the tests expose included — is documented only, never fixed here; report what you found in your reply.\n\n" +
+		"Bug policy — every bug you find, in the tests or anywhere you looked, is recorded in Arete Memory, with out-of-scope bugs reported in your reply. A bug in the tests you are writing is in scope: fix it. Everything else — implementation bugs the tests expose included — is documented only, never fixed here; report what you found in your reply.\n\n" +
 		"Keep it lazy and minimal: test observable behavior, not implementation details. Cover the change's behavior, edge cases, and error paths with the fewest tests that genuinely verify them — no redundant happy-path duplicates, no speculative tests, no over-mocking."
 	if got != want {
 		t.Errorf("Tests = %q, want %q", got, want)
+	}
+}
+
+// TestBugDirPolicy pins the bug_filing branch every round prompt carries:
+// an empty bug dir drops the file-filing instruction entirely (no
+// backlog/bugs default leaks into the prompt), a configured dir renders
+// verbatim into the file-filing instruction, and the review framing
+// reports out-of-scope bugs in review comments rather than the reply.
+func TestBugDirPolicy(t *testing.T) {
+	prompts := map[string]func(string) (string, error){
+		"implement": func(dir string) (string, error) { return Implement("task", dir) },
+		"tests":     Tests,
+		"review": func(dir string) (string, error) {
+			return Review("focus", "M foo.go", "", false, "", dir)
+		},
+		"review tests-in-scope": func(dir string) (string, error) {
+			return Review("focus", "A foo_test.go", "", true, "", dir)
+		},
+		"review repro": func(dir string) (string, error) {
+			return ReviewRepro("focus", "M login.go", "--- FAIL: TestLogin", "", dir)
+		},
+	}
+	for name, render := range prompts {
+		off, err := render("")
+		if err != nil {
+			t.Fatalf("%s (off): %v", name, err)
+		}
+		if strings.Contains(off, "backlog/bugs") || strings.Contains(off, "file under") {
+			t.Errorf("%s prompt with no bug dir must not instruct filing bug files, got %q", name, off)
+		}
+		if !strings.Contains(off, "recorded in Arete Memory") {
+			t.Errorf("%s prompt with no bug dir should keep the Arete Memory duty, got %q", name, off)
+		}
+
+		on, err := render("docs/known-bugs")
+		if err != nil {
+			t.Fatalf("%s (on): %v", name, err)
+		}
+		if !strings.Contains(on, "a file under docs/known-bugs/ (create the folder if missing; trigger, impact, where it lives)") {
+			t.Errorf("%s prompt with a bug dir should file under it verbatim, got %q", name, on)
+		}
+		if !strings.Contains(on, "note in Arete Memory") {
+			t.Errorf("%s prompt with a bug dir should keep the Arete Memory note, got %q", name, on)
+		}
+	}
+
+	// The reply-vs-comments split: round prompts send out-of-scope bugs to
+	// the reply, review prompts to the review comments.
+	reply, err := Implement("task", "")
+	if err != nil {
+		t.Fatalf("Implement: %v", err)
+	}
+	if !strings.Contains(reply, "out-of-scope bugs reported in your reply") {
+		t.Errorf("Implement = %q, want the reply-reporting duty", reply)
+	}
+	comments, err := Review("focus", "M foo.go", "", false, "", "")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !strings.Contains(comments, "out-of-scope bugs named in your comments") {
+		t.Errorf("Review = %q, want the comments-reporting duty", comments)
 	}
 }
 
@@ -122,7 +183,7 @@ func TestTestsFix(t *testing.T) {
 }
 
 func TestReview(t *testing.T) {
-	got, err := Review("the implementation", "M foo.go", "", false, "")
+	got, err := Review("the implementation", "M foo.go", "", false, "", "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -135,7 +196,7 @@ func TestReview(t *testing.T) {
 		"When uncertain, request changes and state exactly what must be verified; approve only what you have checked in full.\n\n" +
 		"Everything here — your review included — runs inside the same sandbox, and git writes are forbidden to every agent: never request a git operation (stage, commit, branch, restore) or a change to anything beyond the implementing agent's reach. Your scope is the diff above and the code it touches, nothing else: changes outside it — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated worktree noise — are not part of this work; ignore them and never flag them, no matter how wrong they look. Every finding must be fixable by editing files in this worktree alone; anything that is not, is not a finding — unless it makes the task itself impossible to complete as stated, which is the one case where you halt instead (see NEEDS_MAINTAINER below).\n\n" +
 		"Tests are out of scope for this review. The test suite is written and reviewed in a separate phase after this one: missing, absent, or thin tests are not findings — do not request changes over test coverage. Judge only the implementation. (You may still build and run the existing suite to verify the change is sound.)\n\n" +
-		"Bug policy — every bug you find, in the diff or anywhere you looked, is recorded twice: a file under backlog/bugs/ (trigger, impact, where it lives) and a note in Arete Memory. If it is in scope for this review, make it a finding and request changes. If it is out of scope, do not block approval over it — record it and add an alert about it in the docs.\n\n" +
+		"Bug policy — every bug you find, in the diff or anywhere you looked, is recorded in Arete Memory, with out-of-scope bugs named in your comments. If it is in scope for this review, make it a finding and request changes. If it is out of scope, do not block approval over it — record it and add an alert about it in the docs.\n\n" +
 		"End your response with a final line containing exactly APPROVED if it is acceptable as-is, " +
 		"CHANGES_REQUESTED if changes are required, " +
 		"or NEEDS_MAINTAINER if the task as stated cannot be completed by editing files in this worktree alone — " +
@@ -157,7 +218,7 @@ func TestReview(t *testing.T) {
 }
 
 func TestReviewWithTestLogs(t *testing.T) {
-	got, err := Review("the test suite", "A foo_test.go", "--- FAIL: TestBoom", true, "")
+	got, err := Review("the test suite", "A foo_test.go", "--- FAIL: TestBoom", true, "", "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -200,7 +261,7 @@ func TestReviewWithTestLogs(t *testing.T) {
 // review carries the test agent's latest reply, and it frames the relay as
 // a request the reviewer verifies rather than obeys.
 func TestReviewWithAgentReply(t *testing.T) {
-	got, err := Review("the test suite", "A foo_test.go", "", true, "the handler fix is outside my test-only scope — please rebuild")
+	got, err := Review("the test suite", "A foo_test.go", "", true, "the handler fix is outside my test-only scope — please rebuild", "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -211,7 +272,7 @@ func TestReviewWithAgentReply(t *testing.T) {
 		t.Errorf("Review = %q, want the relay framing that lets the reviewer trigger the rebuild", got)
 	}
 
-	phase1, err := Review("the implementation", "M foo.go", "", false, "please rebuild")
+	phase1, err := Review("the implementation", "M foo.go", "", false, "please rebuild", "")
 	if err != nil {
 		t.Fatalf("Review: %v", err)
 	}
@@ -404,7 +465,7 @@ func TestBugFixAndFix(t *testing.T) {
 // scope for findings, and the framing carries no REBUILD verdict and no
 // tests-out-of-scope clause.
 func TestReviewRepro(t *testing.T) {
-	got, err := ReviewRepro("the bug fix and its reproducing test", "M login.go", "--- FAIL: TestLogin", "")
+	got, err := ReviewRepro("the bug fix and its reproducing test", "M login.go", "--- FAIL: TestLogin", "", "")
 	if err != nil {
 		t.Fatalf("ReviewRepro: %v", err)
 	}

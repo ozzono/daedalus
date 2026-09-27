@@ -92,6 +92,15 @@ type PipelineInput struct {
 // time would otherwise loop forever on the agent budget.
 const maxConsecutiveTimeouts = 3
 
+// maxVerdictlessReviews caps how many review rounds in a row may exit
+// without any verdict marker before the run parks: a marker-less round
+// still counts as changes requested (the standing contract), but a
+// reviewer that never emits a verdict at all is failing infrastructure —
+// e.g. pi folding every provider request at its request timeout — and the
+// changes-requested equivalence would otherwise alternate dev/review
+// rounds forever, never converging and never parking.
+const maxVerdictlessReviews = 3
+
 // quotaHeartbeatInterval is how long a run sleeps when the agent API is
 // exhausted (hard cap, rate limit, overload) before retrying the same
 // round unchanged.
@@ -200,7 +209,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {
-		initialPrompt, err = template.Implement(input.Prompt)
+		initialPrompt, err = template.Implement(input.Prompt, bugDir())
 	}
 	if err != nil {
 		return "", fmt.Errorf("build implement prompt: %w", err)
@@ -217,7 +226,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// reviewer, which alone can verdict REBUILD — routing an
 	// implementation-level finding back through the dev cycle (above)
 	// before the test loop resumes with both sessions intact.
-	testsPrompt, err := template.Tests()
+	testsPrompt, err := template.Tests(bugDir())
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)
 	}

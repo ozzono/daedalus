@@ -166,7 +166,7 @@ temporal:
 #   thinking: false    env       argv           ignored     argv          ignored
 #   stream on/off      —         argv           ignored     ignored       ignored
 #   samplers (openai)  (n/a)     staged file    ignored     staged file*  (n/a)
-#   timeout_ms         env       (unprobed)     (unprobed)  ignored       (unprobed)
+#   timeout_ms         env       (unprobed)     (unprobed)  staged file*  (unprobed)
 #
 # Lever detail: claude env = CLAUDE_CODE_MAX_CONTEXT_TOKENS (window) and
 # MAX_THINKING_TOKENS=0 (thinking) and CLAUDE_CODE_MAX_OUTPUT_TOKENS
@@ -176,10 +176,14 @@ temporal:
 # stream toggle). pi argv = --thinking off. pi's staged file (*) = the
 # provider entry daedalus stages into the host's ~/.pi/agent/models.json
 # for rounds served by the openai section (model contextWindow/maxTokens
-# and samplingParams; see the openai section below) — outside those rounds
-# pi has no route for these knobs and ignores them. pi ignores
-# API_TIMEOUT_MS entirely (source-verified 2026-09-26 — pi's own timeout
-# channels live in settings.json, not env vars). pi's samplers ride
+# and samplingParams; see the openai section below), plus — for timeout_ms
+# only — retry.provider.timeoutMs merged into the host's
+# ~/.pi/agent/settings.json: pi reads no timeout env var and its provider
+# entries carry no timeout it plumbs, so settings.json is its only
+# request-timeout channel and pi's own 5-minute default folds a slow
+# round (reviewer turns at self-hosted pace legitimately run longer)
+# before it delivers a verdict. Outside those staged rounds pi has no
+# route for these knobs and ignores them. pi's samplers ride
 # samplingParams as top-level OpenAI-completions request params with no
 # litellm layer in between, so top_k/min_p reach only backends that accept
 # non-standard OpenAI params.
@@ -260,8 +264,17 @@ openai:
   # whenever url above is set). Zero/unset falls back to anthropic's
   # timeout value, so a ceiling always applies; set it explicitly for
   # self-hosted endpoints whose litellm would otherwise apply only ~600s
-  # on its own. pi ignores the exported var (see the lever table above);
-  # its own request-timeout channel is settings.json, outside this file.
+  # on its own. pi ignores the exported var; its pi staging bridge merges
+  # this value into the host's ~/.pi/agent/settings.json as
+  # retry.provider.timeoutMs (pi's own request-timeout channel — pi's
+  # 5-minute default otherwise), so this one field bounds pi rounds too.
+  # Note that merge overwrites whatever timeout the host user had set for
+  # their own interactive pi on this key — inherent: settings.json is
+  # pi's only channel for it. Keep the value at least as long as one
+  # honest reviewer turn at the served model's pace: pi folding first
+  # makes rounds exit verdict-less, the run parks after three such rounds
+  # in a row, and review_timeout never fires because pi gives up before
+  # the round ceiling could.
   timeout_ms: 0
   # Sampler knobs for rounds served by this section — sampler behavior is
   # a property of the backend behind url, shared by every agent that dials
@@ -314,4 +327,19 @@ fallback:
   key: ""
   model: ""
   heartbeat_model: ""
+
+# Out-of-scope-bug filing. Off by default (the section absent, or
+# enabled: false): jailed rounds report out-of-scope bugs in their reply or
+# review comments only, and no bug files are written into your repos. When
+# enabled, the prompts additionally instruct every round to file each
+# out-of-scope bug it finds as a file under dir (with the same Arete Memory
+# note as before): dir is worktree-relative and resolves against each run's
+# worktree root, so the files are ordinary committed content of the branch
+# and reach the real repo on merge. dir empty keeps the historical
+# backlog/bugs path. While filing is enabled, load rejects an absolute dir,
+# one escaping the worktree root (".."), or one with empty or dot path
+# components; any other bytes render verbatim into the round prompts.
+bug_filing:
+  enabled: false
+  dir: ""
 `

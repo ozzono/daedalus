@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/template"
 )
 
@@ -117,6 +118,15 @@ type ReviewResult struct {
 	// Comments holds everything the reviewer wrote above its verdict line,
 	// to be fed back to the implementing agent.
 	Comments string
+	// NoVerdict marks a marker-less exit: the reviewer's output carried no
+	// verdict line at all. The pipeline still treats such a round as
+	// CHANGES_REQUESTED (the standing contract for a malformed-but-real
+	// review), but the workflow also counts it against a strike budget —
+	// three in a row park the run, because a reviewer that never emits any
+	// verdict is failing infrastructure (e.g. pi folding every provider
+	// request at its request timeout), not requesting changes, and the
+	// equivalence otherwise converts the failure into an unbounded loop.
+	NoVerdict bool
 	// SessionID identifies the reviewer conversation the round ran in, so
 	// the next round of the same review role can resume it (see
 	// ReviewInput.SessionID). Empty when the agent reports none.
@@ -226,10 +236,14 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 		return ReviewResult{}, err
 	}
 	prompt, err := func() (string, error) {
+		// The configured out-of-scope-bug filing folder, exported at worker
+		// startup iff bug_filing is enabled; empty drops the file-filing
+		// instruction from the reviewer's bug policy.
+		bugDir := os.Getenv(config.BugDirEnv)
 		if input.ReproInScope {
-			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply)
+			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir)
 		}
-		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply)
+		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir)
 	}()
 	if err != nil {
 		return ReviewResult{}, err

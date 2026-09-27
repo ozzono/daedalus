@@ -310,7 +310,7 @@ func TestTestOnlyWorkflowSuiteLoop(t *testing.T) {
 	if len(rec.inputs) != 2 {
 		t.Fatalf("agent ran %d times, want 2 (tests, tests-fix — no implementation round)", len(rec.inputs))
 	}
-	want, err := template.Tests()
+	want, err := template.Tests("")
 	if err != nil {
 		t.Fatalf("build expected tests prompt: %v", err)
 	}

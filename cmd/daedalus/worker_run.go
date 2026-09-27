@@ -106,6 +106,25 @@ func runWorker(cfg config.Config, workerType string) error {
 	} else if err := os.Unsetenv("DAEDALUS_STREAM"); err != nil {
 		return fmt.Errorf("unset DAEDALUS_STREAM: %w", err)
 	}
+	// The out-of-scope-bug filing toggle: DAEDALUS_BUG_DIR (the effective
+	// bug_filing.dir, default applied) is exported only when filing is
+	// enabled — absent means off, and the absence is load-bearing, like
+	// DAEDALUS_THINKING's only-off export above. Unset symmetrically (and
+	// scrubbed from the daemon spawn via ProviderEnvVars) so a stale export
+	// in the invoking shell can never re-enable filing for a config that
+	// says off. The prompt-render sites read it in the worker process. Like
+	// DAEDALUS_SLIM and DAEDALUS_WORKER_NAME it passes through to jailed
+	// rounds wholesale via os.Environ() — benign on exactly those rounds,
+	// since it is exported only when the round's prompt already instructs
+	// filing into that folder; the off case is the one that must stay clean,
+	// and the symmetric unset plus the scrub above keep it that way.
+	if dir := cfg.BugFilingDir(); dir != "" {
+		if err := os.Setenv(config.BugDirEnv, dir); err != nil {
+			return fmt.Errorf("set %s: %w", config.BugDirEnv, err)
+		}
+	} else if err := os.Unsetenv(config.BugDirEnv); err != nil {
+		return fmt.Errorf("unset %s: %w", config.BugDirEnv, err)
+	}
 	// The worker's name is stamped into every round's captured Usage (so
 	// `daedalus report` aggregates per worker) and keys the status file
 	// published below.

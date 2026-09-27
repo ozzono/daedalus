@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -81,6 +82,9 @@ const (
 	// DefaultFallbackType is the fallback provider's wire style when its
 	// type field is unset.
 	DefaultFallbackType = FallbackTypeAnthropic
+	// DefaultBugDir is the effective bug_filing.dir when filing is enabled
+	// without an explicit dir — the historical always-on path.
+	DefaultBugDir = "backlog/bugs"
 )
 
 // Fallback wire styles accepted by the config's fallback.type.
@@ -128,6 +132,12 @@ const (
 	TopKEnv              = "DAEDALUS_TOP_K"
 	MinPEnv              = "DAEDALUS_MIN_P"
 	RepetitionPenaltyEnv = "DAEDALUS_REPETITION_PENALTY"
+	// BugDirEnv carries bug_filing.dir — the worktree-relative folder
+	// unscoped bug files are filed under — to the prompt-render sites.
+	// Exported only when bug_filing is enabled: absent means filing is off,
+	// and the absence is load-bearing (the worker unsets it symmetrically
+	// and the daemon-spawn scrub keeps a stale shell export out).
+	BugDirEnv = "DAEDALUS_BUG_DIR"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -291,6 +301,19 @@ type OpenAIConfig struct {
 	RepetitionPenalty float64 `yaml:"repetition_penalty"`
 }
 
+// BugFilingConfig toggles where jailed rounds record out-of-scope bugs.
+// Off (the section absent, or enabled: false — the default), no bug files
+// are written: bugs surface in the round's reply or review comments only,
+// alongside the Arete Memory note every round carries. On, the prompts
+// additionally instruct the agent to file every out-of-scope bug as a file
+// under dir — worktree-relative, resolved against the run's worktree root,
+// so the files are ordinary committed content of the branch. Dir empty
+// keeps the historical backlog/bugs path.
+type BugFilingConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Dir     string `yaml:"dir"`
+}
+
 // Config holds the runtime configuration for a Daedalus process, loaded
 // from a YAML file (see config-example.yaml).
 type Config struct {
@@ -392,6 +415,23 @@ type Config struct {
 	// Fallback is the independent secondary provider failover uses when
 	// the primary is API-exhausted. Inactive unless Enabled.
 	Fallback FallbackConfig `yaml:"fallback"`
+	// BugFiling is the out-of-scope-bug filing toggle; inactive unless
+	// Enabled (see BugFilingConfig).
+	BugFiling BugFilingConfig `yaml:"bug_filing"`
+}
+
+// BugFilingDir returns the effective worktree-relative folder unscoped bug
+// files are filed under: DefaultBugDir when enabled without an explicit
+// dir, "" when filing is off — the empty return is the off signal the env
+// export and the prompt render sites key on.
+func (c Config) BugFilingDir() string {
+	if !c.BugFiling.Enabled {
+		return ""
+	}
+	if c.BugFiling.Dir == "" {
+		return DefaultBugDir
+	}
+	return c.BugFiling.Dir
 }
 
 // durationValue marshals a time.Duration the way config files express them:
@@ -425,6 +465,7 @@ type renderConfig struct {
 	Anthropic              AnthropicConfig `yaml:"anthropic"`
 	OpenAI                 OpenAIConfig    `yaml:"openai"`
 	Fallback               FallbackConfig  `yaml:"fallback"`
+	BugFiling              BugFilingConfig `yaml:"bug_filing"`
 }
 
 // RenderYAML renders the config as YAML covering every field of the struct,
@@ -449,6 +490,7 @@ func (c Config) RenderYAML() (string, error) {
 		Anthropic:              c.Anthropic,
 		OpenAI:                 c.OpenAI,
 		Fallback:               c.Fallback,
+		BugFiling:              c.BugFiling,
 	})
 	return string(out), err
 }
@@ -628,6 +670,7 @@ func ProviderEnvVars() []string {
 		"DAEDALUS_FALLBACK_API_KEY",
 		"DAEDALUS_FALLBACK_MODEL",
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
+		BugDirEnv,
 	}
 }
 
@@ -766,6 +809,35 @@ func (c Config) validate(path string) error {
 	if !slices.Contains(fallbackTypes, c.Fallback.Type) {
 		return fmt.Errorf("config %s: fallback: unknown type %q (available: %s)",
 			path, c.Fallback.Type, strings.Join(fallbackTypes, ", "))
+	}
+	// Path safety matters only when filing is on: an off toggle never
+	// renders a dir anywhere.
+	if dir := c.BugFilingDir(); dir != "" {
+		if err := ValidateBugDir(dir); err != nil {
+			return fmt.Errorf("config %s: bug_filing: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// ValidateBugDir rejects bug_filing.dir values that could not name a
+// worktree-relative folder: absolute paths, ".." escaping the worktree
+// root, and empty or dot components (asserted on the cleaned path, so
+// "a/./b" and "a//b" normalize before the check rather than being rejected
+// outright). The same path-safety class as the task-log/worktree segment
+// validation in internal/activities, widened to a multi-segment dir.
+func ValidateBugDir(dir string) error {
+	if filepath.IsAbs(dir) {
+		return fmt.Errorf("bug dir %q must be worktree-relative, not absolute", dir)
+	}
+	clean := filepath.Clean(dir)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("bug dir %q must not escape the worktree root", dir)
+	}
+	for seg := range strings.SplitSeq(clean, string(filepath.Separator)) {
+		if seg == "" || seg == "." {
+			return fmt.Errorf("bug dir %q is not a valid worktree-relative folder path", dir)
+		}
 	}
 	return nil
 }

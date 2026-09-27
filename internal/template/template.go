@@ -31,9 +31,11 @@ func render(name string, data any) (string, error) {
 
 // Implement builds the phase-1 opener: the issue task, framed so the
 // implementation phase excludes tests — the test suite gets its own reviewed
-// phase.
-func Implement(task string) (string, error) {
-	return render("implement", struct{ Task string }{task})
+// phase. bugDir is the configured out-of-scope-bug filing folder; empty
+// drops the file-filing instruction from the bug policy (the Arete Memory
+// note and reply-reporting duty stay).
+func Implement(task, bugDir string) (string, error) {
+	return render("implement", struct{ Task, BugDir string }{task, bugDir})
 }
 
 // Continue builds the phase-1 opener for a resumed run: the new task, the
@@ -53,9 +55,10 @@ func ImplementFix(comments string) (string, error) {
 }
 
 // Tests opens phase 2: the agent writes or improves the test suite covering
-// the change.
-func Tests() (string, error) {
-	return render("tests", nil)
+// the change. bugDir is the configured out-of-scope-bug filing folder; empty
+// drops the file-filing instruction from the bug policy.
+func Tests(bugDir string) (string, error) {
+	return render("tests", struct{ BugDir string }{bugDir})
 }
 
 // TestsFix feeds phase-2 (tests ↔ test review) failures back to the agent:
@@ -89,25 +92,27 @@ func TestsFix(testLogs, comments string) (string, error) {
 // (phase 1) is told test coverage is out of scope — tests get their own
 // reviewed phase — while the test reviewer (phase 2) judges the suite itself
 // and alone carries the REBUILD verdict. agentReply, when set, quotes the
-// test agent's latest reply for the test reviewer to weigh. For the bug-fix
+// test agent's latest reply for the test reviewer to weigh. bugDir is the
+// configured out-of-scope-bug filing folder; empty drops the file-filing
+// instruction from the bug policy. For the bug-fix
 // framing — the diff's own repro test in the deliverable — see ReviewRepro.
-func Review(focus, diff, testLogs string, testsInScope bool, agentReply string) (string, error) {
-	return review(focus, diff, testLogs, testsInScope, false, agentReply)
+func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string) (string, error) {
+	return review(focus, diff, testLogs, testsInScope, false, agentReply, bugDir)
 }
 
 // ReviewRepro is Review's bug-fix framing: the diff's own tests are part of
-// the deliverable, and the reviewer must judge whether the repro actually
+// its deliverable, and the reviewer must judge whether the repro actually
 // captures the reported bug — something the repro-first gate cannot. No
 // REBUILD verdict exists in this framing.
-func ReviewRepro(focus, diff, testLogs, agentReply string) (string, error) {
-	return review(focus, diff, testLogs, false, true, agentReply)
+func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string) (string, error) {
+	return review(focus, diff, testLogs, false, true, agentReply, bugDir)
 }
 
 // review renders the shared reviewer template for all three framings.
-func review(focus, diff, testLogs string, testsInScope, reproInScope bool, agentReply string) (string, error) {
+func review(focus, diff, testLogs string, testsInScope, reproInScope bool, agentReply, bugDir string) (string, error) {
 	return render("review", struct {
-		Focus, Diff, TestLogs, AgentReply string
-		TestsInScope, ReproInScope        bool
+		Focus, Diff, TestLogs, AgentReply, BugDir string
+		TestsInScope, ReproInScope                bool
 	}{
 		Focus:        focus,
 		Diff:         diff,
@@ -115,6 +120,7 @@ func review(focus, diff, testLogs string, testsInScope, reproInScope bool, agent
 		TestsInScope: testsInScope,
 		ReproInScope: reproInScope,
 		AgentReply:   agentReply,
+		BugDir:       bugDir,
 	})
 }
 
