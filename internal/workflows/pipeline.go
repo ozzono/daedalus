@@ -79,6 +79,12 @@ type PipelineInput struct {
 	// cleanup_timeout). Same replay-safe zero fallback as AgentRunTimeout:
 	// config.DefaultCleanupTimeout.
 	CleanupTimeout time.Duration
+	// SharedTestQueue routes suite executions onto the fleet-shared
+	// "test" queue when true, or onto this deployment's derived
+	// <task_queue>-test queue when false (config shared_test_queue,
+	// resolved at start). Nil — a run whose input predates the field,
+	// replayed by a newer worker — means shared, the historical routing.
+	SharedTestQueue *bool
 	// Authorship commits daedalus's own work as "daedalus
 	// <daedalus@local>" (config authorship). False — a run whose input
 	// predates the field, or the default — leaves the commits to the

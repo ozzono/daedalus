@@ -33,6 +33,16 @@ import (
 // to it and reports the eventual outcome, parked or otherwise.
 const runWaitTimeout = 12 * time.Hour
 
+// sharedTestQueueInput resolves config shared_test_queue into the
+// PipelineInput field the workflow routes suite executions by: always a
+// concrete value (never nil from here), so the run records the routing its
+// starting config chose — shared or per-deployment — instead of falling
+// back at schedule time.
+func sharedTestQueueInput(cfg config.Config) *bool {
+	shared := cfg.SharesTestQueue()
+	return &shared
+}
+
 // resolveRepoPath turns the operator's repo path into an absolute path and
 // verifies it is a git repository before the workflow starts. The path
 // crosses a process boundary: activities execute on the worker daemon,
@@ -138,6 +148,7 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		AgentRunTimeout: cfg.AgentRunTimeout,
 		ReviewTimeout:   cfg.ReviewTimeout,
 		CleanupTimeout:  cfg.CleanupTimeout,
+		SharedTestQueue: sharedTestQueueInput(cfg),
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -275,6 +286,7 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		AgentRunTimeout: cfg.AgentRunTimeout,
 		ReviewTimeout:   cfg.ReviewTimeout,
 		CleanupTimeout:  cfg.CleanupTimeout,
+		SharedTestQueue: sharedTestQueueInput(cfg),
 		BaseBranch:      base,
 		// No truncation anywhere in the app: the complete last review rides
 		// into the continued run's opening prompt.

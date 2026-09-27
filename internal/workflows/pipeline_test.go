@@ -2434,3 +2434,81 @@ func TestFeatureDevWorkflowParkErrorCarriesFullComments(t *testing.T) {
 	}
 	env.AssertExpectations(t)
 }
+
+// boolPtr is a literal for the PipelineInput pointer toggles.
+func boolPtr(b bool) *bool { return &b }
+
+// TestSuiteQueueRouting pins the suite-execution queue selection: a run
+// sharing its suites (nil input — a pre-field replay — or explicit true)
+// schedules them on the fleet-shared ReservedTestTaskQueue, while an
+// opted-out run derives "<task_queue>-test" from its own task queue. The
+// queue rides the activity's scheduling options, so it is read back from
+// the executing activity's info rather than any input struct.
+func TestSuiteQueueRouting(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		shared *bool
+		want   string
+	}{
+		{"nil input, pre-field replay", nil, config.ReservedTestTaskQueue},
+		{"shared", boolPtr(true), config.ReservedTestTaskQueue},
+		{"opted out", boolPtr(false), config.TestQueueFor("q9")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+				Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil).Once()
+
+			rec := &agentRecorder{env: env}
+			rec.record()
+			rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+			rev.record()
+
+			// Discovery stays on the workflow's queue; only the suite
+			// routing is under test, and its stub reads the queue each
+			// execution was actually scheduled on — the queue rides the
+			// activity's scheduling options, not any input struct.
+			env.OnActivity(activities.ResolveTestCommandActivity, mock.Anything, mock.Anything, mock.Anything).
+				Return("go test ./...", nil)
+			var queues []string
+			env.OnActivity(activities.RunTestSuiteActivity, mock.Anything, mock.Anything).
+				Run(func(args mock.Arguments) {
+					if ctx, ok := args.Get(0).(context.Context); ok {
+						queues = append(queues, activity.GetInfo(ctx).TaskQueue)
+					}
+				}).
+				Return(activities.TestResult{Passed: true, Logs: "ok"}, nil)
+
+			scope := &scopeRecorder{env: env}
+			scope.record()
+			env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+				Return("daedalus/issue-42-1", nil).Once()
+			env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+				Return(nil).Once()
+
+			in := baseInput()
+			// A non-default task queue, so the derived suite queue provably
+			// comes from the run's own queue rather than any constant.
+			in.TaskQueue = "q9"
+			in.Flow = "test-only"
+			in.AllowedPaths = activities.TestPathPatterns
+			in.SharedTestQueue = c.shared
+			env.ExecuteWorkflow(TestOnlyWorkflow, in)
+			if err := env.GetWorkflowError(); err != nil {
+				t.Fatalf("workflow error: %v", err)
+			}
+
+			// Both suite executions — the preflight baseline and the loop
+			// round — must ride the expected queue; the count check keeps
+			// the queue assertion from passing vacuously.
+			if len(queues) != 2 {
+				t.Fatalf("suite ran %d times, want 2 (preflight baseline plus loop round)", len(queues))
+			}
+			for i, q := range queues {
+				if q != c.want {
+					t.Errorf("suite run %d executed on queue %q, want %q", i, q, c.want)
+				}
+			}
+		})
+	}
+}

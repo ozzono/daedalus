@@ -45,8 +45,8 @@ type TestResult struct {
 // RunNativeTestsActivity resolves and runs the repository's own test suite
 // in one activity on the main task queue. Superseded for new runs by
 // ResolveTestCommandActivity (discovery stays on the main queue) plus
-// RunTestSuiteActivity (the suite itself executes on the dedicated test
-// queue, TestTaskQueue); it remains registered so histories and callers
+// RunTestSuiteActivity (the suite itself executes on the deployment's
+// suite queue); it remains registered so histories and callers
 // of the combined form keep working.
 func RunNativeTestsActivity(ctx context.Context, worktreePath, agent string) (TestResult, error) {
 	argv, err := nativeTestCommand(ctx, worktreePath, agent)
@@ -80,16 +80,16 @@ func RunNativeTestsActivity(ctx context.Context, worktreePath, agent string) (Te
 	return res, nil
 }
 
-// TestTaskQueue is the dedicated task queue the native test suite executes
-// on, served by the test worker (a dumb, agent-free command runner — no
-// ai-jail, no agent CLI, no provider env). One shared queue serves every
-// main worker on the Temporal server: suite commands carry absolute
-// worktree paths, so any test worker on the same host can run them. Across
-// hosts the queue is effectively per-host — a test task routed to another
-// host's test worker fails on a `cd` to a path that does not exist there.
-// Main workers refuse to configure this name as their own queue (config
-// ReservedTestTaskQueue), so the two poller populations cannot collide.
-const TestTaskQueue = config.ReservedTestTaskQueue
+// Suite activities execute on a deployment's suite queue: the Temporal-wide
+// shared ReservedTestTaskQueue for a shared_test_queue-true config, the
+// derived config.TestQueueFor(taskQueue) for an opted-out one (schedule
+// site: the workflows package, from the run's PipelineInput; pollers:
+// cmd/daedalus worker startup, from the same config — one config drives
+// both ends, so a deployment never schedules on a queue its own workers
+// ignore). Suite commands carry absolute worktree paths, so any worker on
+// the same host can run them; across hosts the queue is effectively
+// per-host — a suite routed to another host's worker fails on a `cd` to a
+// path that does not exist there.
 
 // testConcurrency reads the worker-level cap on concurrent test-suite
 // executions, exported at worker startup from config max_concurrent_tests

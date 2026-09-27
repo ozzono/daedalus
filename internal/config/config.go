@@ -24,10 +24,14 @@ const (
 	// queue — the queue also scopes workflow IDs and worktree paths, so
 	// nothing collides across queues.
 	DefaultTaskQueue = "daedalus"
-	// ReservedTestTaskQueue is the shared test worker's queue (activities
-	// serves it as TestTaskQueue). temporal.task_queue rejects it: a main
-	// worker polling it too would receive suite tasks it cannot run, while
-	// the test worker holds no workflows.
+	// ReservedTestTaskQueue is the fleet-wide shared suite queue name
+	// ("test"): the queue an unmodified config (shared_test_queue unset or
+	// true) schedules its native test suites on and its workers poll, so
+	// any deployment's worker can serve any deployment's suites. It is
+	// rejected as temporal.task_queue — a main queue of that name would
+	// receive suite tasks no pipeline schedules and lose its own routing —
+	// and so is any name carrying the "-test" suffix, whose suite queue
+	// (TestQueueFor) would collide with the stem deployment's.
 	ReservedTestTaskQueue = "test"
 	// DefaultTemporalHost is Temporal's own default frontend address.
 	DefaultTemporalHost = "127.0.0.1:7233"
@@ -408,10 +412,19 @@ type Config struct {
 	// further suites queue until a slot frees. Suites are CPU-bound host
 	// work, unlike the provider-bound agent rounds, so the cap is separate.
 	// DefaultMaxConcurrentTests when unset.
-	MaxConcurrentTests int             `yaml:"max_concurrent_tests"`
-	Temporal           TemporalConfig  `yaml:"temporal"`
-	Anthropic          AnthropicConfig `yaml:"anthropic"`
-	OpenAI             OpenAIConfig    `yaml:"openai"`
+	MaxConcurrentTests int `yaml:"max_concurrent_tests"`
+	// SharedTestQueue routes this deployment's native test suites onto the
+	// one Temporal-wide shared queue (ReservedTestTaskQueue), where any
+	// deployment's worker may execute them — today's fleet-shared
+	// behavior, and the effect of nil (the key absent) or true. Explicit
+	// false gives the deployment its own derived suite queue
+	// (TestQueueFor) that only workers started from this config poll, so
+	// a stale worker of any other deployment can no longer serve — or
+	// fail — its suites.
+	SharedTestQueue *bool           `yaml:"shared_test_queue"`
+	Temporal        TemporalConfig  `yaml:"temporal"`
+	Anthropic       AnthropicConfig `yaml:"anthropic"`
+	OpenAI          OpenAIConfig    `yaml:"openai"`
 	// Fallback is the independent secondary provider failover uses when
 	// the primary is API-exhausted. Inactive unless Enabled.
 	Fallback FallbackConfig `yaml:"fallback"`
@@ -461,6 +474,7 @@ type renderConfig struct {
 	CleanupTimeout         durationValue   `yaml:"cleanup_timeout"`
 	MaxConcurrentAgentRuns int             `yaml:"max_concurrent_agent_runs"`
 	MaxConcurrentTests     int             `yaml:"max_concurrent_tests"`
+	SharedTestQueue        *bool           `yaml:"shared_test_queue"`
 	Temporal               TemporalConfig  `yaml:"temporal"`
 	Anthropic              AnthropicConfig `yaml:"anthropic"`
 	OpenAI                 OpenAIConfig    `yaml:"openai"`
@@ -486,6 +500,7 @@ func (c Config) RenderYAML() (string, error) {
 		CleanupTimeout:         durationValue(c.CleanupTimeout),
 		MaxConcurrentAgentRuns: c.MaxConcurrentAgentRuns,
 		MaxConcurrentTests:     c.MaxConcurrentTests,
+		SharedTestQueue:        c.SharedTestQueue,
 		Temporal:               c.Temporal,
 		Anthropic:              c.Anthropic,
 		OpenAI:                 c.OpenAI,
@@ -523,6 +538,21 @@ func ValidateAgent(a string) error {
 	}
 	return nil
 }
+
+// SharesTestQueue reports the effective shared_test_queue value: true —
+// fleet-shared suites, the historical routing — unless the config
+// explicitly opts out with false.
+func (c Config) SharesTestQueue() bool { return c.SharedTestQueue == nil || *c.SharedTestQueue }
+
+// TestQueueFor derives the suite-execution queue of the deployment whose
+// main task queue is queue: queue + "-test". A config with
+// shared_test_queue: false schedules its native test suites on this
+// derived queue and its workers poll it, so those suites are schedulable
+// only by that deployment's own workers — restarting the deployment's
+// daemon is then sufficient to change which binary executes its suites.
+// Validation rejects a task_queue carrying the "-test" suffix, so a
+// derived name can never collide with another deployment's main queue.
+func TestQueueFor(queue string) string { return queue + "-test" }
 
 // UIURL returns the Temporal UI address corresponding to Temporal.UIPort.
 func (c Config) UIURL() string {
@@ -752,7 +782,14 @@ func (c Config) validate(path string) error {
 		return fmt.Errorf("config %s: %w", path, err)
 	}
 	if c.Temporal.TaskQueue == ReservedTestTaskQueue {
-		return fmt.Errorf("config %s: temporal.task_queue: %q is reserved for the shared test queue", path, c.Temporal.TaskQueue)
+		return fmt.Errorf("config %s: temporal.task_queue: %q is reserved for suite queues", path, c.Temporal.TaskQueue)
+	}
+	// A "-test" suffixed main queue would derive a suite queue colliding
+	// with the stem name's plain deployment (foo-test's suites on foo's
+	// queue, pollable by the wrong workers) — rejected up front instead.
+	if stem, suffix := strings.CutSuffix(c.Temporal.TaskQueue, "-test"); suffix {
+		return fmt.Errorf("config %s: temporal.task_queue: %q must not carry the \"-test\" suffix — suites for %q derive the queue %q, colliding with this deployment's own main queue",
+			path, c.Temporal.TaskQueue, stem, TestQueueFor(stem))
 	}
 	if c.TestsTimeout < 0 {
 		return fmt.Errorf("config %s: tests_timeout: must not be negative", path)

@@ -303,10 +303,11 @@ FLAGS
   --all                 Restart target: every worker on record (same as the
                         "all" argument).
 
-The untyped daemon (no -t) also serves the shared test task queue ("test")
-that executes native test suites, bounded by config max_concurrent_tests.
-("daedalus report" shows the jailed-round slot occupancy, not the test
-queue's.)
+The untyped daemon (no -t) also serves the deployment's suite task queue —
+the Temporal-wide shared "test" queue with shared_test_queue true (the
+default), or its own derived "<task_queue>-test" otherwise — that executes
+native test suites, bounded by config max_concurrent_tests. ("daedalus
+report" shows the jailed-round slot occupancy, not the suite queue's.)
 
 anthropic.key is optional — if unset, the jailed agent authenticates through
 the worker's inherited environment or its own login.
@@ -357,8 +358,16 @@ CONFIGURATION REFERENCE
                         per-model limits stay operator-side — see
                         config-example.yaml for the per-agent prerequisites
                         (default false)
-  max_concurrent_tests  Native test suites the test worker (shared "test"
-                        queue) runs at once; further suites queue (default 2)
+  max_concurrent_tests  Native test suites the test worker (the
+                        deployment's suite queue) runs at once; further
+                        suites queue (default 2)
+  shared_test_queue     true (default) schedules this deployment's native
+                        test suites on the Temporal-wide shared "test"
+                        queue, served by every deployment's workers. false
+                        moves them to this deployment's own derived
+                        "<task_queue>-test" queue, schedulable only by its
+                        own workers — flip it and upgrade this
+                        deployment's daemons in the same pass.
   bug_filing            Out-of-scope-bug filing toggle. Off by default (the
                         section absent, or enabled: false): no bug files are
                         written and out-of-scope bugs surface in round
@@ -375,7 +384,11 @@ CONFIGURATION REFERENCE
   temporal.host         Temporal frontend address (default 127.0.0.1:7233)
   temporal.ui_port      Temporal UI port, shown at worker startup (default 8233)
   temporal.task_queue   Routing key; distinct projects or flows sharing one
-                        Temporal server use distinct queues (default daedalus)
+                        Temporal server use distinct queues (default
+                        daedalus). Rejected when it is the reserved name
+                        "test" or carries the "-test" suffix — suite
+                        queues derive from it (shared_test_queue) and must
+                        never collide with a main queue.
   anthropic.url         Anthropic API base URL (default https://api.anthropic.com)
   anthropic.key         Anthropic API key (optional — skipped if unset)
   anthropic.model       Model for the jailed agent (agent default if unset)

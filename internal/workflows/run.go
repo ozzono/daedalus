@@ -54,8 +54,8 @@ type pipelineRun struct {
 
 	// testTimeout is the run's resolved tests_timeout (config default
 	// applied); discoverCtx runs test-command discovery under it on this
-	// workflow's queue, testExecCtx runs suites and gates on the dedicated
-	// test queue (activities.TestTaskQueue).
+	// workflow's queue, testExecCtx runs suites and gates on the
+	// deployment's suite queue (shared "test", or derived "<queue>-test").
 	testTimeout time.Duration
 	// agentRunTimeout is the run's resolved agent_run_timeout — the
 	// ceiling named in a cut-off round's continuation prompt.
@@ -156,10 +156,14 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 	// shared 15 minutes. They run on different queues, though: discovery
 	// stays on this workflow's queue (its AI fallback is a jailed round
 	// needing the worker's provider environment), while suites execute on
-	// the dedicated test queue served by the agent-free test worker
-	// (activities.TestTaskQueue) — suite runtime answers only to
-	// tests_timeout, outside the agent-slot semaphore, and Get still uses
-	// ctx so cancellation propagates normally.
+	// the deployment's suite queue served by the agent-free test worker —
+	// suite runtime answers only to tests_timeout, outside the
+	// agent-slot semaphore, and Get still uses ctx so cancellation
+	// propagates normally. The queue is the fleet-shared "test" when the
+	// run's config shares suites (the default, and the pre-field
+	// fallback), or the derived "<queue>-test" when it opted out — the
+	// worker's pollers follow the same config, so a deployment never
+	// schedules on a queue its own workers ignore.
 	testTimeout := input.TestTimeout
 	if testTimeout <= 0 {
 		testTimeout = config.DefaultTestsTimeout
@@ -168,7 +172,11 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 		StartToCloseTimeout: testTimeout,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
 	})
-	testExecCtx := workflow.WithTaskQueue(discoverCtx, activities.TestTaskQueue)
+	suiteQueue := config.ReservedTestTaskQueue
+	if input.SharedTestQueue != nil && !*input.SharedTestQueue {
+		suiteQueue = config.TestQueueFor(input.TaskQueue)
+	}
+	testExecCtx := workflow.WithTaskQueue(discoverCtx, suiteQueue)
 
 	flowScope := FlowScope(input.Flow)
 	// The in-flight branch carries the flow segment too: a flow-scoped run's
