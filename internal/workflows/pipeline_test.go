@@ -296,14 +296,14 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	if len(rec.inputs) != 2 {
 		t.Fatalf("agent ran %d times, want 2 (implement + tests)", len(rec.inputs))
 	}
-	want, err := template.Implement("implement the feature")
+	want, err := template.Implement("implement the feature", "")
 	if err != nil {
 		t.Fatalf("build expected implement prompt: %v", err)
 	}
 	if rec.inputs[0].Prompt != want {
 		t.Errorf("implement prompt = %q, want %q", rec.inputs[0].Prompt, want)
 	}
-	want, err = template.Tests()
+	want, err = template.Tests("")
 	if err != nil {
 		t.Fatalf("build expected test-phase prompt: %v", err)
 	}
@@ -321,6 +321,56 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	}
 	if cleanupCount != 1 {
 		t.Errorf("cleanup ran %d times, want 1", cleanupCount)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowBugDirPrompt pins the env channel the bug-filing
+// toggle travels on: the workflow reads DAEDALUS_BUG_DIR from the worker
+// process (exported at startup iff bug_filing is enabled — never workflow
+// history or activity inputs) and hands it to the round-prompt builders,
+// so the opener and the tests prompt carry the configured bug dir.
+func TestFeatureDevWorkflowBugDirPrompt(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "docs/known-bugs")
+	env := newTestEnv(t)
+
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil).Once()
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	stubTestPhase(env)
+
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (implement + tests)", len(rec.inputs))
+	}
+	want, err := template.Implement("implement the feature", "docs/known-bugs")
+	if err != nil {
+		t.Fatalf("build expected implement prompt: %v", err)
+	}
+	if rec.inputs[0].Prompt != want {
+		t.Errorf("implement prompt = %q, want the bug-dir variant", rec.inputs[0].Prompt)
+	}
+	want, err = template.Tests("docs/known-bugs")
+	if err != nil {
+		t.Fatalf("build expected tests prompt: %v", err)
+	}
+	if rec.inputs[1].Prompt != want {
+		t.Errorf("test-phase prompt = %q, want the bug-dir variant", rec.inputs[1].Prompt)
 	}
 	env.AssertExpectations(t)
 }
@@ -2164,7 +2214,7 @@ func TestFeatureDevWorkflowTestReviewRebuildLoopsThroughDevCycle(t *testing.T) {
 	if !strings.Contains(rebuildPrompt, "handler drops the error path") {
 		t.Errorf("rebuild prompt %q should carry the finding", rebuildPrompt)
 	}
-	if implPrompt, err := template.Implement("implement the feature"); err != nil || strings.Contains(rebuildPrompt, implPrompt) {
+	if implPrompt, err := template.Implement("implement the feature", ""); err != nil || strings.Contains(rebuildPrompt, implPrompt) {
 		t.Errorf("rebuild prompt %q should be tight-context, not replay the implement prompt (%v)", rebuildPrompt, err)
 	}
 	if rec.inputs[2].SessionID != "dev-sess" {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/template"
 )
 
@@ -226,10 +227,14 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 		return ReviewResult{}, err
 	}
 	prompt, err := func() (string, error) {
+		// The configured out-of-scope-bug filing folder, exported at worker
+		// startup iff bug_filing is enabled; empty drops the file-filing
+		// instruction from the reviewer's bug policy.
+		bugDir := os.Getenv(config.BugDirEnv)
 		if input.ReproInScope {
-			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply)
+			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir)
 		}
-		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply)
+		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir)
 	}()
 	if err != nil {
 		return ReviewResult{}, err

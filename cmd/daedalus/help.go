@@ -359,6 +359,19 @@ CONFIGURATION REFERENCE
                         (default false)
   max_concurrent_tests  Native test suites the test worker (shared "test"
                         queue) runs at once; further suites queue (default 2)
+  bug_filing            Out-of-scope-bug filing toggle. Off by default (the
+                        section absent, or enabled: false): no bug files are
+                        written and out-of-scope bugs surface in round
+                        replies and review comments only. When enabled, the
+                        round prompts instruct the agent to file every
+                        out-of-scope bug as a file under bug_filing.dir —
+                        worktree-relative, resolved against the run's
+                        worktree root, committed branch content like any
+                        other diff; dir empty keeps the historical
+                        backlog/bugs path. While enabled, load rejects an
+                        absolute dir, one escaping the worktree root, or one
+                        with empty or dot path components; any other bytes
+                        render verbatim into the round prompts
   temporal.host         Temporal frontend address (default 127.0.0.1:7233)
   temporal.ui_port      Temporal UI port, shown at worker startup (default 8233)
   temporal.task_queue   Routing key; distinct projects or flows sharing one

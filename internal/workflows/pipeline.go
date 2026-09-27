@@ -200,7 +200,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {
-		initialPrompt, err = template.Implement(input.Prompt)
+		initialPrompt, err = template.Implement(input.Prompt, bugDir())
 	}
 	if err != nil {
 		return "", fmt.Errorf("build implement prompt: %w", err)
@@ -217,7 +217,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// reviewer, which alone can verdict REBUILD — routing an
 	// implementation-level finding back through the dev cycle (above)
 	// before the test loop resumes with both sessions intact.
-	testsPrompt, err := template.Tests()
+	testsPrompt, err := template.Tests(bugDir())
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)
 	}

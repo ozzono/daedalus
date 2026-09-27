@@ -37,7 +37,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {
-		initialPrompt, err = template.Tests()
+		initialPrompt, err = template.Tests(bugDir())
 	}
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)

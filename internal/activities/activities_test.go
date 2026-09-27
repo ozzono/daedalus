@@ -3359,3 +3359,53 @@ func TestNativeTestsAIDiscoveryPlainText(t *testing.T) {
 		t.Errorf("Command = %q, want the raw reply as the discovered command", result.Command)
 	}
 }
+
+// TestRunJailedReviewerActivityBugDir pins the env channel the bug-filing
+// toggle reaches the reviewer prompt on: the activity reads DAEDALUS_BUG_DIR
+// from the worker process (exported at startup iff bug_filing is enabled)
+// and hands it to the prompt builder, so an enabled config's dir lands in
+// the bug policy and an absent env keeps the file-filing instruction out.
+func TestRunJailedReviewerActivityBugDir(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     string
+		want    string
+		notWant string
+	}{
+		{name: "enabled", env: "docs/known-bugs", want: "a file under docs/known-bugs/ (create the folder if missing; trigger, impact, where it lives)"},
+		{name: "off", env: "", notWant: "file under"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv(config.BugDirEnv, tc.env)
+			} else {
+				t.Setenv(config.BugDirEnv, "")
+			}
+			log := newStubLog(t)
+			stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+			stubBin(t, "ai-jail", `printf 'Looks good.\nAPPROVED\n'; exit 0`)
+
+			res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+				WorktreePath: t.TempDir(),
+				Focus:        "the implementation",
+			})
+			if err != nil {
+				t.Fatalf("RunJailedReviewerActivity: %v", err)
+			}
+			if !res.Approved {
+				t.Error("Approved = false, want true")
+			}
+			calls := readCalls(t, log)
+			if len(calls) != 3 {
+				t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+			}
+			if tc.want != "" && !strings.Contains(calls[2].Stdin, tc.want) {
+				t.Errorf("reviewer prompt should carry the bug dir %q, got %q", tc.want, calls[2].Stdin)
+			}
+			if tc.notWant != "" && strings.Contains(calls[2].Stdin, tc.notWant) {
+				t.Errorf("reviewer prompt should not carry a file-filing instruction, got %q", calls[2].Stdin)
+			}
+		})
+	}
+}

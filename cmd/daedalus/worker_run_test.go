@@ -144,3 +144,38 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 		}
 	}
 }
+
+// TestRunWorkerBugDirEnvExports pins the bug-filing toggle's env channel:
+// DAEDALUS_BUG_DIR (the effective bug_filing.dir, default applied) is
+// exported only when filing is enabled — absent means off — and a stale
+// export in the invoking shell is cleared by a config that says off, so
+// it can never re-enable filing.
+func TestRunWorkerBugDirEnvExports(t *testing.T) {
+	restoreProcessEnv(t, "DAEDALUS_SLIM", "DAEDALUS_THINKING", "DAEDALUS_STREAM", "DAEDALUS_BUG_DIR")
+
+	// A stale export must not outlive a config that says off.
+	t.Setenv("DAEDALUS_BUG_DIR", "stale/bugs")
+	if err := runWorker(config.Config{}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv("DAEDALUS_BUG_DIR"); got != "" {
+		t.Errorf("DAEDALUS_BUG_DIR = %q after an off config, want the stale export cleared", got)
+	}
+
+	// Enabled without an explicit dir exports the historical default;
+	// an explicit dir exports verbatim.
+	for _, c := range []struct {
+		cfg  config.Config
+		want string
+	}{
+		{config.Config{BugFiling: config.BugFilingConfig{Enabled: true}}, config.DefaultBugDir},
+		{config.Config{BugFiling: config.BugFilingConfig{Enabled: true, Dir: "docs/known-bugs"}}, "docs/known-bugs"},
+	} {
+		if err := runWorker(c.cfg, ""); err == nil {
+			t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+		}
+		if got := os.Getenv("DAEDALUS_BUG_DIR"); got != c.want {
+			t.Errorf("DAEDALUS_BUG_DIR = %q after an enabled config, want %q", got, c.want)
+		}
+	}
+}

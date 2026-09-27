@@ -2,6 +2,7 @@ package workflows
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -13,6 +14,15 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/template"
 )
+
+// bugDir reads the worker-exported out-of-scope-bug filing folder
+// (DAEDALUS_BUG_DIR, exported at worker startup iff bug_filing is enabled;
+// absent means off). Config values travel the same worker-process env
+// channel they reach activities on — never workflow history or activity
+// inputs — and the rendered prompt then becomes a recorded activity input:
+// a replay on a differently-configured worker may re-render differently,
+// but the recorded input is what executes, so nothing replays differently.
+func bugDir() string { return os.Getenv(config.BugDirEnv) }
 
 // FlowScope returns the per-issue scope segment a flow's derived names
 // (worktree path, in-flight and aborted branches, stale sweep) carry: empty

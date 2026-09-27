@@ -1139,3 +1139,67 @@ func TestProviderEnvVarsIncludesKnobExports(t *testing.T) {
 		}
 	}
 }
+
+// TestBugFilingDir pins the effective-dir resolution: off (the section
+// absent, or enabled: false) returns "" — the off signal the env export
+// and the prompt render sites key on; enabled without a dir keeps the
+// historical DefaultBugDir path; an explicit dir loads through verbatim.
+func TestBugFilingDir(t *testing.T) {
+	for _, tc := range []struct {
+		name, doc, want string
+	}{
+		{name: "absent", doc: "", want: ""},
+		{name: "disabled", doc: "bug_filing:\n  enabled: false\n  dir: docs/bugs\n", want: ""},
+		{name: "enabled default dir", doc: "bug_filing:\n  enabled: true\n", want: DefaultBugDir},
+		{name: "enabled explicit dir", doc: "bug_filing:\n  enabled: true\n  dir: docs/known-bugs\n", want: "docs/known-bugs"},
+	} {
+		cfg, err := Load(writeConfig(t, tc.doc))
+		if err != nil {
+			t.Fatalf("%s: Load: %v", tc.name, err)
+		}
+		if got := cfg.BugFilingDir(); got != tc.want {
+			t.Errorf("%s: BugFilingDir() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestValidateBugDir pins the path-safety classes a worktree-relative
+// folder must satisfy: absolute paths, ".." escaping the root, and empty
+// or dot components are rejected, while equivalent spellings ("a/./b",
+// "a//b", trailing slash) normalize to the same clean path and load.
+func TestValidateBugDir(t *testing.T) {
+	for _, dir := range []string{"backlog/bugs", "docs", "a/./b", "a//b", "a/"} {
+		if err := ValidateBugDir(dir); err != nil {
+			t.Errorf("ValidateBugDir(%q) = %v, want nil", dir, err)
+		}
+	}
+	for _, dir := range []string{"/abs", "", ".", "..", "../up", "a/../..", "a/.."} {
+		if err := ValidateBugDir(dir); err == nil {
+			t.Errorf("ValidateBugDir(%q) = nil, want an error", dir)
+		}
+	}
+}
+
+// TestLoadBugFilingValidation pins that the path-safety gate arms only
+// when filing is on: an off toggle never renders a dir anywhere, so a
+// garbage dir loads fine disabled but is rejected at load — with the
+// section named — once enabled.
+func TestLoadBugFilingValidation(t *testing.T) {
+	if _, err := Load(writeConfig(t, "bug_filing:\n  enabled: false\n  dir: ../escape\n")); err != nil {
+		t.Fatalf("Load (off): %v", err)
+	}
+	_, err := Load(writeConfig(t, "bug_filing:\n  enabled: true\n  dir: ../escape\n"))
+	if err == nil || !strings.Contains(err.Error(), "bug_filing:") || !strings.Contains(err.Error(), "must not escape the worktree root") {
+		t.Fatalf("Load (on, escaping dir) error = %v, want a bug_filing path-safety rejection", err)
+	}
+}
+
+// TestProviderEnvVarsIncludesBugDir pins that DAEDALUS_BUG_DIR is in the
+// scrub/restore list: a daemon spawn must clear ambient values, or an
+// off-config worker would silently inherit a stale shell export that
+// re-enables filing.
+func TestProviderEnvVarsIncludesBugDir(t *testing.T) {
+	if !slices.Contains(ProviderEnvVars(), BugDirEnv) {
+		t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), BugDirEnv)
+	}
+}
