@@ -90,6 +90,14 @@ type PipelineInput struct {
 	// predates the field, or the default — leaves the commits to the
 	// worker's git config.
 	Authorship bool
+	// TestOutputDir is the worktree-relative folder each suite run's
+	// complete output is dumped into (config test_output, resolved at
+	// start). Empty — dumping off, or a run whose input predates the
+	// field — means no dump, byte-identical behavior. It rides the
+	// pipeline input, not worker env: with a shared test queue a foreign
+	// deployment's worker may run the suite, and env would apply the
+	// wrong deployment's dir.
+	TestOutputDir string
 }
 
 // maxConsecutiveTimeouts caps how many timed-out rounds in a row the

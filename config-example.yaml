@@ -344,3 +344,22 @@ fallback:
 bug_filing:
   enabled: false
   dir: ""
+
+# Native test-suite output dumping. Off by default (the section absent, or
+# enabled: false): nothing is written and suite output reaches the run's
+# task log only, as before. When enabled, every suite execution writes its
+# complete combined output to <dir>/<timestamp>.log in the run's worktree
+# (a same-second collision gains a -2, -3, … suffix, never an overwrite)
+# and the run's tester and reviewer are told the path — a worktree-relative
+# dir puts the dump inside the agent sandbox's only mounted tree, so a fix
+# loop holding a transport-bounded tail can read the full record. Files
+# accumulate in the worktree; the run's worktree cleanup disposes of them.
+# The dump is transient and never part of the deliverable: the activity
+# keeps the dir out of "git status" via the repository's .git/info/exclude.
+# dir empty keeps the default .daedalus/test-output path. While dumping is
+# enabled, load rejects an absolute dir, one escaping the worktree root
+# (".."), or one with empty or dot path components; any other bytes are
+# used verbatim.
+test_output:
+  enabled: false
+  dir: ""

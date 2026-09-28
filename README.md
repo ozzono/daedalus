@@ -335,7 +335,9 @@ issue never share live state). Re-running
   `<branch_prefix>/issue-<id>-<unix>` (default `daedalus`) is the committed,
   approved deliverable;
   `aborted/issue-<id>` carries a run that closed without approval, replaced
-  by each newer abort and consumed by `daedalus continue`.
+  by each newer abort and consumed by `daedalus continue`; when that name
+  is checked out in another worktree at abort time, the snapshot lands
+  under a suffixed `aborted/issue-<id>-<n>` name instead.
 - **Operator guidance**: `daedalus guide` (or `run -a`) messages arrive as a
   Temporal signal and are prefixed onto the agent's next fix prompt,
   marked as direct operator instructions taking precedence over earlier

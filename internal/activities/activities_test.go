@@ -323,8 +323,8 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 9 {
-		t.Fatalf("git called %d times, want 9 (preserve list, add, commit, drop aborted, rename, remove, prune, stale sweep, worktree add)", len(calls))
+	if len(calls) != 10 {
+		t.Fatalf("git called %d times, want 10 (preserve list, add, commit, checkout probe, drop aborted, rename, remove, prune, stale sweep, worktree add)", len(calls))
 	}
 	// A stale worktree from a crashed run is preserved, not discarded: its
 	// contents are committed and its branch renamed to aborted/issue-42.
@@ -334,12 +334,13 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	// worker's git config, not a forced identity.
 	assertArgs(t, calls[2].Args, []string{"-C", worktreePath,
 		"commit", "-m", "daedalus: run closed without approval, work preserved for continue"}, "preserve commit")
-	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
-	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
-	assertArgs(t, calls[5].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "pre-clean remove")
-	assertArgs(t, calls[6].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
-	assertArgs(t, calls[7].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "pre-clean stale branch sweep")
-	assertArgs(t, calls[8].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123"}, "worktree add")
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "worktree", "list", "--porcelain"}, "aborted checkout probe")
+	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
+	assertArgs(t, calls[5].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	assertArgs(t, calls[6].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "pre-clean remove")
+	assertArgs(t, calls[7].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
+	assertArgs(t, calls[8].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "pre-clean stale branch sweep")
+	assertArgs(t, calls[9].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123"}, "worktree add")
 }
 
 // TestCreateWorktreeFromAbortedBase pins the continued-run path: the new
@@ -437,8 +438,8 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 9 {
-		t.Fatalf("git called %d times, want 9", len(calls))
+	if len(calls) != 10 {
+		t.Fatalf("git called %d times, want 10", len(calls))
 	}
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Errorf("stale directory should be removed even when git remove failed (stat err = %v)", err)
@@ -521,17 +522,92 @@ func TestCleanupPreservesAbortedWork(t *testing.T) {
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 8 {
-		t.Fatalf("git called %d times, want 8 (list, add, commit, drop aborted, rename, remove, prune, sweep)", len(calls))
+	if len(calls) != 9 {
+		t.Fatalf("git called %d times, want 9 (list, add, commit, checkout probe, drop aborted, rename, remove, prune, sweep)", len(calls))
 	}
 	assertArgs(t, calls[1].Args, []string{"-C", worktreePath, "add", "-A"}, "preserve stage")
 	if !contains(calls[2].Args, "work preserved for continue") {
 		t.Errorf("commit %v should carry the preservation message", calls[2].Args)
 	}
-	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
-	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "worktree", "list", "--porcelain"}, "aborted checkout probe")
+	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
+	assertArgs(t, calls[5].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Errorf("worktree dir should be removed after preservation (stat err = %v)", err)
+	}
+}
+
+// TestCleanupPreservesAbortedWorkForeignCheckout pins the collision path:
+// when the canonical aborted branch is checked out in another worktree, git
+// bars both its deletion and its force-update, so the snapshot must land
+// under the first free suffixed name instead — and the held branch must be
+// left untouched.
+func TestCleanupPreservesAbortedWorkForeignCheckout(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitStub string
+		want    string
+	}{
+		{
+			name: "first free suffix",
+			// worktree list reports the canonical aborted branch checked
+			// out elsewhere; every rev-parse probe fails, i.e. no suffixed
+			// ref exists yet, so -2 is free. (argv: -C repo <sub> … — the
+			// probed ref is $6, after --verify --quiet.)
+			gitStub: `case "$3" in
+  worktree) printf 'worktree /elsewhere\nbranch refs/heads/aborted/issue-42\n'; exit 0 ;;
+  rev-parse) exit 1 ;;
+esac
+exit 0`,
+			want: "aborted/issue-42-2",
+		},
+		{
+			name: "taken suffixes are skipped",
+			// rev-parse answers "exists" only for -2, so the probe walks
+			// past it to -3.
+			gitStub: `case "$3" in
+  worktree) printf 'branch refs/heads/aborted/issue-42\n'; exit 0 ;;
+  rev-parse) [ "$6" = "refs/heads/aborted/issue-42-2" ] && exit 0; exit 1 ;;
+esac
+exit 0`,
+			want: "aborted/issue-42-3",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := fakeHome(t)
+			log := newStubLog(t)
+			stubBin(t, "git", c.gitStub)
+			worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+				RepoPath:   "/repo",
+				TaskQueue:  "daedalus",
+				IssueID:    "42",
+				BranchName: "feat/issue-42-7",
+			}); err != nil {
+				t.Fatalf("CleanupWorktreeActivity: %v", err)
+			}
+
+			var renamed bool
+			for _, call := range readCalls(t, log) {
+				if reflect.DeepEqual(call.Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}) {
+					t.Errorf("the held canonical aborted branch must not be deleted: %v", call.Args)
+				}
+				if contains(call.Args, "-m") && contains(call.Args, c.want) {
+					renamed = true
+				}
+			}
+			if !renamed {
+				t.Errorf("snapshot should be renamed to the free suffixed name %s", c.want)
+			}
+			if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+				t.Errorf("worktree dir should be removed after preservation (stat err = %v)", err)
+			}
+		})
 	}
 }
 
@@ -1723,11 +1799,11 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 8 {
-		t.Fatalf("git called %d times, want 8 (list, add, commit, drop aborted, rename, remove, prune, sweep)", len(calls))
+	if len(calls) != 9 {
+		t.Fatalf("git called %d times, want 9 (list, add, commit, checkout probe, drop aborted, rename, remove, prune, sweep)", len(calls))
 	}
 	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "team/ship/issue-42-*", "--format=%(refname:short)"}, "finalized check")
-	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	assertArgs(t, calls[5].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
 }
 
 // TestCleanupRejectsReservedBranchPrefix pins the trust boundary: a workflow
@@ -2871,6 +2947,233 @@ func TestRunTestSuiteActivityHugeOutputNoTaskLog(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("a run outside an activity context created task logs %v", entries)
+	}
+}
+
+// gitInfoExclude resolves the repository's .git/info/exclude path the way
+// the activity does — through git, so a linked worktree's gitdir indirection
+// is honored — for assertions on what the dump exclusion wrote.
+func gitInfoExclude(t *testing.T, wt string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", wt, "rev-parse", "--git-path", "info/exclude").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse --git-path info/exclude: %v: %s", err, out)
+	}
+	path := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(wt, path)
+	}
+	return path
+}
+
+// TestRunTestSuiteActivityOutputDump pins the suite-output dump contract:
+// off (OutputDir empty) writes nothing at all; on, the complete combined
+// output lands at <dir>/<timestamp>.log inside the worktree and DumpPath
+// names it worktree-relative; a same-second collision gains a -2 suffix,
+// never an overwrite; and a failed dump is best-effort — DumpPath empty,
+// the verdict untouched. A real git repository backs the enabled case, so
+// the .git/info/exclude side effect is asserted too.
+func TestRunTestSuiteActivityOutputDump(t *testing.T) {
+	t.Run("off writes nothing", func(t *testing.T) {
+		newStubLog(t)
+		wt := t.TempDir()
+		res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: wt,
+			Command:      "echo 'suite green'",
+		})
+		if err != nil {
+			t.Fatalf("RunTestSuiteActivity: %v", err)
+		}
+		if res.DumpPath != "" {
+			t.Errorf("DumpPath = %q, want empty with dumping off", res.DumpPath)
+		}
+		if _, err := os.Stat(filepath.Join(wt, ".daedalus", "test-output")); !os.IsNotExist(err) {
+			t.Errorf("dump dir exists with dumping off: %v", err)
+		}
+		if !strings.Contains(res.Logs, "suite green") {
+			t.Errorf("logs %q should contain suite output", res.Logs)
+		}
+	})
+
+	t.Run("enabled writes the complete record, excluded from status", func(t *testing.T) {
+		newStubLog(t)
+		wt := gitRepo(t)
+		res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: wt,
+			Command:      "echo 'suite green'; echo 'on stderr' >&2",
+			OutputDir:    ".daedalus/test-output",
+		})
+		if err != nil {
+			t.Fatalf("RunTestSuiteActivity: %v", err)
+		}
+		if !res.Passed {
+			t.Error("Passed = false, want true")
+		}
+		dumpRe := regexp.MustCompile(`^\.daedalus/test-output/\d{8}-\d{6}\.log$`)
+		if !dumpRe.MatchString(res.DumpPath) {
+			t.Fatalf("DumpPath = %q, want a worktree-relative <timestamp>.log under .daedalus/test-output", res.DumpPath)
+		}
+		data, err := os.ReadFile(filepath.Join(wt, res.DumpPath))
+		if err != nil {
+			t.Fatalf("read dump: %v", err)
+		}
+		if !strings.Contains(string(data), "suite green") || !strings.Contains(string(data), "on stderr") {
+			t.Errorf("dump %q lacks the complete combined output (stdout or stderr missing)", data)
+		}
+		// The complete output still travels the task-log-free unit path
+		// when it fits the transport.
+		if !strings.Contains(res.Logs, "suite green") {
+			t.Errorf("logs %q should contain suite output", res.Logs)
+		}
+		// The dir never joins the deliverable diff: excluded via
+		// .git/info/exclude, exactly once, and git agrees.
+		excl := gitInfoExclude(t, wt)
+		data, err = os.ReadFile(excl)
+		if err != nil {
+			t.Fatalf("read exclude: %v", err)
+		}
+		if got := strings.Count(string(data), ".daedalus/test-output\n"); got != 1 {
+			t.Errorf("exclude file carries the dir %d times, want exactly once: %q", got, data)
+		}
+		if out, err := exec.Command("git", "-C", wt, "check-ignore", "-q",
+			filepath.Join(".daedalus", "test-output", "x.log")).CombinedOutput(); err != nil {
+			t.Errorf("git check-ignore the dumped log failed: %v: %s", err, out)
+		}
+		if out, err := exec.Command("git", "-C", wt, "status", "--porcelain").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "" {
+			t.Errorf("git status after the dump = %q (%v), want a clean tree", out, err)
+		}
+	})
+
+	t.Run("same-second collision gains -2, never overwrites", func(t *testing.T) {
+		newStubLog(t)
+		wt := t.TempDir()
+		dir := filepath.Join(wt, ".daedalus", "test-output")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		var res TestResult
+		var err error
+		for attempt := 0; ; attempt++ {
+			if attempt == 8 {
+				t.Fatal("no same-second collision produced in 8 attempts")
+			}
+			// Pre-occupy the exact <timestamp>.log the dump would take if
+			// it ended this second; a second rollover between here and the
+			// dump would dodge the collision, so retry.
+			base := time.Now().Format("20060102-150405")
+			preExisting := filepath.Join(dir, base+".log")
+			if err := os.WriteFile(preExisting, []byte("pre-existing\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res, err = RunTestSuiteActivity(context.Background(), TestRunInput{
+				WorktreePath: wt,
+				Command:      "echo 'suite green'",
+				OutputDir:    ".daedalus/test-output",
+			})
+			if err != nil {
+				t.Fatalf("RunTestSuiteActivity: %v", err)
+			}
+			if filepath.Base(res.DumpPath) == base+"-2.log" {
+				break
+			}
+		}
+		// The occupied name kept its original content, and the dump landed
+		// beside it under the -2 suffix.
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var dumped bool
+		for _, e := range entries {
+			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) == "pre-existing\n" {
+				continue
+			}
+			if !strings.Contains(string(data), "suite green") {
+				t.Errorf("dump file %s = %q, want the suite output", e.Name(), data)
+			}
+			dumped = true
+		}
+		if !dumped {
+			t.Fatalf("no dump file written beside the occupied name: DumpPath %q, entries %v", res.DumpPath, entries)
+		}
+		if !strings.HasSuffix(res.DumpPath, "-2.log") {
+			t.Errorf("DumpPath = %q, want the -2 collision suffix", res.DumpPath)
+		}
+	})
+
+	t.Run("failed dump is best-effort", func(t *testing.T) {
+		newStubLog(t)
+		wt := t.TempDir()
+		// A regular file where the dump dir's parent would go makes
+		// MkdirAll fail — the dump gives up, the suite stays green.
+		if err := os.WriteFile(filepath.Join(wt, "blocker"), []byte("in the way"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: wt,
+			Command:      "echo 'suite green'",
+			OutputDir:    "blocker/nested",
+		})
+		if err != nil {
+			t.Fatalf("a failed dump must not fail the suite, got %v", err)
+		}
+		if res.DumpPath != "" {
+			t.Errorf("DumpPath = %q, want empty after the failed dump", res.DumpPath)
+		}
+		if !res.Passed || !strings.Contains(res.Logs, "suite green") {
+			t.Errorf("result = %+v, want the ordinary green result with its logs", res)
+		}
+	})
+}
+
+// TestRunTestSuiteActivityHugeOutputDumpNamesWorktreeRecord pins the
+// over-limit contract with dumping on: the marker names the worktree dump
+// — readable by a jailed agent — instead of the task log, and the dump
+// file itself holds the complete record the result lost.
+func TestRunTestSuiteActivityHugeOutputDumpNamesWorktreeRecord(t *testing.T) {
+	dir := useTaskLogDir(t)
+	command, head, tail, total := hugeSuiteCommand()
+	wt := t.TempDir()
+
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(RunTestSuiteActivity)
+	v, err := env.ExecuteActivity(RunTestSuiteActivity, TestRunInput{
+		WorktreePath: wt,
+		Command:      command,
+		OutputDir:    ".daedalus/test-output",
+	})
+	if err != nil {
+		t.Fatalf("a failing suite must not be a system error, got %v", err)
+	}
+	var res TestResult
+	if err := v.Get(&res); err != nil {
+		t.Fatalf("decode TestResult: %v", err)
+	}
+	if res.Passed {
+		t.Error("Passed = true, want false on non-zero exit")
+	}
+	m := regexp.MustCompile(`full output: ([^\]]+)\]`).FindStringSubmatch(res.Logs)
+	if m == nil {
+		t.Fatalf("marker does not name the full record: %q", firstLine(res.Logs))
+	}
+	if m[1] != res.DumpPath {
+		t.Errorf("marker names %q, want the dump path %q", m[1], res.DumpPath)
+	}
+	if strings.Contains(res.Logs, dir) {
+		t.Errorf("marker falls back to the task log %q despite a written dump: %q", dir, firstLine(res.Logs))
+	}
+	data, err := os.ReadFile(filepath.Join(wt, res.DumpPath))
+	if err != nil {
+		t.Fatalf("the dump (%q) is not readable: %v", res.DumpPath, err)
+	}
+	record := string(data)
+	if !strings.Contains(record, head) || !strings.Contains(record, tail) {
+		t.Errorf("the dump lacks the complete record (head or tail missing): %d bytes, want %d", len(record), total)
 	}
 }
 

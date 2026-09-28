@@ -117,6 +117,28 @@ func TestWipeBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("suffixed aborted variants match their glob, the canonical name does not", func(t *testing.T) {
+		// A snapshot preserved while the canonical aborted name was checked
+		// out elsewhere carries a -<n> suffix; the wipe's suffixed-aborted
+		// glob must catch it, without the glob bleeding into the canonical
+		// name (which its own exact category deletes).
+		repo := wipeTestRepo(t)
+		wipeGitHelper(t, repo, "branch", "aborted/issue-42-2")
+
+		n, err := wipeBranches(repo, "aborted/issue-42-*")
+		if err != nil {
+			t.Fatalf("wipeBranches: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("wipeBranches deleted %d branches, want 1 (the suffixed variant)", n)
+		}
+		got := listBranches(t, repo)
+		want := []string{"aborted/issue-42", "feat/issue-42-a", "feat/issue-42-stale", "master", "team/issue-42-a"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("surviving branches = %v, want %v", got, want)
+		}
+	})
+
 	t.Run("listing failure is returned", func(t *testing.T) {
 		if _, err := wipeBranches(t.TempDir(), "feat/*"); err == nil ||
 			!strings.Contains(err.Error(), "git branch") {

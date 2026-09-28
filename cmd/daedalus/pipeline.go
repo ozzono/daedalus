@@ -149,6 +149,7 @@ func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt st
 		ReviewTimeout:   cfg.ReviewTimeout,
 		CleanupTimeout:  cfg.CleanupTimeout,
 		SharedTestQueue: sharedTestQueueInput(cfg),
+		TestOutputDir:   cfg.TestOutputDir(),
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -287,6 +288,7 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		ReviewTimeout:   cfg.ReviewTimeout,
 		CleanupTimeout:  cfg.CleanupTimeout,
 		SharedTestQueue: sharedTestQueueInput(cfg),
+		TestOutputDir:   cfg.TestOutputDir(),
 		BaseBranch:      base,
 		// No truncation anywhere in the app: the complete last review rides
 		// into the continued run's opening prompt.

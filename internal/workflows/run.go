@@ -525,12 +525,21 @@ func (r *pipelineRun) runSuite(command string) (activities.TestResult, error) {
 			WorktreePath: r.worktree.WorktreePath,
 			Command:      command,
 			Cover:        r.cover,
+			OutputDir:    r.input.TestOutputDir,
 		}).Get(r.ctx, &result)
 	if err == nil {
 		// A suite round that ran to completion resets the quota streak
 		// like any other completed round — even a red one, since the
 		// provider was reachable for it.
 		r.quotaHeartbeats = 0
+		// The dump relay: wherever Logs already travels — every fix
+		// prompt and reviewer round — a successful dump adds one line
+		// naming the file (worktree-relative, so a jailed agent can open
+		// it), even under the transport limit. Empty DumpPath (dumping
+		// off, or the best-effort write failed) adds nothing.
+		if result.DumpPath != "" {
+			result.Logs += "\nfull suite output: " + result.DumpPath + "\n"
+		}
 		return result, nil
 	}
 	if !temporal.IsTimeoutError(err) {

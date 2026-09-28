@@ -107,6 +107,7 @@ func wipePipeline(cfg config.Config, workflowID string, yes bool) error {
 	// activities, so the naming rule stays single-sourced.
 	inFlightGlob := activities.InFlightBranchPrefix + segment + "-*"
 	preservedGlob := prefix + "/" + segment + "-*"
+	abortedGlob := aborted + "-*"
 
 	// A parked run's preserved work is resumable via `daedalus continue`;
 	// wipe destroys that path permanently. A park shows only as the failed
@@ -128,8 +129,8 @@ func wipePipeline(cfg config.Config, workflowID string, yes bool) error {
 		fmt.Printf("daedalus wipe %s (status: %v)\n", workflowID, status)
 		fmt.Printf("  repo:          %s\n", prev.RepoPath)
 		fmt.Printf("  worktree:      %s\n", worktree)
-		fmt.Printf("  branches:      %s, %s, %s (deleted from the repo)\n",
-			inFlightGlob, preservedGlob, aborted)
+		fmt.Printf("  branches:      %s, %s, %s, %s (deleted from the repo)\n",
+			inFlightGlob, preservedGlob, aborted, abortedGlob)
 		fmt.Printf("  session file:  %s\n", sessionFile)
 		fmt.Printf("  task log:      %s\n", logFile)
 		fmt.Println("Every artifact above is erased permanently; Temporal's history is the only record left.")
@@ -200,12 +201,15 @@ func wipePipeline(cfg config.Config, workflowID string, yes bool) error {
 	// Branches: in-flight (crashed runs' stale ones included — the normal
 	// path only sweeps them on the next run for the same issue), every
 	// preserved deliverable, and the aborted/ continue snapshot (deleting
-	// it is what makes post-wipe `continue` fail cleanly). Each category
-	// reports its own line.
+	// it is what makes post-wipe `continue` fail cleanly) plus its suffixed
+	// variants — a snapshot preserved while the canonical name was checked
+	// out elsewhere carries a -<n> suffix and would otherwise survive every
+	// wipe of this issue. Each category reports its own line.
 	for _, cat := range []struct{ label, pattern string }{
 		{"in-flight branches", inFlightGlob},
 		{"preserved branches", preservedGlob},
 		{"aborted branch", aborted},
+		{"suffixed aborted branches", abortedGlob},
 	} {
 		n, err := wipeBranches(prev.RepoPath, cat.pattern)
 		erase(cat.label, n > 0, err)
