@@ -244,6 +244,11 @@ func RunTestSuiteActivity(ctx context.Context, input TestRunInput) (TestResult, 
 			res.DumpPath = dumpPath
 			fullLogPath = dumpPath
 		}
+		// Post-dump mirror (test_output.mirror), the same best-effort
+		// contract as the dump itself: a mirror failure leaves the task
+		// log and the worktree dump holding the complete record and never
+		// changes the verdict.
+		mirrorToHost(ctx, input.WorktreePath, input.OutputDir, os.Getenv(config.TestOutputMirrorEnv))
 	}
 	if err != nil && !isWaitDelay(err) {
 		if _, ok := errors.AsType[*exec.ExitError](err); !ok {

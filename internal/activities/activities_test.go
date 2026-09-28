@@ -3891,3 +3891,191 @@ exit 0`)
 		})
 	}
 }
+
+// TestRunJailedClaudeActivityBugMirror pins the implementing round's
+// post-round mirror wiring: the activity mirrors each file under the bug
+// dir (read from DAEDALUS_BUG_DIR) into the host mirror (read from
+// DAEDALUS_BUG_MIRROR) on every exit path — including a round whose
+// ai-jail fails, since a round cut off at its ceiling may already have
+// filed files — and an absent mirror env mirrors nothing.
+func TestRunJailedClaudeActivityBugMirror(t *testing.T) {
+	fileBug := func(t *testing.T, wt string) {
+		t.Helper()
+		bug := filepath.Join(wt, "backlog", "bugs", "issue-1.md")
+		if err := os.MkdirAll(filepath.Dir(bug), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(bug, []byte("trigger: x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("mirrors filed bugs after the round", func(t *testing.T) {
+		newStubLog(t)
+		stubBin(t, "ai-jail", "echo done; exit 0")
+		t.Setenv(config.BugDirEnv, "backlog/bugs")
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		t.Setenv(config.BugMirrorEnv, mirror)
+		wt := t.TempDir()
+		fileBug(t, wt)
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		data, err := os.ReadFile(filepath.Join(mirror, "issue-1.md"))
+		if err != nil {
+			t.Fatalf("read mirrored bug file: %v", err)
+		}
+		if string(data) != "trigger: x\n" {
+			t.Errorf("mirrored content = %q, want the filed bug file's content", data)
+		}
+	})
+
+	t.Run("mirrors after a failed round too", func(t *testing.T) {
+		newStubLog(t)
+		stubBin(t, "ai-jail", "exit 1")
+		t.Setenv(config.BugDirEnv, "backlog/bugs")
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		t.Setenv(config.BugMirrorEnv, mirror)
+		wt := t.TempDir()
+		fileBug(t, wt)
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err == nil {
+			t.Fatal("RunJailedClaudeActivity = nil error, want the ai-jail failure")
+		}
+		if _, err := os.Stat(filepath.Join(mirror, "issue-1.md")); err != nil {
+			t.Errorf("mirrored bug file missing after a failed round: %v", err)
+		}
+	})
+
+	t.Run("no mirror env mirrors nothing", func(t *testing.T) {
+		newStubLog(t)
+		stubBin(t, "ai-jail", "echo done; exit 0")
+		t.Setenv(config.BugDirEnv, "backlog/bugs")
+		t.Setenv(config.BugMirrorEnv, "")
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		wt := t.TempDir()
+		fileBug(t, wt)
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		if _, err := os.Stat(mirror); !os.IsNotExist(err) {
+			t.Errorf("mirror dir created with mirroring off: %v", err)
+		}
+	})
+}
+
+// TestRunJailedReviewerActivityBugMirror pins the reviewer round's mirror
+// wiring: the reviewer's prompt carries the bug policy, so its filed files
+// mirror onto the host the same way the implementing round's do.
+func TestRunJailedReviewerActivityBugMirror(t *testing.T) {
+	newStubLog(t)
+	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+	stubBin(t, "ai-jail", `printf 'Looks good.\nAPPROVED\n'; exit 0`)
+	t.Setenv(config.BugDirEnv, "backlog/bugs")
+	mirror := filepath.Join(t.TempDir(), "mirror")
+	t.Setenv(config.BugMirrorEnv, mirror)
+
+	wt := t.TempDir()
+	bug := filepath.Join(wt, "backlog", "bugs", "review-found.md")
+	if err := os.MkdirAll(filepath.Dir(bug), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bug, []byte("trigger: y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+		WorktreePath: wt,
+		Focus:        "the implementation",
+	})
+	if err != nil {
+		t.Fatalf("RunJailedReviewerActivity: %v", err)
+	}
+	if !res.Approved {
+		t.Error("Approved = false, want true")
+	}
+	data, err := os.ReadFile(filepath.Join(mirror, "review-found.md"))
+	if err != nil {
+		t.Fatalf("read mirrored bug file: %v", err)
+	}
+	if string(data) != "trigger: y\n" {
+		t.Errorf("mirrored content = %q, want the filed bug file's content", data)
+	}
+}
+
+// TestRunTestSuiteActivityOutputMirror pins the suite dump's mirror
+// wiring: with dumping on and DAEDALUS_TEST_OUTPUT_MIRROR set, the dump
+// is copied into the host mirror under its dump name (best-effort — the
+// verdict is untouched either way); with the env absent, or dumping off,
+// nothing is mirrored.
+func TestRunTestSuiteActivityOutputMirror(t *testing.T) {
+	t.Run("enabled mirrors the dump", func(t *testing.T) {
+		newStubLog(t)
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		t.Setenv(config.TestOutputMirrorEnv, mirror)
+
+		res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: t.TempDir(),
+			Command:      "echo 'suite green'",
+			OutputDir:    ".daedalus/test-output",
+		})
+		if err != nil {
+			t.Fatalf("RunTestSuiteActivity: %v", err)
+		}
+		if !res.Passed {
+			t.Error("Passed = false, want true")
+		}
+		data, err := os.ReadFile(filepath.Join(mirror, filepath.Base(res.DumpPath)))
+		if err != nil {
+			t.Fatalf("read mirrored dump: %v", err)
+		}
+		if !strings.Contains(string(data), "suite green") {
+			t.Errorf("mirrored dump %q lacks the suite output", data)
+		}
+	})
+
+	t.Run("no mirror env mirrors nothing", func(t *testing.T) {
+		newStubLog(t)
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		t.Setenv(config.TestOutputMirrorEnv, "")
+
+		if _, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: t.TempDir(),
+			Command:      "echo 'suite green'",
+			OutputDir:    ".daedalus/test-output",
+		}); err != nil {
+			t.Fatalf("RunTestSuiteActivity: %v", err)
+		}
+		if _, err := os.Stat(mirror); !os.IsNotExist(err) {
+			t.Errorf("mirror dir created with mirroring off: %v", err)
+		}
+	})
+
+	t.Run("dumping off mirrors nothing", func(t *testing.T) {
+		newStubLog(t)
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		t.Setenv(config.TestOutputMirrorEnv, mirror)
+
+		if _, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: t.TempDir(),
+			Command:      "echo 'suite green'",
+		}); err != nil {
+			t.Fatalf("RunTestSuiteActivity: %v", err)
+		}
+		if _, err := os.Stat(mirror); !os.IsNotExist(err) {
+			t.Errorf("mirror dir created with dumping off: %v", err)
+		}
+	})
+}

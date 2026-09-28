@@ -125,6 +125,45 @@ func runWorker(cfg config.Config, workerType string) error {
 	} else if err := os.Unsetenv(config.BugDirEnv); err != nil {
 		return fmt.Errorf("unset %s: %w", config.BugDirEnv, err)
 	}
+	// The host mirror dirs (config bug_filing.mirror / test_output.mirror,
+	// resolved through config.ResolveMirror): each section's worker copies
+	// its filed files there after the round that wrote them. Exported only
+	// when the section is enabled and a mirror configured — absent means
+	// off, the same load-bearing absence as DAEDALUS_BUG_DIR, with the
+	// same symmetric unset and daemon-spawn scrub (ProviderEnvVars). They
+	// travel worker env, not pipeline input, because a mirror is a host
+	// path: a shared test queue may run a suite on a foreign deployment's
+	// worker, and each deployment mirrors onto its own host.
+	bugMirror := ""
+	if dir := cfg.BugFilingDir(); dir != "" && cfg.BugFiling.Mirror != "" {
+		m, err := config.ResolveMirror("bug_filing mirror", cfg.BugFiling.Mirror)
+		if err != nil {
+			return fmt.Errorf("resolve bug_filing.mirror: %w", err)
+		}
+		bugMirror = m
+	}
+	if bugMirror != "" {
+		if err := os.Setenv(config.BugMirrorEnv, bugMirror); err != nil {
+			return fmt.Errorf("set %s: %w", config.BugMirrorEnv, err)
+		}
+	} else if err := os.Unsetenv(config.BugMirrorEnv); err != nil {
+		return fmt.Errorf("unset %s: %w", config.BugMirrorEnv, err)
+	}
+	testMirror := ""
+	if dir := cfg.TestOutputDir(); dir != "" && cfg.TestOutput.Mirror != "" {
+		m, err := config.ResolveMirror("test_output mirror", cfg.TestOutput.Mirror)
+		if err != nil {
+			return fmt.Errorf("resolve test_output.mirror: %w", err)
+		}
+		testMirror = m
+	}
+	if testMirror != "" {
+		if err := os.Setenv(config.TestOutputMirrorEnv, testMirror); err != nil {
+			return fmt.Errorf("set %s: %w", config.TestOutputMirrorEnv, err)
+		}
+	} else if err := os.Unsetenv(config.TestOutputMirrorEnv); err != nil {
+		return fmt.Errorf("unset %s: %w", config.TestOutputMirrorEnv, err)
+	}
 	// The worker's name is stamped into every round's captured Usage (so
 	// `daedalus report` aggregates per worker) and keys the status file
 	// published below.

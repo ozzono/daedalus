@@ -347,11 +347,20 @@ fallback:
 # worktree root, so the files are ordinary committed content of the branch
 # and reach the real repo on merge. dir empty keeps the historical
 # backlog/bugs path. While filing is enabled, load rejects an absolute dir,
-# one escaping the worktree root (".."), or one with empty or dot path
-# components; any other bytes render verbatim into the round prompts.
+# one escaping the worktree root (".."), a ~-prefixed one (~ is not
+# expanded for dirs — use mirror for host paths), or one with empty or dot
+# path components; any other bytes render verbatim into the round prompts.
+# mirror, when set, names a host directory the worker copies each filed bug
+# file into after the round that filed it: an absolute path, or ~/…
+# expanded against the worker's home (a relative mirror is rejected at
+# load). The files still ride the branch exactly as before — the mirror is
+# a host-side reflection that survives worktree cleanup, updated when a
+# later round edits a file, and a mirror failure is logged without failing
+# the round. mirror empty keeps mirroring off.
 bug_filing:
   enabled: false
   dir: ""
+  mirror: ""
 
 # Native test-suite output dumping. Off by default (the section absent, or
 # enabled: false): nothing is written and suite output reaches the run's
@@ -366,9 +375,14 @@ bug_filing:
 # keeps the dir out of "git status" via the repository's .git/info/exclude.
 # dir empty keeps the default .daedalus/test-output path. While dumping is
 # enabled, load rejects an absolute dir, one escaping the worktree root
-# (".."), or one with empty or dot path components; any other bytes are
-# used verbatim.
+# (".."), a ~-prefixed one (~ is not expanded for dirs — use mirror for
+# host paths), or one with empty or dot path components; any other bytes
+# are used verbatim. mirror, when set, names a host directory the worker
+# copies each dump into after the suite runs — cleanup otherwise disposes
+# of the dumps. Same accepted shapes and rules as bug_filing's mirror;
+# empty keeps mirroring off.
 test_output:
   enabled: false
   dir: ""
+  mirror: ""
 `

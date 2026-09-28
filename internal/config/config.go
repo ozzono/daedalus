@@ -146,6 +146,22 @@ const (
 	// and the absence is load-bearing (the worker unsets it symmetrically
 	// and the daemon-spawn scrub keeps a stale shell export out).
 	BugDirEnv = "DAEDALUS_BUG_DIR"
+	// BugMirrorEnv carries bug_filing.mirror — the host directory each
+	// round's filed bug files are copied into after the round (see
+	// ResolveMirror). Exported only when filing is enabled and a mirror
+	// is configured: absent means the mirror is off, and the absence is
+	// load-bearing (the worker unsets it symmetrically and the
+	// daemon-spawn scrub keeps a stale shell export out).
+	BugMirrorEnv = "DAEDALUS_BUG_MIRROR"
+	// TestOutputMirrorEnv carries test_output.mirror — the host directory
+	// each suite dump is copied into (see ResolveMirror). Exported only
+	// when dumping is enabled and a mirror is configured, under the same
+	// symmetric-unset discipline as BugMirrorEnv. It travels worker env
+	// rather than the pipeline input that carries test_output.dir
+	// because the mirror is a host path: a shared test queue may run a
+	// suite on a foreign deployment's worker, and each deployment
+	// mirrors onto its own host.
+	TestOutputMirrorEnv = "DAEDALUS_TEST_OUTPUT_MIRROR"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -320,6 +336,13 @@ type OpenAIConfig struct {
 type BugFilingConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Dir     string `yaml:"dir"`
+	// Mirror, when set, names a host directory each filed bug file is
+	// copied into after the round that filed it — a host-side reflection
+	// that survives worktree cleanup, complementing the worktree-relative
+	// dir the files ride the branch through. Absolute, or ~/… expanded
+	// against the worker's home (see ResolveMirror); a relative value is
+	// rejected at load. Empty keeps mirroring off.
+	Mirror string `yaml:"mirror"`
 }
 
 // TestOutputConfig toggles dumping each native test suite's complete
@@ -337,6 +360,12 @@ type BugFilingConfig struct {
 type TestOutputConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Dir     string `yaml:"dir"`
+	// Mirror, when set, names a host directory each suite dump is copied
+	// into after the suite runs — a host-side reflection that survives
+	// worktree cleanup, which otherwise disposes of the dumps. Same
+	// accepted shapes and rejection rules as BugFilingConfig.Mirror (see
+	// ResolveMirror); empty keeps mirroring off.
+	Mirror string `yaml:"mirror"`
 }
 
 // Config holds the runtime configuration for a Daedalus process, loaded
@@ -741,6 +770,8 @@ func ProviderEnvVars() []string {
 		"DAEDALUS_FALLBACK_MODEL",
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
 		BugDirEnv,
+		BugMirrorEnv,
+		TestOutputMirrorEnv,
 	}
 }
 
@@ -899,6 +930,14 @@ func (c Config) validate(path string) error {
 			return fmt.Errorf("config %s: test_output: %w", path, err)
 		}
 	}
+	// The mirrors are host paths, validated regardless of their section's
+	// toggle so a typo fails load even while mirroring is inert.
+	if _, err := ResolveMirror("bug_filing mirror", c.BugFiling.Mirror); err != nil {
+		return fmt.Errorf("config %s: bug_filing: %w", path, err)
+	}
+	if _, err := ResolveMirror("test_output mirror", c.TestOutput.Mirror); err != nil {
+		return fmt.Errorf("config %s: test_output: %w", path, err)
+	}
 	return nil
 }
 
@@ -914,13 +953,46 @@ func ValidateTestOutputDir(dir string) error {
 	return validateWorktreeRelDir("test_output dir", dir)
 }
 
+// ResolveMirror validates and resolves a bug_filing.mirror /
+// test_output.mirror value — the host-path complement of dir, and one
+// shared code path for both sections. Empty stays empty (mirroring off,
+// today's behavior). ~ and ~/… expand against the user's home directory;
+// everything else must already be absolute: a relative mirror would
+// resolve against the worktree (the copy would land back inside the tree
+// and die with its cleanup) or the daemon's cwd (nondeterministic), so
+// the error points at dir for worktree-relative intent.
+func ResolveMirror(what, mirror string) (string, error) {
+	if mirror == "" {
+		return "", nil
+	}
+	if mirror == "~" || strings.HasPrefix(mirror, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("%s %q: resolve home directory: %w", what, mirror, err)
+		}
+		return filepath.Join(home, strings.TrimPrefix(mirror, "~")), nil
+	}
+	if !filepath.IsAbs(mirror) {
+		return "", fmt.Errorf("%s %q must be an absolute host path (or ~/…); mirror is host-side — use dir for a worktree-relative folder", what, mirror)
+	}
+	return filepath.Clean(mirror), nil
+}
+
 // validateWorktreeRelDir rejects dir values that could not name a
-// worktree-relative folder: absolute paths, ".." escaping the worktree
-// root, and empty or dot components (asserted on the cleaned path, so
+// worktree-relative folder: absolute paths, ~-prefixed values, ".."
+// escaping the worktree root, and empty or dot components (asserted on
+// the cleaned path, so
 // "a/./b" and "a//b" normalize before the check rather than being rejected
 // outright). The same path-safety class as the task-log/worktree segment
 // validation in internal/activities, widened to a multi-segment dir.
 func validateWorktreeRelDir(what, dir string) error {
+	// A ~-prefixed dir would pass the checks below (filepath.IsAbs is
+	// false for it) and silently create a literal "~" directory inside
+	// the worktree — the failure mode the section's mirror exists for,
+	// so name it in the error.
+	if strings.HasPrefix(dir, "~") {
+		return fmt.Errorf("%s %q must be worktree-relative; ~ is not expanded — use the section's mirror for host paths", what, dir)
+	}
 	if filepath.IsAbs(dir) {
 		return fmt.Errorf("%s %q must be worktree-relative, not absolute", what, dir)
 	}

@@ -1173,7 +1173,7 @@ func TestValidateBugDir(t *testing.T) {
 			t.Errorf("ValidateBugDir(%q) = %v, want nil", dir, err)
 		}
 	}
-	for _, dir := range []string{"/abs", "", ".", "..", "../up", "a/../..", "a/.."} {
+	for _, dir := range []string{"/abs", "", ".", "..", "../up", "a/../..", "a/..", "~", "~/bugs"} {
 		if err := ValidateBugDir(dir); err == nil {
 			t.Errorf("ValidateBugDir(%q) = nil, want an error", dir)
 		}
@@ -1331,7 +1331,7 @@ func TestValidateTestOutputDir(t *testing.T) {
 			t.Errorf("ValidateTestOutputDir(%q) = %v, want nil", dir, err)
 		}
 	}
-	for _, dir := range []string{"/abs", "", ".", "..", "../up", "a/../..", "a/.."} {
+	for _, dir := range []string{"/abs", "", ".", "..", "../up", "a/../..", "a/..", "~", "~/dumps"} {
 		if err := ValidateTestOutputDir(dir); err == nil {
 			t.Errorf("ValidateTestOutputDir(%q) = nil, want an error", dir)
 		}
@@ -1359,7 +1359,7 @@ func TestRenderYAMLTestOutput(t *testing.T) {
 	// The durations are pinned because the render of an unset duration is
 	// a bare 0, which Load's time.Duration decode rejects outright (filed
 	// separately) — the round trip here must not stand on that bug.
-	raw, err := LoadRaw(writeConfig(t, "tests_timeout: 45m\nagent_run_timeout: 30m\nreview_timeout: 15m\ncleanup_timeout: 5m\ntest_output:\n  enabled: true\n  dir: tmp/suite-dumps\n"))
+	raw, err := LoadRaw(writeConfig(t, "tests_timeout: 45m\nagent_run_timeout: 30m\nreview_timeout: 15m\ncleanup_timeout: 5m\ntest_output:\n  enabled: true\n  dir: tmp/suite-dumps\n  mirror: /host/dumps\n"))
 	if err != nil {
 		t.Fatalf("LoadRaw: %v", err)
 	}
@@ -1367,7 +1367,7 @@ func TestRenderYAMLTestOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderYAML: %v", err)
 	}
-	for _, want := range []string{"test_output:", "enabled: true", "dir: tmp/suite-dumps"} {
+	for _, want := range []string{"test_output:", "enabled: true", "dir: tmp/suite-dumps", "mirror: /host/dumps"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderYAML output is missing %q:\n%s", want, out)
 		}
@@ -1381,5 +1381,89 @@ func TestRenderYAMLTestOutput(t *testing.T) {
 	}
 	if got := back.TestOutputDir(); got != "tmp/suite-dumps" {
 		t.Errorf("round-trip TestOutputDir() = %q, want tmp/suite-dumps", got)
+	}
+}
+
+// TestResolveMirror pins the host-path resolution shared by
+// bug_filing.mirror and test_output.mirror: empty stays empty (mirroring
+// off), ~/… expands against the user's home, an already-absolute path is
+// cleaned verbatim, and a relative path is rejected — the error pointing
+// at dir for worktree-relative intent.
+func TestResolveMirror(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{"~/bugs", filepath.Join(home, "bugs")},
+		{"/host/bugs", "/host/bugs"},
+		// Cleaning normalizes redundant spellings rather than rejecting.
+		{"/host//bugs/./x", "/host/bugs/x"},
+	} {
+		got, err := ResolveMirror("bug_filing mirror", tc.in)
+		if err != nil {
+			t.Errorf("ResolveMirror(%q) error = %v, want nil", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ResolveMirror(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	_, err := ResolveMirror("bug_filing mirror", "rel/bugs")
+	if err == nil || !strings.Contains(err.Error(), "absolute") || !strings.Contains(err.Error(), "dir") {
+		t.Errorf("ResolveMirror(%q) error = %v, want a rejection naming the host-path rule and dir", "rel/bugs", err)
+	}
+}
+
+// TestLoadMirrorValidation pins the load-time mirror gate and its
+// asymmetry with dir: a dir's path-safety gate arms only when its section
+// is enabled, but a mirror is a host path validated regardless of the
+// toggle — a typo fails load even while mirroring is inert, with the
+// section named. Accepted shapes (absolute, ~/…) load with the raw value
+// intact — resolution is the worker's job, not the load's.
+func TestLoadMirrorValidation(t *testing.T) {
+	for _, section := range []string{"bug_filing", "test_output"} {
+		_, err := Load(writeConfig(t, section+":\n  mirror: rel/bugs\n"))
+		if err == nil || !strings.Contains(err.Error(), section) || !strings.Contains(err.Error(), "absolute") {
+			t.Errorf("Load(%s mirror: rel) error = %v, want a %s mirror rejection even with the section disabled", section, err, section)
+		}
+	}
+	cfg, err := Load(writeConfig(t, "bug_filing:\n  enabled: true\n  dir: docs/bugs\n  mirror: /host/bugs\ntest_output:\n  enabled: true\n  mirror: ~/dumps\n"))
+	if err != nil {
+		t.Fatalf("Load (absolute and ~/… mirrors): %v", err)
+	}
+	if cfg.BugFiling.Mirror != "/host/bugs" {
+		t.Errorf("BugFiling.Mirror = %q, want /host/bugs", cfg.BugFiling.Mirror)
+	}
+	if cfg.TestOutput.Mirror != "~/dumps" {
+		t.Errorf("TestOutput.Mirror = %q, want the raw ~/dumps (resolution is the worker's job)", cfg.TestOutput.Mirror)
+	}
+}
+
+// TestProviderEnvVarsIncludesMirrorEnvs pins that both mirror env vars
+// are in the scrub/restore list: a daemon spawn must clear ambient
+// values, or an off-config worker would silently inherit a stale shell
+// export pointing its rounds at the wrong host directory.
+func TestProviderEnvVarsIncludesMirrorEnvs(t *testing.T) {
+	for _, env := range []string{BugMirrorEnv, TestOutputMirrorEnv} {
+		if !slices.Contains(ProviderEnvVars(), env) {
+			t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), env)
+		}
+	}
+}
+
+// TestResolveMirrorBareTilde pins the bare "~" spelling: ResolveMirror
+// expands it to the home directory, like the shell (a past implementation
+// sliced mirror[2:] on the one-byte string and panicked here, which is
+// why this lives apart from TestResolveMirror, last in the file — the
+// placement keeps any future panic from masking the table's results).
+func TestResolveMirrorBareTilde(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	got, err := ResolveMirror("bug_filing mirror", "~")
+	if err != nil {
+		t.Fatalf("ResolveMirror(\"~\") error = %v, want nil", err)
+	}
+	if got != home {
+		t.Errorf("ResolveMirror(\"~\") = %q, want %q", got, home)
 	}
 }
