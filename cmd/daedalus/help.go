@@ -381,6 +381,21 @@ CONFIGURATION REFERENCE
                         absolute dir, one escaping the worktree root, or one
                         with empty or dot path components; any other bytes
                         render verbatim into the round prompts
+  test_output           Suite-output dump toggle. Off by default (the
+                        section absent, or enabled: false): nothing is
+                        written beyond today's task log. When enabled, the
+                        native test suite execution each round writes its
+                        complete combined output to
+                        <test_output.dir>/<timestamp>.log in the run's
+                        worktree and the run's tester, reviewer, and result
+                        report are told the path — the fix loop can then
+                        read the full record inside its sandbox instead of
+                        a transport-bounded tail. The dir is kept out of
+                        "git status" via .git/info/exclude, so the dump
+                        never joins the deliverable diff; the run's
+                        worktree cleanup removes it. dir empty keeps the
+                        default .daedalus/test-output path. Same path
+                        validation as bug_filing while enabled
   temporal.host         Temporal frontend address (default 127.0.0.1:7233)
   temporal.ui_port      Temporal UI port, shown at worker startup (default 8233)
   temporal.task_queue   Routing key; distinct projects or flows sharing one

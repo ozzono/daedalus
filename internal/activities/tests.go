@@ -40,6 +40,13 @@ type TestResult struct {
 	// computable; empty otherwise. The workflow relays it (and the delta
 	// against the previous round) to the reviewer.
 	Coverage string
+	// DumpPath is the worktree-relative path of the file holding the
+	// suite's complete combined output (test_output dumping enabled and
+	// the write succeeded); empty otherwise — dumping off or the
+	// best-effort write failed, in which case the task log alone holds the
+	// complete record, exactly as before. Inside the run's worktree, so a
+	// jailed tester or reviewer can read it.
+	DumpPath string
 }
 
 // RunNativeTestsActivity resolves and runs the repository's own test suite
@@ -133,6 +140,15 @@ type TestRunInput struct {
 	// "go test" — other languages' coverage needs the same slot built for
 	// their runners before a flow asks for it.
 	Cover bool
+	// OutputDir is the worktree-relative folder the suite's complete
+	// combined output is dumped under (config test_output, resolved by the
+	// scheduling deployment and carried through the pipeline input — never
+	// worker env, since a shared test queue can land the suite on a
+	// foreign deployment's worker whose env would name the wrong dir).
+	// Empty means dumping is off; nothing is written and the result is
+	// byte-identical to before. It rides the same config→pipeline-input
+	// route as shared_test_queue (one config drives the scheduling end).
+	OutputDir string
 }
 
 // shellQuote single-quotes s for sh, escaping embedded single quotes.
@@ -218,21 +234,121 @@ func RunTestSuiteActivity(ctx context.Context, input TestRunInput) (TestResult, 
 	// point. The path feeds the transport-bound copies below.
 	logPath := appendTaskLog(ctx, fmt.Sprintf("test suite exited after %s: %s",
 		time.Since(start).Round(time.Second), command), out.String())
+	// Suite-output dump (test_output enabled): the complete record also
+	// lands in the worktree, where the jailed tester and reviewer can read
+	// it. Best-effort — a failed dump leaves DumpPath empty and the task
+	// log holding the complete record, and never changes the verdict.
+	fullLogPath := logPath
+	if input.OutputDir != "" {
+		if dumpPath := dumpSuiteOutput(ctx, input.WorktreePath, input.OutputDir, out.String()); dumpPath != "" {
+			res.DumpPath = dumpPath
+			fullLogPath = dumpPath
+		}
+	}
 	if err != nil && !isWaitDelay(err) {
 		if _, ok := errors.AsType[*exec.ExitError](err); !ok {
 			return TestResult{}, fmt.Errorf("run tests (%s): %w: %s",
-				res.Command, err, boundedOutput(logPath, out.String()))
+				res.Command, err, boundedOutput(fullLogPath, out.String()))
 		}
 		// A failing suite is a red round, not a system error — and the
 		// output captured before the failure is the point: the fix loop
 		// digests it.
-		res.Passed, res.Logs = false, boundedOutput(logPath, out.String())
+		res.Passed, res.Logs = false, boundedOutput(fullLogPath, out.String())
 		res.Coverage = goTotalCoverage(ctx, profile)
 		return res, nil
 	}
-	res.Passed, res.Logs = true, boundedOutput(logPath, out.String())
+	res.Passed, res.Logs = true, boundedOutput(fullLogPath, out.String())
 	res.Coverage = goTotalCoverage(ctx, profile)
 	return res, nil
+}
+
+// dumpSuiteOutput writes the suite's complete combined output to
+// <worktreePath>/<dir>/<timestamp>.log and returns the worktree-relative
+// path; "" when the write failed (best-effort — see RunTestSuiteActivity).
+// The timestamp is second-precision; a file already at that name is never
+// overwritten — the run lands in "-2", "-3", … (O_EXCL create, so two
+// suites ending the same second cannot clobber each other). The dir is
+// kept out of `git status` (excludeSuiteDirFromStatus) so an
+// agent-staged diff cannot pick the log up.
+func dumpSuiteOutput(ctx context.Context, worktreePath, dir, out string) string {
+	logger := activityLogger(ctx)
+	absDir := filepath.Join(worktreePath, dir)
+	if err := os.MkdirAll(absDir, 0o755); err != nil {
+		logger.Warn("Test-output dump dir could not be created", "Dir", absDir, "Error", err)
+		return ""
+	}
+	base := time.Now().Format("20060102-150405")
+	name := base + ".log"
+	for i := 2; ; i++ {
+		f, err := os.OpenFile(filepath.Join(absDir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if os.IsExist(err) {
+			name = fmt.Sprintf("%s-%d.log", base, i)
+			continue
+		}
+		if err != nil {
+			logger.Warn("Test-output dump file could not be created", "Path", filepath.Join(absDir, name), "Error", err)
+			return ""
+		}
+		if _, err := f.WriteString(out); err != nil {
+			f.Close()
+			logger.Warn("Test-output dump write failed", "Path", filepath.Join(absDir, name), "Error", err)
+			return ""
+		}
+		if err := f.Close(); err != nil {
+			logger.Warn("Test-output dump write failed", "Path", filepath.Join(absDir, name), "Error", err)
+			return ""
+		}
+		excludeSuiteDirFromStatus(ctx, worktreePath, dir)
+		return filepath.Join(dir, name)
+	}
+}
+
+// excludeSuiteDirFromStatus best-effort appends dir to the repository's
+// .git/info/exclude, so the dump never surfaces as an untracked file a
+// stage-everything agent round could commit into the deliverable diff. The
+// real exclude path is resolved through git — a linked worktree's `.git`
+// is a file pointing at its gitdir, and info/exclude lives in the common
+// dir — and any failure is a logged no-op: a leftover untracked log is a
+// review-visible artifact, never a failed suite. ponytail: info/exclude
+// matches gitignore-style, so a dir bearing `*?[` metachars may not match
+// its own line, and one starting with `!` or `#` lands as a negation or
+// comment — un-ignoring (or ignoring nothing) across every worktree of
+// that repository — because validateWorktreeRelDir admits any non-path
+// bytes verbatim. The operator-trusted dir makes residual risk
+// review-visible, per the same ceiling as the task's branch-hygiene
+// contract.
+func excludeSuiteDirFromStatus(ctx context.Context, worktreePath, dir string) {
+	out, err := exec.CommandContext(ctx, "git", "-C", worktreePath,
+		"rev-parse", "--git-path", "info/exclude").Output()
+	if err != nil {
+		return
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(worktreePath, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if line == dir {
+			return
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	prefix := ""
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		prefix = "\n"
+	}
+	f.WriteString(prefix + dir + "\n")
 }
 
 // testOutputTailLimit bounds suite output that travels through Temporal
@@ -244,19 +360,21 @@ const testOutputTailLimit = 512 << 10 // 512 KiB
 
 // boundedOutput passes out through byte-identical when it fits the
 // transport limit; larger output becomes a marker line — total size, the
-// fact of the cut, and the task-log path holding the complete record —
-// followed by the final testOutputTailLimit bytes (a tail: the end of a
-// run is where failures live). logPath may be empty (no task log was
-// written); the marker then names the cut only. The complete output always
-// reaches the task log before anything is bounded, so the no-truncation
-// contract holds — only what fits Temporal's payload cap changes.
-func boundedOutput(logPath, out string) string {
+// fact of the cut, and the path holding the complete record — followed by
+// the final testOutputTailLimit bytes (a tail: the end of a run is where
+// failures live). fullPath may be empty (no full record exists); the
+// marker then names the cut only. It is the worktree dump path when a
+// dump was written (readable by a jailed agent), else the task-log path.
+// The complete output always reaches the task log before anything is
+// bounded, so the no-truncation contract holds — only what fits
+// Temporal's payload cap changes.
+func boundedOutput(fullPath, out string) string {
 	if len(out) <= testOutputTailLimit {
 		return out
 	}
 	loc := ""
-	if logPath != "" {
-		loc = "; full output: " + logPath
+	if fullPath != "" {
+		loc = "; full output: " + fullPath
 	}
 	marker := fmt.Sprintf("[daedalus: suite output exceeds the transport limit — %d bytes total; last %d bytes follow%s]\n",
 		len(out), testOutputTailLimit, loc)

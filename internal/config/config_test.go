@@ -1297,3 +1297,89 @@ func TestRenderYAMLSharedTestQueue(t *testing.T) {
 		t.Error("round-trip SharesTestQueue() = true, want false")
 	}
 }
+
+// TestTestOutputDir pins the effective-dir resolution: off (the section
+// absent, or enabled: false) returns "" — the off signal the pipeline
+// input carries to the suite activity; enabled without a dir keeps
+// DefaultTestOutputDir; an explicit dir loads through verbatim.
+func TestTestOutputDir(t *testing.T) {
+	for _, tc := range []struct {
+		name, doc, want string
+	}{
+		{name: "absent", doc: "", want: ""},
+		{name: "disabled", doc: "test_output:\n  enabled: false\n  dir: dumps\n", want: ""},
+		{name: "enabled default dir", doc: "test_output:\n  enabled: true\n", want: DefaultTestOutputDir},
+		{name: "enabled explicit dir", doc: "test_output:\n  enabled: true\n  dir: tmp/suite-dumps\n", want: "tmp/suite-dumps"},
+	} {
+		cfg, err := Load(writeConfig(t, tc.doc))
+		if err != nil {
+			t.Fatalf("%s: Load: %v", tc.name, err)
+		}
+		if got := cfg.TestOutputDir(); got != tc.want {
+			t.Errorf("%s: TestOutputDir() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestValidateTestOutputDir pins the path-safety classes a worktree-relative
+// folder must satisfy: absolute paths, ".." escaping the root, and empty
+// or dot components are rejected, while equivalent spellings ("a/./b",
+// "a//b", trailing slash) normalize to the same clean path and load.
+func TestValidateTestOutputDir(t *testing.T) {
+	for _, dir := range []string{".daedalus/test-output", "tmp", "a/./b", "a//b", "a/"} {
+		if err := ValidateTestOutputDir(dir); err != nil {
+			t.Errorf("ValidateTestOutputDir(%q) = %v, want nil", dir, err)
+		}
+	}
+	for _, dir := range []string{"/abs", "", ".", "..", "../up", "a/../..", "a/.."} {
+		if err := ValidateTestOutputDir(dir); err == nil {
+			t.Errorf("ValidateTestOutputDir(%q) = nil, want an error", dir)
+		}
+	}
+}
+
+// TestLoadTestOutputValidation pins that the path-safety gate arms only
+// when dumping is on: an off toggle never writes anything, so a garbage
+// dir loads fine disabled but is rejected at load — with the section
+// named — once enabled.
+func TestLoadTestOutputValidation(t *testing.T) {
+	if _, err := Load(writeConfig(t, "test_output:\n  enabled: false\n  dir: ../escape\n")); err != nil {
+		t.Fatalf("Load (off): %v", err)
+	}
+	_, err := Load(writeConfig(t, "test_output:\n  enabled: true\n  dir: ../escape\n"))
+	if err == nil || !strings.Contains(err.Error(), "test_output:") || !strings.Contains(err.Error(), "must not escape the worktree root") {
+		t.Fatalf("Load (on, escaping dir) error = %v, want a test_output path-safety rejection", err)
+	}
+}
+
+// TestRenderYAMLTestOutput pins that the test_output section renders and
+// round-trips: an enabled run with an explicit dir renders the section and
+// parses back to the same Config.
+func TestRenderYAMLTestOutput(t *testing.T) {
+	// The durations are pinned because the render of an unset duration is
+	// a bare 0, which Load's time.Duration decode rejects outright (filed
+	// separately) — the round trip here must not stand on that bug.
+	raw, err := LoadRaw(writeConfig(t, "tests_timeout: 45m\nagent_run_timeout: 30m\nreview_timeout: 15m\ncleanup_timeout: 5m\ntest_output:\n  enabled: true\n  dir: tmp/suite-dumps\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	for _, want := range []string{"test_output:", "enabled: true", "dir: tmp/suite-dumps"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderYAML output is missing %q:\n%s", want, out)
+		}
+	}
+	back, err := Load(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("Load(RenderYAML output): %v\n%s", err, out)
+	}
+	if back.TestOutput != raw.TestOutput {
+		t.Errorf("round-trip TestOutput = %+v, want %+v", back.TestOutput, raw.TestOutput)
+	}
+	if got := back.TestOutputDir(); got != "tmp/suite-dumps" {
+		t.Errorf("round-trip TestOutputDir() = %q, want tmp/suite-dumps", got)
+	}
+}

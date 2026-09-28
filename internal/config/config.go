@@ -89,6 +89,10 @@ const (
 	// DefaultBugDir is the effective bug_filing.dir when filing is enabled
 	// without an explicit dir — the historical always-on path.
 	DefaultBugDir = "backlog/bugs"
+	// DefaultTestOutputDir is the effective test_output.dir when dumping is
+	// enabled without an explicit dir — the .daedalus/ entrypoint
+	// convention, like the .daedalus.yaml test declaration.
+	DefaultTestOutputDir = ".daedalus/test-output"
 )
 
 // Fallback wire styles accepted by the config's fallback.type.
@@ -318,6 +322,23 @@ type BugFilingConfig struct {
 	Dir     string `yaml:"dir"`
 }
 
+// TestOutputConfig toggles dumping each native test suite's complete
+// combined output into a worktree file. Off (the section absent, or
+// enabled: false — the default), no file is written and the run behaves
+// byte-identically to before. On, RunTestSuiteActivity writes the full
+// output to <dir>/<timestamp>.log in the run's worktree and names the path
+// to the jailed tester and reviewer — a worktree-relative dir puts the dump
+// inside the ai-jail sandbox's only mounted tree, so the fix loop holding a
+// transport-bounded tail can read the complete record (the task-log
+// pointer is decorative to a jailed agent; /tmp/daedalus is not mounted).
+// Dir empty keeps DefaultTestOutputDir. Unlike bug_filing's files, a dump
+// is transient and never part of the deliverable: the activity keeps the
+// dir out of `git status` via .git/info/exclude.
+type TestOutputConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Dir     string `yaml:"dir"`
+}
+
 // Config holds the runtime configuration for a Daedalus process, loaded
 // from a YAML file (see config-example.yaml).
 type Config struct {
@@ -431,6 +452,9 @@ type Config struct {
 	// BugFiling is the out-of-scope-bug filing toggle; inactive unless
 	// Enabled (see BugFilingConfig).
 	BugFiling BugFilingConfig `yaml:"bug_filing"`
+	// TestOutput is the suite-output dump toggle; inactive unless Enabled
+	// (see TestOutputConfig).
+	TestOutput TestOutputConfig `yaml:"test_output"`
 }
 
 // BugFilingDir returns the effective worktree-relative folder unscoped bug
@@ -445,6 +469,20 @@ func (c Config) BugFilingDir() string {
 		return DefaultBugDir
 	}
 	return c.BugFiling.Dir
+}
+
+// TestOutputDir returns the effective worktree-relative folder suite
+// outputs are dumped under: DefaultTestOutputDir when enabled without an
+// explicit dir, "" when dumping is off — the empty return is the off
+// signal the pipeline input carries to the suite activity.
+func (c Config) TestOutputDir() string {
+	if !c.TestOutput.Enabled {
+		return ""
+	}
+	if c.TestOutput.Dir == "" {
+		return DefaultTestOutputDir
+	}
+	return c.TestOutput.Dir
 }
 
 // durationValue marshals a time.Duration the way config files express them:
@@ -464,22 +502,23 @@ func (d durationValue) MarshalYAML() (any, error) {
 // field in struct order with the durations carried by durationValue; the
 // nested sections marshal as themselves.
 type renderConfig struct {
-	Agent                  string          `yaml:"agent"`
-	BranchPrefix           string          `yaml:"branch_prefix"`
-	Authorship             bool            `yaml:"authorship"`
-	WorkerID               string          `yaml:"worker_id"`
-	TestsTimeout           durationValue   `yaml:"tests_timeout"`
-	AgentRunTimeout        durationValue   `yaml:"agent_run_timeout"`
-	ReviewTimeout          durationValue   `yaml:"review_timeout"`
-	CleanupTimeout         durationValue   `yaml:"cleanup_timeout"`
-	MaxConcurrentAgentRuns int             `yaml:"max_concurrent_agent_runs"`
-	MaxConcurrentTests     int             `yaml:"max_concurrent_tests"`
-	SharedTestQueue        *bool           `yaml:"shared_test_queue"`
-	Temporal               TemporalConfig  `yaml:"temporal"`
-	Anthropic              AnthropicConfig `yaml:"anthropic"`
-	OpenAI                 OpenAIConfig    `yaml:"openai"`
-	Fallback               FallbackConfig  `yaml:"fallback"`
-	BugFiling              BugFilingConfig `yaml:"bug_filing"`
+	Agent                  string           `yaml:"agent"`
+	BranchPrefix           string           `yaml:"branch_prefix"`
+	Authorship             bool             `yaml:"authorship"`
+	WorkerID               string           `yaml:"worker_id"`
+	TestsTimeout           durationValue    `yaml:"tests_timeout"`
+	AgentRunTimeout        durationValue    `yaml:"agent_run_timeout"`
+	ReviewTimeout          durationValue    `yaml:"review_timeout"`
+	CleanupTimeout         durationValue    `yaml:"cleanup_timeout"`
+	MaxConcurrentAgentRuns int              `yaml:"max_concurrent_agent_runs"`
+	MaxConcurrentTests     int              `yaml:"max_concurrent_tests"`
+	SharedTestQueue        *bool            `yaml:"shared_test_queue"`
+	Temporal               TemporalConfig   `yaml:"temporal"`
+	Anthropic              AnthropicConfig  `yaml:"anthropic"`
+	OpenAI                 OpenAIConfig     `yaml:"openai"`
+	Fallback               FallbackConfig   `yaml:"fallback"`
+	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
+	TestOutput             TestOutputConfig `yaml:"test_output"`
 }
 
 // RenderYAML renders the config as YAML covering every field of the struct,
@@ -506,6 +545,7 @@ func (c Config) RenderYAML() (string, error) {
 		OpenAI:                 c.OpenAI,
 		Fallback:               c.Fallback,
 		BugFiling:              c.BugFiling,
+		TestOutput:             c.TestOutput,
 	})
 	return string(out), err
 }
@@ -854,26 +894,43 @@ func (c Config) validate(path string) error {
 			return fmt.Errorf("config %s: bug_filing: %w", path, err)
 		}
 	}
+	if dir := c.TestOutputDir(); dir != "" {
+		if err := ValidateTestOutputDir(dir); err != nil {
+			return fmt.Errorf("config %s: test_output: %w", path, err)
+		}
+	}
 	return nil
 }
 
 // ValidateBugDir rejects bug_filing.dir values that could not name a
+// worktree-relative folder (see validateWorktreeRelDir).
+func ValidateBugDir(dir string) error {
+	return validateWorktreeRelDir("bug dir", dir)
+}
+
+// ValidateTestOutputDir rejects test_output.dir values that could not name
+// a worktree-relative folder (see validateWorktreeRelDir).
+func ValidateTestOutputDir(dir string) error {
+	return validateWorktreeRelDir("test_output dir", dir)
+}
+
+// validateWorktreeRelDir rejects dir values that could not name a
 // worktree-relative folder: absolute paths, ".." escaping the worktree
 // root, and empty or dot components (asserted on the cleaned path, so
 // "a/./b" and "a//b" normalize before the check rather than being rejected
 // outright). The same path-safety class as the task-log/worktree segment
 // validation in internal/activities, widened to a multi-segment dir.
-func ValidateBugDir(dir string) error {
+func validateWorktreeRelDir(what, dir string) error {
 	if filepath.IsAbs(dir) {
-		return fmt.Errorf("bug dir %q must be worktree-relative, not absolute", dir)
+		return fmt.Errorf("%s %q must be worktree-relative, not absolute", what, dir)
 	}
 	clean := filepath.Clean(dir)
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("bug dir %q must not escape the worktree root", dir)
+		return fmt.Errorf("%s %q must not escape the worktree root", what, dir)
 	}
 	for seg := range strings.SplitSeq(clean, string(filepath.Separator)) {
 		if seg == "" || seg == "." {
-			return fmt.Errorf("bug dir %q is not a valid worktree-relative folder path", dir)
+			return fmt.Errorf("%s %q is not a valid worktree-relative folder path", what, dir)
 		}
 	}
 	return nil

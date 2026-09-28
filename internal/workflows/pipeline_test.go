@@ -868,6 +868,81 @@ func TestFeatureDevWorkflowTestLoopFeedback(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowTestOutputDumpRelay pins the dump relay end to end:
+// the config-resolved dir rides the pipeline input into every suite
+// activity call (never worker env), a dumped round's Logs gain one line
+// naming the file wherever they travel — the fix prompt and the test
+// review — and a round with no dump (off, or the write failed) travels
+// byte-identical to before.
+func TestFeatureDevWorkflowTestOutputDumpRelay(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: true},
+		{Approved: true},
+	}}
+	rev.record()
+
+	_, suiteRec := stubTestPhase(env)
+	// Green preflight baseline (no dump recorded), red phase-2 round with
+	// a dump, then the green fix round (no dump — as if the write failed).
+	const dumpPath = ".daedalus/test-output/20260927-101112.log"
+	suiteRec.script = []suiteStep{
+		{result: activities.TestResult{Passed: true, Logs: "ok"}},
+		{result: activities.TestResult{Passed: false, Logs: "--- FAIL: TestBoom\nboom", DumpPath: dumpPath}},
+		{result: activities.TestResult{Passed: true, Logs: "ok"}},
+	}
+
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-3", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	input := baseInput()
+	input.TestOutputDir = ".daedalus/test-output"
+	env.ExecuteWorkflow(FeatureDevWorkflow, input)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	// The dir rides the activity input, so a shared test queue landing the
+	// suite on a foreign deployment's worker still dumps into this run's
+	// worktree-relative dir.
+	if len(suiteRec.runs) != 3 {
+		t.Fatalf("suite ran %d times, want 3 (baseline, red round, fix round)", len(suiteRec.runs))
+	}
+	for i, run := range suiteRec.runs {
+		if run.OutputDir != ".daedalus/test-output" {
+			t.Errorf("suite run %d OutputDir = %q, want the pipeline input's dir", i, run.OutputDir)
+		}
+	}
+	// The red round's dump line rides Logs into the fix prompt...
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement, tests, tests-fix)", len(rec.inputs))
+	}
+	fixPrompt := rec.inputs[2].Prompt
+	if !strings.Contains(fixPrompt, "full suite output: "+dumpPath) {
+		t.Errorf("test-fix prompt should name the dumped record %s: %q", dumpPath, fixPrompt)
+	}
+	// ...and into the reviewer round that saw the failing output.
+	if !strings.Contains(rev.inputs[1].TestLogs, "full suite output: "+dumpPath) {
+		t.Errorf("test review logs should name the dumped record: %q", rev.inputs[1].TestLogs)
+	}
+	// A round with no dump adds nothing: the fix round's green Logs reach
+	// the second test review byte-identical to the pre-toggle shape.
+	if len(rev.inputs) != 3 {
+		t.Fatalf("reviewer ran %d times, want 3 (code, red test review, green test review)", len(rev.inputs))
+	}
+	if rev.inputs[2].TestLogs != "ok" {
+		t.Errorf("second test review logs = %q, want the undumped round's logs with no relay line", rev.inputs[2].TestLogs)
+	}
+	env.AssertExpectations(t)
+}
+
 func TestFeatureDevWorkflowReviewerErrorFails(t *testing.T) {
 	env := newTestEnv(t)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).

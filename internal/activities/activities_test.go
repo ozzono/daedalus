@@ -2950,6 +2950,233 @@ func TestRunTestSuiteActivityHugeOutputNoTaskLog(t *testing.T) {
 	}
 }
 
+// gitInfoExclude resolves the repository's .git/info/exclude path the way
+// the activity does — through git, so a linked worktree's gitdir indirection
+// is honored — for assertions on what the dump exclusion wrote.
+func gitInfoExclude(t *testing.T, wt string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", wt, "rev-parse", "--git-path", "info/exclude").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse --git-path info/exclude: %v: %s", err, out)
+	}
+	path := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(wt, path)
+	}
+	return path
+}
+
+// TestRunTestSuiteActivityOutputDump pins the suite-output dump contract:
+// off (OutputDir empty) writes nothing at all; on, the complete combined
+// output lands at <dir>/<timestamp>.log inside the worktree and DumpPath
+// names it worktree-relative; a same-second collision gains a -2 suffix,
+// never an overwrite; and a failed dump is best-effort — DumpPath empty,
+// the verdict untouched. A real git repository backs the enabled case, so
+// the .git/info/exclude side effect is asserted too.
+func TestRunTestSuiteActivityOutputDump(t *testing.T) {
+	t.Run("off writes nothing", func(t *testing.T) {
+		newStubLog(t)
+		wt := t.TempDir()
+		res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: wt,
+			Command:      "echo 'suite green'",
+		})
+		if err != nil {
+			t.Fatalf("RunTestSuiteActivity: %v", err)
+		}
+		if res.DumpPath != "" {
+			t.Errorf("DumpPath = %q, want empty with dumping off", res.DumpPath)
+		}
+		if _, err := os.Stat(filepath.Join(wt, ".daedalus", "test-output")); !os.IsNotExist(err) {
+			t.Errorf("dump dir exists with dumping off: %v", err)
+		}
+		if !strings.Contains(res.Logs, "suite green") {
+			t.Errorf("logs %q should contain suite output", res.Logs)
+		}
+	})
+
+	t.Run("enabled writes the complete record, excluded from status", func(t *testing.T) {
+		newStubLog(t)
+		wt := gitRepo(t)
+		res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: wt,
+			Command:      "echo 'suite green'; echo 'on stderr' >&2",
+			OutputDir:    ".daedalus/test-output",
+		})
+		if err != nil {
+			t.Fatalf("RunTestSuiteActivity: %v", err)
+		}
+		if !res.Passed {
+			t.Error("Passed = false, want true")
+		}
+		dumpRe := regexp.MustCompile(`^\.daedalus/test-output/\d{8}-\d{6}\.log$`)
+		if !dumpRe.MatchString(res.DumpPath) {
+			t.Fatalf("DumpPath = %q, want a worktree-relative <timestamp>.log under .daedalus/test-output", res.DumpPath)
+		}
+		data, err := os.ReadFile(filepath.Join(wt, res.DumpPath))
+		if err != nil {
+			t.Fatalf("read dump: %v", err)
+		}
+		if !strings.Contains(string(data), "suite green") || !strings.Contains(string(data), "on stderr") {
+			t.Errorf("dump %q lacks the complete combined output (stdout or stderr missing)", data)
+		}
+		// The complete output still travels the task-log-free unit path
+		// when it fits the transport.
+		if !strings.Contains(res.Logs, "suite green") {
+			t.Errorf("logs %q should contain suite output", res.Logs)
+		}
+		// The dir never joins the deliverable diff: excluded via
+		// .git/info/exclude, exactly once, and git agrees.
+		excl := gitInfoExclude(t, wt)
+		data, err = os.ReadFile(excl)
+		if err != nil {
+			t.Fatalf("read exclude: %v", err)
+		}
+		if got := strings.Count(string(data), ".daedalus/test-output\n"); got != 1 {
+			t.Errorf("exclude file carries the dir %d times, want exactly once: %q", got, data)
+		}
+		if out, err := exec.Command("git", "-C", wt, "check-ignore", "-q",
+			filepath.Join(".daedalus", "test-output", "x.log")).CombinedOutput(); err != nil {
+			t.Errorf("git check-ignore the dumped log failed: %v: %s", err, out)
+		}
+		if out, err := exec.Command("git", "-C", wt, "status", "--porcelain").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "" {
+			t.Errorf("git status after the dump = %q (%v), want a clean tree", out, err)
+		}
+	})
+
+	t.Run("same-second collision gains -2, never overwrites", func(t *testing.T) {
+		newStubLog(t)
+		wt := t.TempDir()
+		dir := filepath.Join(wt, ".daedalus", "test-output")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		var res TestResult
+		var err error
+		for attempt := 0; ; attempt++ {
+			if attempt == 8 {
+				t.Fatal("no same-second collision produced in 8 attempts")
+			}
+			// Pre-occupy the exact <timestamp>.log the dump would take if
+			// it ended this second; a second rollover between here and the
+			// dump would dodge the collision, so retry.
+			base := time.Now().Format("20060102-150405")
+			preExisting := filepath.Join(dir, base+".log")
+			if err := os.WriteFile(preExisting, []byte("pre-existing\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res, err = RunTestSuiteActivity(context.Background(), TestRunInput{
+				WorktreePath: wt,
+				Command:      "echo 'suite green'",
+				OutputDir:    ".daedalus/test-output",
+			})
+			if err != nil {
+				t.Fatalf("RunTestSuiteActivity: %v", err)
+			}
+			if filepath.Base(res.DumpPath) == base+"-2.log" {
+				break
+			}
+		}
+		// The occupied name kept its original content, and the dump landed
+		// beside it under the -2 suffix.
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var dumped bool
+		for _, e := range entries {
+			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) == "pre-existing\n" {
+				continue
+			}
+			if !strings.Contains(string(data), "suite green") {
+				t.Errorf("dump file %s = %q, want the suite output", e.Name(), data)
+			}
+			dumped = true
+		}
+		if !dumped {
+			t.Fatalf("no dump file written beside the occupied name: DumpPath %q, entries %v", res.DumpPath, entries)
+		}
+		if !strings.HasSuffix(res.DumpPath, "-2.log") {
+			t.Errorf("DumpPath = %q, want the -2 collision suffix", res.DumpPath)
+		}
+	})
+
+	t.Run("failed dump is best-effort", func(t *testing.T) {
+		newStubLog(t)
+		wt := t.TempDir()
+		// A regular file where the dump dir's parent would go makes
+		// MkdirAll fail — the dump gives up, the suite stays green.
+		if err := os.WriteFile(filepath.Join(wt, "blocker"), []byte("in the way"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, err := RunTestSuiteActivity(context.Background(), TestRunInput{
+			WorktreePath: wt,
+			Command:      "echo 'suite green'",
+			OutputDir:    "blocker/nested",
+		})
+		if err != nil {
+			t.Fatalf("a failed dump must not fail the suite, got %v", err)
+		}
+		if res.DumpPath != "" {
+			t.Errorf("DumpPath = %q, want empty after the failed dump", res.DumpPath)
+		}
+		if !res.Passed || !strings.Contains(res.Logs, "suite green") {
+			t.Errorf("result = %+v, want the ordinary green result with its logs", res)
+		}
+	})
+}
+
+// TestRunTestSuiteActivityHugeOutputDumpNamesWorktreeRecord pins the
+// over-limit contract with dumping on: the marker names the worktree dump
+// — readable by a jailed agent — instead of the task log, and the dump
+// file itself holds the complete record the result lost.
+func TestRunTestSuiteActivityHugeOutputDumpNamesWorktreeRecord(t *testing.T) {
+	dir := useTaskLogDir(t)
+	command, head, tail, total := hugeSuiteCommand()
+	wt := t.TempDir()
+
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(RunTestSuiteActivity)
+	v, err := env.ExecuteActivity(RunTestSuiteActivity, TestRunInput{
+		WorktreePath: wt,
+		Command:      command,
+		OutputDir:    ".daedalus/test-output",
+	})
+	if err != nil {
+		t.Fatalf("a failing suite must not be a system error, got %v", err)
+	}
+	var res TestResult
+	if err := v.Get(&res); err != nil {
+		t.Fatalf("decode TestResult: %v", err)
+	}
+	if res.Passed {
+		t.Error("Passed = true, want false on non-zero exit")
+	}
+	m := regexp.MustCompile(`full output: ([^\]]+)\]`).FindStringSubmatch(res.Logs)
+	if m == nil {
+		t.Fatalf("marker does not name the full record: %q", firstLine(res.Logs))
+	}
+	if m[1] != res.DumpPath {
+		t.Errorf("marker names %q, want the dump path %q", m[1], res.DumpPath)
+	}
+	if strings.Contains(res.Logs, dir) {
+		t.Errorf("marker falls back to the task log %q despite a written dump: %q", dir, firstLine(res.Logs))
+	}
+	data, err := os.ReadFile(filepath.Join(wt, res.DumpPath))
+	if err != nil {
+		t.Fatalf("the dump (%q) is not readable: %v", res.DumpPath, err)
+	}
+	record := string(data)
+	if !strings.Contains(record, head) || !strings.Contains(record, tail) {
+		t.Errorf("the dump lacks the complete record (head or tail missing): %d bytes, want %d", len(record), total)
+	}
+}
+
 // TestTestConcurrency pins the env parsing behind the test-suite cap:
 // positive values pass through; unset, malformed, and non-positive values
 // fall back to the config default.
