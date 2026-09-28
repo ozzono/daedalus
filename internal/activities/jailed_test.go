@@ -650,3 +650,147 @@ exit 0`)
 		})
 	}
 }
+
+// TestRunJailedBugMirrorMount pins the bug-mirror mount seam in
+// runJailedRound: with both mirror envs exported, the round argv gains
+// --rw-map <mirror>:<worktree>/<bug dir> before the "--" terminator, and
+// both host-side dirs (mirror and mountpoint) are created before spawn —
+// an empty mountpoint is invisible to git, and an unusable dir fails the
+// round here, because a round that ran unmounted would write bug files
+// into the real worktree and stage them onto the branch. Either env empty
+// means off: the argv stays free of --rw-map and nothing is created. A
+// colon in the composed DEST fails the round before spawn for the same
+// SOURCE:DEST ambiguity (the worktree root is not load-validated, so the
+// composed path is what gets checked).
+func TestRunJailedBugMirrorMount(t *testing.T) {
+	runRound := func(t *testing.T, wt string) ([]stubCall, error) {
+		t.Helper()
+		log := newStubLog(t)
+		// Pre-create the log so a round that fails before spawn — never
+		// invoking ai-jail, hence never appending — parses as zero calls.
+		if err := os.WriteFile(log, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stubBin(t, "ai-jail", "exit 0")
+		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		})
+		return readCalls(t, log), err
+	}
+
+	t.Run("configured mirror appends --rw-map and pre-creates dirs", func(t *testing.T) {
+		t.Setenv("DAEDALUS_AGENT", "claude")
+		wt := t.TempDir()
+		mirror := filepath.Join(t.TempDir(), "mirror")
+		t.Setenv(config.BugDirEnv, "backlog/bugs")
+		t.Setenv(config.BugMirrorEnv, mirror)
+
+		calls, err := runRound(t, wt)
+		if err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		args := calls[0].Args
+		i := slices.Index(args, "--rw-map")
+		if i == -1 || i+1 >= len(args) {
+			t.Fatalf("args %v carry no --rw-map <mirror>:<dir> pair", args)
+		}
+		want := mirror + ":" + filepath.Join(wt, "backlog/bugs")
+		if args[i+1] != want {
+			t.Errorf("--rw-map spec = %q, want %q", args[i+1], want)
+		}
+		if term := slices.Index(args, "--"); term == -1 || term < i {
+			t.Errorf("--rw-map at %d is not before the -- terminator in %v", i, args)
+		}
+		for _, dir := range []string{mirror, filepath.Join(wt, "backlog/bugs")} {
+			info, err := os.Stat(dir)
+			if err != nil || !info.IsDir() {
+				t.Errorf("mount dir %s not created before spawn: %v", dir, err)
+			}
+		}
+	})
+
+	for _, c := range []struct{ name, bugDir, mirrorEnv string }{
+		{"both envs empty", "", ""},
+		{"dir without mirror", "backlog/bugs", ""},
+		{"mirror without dir", "", "/host/bugs"},
+	} {
+		t.Run("off leaves argv unmounted: "+c.name, func(t *testing.T) {
+			t.Setenv("DAEDALUS_AGENT", "claude")
+			wt := t.TempDir()
+			t.Setenv(config.BugDirEnv, c.bugDir)
+			t.Setenv(config.BugMirrorEnv, c.mirrorEnv)
+
+			calls, err := runRound(t, wt)
+			if err != nil {
+				t.Fatalf("RunJailedClaudeActivity: %v", err)
+			}
+			for _, call := range calls {
+				if slices.Contains(call.Args, "--rw-map") {
+					t.Errorf("args %v carry --rw-map with the mirror off (%s)", call.Args, c.name)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(wt, "backlog/bugs")); !os.IsNotExist(err) {
+				t.Errorf("bug mountpoint created under the worktree while off: %v", err)
+			}
+		})
+	}
+
+	t.Run("colon in the composed mountpoint fails before spawn", func(t *testing.T) {
+		t.Setenv("DAEDALUS_AGENT", "claude")
+		wt := t.TempDir()
+		t.Setenv(config.BugDirEnv, "back:log/bugs")
+		t.Setenv(config.BugMirrorEnv, filepath.Join(t.TempDir(), "mirror"))
+
+		calls, err := runRound(t, wt)
+		if err == nil || !strings.Contains(err.Error(), "--rw-map") || !strings.Contains(err.Error(), ":") {
+			t.Fatalf("RunJailedClaudeActivity error = %v, want a mount-spec colon rejection", err)
+		}
+		if len(calls) != 0 {
+			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
+		}
+		if _, serr := os.Stat(filepath.Join(wt, "back:log")); !os.IsNotExist(serr) {
+			t.Errorf("colon mountpoint created in the real worktree: %v", serr)
+		}
+	})
+
+	t.Run("unusable mirror dir fails the round", func(t *testing.T) {
+		t.Setenv("DAEDALUS_AGENT", "claude")
+		wt := t.TempDir()
+		blocker := filepath.Join(t.TempDir(), "notdir")
+		if err := os.WriteFile(blocker, []byte("file\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(config.BugDirEnv, "backlog/bugs")
+		t.Setenv(config.BugMirrorEnv, filepath.Join(blocker, "mirror"))
+
+		calls, err := runRound(t, wt)
+		if err == nil || !strings.Contains(err.Error(), "prepare bug mirror dir") {
+			t.Fatalf("RunJailedClaudeActivity error = %v, want a mirror-dir preparation failure", err)
+		}
+		if len(calls) != 0 {
+			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
+		}
+	})
+
+	t.Run("unusable mountpoint fails the round", func(t *testing.T) {
+		t.Setenv("DAEDALUS_AGENT", "claude")
+		wt := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wt, "bugs"), []byte("file\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(config.BugDirEnv, "bugs")
+		t.Setenv(config.BugMirrorEnv, filepath.Join(t.TempDir(), "mirror"))
+
+		calls, err := runRound(t, wt)
+		if err == nil || !strings.Contains(err.Error(), "prepare bug dir mountpoint") {
+			t.Fatalf("RunJailedClaudeActivity error = %v, want a mountpoint preparation failure", err)
+		}
+		if len(calls) != 0 {
+			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
+		}
+	})
+}

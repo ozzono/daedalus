@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ozzono/daedalus/internal/version"
@@ -177,5 +178,85 @@ func TestRunWorkerBugDirEnvExports(t *testing.T) {
 		if got := os.Getenv("DAEDALUS_BUG_DIR"); got != c.want {
 			t.Errorf("DAEDALUS_BUG_DIR = %q after an enabled config, want %q", got, c.want)
 		}
+	}
+}
+
+// TestRunWorkerMirrorEnvExports pins the host-mirror env channel:
+// DAEDALUS_BUG_MIRROR and DAEDALUS_TEST_OUTPUT_MIRROR carry the resolved
+// bug_filing.mirror / test_output.mirror only when their section is
+// enabled AND a mirror is configured — absent means mirroring off, and a
+// stale shell export is cleared by a config that says off. The ~/… shape
+// is resolved by the worker (against its home), and a relative mirror
+// fails the worker startup outright with the resolver's rejection.
+func TestRunWorkerMirrorEnvExports(t *testing.T) {
+	restoreProcessEnv(t, "DAEDALUS_BUG_MIRROR", "DAEDALUS_TEST_OUTPUT_MIRROR")
+
+	// A stale export must not outlive a config that says off.
+	t.Setenv("DAEDALUS_BUG_MIRROR", "stale/host")
+	t.Setenv("DAEDALUS_TEST_OUTPUT_MIRROR", "stale/host")
+	if err := runWorker(config.Config{}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	for _, env := range []string{"DAEDALUS_BUG_MIRROR", "DAEDALUS_TEST_OUTPUT_MIRROR"} {
+		if got := os.Getenv(env); got != "" {
+			t.Errorf("%s = %q after an off config, want the stale export cleared", env, got)
+		}
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// The on-config exports both mirrors — the absolute one verbatim, the
+	// ~/… one resolved against the worker's home. A section enabled
+	// without a mirror, and a mirror configured while its section is
+	// disabled, both keep the env absent.
+	cfg := config.Config{
+		BugFiling:  config.BugFilingConfig{Enabled: true, Dir: "docs/bugs", Mirror: "/host/bugs"},
+		TestOutput: config.TestOutputConfig{Enabled: true, Dir: "dumps", Mirror: "~/mirror"},
+	}
+	if err := runWorker(cfg, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv("DAEDALUS_BUG_MIRROR"); got != "/host/bugs" {
+		t.Errorf("DAEDALUS_BUG_MIRROR = %q, want /host/bugs", got)
+	}
+	if got := os.Getenv("DAEDALUS_TEST_OUTPUT_MIRROR"); got != filepath.Join(home, "mirror") {
+		t.Errorf("DAEDALUS_TEST_OUTPUT_MIRROR = %q, want %q", got, filepath.Join(home, "mirror"))
+	}
+
+	// Enabled without a mirror: the env stays absent.
+	if err := runWorker(config.Config{
+		BugFiling:  config.BugFilingConfig{Enabled: true, Dir: "docs/bugs"},
+		TestOutput: config.TestOutputConfig{Enabled: true, Dir: "dumps"},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	for _, env := range []string{"DAEDALUS_BUG_MIRROR", "DAEDALUS_TEST_OUTPUT_MIRROR"} {
+		if got := os.Getenv(env); got != "" {
+			t.Errorf("%s = %q with no mirror configured, want it absent", env, got)
+		}
+	}
+
+	// A mirror configured while its section is disabled: absent, whatever
+	// the mirror's shape.
+	if err := runWorker(config.Config{
+		BugFiling:  config.BugFilingConfig{Mirror: "/host/bugs"},
+		TestOutput: config.TestOutputConfig{Mirror: "~/mirror"},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	for _, env := range []string{"DAEDALUS_BUG_MIRROR", "DAEDALUS_TEST_OUTPUT_MIRROR"} {
+		if got := os.Getenv(env); got != "" {
+			t.Errorf("%s = %q with the section disabled, want it absent", env, got)
+		}
+	}
+
+	// A relative mirror fails startup at resolve, before preflight —
+	// the error names the resolver, distinguishing it from the empty-queue
+	// preflight failure every case above rides on.
+	_, relErr := config.ResolveMirror("bug_filing mirror", "rel/bugs")
+	if err := runWorker(config.Config{
+		BugFiling: config.BugFilingConfig{Enabled: true, Mirror: "rel/bugs"},
+	}, ""); err == nil || !strings.Contains(err.Error(), "resolve bug_filing.mirror") || err.Error() != "resolve bug_filing.mirror: "+relErr.Error() {
+		t.Errorf("runWorker (relative bug mirror) error = %v, want the resolver's rejection wrapped under resolve bug_filing.mirror", err)
 	}
 }

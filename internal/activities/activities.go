@@ -8,8 +8,12 @@ package activities
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ozzono/daedalus/internal/config"
@@ -149,6 +153,14 @@ type ReviewResult struct {
 // guard rejects --verbose after the command by prefix match, even
 // behind --.
 func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
+	// Post-round bug mirror (bug_filing.mirror): on every exit path — a
+	// round cut off at its ceiling may already have filed files, and its
+	// worktree dies with the run's cleanup all the same. With the mirror
+	// bind-mounted into the round's jail this is a no-op (the writes
+	// already landed host-side; see mirrorToHost's SameFile guard); it
+	// stays for the unmounted fallback shape.
+	defer mirrorToHost(ctx, input.WorktreePath,
+		os.Getenv(config.BugDirEnv), os.Getenv(config.BugMirrorEnv))
 	agent, _, agentArgs := jailedAgentCLI(input.Agent)
 	// A session id from a previous round resumes that conversation instead
 	// of starting cold — the round inherits the prior context and the
@@ -231,6 +243,11 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 // verdict is parsed from the agent's visible text, falling back to raw stdout
 // for a CLI that printed plain text.
 func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewResult, error) {
+	// Post-round bug mirror: same shape and reasoning as the implementing
+	// rounds — the reviewer's prompt carries the bug policy too. A no-op
+	// under the jail mount (see mirrorToHost's SameFile guard).
+	defer mirrorToHost(ctx, input.WorktreePath,
+		os.Getenv(config.BugDirEnv), os.Getenv(config.BugMirrorEnv))
 	diff, err := stagedDiff(ctx, input.WorktreePath)
 	if err != nil {
 		return ReviewResult{}, err
@@ -307,6 +324,85 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	verdict.SessionID = session
 	verdict.Usage = usage
 	return verdict, nil
+}
+
+// mirrorToHost copies each file directly under <worktreePath>/<relDir>
+// into the host mirror directory (bug_filing.mirror / test_output.mirror,
+// exported at worker startup; either side empty means off — a no-op):
+// copy-on-first-see preserving the file name, an existing same-name mirror
+// file overwritten only when the worktree copy is newer (files are
+// written and edited across rounds). Best-effort and logged: a mirror
+// failure never fails the round or changes the verdict. The branch copy
+// stays the designed flow — the mirror is a host-side reflection that
+// survives worktree cleanup, not a relocation. Subdirectories are skipped:
+// bug files and dumps are flat files by convention. A missing source dir
+// (nothing filed yet) is silent; anything else is a logged warning. When
+// the source dir IS the mirror — the bug dir bind-mounted into the round's
+// jail (runJailedRound's --rw-map), writes already landed host-side — the
+// copy is a silent no-op: SameFile catches the bind mount, whose two host
+// paths differ but share dev+inode, where a copy would read and truncate
+// the very file it mirrors. This keeps the copy alive as the fallback for
+// an environment where the mount is absent.
+func mirrorToHost(ctx context.Context, worktreePath, relDir, mirrorDir string) {
+	if relDir == "" || mirrorDir == "" {
+		return
+	}
+	logger := activityLogger(ctx)
+	srcDir := filepath.Join(worktreePath, relDir)
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("Mirror source dir unreadable", "Dir", srcDir, "Error", err)
+		}
+		return
+	}
+	if srcInfo, err := os.Stat(srcDir); err == nil {
+		if dstInfo, err := os.Stat(mirrorDir); err == nil && os.SameFile(srcInfo, dstInfo) {
+			return
+		}
+	}
+	if err := os.MkdirAll(mirrorDir, 0o755); err != nil {
+		logger.Warn("Mirror dir could not be created", "Dir", mirrorDir, "Error", err)
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		src := filepath.Join(srcDir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			logger.Warn("Mirror source stat failed", "Path", src, "Error", err)
+			continue
+		}
+		if dstInfo, err := os.Stat(filepath.Join(mirrorDir, entry.Name())); err == nil &&
+			!info.ModTime().After(dstInfo.ModTime()) {
+			continue
+		}
+		dst := filepath.Join(mirrorDir, entry.Name())
+		if err := copyFile(src, dst, info.Mode()); err != nil {
+			logger.Warn("Mirror copy failed", "From", src, "To", dst, "Error", err)
+		}
+	}
+}
+
+// copyFile streams src into dst with src's mode, replacing any existing
+// file — the newer-wins decision belongs to mirrorToHost.
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // stagedDiff returns the full diff of the worktree against HEAD, including

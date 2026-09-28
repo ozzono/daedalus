@@ -452,6 +452,53 @@ func runJailedRound(ctx context.Context, env []string, role SessionRole, agent, 
 		}
 		args = append(args, mounts...)
 	}
+	// The bug-file mirror (bug_filing.mirror), mounted read-write into the
+	// round's sandbox at the worktree-relative bug dir when configured: the
+	// agent writes through the familiar worktree-relative path and the
+	// writes are bind-mounted straight onto the host dir — the real
+	// worktree never holds the files, so host-side git status stays clean
+	// and the branch copies nothing. Both envs are exported together at
+	// worker startup iff filing is enabled and a mirror configured; either
+	// absent means off and the args stay byte-identical to the unmounted
+	// shape. The mirror is an accepted operator trade (mirror-mapping task,
+	// 2026-09-28): it hands the jailed agent a read-write window onto a
+	// host path, steerable by repo content — the operator chooses the path.
+	// Fail-fast by construction: the mountpoint is created host-side before
+	// spawn (an empty dir is invisible to git) and an unusable mirror fails
+	// the round here, because a round that ran unmounted would write bug
+	// files into the real worktree and stage them into the branch — the
+	// exact pollution the mirror exists to prevent. ai-jail itself failing
+	// the mount (rejected flag, bwrap error) exits nonzero before the agent
+	// runs, which the wait below already surfaces as a failed round; there
+	// is no proceed-unmounted path. The spec's SOURCE:DEST split is kept
+	// unambiguous: ResolveMirror rejects a colon in the mirror and
+	// config.validate rejects one in dir while a mirror is configured —
+	// but the worktree root is not load-validated (task_queue names it),
+	// so the block below checks the composed DEST itself.
+	// ponytail: assembled here but never
+	// probed against a real ai-jail — this sandbox has no binary; that
+	// --rw-map nests inside the --worktree rw mount, tolerates the argument
+	// ordering, and leaves the per-agent masks (pi auth, aider venv,
+	// .claude/settings*) unaffected is verified only against the host-side
+	// `ai-jail --help` of 2026-09-28. Probe per preset (claude first) on
+	// the first live host.
+	if bugDir, mirror := os.Getenv(config.BugDirEnv), os.Getenv(config.BugMirrorEnv); bugDir != "" && mirror != "" {
+		if err := os.MkdirAll(mirror, 0o755); err != nil {
+			return jailResult{}, fmt.Errorf("prepare bug mirror dir %s: %w", mirror, err)
+		}
+		dest := filepath.Join(worktreePath, bugDir)
+		// The load gates keep mirror and dir colon-free, but the worktree
+		// root is not load-validated (task_queue names it, and only
+		// emptiness and the -test suffix are checked) — so the composed
+		// DEST is checked here, fail-fast like the rest of the block.
+		if strings.ContainsRune(dest, ':') {
+			return jailResult{}, fmt.Errorf("bug dir mountpoint %s must not contain %q — it is composed into the jail's --rw-map <mirror>:<dir> mount spec", dest, ":")
+		}
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			return jailResult{}, fmt.Errorf("prepare bug dir mountpoint %s: %w", dest, err)
+		}
+		args = append(args, "--rw-map", mirror+":"+dest)
+	}
 	// "--" ends ai-jail's own flags: everything after it is the jailed
 	// command, verbatim — otherwise ai-jail rejects child flags that
 	// resemble its own (e.g. claude's --verbose) as misplaced.
