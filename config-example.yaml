@@ -342,13 +342,22 @@ fallback:
 # one escaping the worktree root (".."), a ~-prefixed one (~ is not
 # expanded for dirs — use mirror for host paths), or one with empty or dot
 # path components; any other bytes render verbatim into the round prompts.
-# mirror, when set, names a host directory the worker copies each filed bug
-# file into after the round that filed it: an absolute path, or ~/…
-# expanded against the worker's home (a relative mirror is rejected at
-# load). The files still ride the branch exactly as before — the mirror is
-# a host-side reflection that survives worktree cleanup, updated when a
-# later round edits a file, and a mirror failure is logged without failing
-# the round. mirror empty keeps mirroring off.
+# mirror, when set, names a host directory each filed bug file lands in:
+# absolute, or ~/… expanded against the worker's home (a relative mirror,
+# the filesystem root, or a colon is rejected at load). The host dir is
+# bind-mounted read-write into each jailed round's sandbox at the
+# worktree-relative dir, so the agent's writes land on the host directly —
+# one mechanism, no post-round copy — and the files never enter the real
+# worktree, so they do not ride the branch. Without the mount (or on an
+# ai-jail that rejects it — such a round fails loudly, it never runs
+# unmounted), the worker-side copy after the round remains as the fallback
+# shape. Bug files already committed to your branches under dir from before
+# a mirror was configured stay on the branch while the mount shadows them
+# in future rounds. Accepting this trade is yours: a configured mirror
+# hands the jailed agent a read-write window onto a host path — repo
+# content could steer writes under it — so point it at a dedicated
+# directory, never at a shared or sensitive one. mirror empty keeps
+# mirroring off.
 bug_filing:
   enabled: false
   dir: ""

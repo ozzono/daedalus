@@ -336,12 +336,15 @@ type OpenAIConfig struct {
 type BugFilingConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Dir     string `yaml:"dir"`
-	// Mirror, when set, names a host directory each filed bug file is
-	// copied into after the round that filed it — a host-side reflection
-	// that survives worktree cleanup, complementing the worktree-relative
-	// dir the files ride the branch through. Absolute, or ~/… expanded
-	// against the worker's home (see ResolveMirror); a relative value is
-	// rejected at load. Empty keeps mirroring off.
+	// Mirror, when set, names a host directory each filed bug file lands
+	// in, complementing the worktree-relative dir. The host dir is
+	// bind-mounted read-write into each jailed round's sandbox at dir
+	// (activities' --rw-map), so the agent's writes land on the host
+	// directly and never ride the branch; without the mount, the
+	// worker-side copy after the round remains as the fallback shape.
+	// Absolute, or ~/… expanded against the worker's home (see
+	// ResolveMirror); a relative value, the filesystem root, or a colon
+	// is rejected at load. Empty keeps mirroring off.
 	Mirror string `yaml:"mirror"`
 }
 
@@ -362,9 +365,11 @@ type TestOutputConfig struct {
 	Dir     string `yaml:"dir"`
 	// Mirror, when set, names a host directory each suite dump is copied
 	// into after the suite runs — a host-side reflection that survives
-	// worktree cleanup, which otherwise disposes of the dumps. Same
-	// accepted shapes and rejection rules as BugFilingConfig.Mirror (see
-	// ResolveMirror); empty keeps mirroring off.
+	// worktree cleanup, which otherwise disposes of the dumps. Copied
+	// worker-side (the dump is written by the activity, already
+	// host-capable — no mount). Same accepted shapes and rejection rules
+	// as BugFilingConfig.Mirror (see ResolveMirror); empty keeps mirroring
+	// off.
 	Mirror string `yaml:"mirror"`
 }
 
@@ -924,6 +929,14 @@ func (c Config) validate(path string) error {
 		if err := ValidateBugDir(dir); err != nil {
 			return fmt.Errorf("config %s: bug_filing: %w", path, err)
 		}
+		// With a mirror configured, dir is composed into the jail's
+		// --rw-map <mirror>:<dir> mount spec, so a colon in dir would make
+		// the SOURCE:DEST split ambiguous — reject it at load alongside
+		// the path-safety gate. The mirror side of the spec is capped the
+		// same way in ResolveMirror.
+		if c.BugFiling.Mirror != "" && strings.ContainsRune(dir, ':') {
+			return fmt.Errorf("config %s: bug_filing: dir %q must not contain %q while a mirror is configured — it is composed into the jail's --rw-map <mirror>:<dir> mount spec", path, dir, ":")
+		}
 	}
 	if dir := c.TestOutputDir(); dir != "" {
 		if err := ValidateTestOutputDir(dir); err != nil {
@@ -960,22 +973,34 @@ func ValidateTestOutputDir(dir string) error {
 // everything else must already be absolute: a relative mirror would
 // resolve against the worktree (the copy would land back inside the tree
 // and die with its cleanup) or the daemon's cwd (nondeterministic), so
-// the error points at dir for worktree-relative intent.
+// the error points at dir for worktree-relative intent. The resolved path
+// is capped two ways because the bug mirror is mounted read-write into
+// the round's jail (activities' --rw-map): the filesystem root is
+// rejected (a root mirror would expose the whole host, HOME=/ included),
+// and so is any colon (it would make the --rw-map SOURCE:DEST split
+// ambiguous).
 func ResolveMirror(what, mirror string) (string, error) {
 	if mirror == "" {
 		return "", nil
 	}
+	resolved := mirror
 	if mirror == "~" || strings.HasPrefix(mirror, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("%s %q: resolve home directory: %w", what, mirror, err)
 		}
-		return filepath.Join(home, strings.TrimPrefix(mirror, "~")), nil
-	}
-	if !filepath.IsAbs(mirror) {
+		resolved = filepath.Join(home, strings.TrimPrefix(mirror, "~"))
+	} else if !filepath.IsAbs(mirror) {
 		return "", fmt.Errorf("%s %q must be an absolute host path (or ~/…); mirror is host-side — use dir for a worktree-relative folder", what, mirror)
 	}
-	return filepath.Clean(mirror), nil
+	clean := filepath.Clean(resolved)
+	if clean == "/" {
+		return "", fmt.Errorf("%s %q must name a host directory, not the filesystem root — the round would mount a read-write window on the whole host", what, mirror)
+	}
+	if strings.ContainsRune(clean, ':') {
+		return "", fmt.Errorf("%s %q must not contain %q — the mirror is composed into the jail's --rw-map <mirror>:<dir> mount spec", what, mirror, ":")
+	}
+	return clean, nil
 }
 
 // validateWorktreeRelDir rejects dir values that could not name a

@@ -375,12 +375,24 @@ CONFIGURATION REFERENCE
                         round prompts instruct the agent to file every
                         out-of-scope bug as a file under bug_filing.dir —
                         worktree-relative, resolved against the run's
-                        worktree root, committed branch content like any
-                        other diff; dir empty keeps the historical
-                        backlog/bugs path. While enabled, load rejects an
-                        absolute dir, one escaping the worktree root, or one
-                        with empty or dot path components; any other bytes
-                        render verbatim into the round prompts
+                        worktree root; dir empty keeps the historical
+                        backlog/bugs path. Without bug_filing.mirror the
+                        files are committed branch content like any other
+                        diff. With a mirror set (absolute, or ~/… — a
+                        relative path, the filesystem root, or a colon is
+                        rejected at load) the host dir is bind-mounted
+                        read-write into each jailed round's sandbox at dir,
+                        so the agent's writes land on the host directly and
+                        never ride the branch. A configured mirror hands
+                        the jailed agent a read-write window onto a host
+                        path — repo content could steer writes under it —
+                        so point it at a dedicated directory. While
+                        enabled, load also rejects an absolute dir, one
+                        escaping the worktree root, or one with empty or
+                        dot path components; and while a mirror is
+                        configured, a colon in dir (it is composed into the
+                        jail's mount spec). Any other bytes render verbatim
+                        into the round prompts
   test_output           Suite-output dump toggle. Off by default (the
                         section absent, or enabled: false): nothing is
                         written beyond today's task log. When enabled, the

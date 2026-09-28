@@ -155,7 +155,10 @@ type ReviewResult struct {
 func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
 	// Post-round bug mirror (bug_filing.mirror): on every exit path — a
 	// round cut off at its ceiling may already have filed files, and its
-	// worktree dies with the run's cleanup all the same.
+	// worktree dies with the run's cleanup all the same. With the mirror
+	// bind-mounted into the round's jail this is a no-op (the writes
+	// already landed host-side; see mirrorToHost's SameFile guard); it
+	// stays for the unmounted fallback shape.
 	defer mirrorToHost(ctx, input.WorktreePath,
 		os.Getenv(config.BugDirEnv), os.Getenv(config.BugMirrorEnv))
 	agent, _, agentArgs := jailedAgentCLI(input.Agent)
@@ -241,7 +244,8 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 // for a CLI that printed plain text.
 func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewResult, error) {
 	// Post-round bug mirror: same shape and reasoning as the implementing
-	// rounds — the reviewer's prompt carries the bug policy too.
+	// rounds — the reviewer's prompt carries the bug policy too. A no-op
+	// under the jail mount (see mirrorToHost's SameFile guard).
 	defer mirrorToHost(ctx, input.WorktreePath,
 		os.Getenv(config.BugDirEnv), os.Getenv(config.BugMirrorEnv))
 	diff, err := stagedDiff(ctx, input.WorktreePath)
@@ -332,7 +336,13 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 // stays the designed flow — the mirror is a host-side reflection that
 // survives worktree cleanup, not a relocation. Subdirectories are skipped:
 // bug files and dumps are flat files by convention. A missing source dir
-// (nothing filed yet) is silent; anything else is a logged warning.
+// (nothing filed yet) is silent; anything else is a logged warning. When
+// the source dir IS the mirror — the bug dir bind-mounted into the round's
+// jail (runJailedRound's --rw-map), writes already landed host-side — the
+// copy is a silent no-op: SameFile catches the bind mount, whose two host
+// paths differ but share dev+inode, where a copy would read and truncate
+// the very file it mirrors. This keeps the copy alive as the fallback for
+// an environment where the mount is absent.
 func mirrorToHost(ctx context.Context, worktreePath, relDir, mirrorDir string) {
 	if relDir == "" || mirrorDir == "" {
 		return
@@ -345,6 +355,11 @@ func mirrorToHost(ctx context.Context, worktreePath, relDir, mirrorDir string) {
 			logger.Warn("Mirror source dir unreadable", "Dir", srcDir, "Error", err)
 		}
 		return
+	}
+	if srcInfo, err := os.Stat(srcDir); err == nil {
+		if dstInfo, err := os.Stat(mirrorDir); err == nil && os.SameFile(srcInfo, dstInfo) {
+			return
+		}
 	}
 	if err := os.MkdirAll(mirrorDir, 0o755); err != nil {
 		logger.Warn("Mirror dir could not be created", "Dir", mirrorDir, "Error", err)

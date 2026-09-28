@@ -134,3 +134,44 @@ func TestMirrorToHostNoopWhenOff(t *testing.T) {
 		t.Errorf("mirror dir exists after no-op runs: %v", err)
 	}
 }
+
+// TestMirrorToHostSameFileSourceIsMirror pins the bind-mount no-op: when
+// the source dir and the mirror are one directory under two host paths —
+// the bug dir bind-mounted into the round's jail, simulated here with a
+// symlink (os.SameFile compares dev+inode, exactly what catches the
+// mount) — the copy is a silent no-op that touches nothing: contents and
+// mtimes survive verbatim instead of a copy reading and truncating the
+// very files it mirrors.
+func TestMirrorToHostSameFileSourceIsMirror(t *testing.T) {
+	wt := t.TempDir()
+	srcDir := writeMirroredSource(t, wt, "backlog/bugs", "bug one\n", 0o600)
+	mirror := filepath.Join(t.TempDir(), "mirror-link")
+	if err := os.Symlink(srcDir, mirror); err != nil {
+		t.Fatal(err)
+	}
+	type snapshot struct {
+		size    int64
+		modTime time.Time
+	}
+	before := map[string]snapshot{}
+	for _, name := range []string{"file-a.md", filepath.Join("sub", "nested.md")} {
+		info, err := os.Stat(filepath.Join(srcDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[name] = snapshot{info.Size(), info.ModTime()}
+	}
+
+	mirrorToHost(context.Background(), wt, "backlog/bugs", mirror)
+
+	for _, name := range []string{"file-a.md", filepath.Join("sub", "nested.md")} {
+		info, err := os.Stat(filepath.Join(srcDir, name))
+		if err != nil {
+			t.Fatalf("stat %s after same-inode mirror: %v", name, err)
+		}
+		if want := before[name]; info.Size() != want.size || !info.ModTime().Equal(want.modTime) {
+			t.Errorf("same-inode mirror touched %s: size %d→%d, mtime %v→%v",
+				name, want.size, info.Size(), want.modTime, info.ModTime())
+		}
+	}
+}

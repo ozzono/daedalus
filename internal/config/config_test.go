@@ -1439,6 +1439,48 @@ func TestLoadMirrorValidation(t *testing.T) {
 	}
 }
 
+// TestResolveMirrorMountSpecCaps pins the two caps the jail mount puts on
+// the resolved host path: the filesystem root is rejected (a root mirror
+// would mount a read-write window on the whole host) — including a
+// redundant spelling that only cleans down to the root — and so is any
+// colon (the mirror is composed into ai-jail's --rw-map <mirror>:<dir>
+// mount spec, where a colon would make the SOURCE:DEST split ambiguous),
+// including one introduced by tilde expansion.
+func TestResolveMirrorMountSpecCaps(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, tc := range []struct{ name, in, wantErr string }{
+		{"filesystem root", "/", "filesystem root"},
+		{"redundant spelling cleaning to the root", "/host/..", "filesystem root"},
+		{"colon in an absolute path", "/host/bugs:1", "rw-map"},
+		{"colon introduced by tilde expansion", "~/bugs:1", "rw-map"},
+	} {
+		_, err := ResolveMirror("bug_filing mirror", tc.in)
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("%s: ResolveMirror(%q) error = %v, want a rejection naming %q", tc.name, tc.in, err, tc.wantErr)
+		}
+	}
+}
+
+// TestLoadBugDirColonGate pins the dir half of the --rw-map SOURCE:DEST
+// split: with a mirror configured, a colon in bug_filing.dir is rejected
+// at load (dir is composed into the mount spec's DEST half), while the
+// same dir without a mirror still loads — unmounted, its bytes render
+// verbatim into the round prompts and no mount spec exists to be
+// ambiguous.
+func TestLoadBugDirColonGate(t *testing.T) {
+	_, err := Load(writeConfig(t, "bug_filing:\n  enabled: true\n  dir: back:log\n  mirror: /host/bugs\n"))
+	if err == nil || !strings.Contains(err.Error(), "bug_filing") || !strings.Contains(err.Error(), "back:log") {
+		t.Errorf("Load(colon dir with mirror) error = %v, want a bug_filing rejection naming the dir", err)
+	}
+	cfg, err := Load(writeConfig(t, "bug_filing:\n  enabled: true\n  dir: back:log\n"))
+	if err != nil {
+		t.Fatalf("Load(colon dir without mirror): %v", err)
+	}
+	if cfg.BugFiling.Dir != "back:log" {
+		t.Errorf("BugFiling.Dir = %q, want back:log kept verbatim without a mirror", cfg.BugFiling.Dir)
+	}
+}
+
 // TestProviderEnvVarsIncludesMirrorEnvs pins that both mirror env vars
 // are in the scrub/restore list: a daemon spawn must clear ambient
 // values, or an off-config worker would silently inherit a stale shell
