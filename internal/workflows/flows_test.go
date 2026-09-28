@@ -12,6 +12,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/template"
 )
 
@@ -260,6 +261,9 @@ func TestInvestigateWorkflowScopeViolationParks(t *testing.T) {
 // write-scope gate (tests allowed, everything else frozen by omission) to
 // finalize.
 func TestTestOnlyWorkflowSuiteLoop(t *testing.T) {
+	// The expected prompts below pin the no-bug-dir rendering; a worker host
+	// with bug_filing enabled exports DAEDALUS_BUG_DIR into this process.
+	t.Setenv(config.BugDirEnv, "")
 	env := newTestEnv(t)
 
 	var created activities.WorktreeInput

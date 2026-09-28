@@ -43,6 +43,17 @@ func newStubLog(t *testing.T) string {
 	return log
 }
 
+// scrubBugFilingEnv pins the bug-filing channel off for argv and prompt
+// pins: the jail composes --rw-map from DAEDALUS_BUG_DIR/DAEDALUS_BUG_MIRROR
+// whenever both are set, so a host that exports them — any live daedalus
+// worker serving a config with bug_filing enabled — would otherwise leak its
+// mirror into these expectations.
+func scrubBugFilingEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv(config.BugDirEnv, "")
+	t.Setenv(config.BugMirrorEnv, "")
+}
+
 // stubBin installs an executable shell script named name earlier on PATH.
 // Each invocation appends "=== CALL ===", "CWD=<pwd>", one "ARG:<arg>" line
 // per argument (newlines escaped as \x1e, so multi-line arguments like agent
@@ -973,6 +984,7 @@ func TestKillWorktreeStragglersSweepsReferencingProcesses(t *testing.T) {
 }
 
 func TestRunJailedClaudeActivity(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "echo AGENT-OUTPUT; exit 0")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-test")
@@ -1032,6 +1044,7 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 // the headless flags, after the agent's own flags), and the reported
 // session_id flows back through AgentRunResult for the next round.
 func TestRunJailedClaudeActivityResume(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	script := `printf '%s\n' '{"type":"result","subtype":"success","result":"resumed work","session_id":"sess-7"}'; exit 0`
 	stubBin(t, "ai-jail", script)
@@ -1183,6 +1196,7 @@ func TestRunJailedSlotWaitBounded(t *testing.T) {
 // switches the jailed CLI, the headless flags replace claude's, no
 // stream-json is requested, and the plain output is taken as-is.
 func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "echo OPENCODE-OUTPUT; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "opencode")
@@ -1228,6 +1242,7 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 // DAEDALUS_AGENT — here the worker runs claude while the run asks for
 // opencode, and opencode's headless flag set is what reaches ai-jail.
 func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "echo OPENCODE-OUTPUT; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "claude")
@@ -1263,6 +1278,7 @@ func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 // events parse like claude's), and a set AMP_API_KEY reaches the jail via
 // --env, by name only — never in argv. Without a key no --env is passed.
 func TestRunJailedClaudeActivityAmp(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	script := `printf '%s\n' ` +
 		`'{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"plan via amp"}]}}' ` +
@@ -1563,6 +1579,7 @@ exit 0`)
 // plumbing: ReviewInput.Agent picks the jailed CLI for the review round too,
 // over the worker's DAEDALUS_AGENT.
 func TestRunJailedReviewerActivityAgentOverride(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
 exit 0`)
@@ -1623,6 +1640,7 @@ func TestRunJailedReviewerActivityStderrNoise(t *testing.T) {
 // verdict is parsed from the json result's text), and the session_id comes
 // back on the verdict for the next round of the same role.
 func TestRunJailedReviewerActivityResume(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
 exit 0`)
@@ -1974,6 +1992,7 @@ func TestNativeTestsAIDiscovery(t *testing.T) {
 // Makefile carries a `test:` target (not test-ui/test-api, which static
 // detection would claim first), so the probed reply is real.
 func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail",
 		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test"}'; exit 0`)
@@ -3372,6 +3391,7 @@ func gitRepo(t *testing.T) string {
 // parsed by its own branch — thinking, text, session id, and usage all
 // captured from pi's event shapes).
 func TestRunJailedClaudeActivityPi(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	script := `printf '%s\n' ` +
 		`'{"type":"session","id":"sess-pi-9"}' ` +
@@ -3777,6 +3797,7 @@ func TestParseRoundOutput(t *testing.T) {
 // is extracted from the round's plain output (discovery rounds run without
 // output-mode flags, so the raw-stdout fallback is what carries the reply).
 func TestNativeTestsAIDiscoveryPi(t *testing.T) {
+	scrubBugFilingEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "echo 'make test'; exit 0")
 	stubBin(t, "sh", "echo 'suite green'; exit 0")

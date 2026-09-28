@@ -99,6 +99,20 @@ FLAGS
                           -f works here too; -d has no effect and -p is rejected:
                           the run keeps the branch prefix it started with.
 
+PREFLIGHT
+Before dispatching, run checks two things, in order. First, the target
+repo must be clean: with uncommitted changes (staged, unstaged, or
+untracked), run prints them and asks for confirmation — only "y"/"yes"
+proceeds; anything else (or a closed stdin) cancels before any workflow,
+branch, or worktree is created, and before any worker is started. Second,
+the worker serving this config (worker_id, else task_queue — the same
+worker "worker status" reports on) must be running: when it is not, run
+starts it (the "worker start" daemon, untyped — both pollers) and waits
+for it to come up; a start that never comes up fails the run with a clean
+error instead of silently queueing the workflow. Append mode runs the
+worker check only: it targets an already-running pipeline and never
+touches the repo.
+
 EXAMPLES
   $ daedalus run ./my-repo 42 "Add /health endpoint"
   $ daedalus run -d ./my-repo 43 "Refactor the config loader"

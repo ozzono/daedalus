@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -75,6 +76,43 @@ func writeLivePidFile(t *testing.T, queue string) {
 func noDaemonSpawn(t *testing.T) {
 	t.Helper()
 	t.Setenv(reexecEnv, "-v")
+}
+
+// TestPidAlive pins the liveness probe's zombie discrimination: a live
+// process answers, and a released-but-unreaped child — exactly what a
+// daemon that died during startup is to the run that spawned it — must not,
+// even though a plain kill(0) still answers for a zombie.
+func TestPidAlive(t *testing.T) {
+	if !pidAlive(os.Getpid()) {
+		t.Errorf("pidAlive(this process) = false, want true")
+	}
+
+	// Start a child that runs to completion; until this test reaps it, it
+	// lingers as a zombie.
+	exited := filepath.Join(t.TempDir(), "exited")
+	cmd := exec.Command("sh", "-c", "touch "+exited+"; exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Wait() }) // reap, whatever the assertions did
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(exited); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child never ran to completion")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for pidAlive(cmd.Process.Pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("pidAlive(zombie %d) stayed true for 5s — a zombie answers kill(0) but is dead for every daedalus purpose", cmd.Process.Pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestRecordedConfigPath pins the record's read-side contract: a written

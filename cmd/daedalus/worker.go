@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -362,11 +363,27 @@ func readLivePid(pidFile string) (int, bool) {
 	return pid, true
 }
 
-// pidAlive reports whether the process exists (signal 0 probes without
-// delivering anything).
+// pidAlive reports whether the process exists and is live. Signal 0
+// probes without delivering anything — but it is also answered by a
+// zombie: a daemon is spawned released and can stay its spawner's
+// unreaped child for as long as that spawner lives (a `run` that started
+// a worker waits up to runWaitTimeout), and a zombie is gone for every
+// daedalus purpose. Its /proc state says so; on anything without /proc
+// the read fails and existence alone decides, as before.
 func pidAlive(pid int) bool {
 	err := syscall.Kill(pid, 0)
-	return err == nil || err == syscall.EPERM
+	if err != nil {
+		return err == syscall.EPERM
+	}
+	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		// stat's second field (the comm, wrapped in parentheses) may itself
+		// contain parentheses and spaces; the state letter sits after the
+		// LAST closing paren, and Z is the zombie state.
+		if i := bytes.LastIndexByte(data, ')'); i >= 0 && i+2 < len(data) {
+			return data[i+2] != 'Z'
+		}
+	}
+	return true
 }
 
 // pruneOldLogs removes daemon logs untouched for longer than the retention
