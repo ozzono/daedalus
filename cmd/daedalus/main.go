@@ -216,6 +216,13 @@ func main() {
 			default:
 				usageFail(`run -a/--append takes <workflow-id> "<prompt>" (or -f <file>)`)
 			}
+			// Append mode still needs a live worker — the guidance signal is
+			// consumed by a round's poller — so the worker preflight applies
+			// here too. The repo check does not: an append targets an
+			// already-running pipeline and never touches the repo.
+			if err := ensureWorkerActive(cfg, configPath.configPath); err != nil {
+				fail("run", err)
+			}
 			if err := guidePipeline(cfg, configPath.appendID, prompt); err != nil {
 				fail("run", err)
 			}
@@ -224,7 +231,7 @@ func main() {
 			if err != nil {
 				usageFail("%v", err)
 			}
-			err = startPipeline(cfg, configPath.workflow, args[1], args[2], prompt, configPath.detach,
+			err = startPipeline(cfg, configPath.configPath, configPath.workflow, args[1], args[2], prompt, configPath.detach,
 				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI)
 			if err != nil {
 				fail("run", err)

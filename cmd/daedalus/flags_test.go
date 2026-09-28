@@ -138,6 +138,22 @@ func TestParseFlagsWorkerType(t *testing.T) {
 			}
 		}
 	})
+
+	// A typed daemon serves only its own poller, but a run always needs the
+	// main-queue one — the worker preflight starts its daemon untyped, so
+	// the flag has nothing to do on run and is rejected at parse time.
+	const runRejection = "-t/--type does not apply to daedalus run — the worker it starts comes untyped (both pollers); type one with `daedalus worker start -t <type>`"
+	t.Run("rejected on run", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"run", "-t", "dev"},
+			{"-t", "dev", "run"},
+			{"run", "--type=test"},
+		} {
+			if _, _, err := parseFlags(args); err == nil || err.Error() != runRejection {
+				t.Errorf("parseFlags(%v) err = %v, want %q", args, err, runRejection)
+			}
+		}
+	})
 }
 
 // TestParseFlagsYes pins the --yes surface: it belongs to `wipe` alone —

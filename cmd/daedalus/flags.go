@@ -245,6 +245,16 @@ parse:
 	if f.workerType != "" && (isRestartAll(rest) || restartNamed || isWorkerStatus(rest)) {
 		return f, nil, errors.New("-t/--type does not apply to worker restart all, restart <worker>, or worker status")
 	}
+	// -t/--type on `run` would shape the daemon the worker preflight starts
+	// — but a run always needs the main-queue poller, and a test-only
+	// daemon serves none: it would pass the preflight's status-file
+	// handshake while the workflow waits for a poller that never comes. A
+	// run-started daemon therefore always comes up untyped (both pollers),
+	// and the flag is rejected here where it cannot be honored — typing a
+	// daemon stays an explicit `worker start`/`worker restart` concern.
+	if f.workerType != "" && len(rest) > 0 && rest[0] == "run" {
+		return f, nil, errors.New("-t/--type does not apply to daedalus run — the worker it starts comes untyped (both pollers); type one with `daedalus worker start -t <type>`")
+	}
 	// --status switches `log` from the raw file to the status brief;
 	// anywhere else it would be an option the subcommand ignores — reject
 	// it.

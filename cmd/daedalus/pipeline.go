@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -89,18 +90,105 @@ func envWithoutGitRepoOverrides(environ []string) []string {
 	return out
 }
 
+// confirmCleanRepo is run's repo preflight: a dirty working tree in the
+// repo sessions branch from is surfaced to the operator before the
+// pipeline starts. Dirty is what `git status --porcelain` reports —
+// staged, unstaged, and untracked files alike (the repo state the run's
+// worktree and branches derive from). Declining — or a closed stdin, so a
+// scripted run can never confirm by accident — returns before any
+// workflow is dispatched: no session, branch, or worktree exists yet, so
+// the cancellation leaves nothing behind by construction.
+func confirmCleanRepo(repoPath string) error {
+	cmd := exec.Command("git", "-C", repoPath, "status", "--porcelain")
+	cmd.Env = envWithoutGitRepoOverrides(os.Environ())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("check %s for uncommitted changes: %v: %s", repoPath, err, strings.TrimSpace(string(out)))
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return nil
+	}
+	fmt.Printf("repo %s has uncommitted changes:\n%s\n", repoPath, strings.TrimRight(string(out), "\n"))
+	fmt.Print(`Start the pipeline anyway? Type "y" to proceed: `)
+	answer, rerr := readConfirmLine()
+	if rerr != nil {
+		return fmt.Errorf("run aborted — no confirmation given (repo %s is dirty; nothing was started)", repoPath)
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return nil
+	default:
+		return fmt.Errorf("run aborted — commit or stash the changes in %s first (nothing was started)", repoPath)
+	}
+}
+
+// workerBootWait bounds how long run's worker preflight waits for a
+// freshly started daemon to publish its first status file.
+const workerBootWait = 30 * time.Second
+
+// ensureWorkerActive is run's worker preflight: the worker serving cfg
+// (named worker_id, else the task queue — the same worker `worker status`
+// reports on) must be running before a workflow is dispatched, and is
+// started here when it is not. workerStart returns once the daemon is
+// spawned; "up" is its first published status file naming the spawned pid
+// — the daemon got past config load and the worktree-root preflight and
+// is about to poll. A boot that never publishes (a bad config, a failed
+// preflight) is a clean error here, not a workflow silently queued for a
+// poller that will never come. The daemon is started untyped (both
+// pollers), like bare `worker start`: a run always needs the main-queue
+// poller, and -t/--type is rejected on run for exactly that reason.
+func ensureWorkerActive(cfg config.Config, configPath string) error {
+	name := cfg.WorkerName()
+	pidFile, logFile, _ := daemonPaths(name)
+	if _, ok := readLivePid(pidFile); ok {
+		return nil
+	}
+	fmt.Printf("worker %s is not running — starting it\n", name)
+	if err := workerStart(cfg, configPath, ""); err != nil {
+		return fmt.Errorf("worker preflight: %w", err)
+	}
+	statusFile := filepath.Join(daemonDir, "worker-"+name+".status")
+	for start := time.Now(); time.Since(start) < workerBootWait; time.Sleep(200 * time.Millisecond) {
+		// readLivePid counts a zombie as not alive (see pidAlive): the
+		// daemon spawned below is this process's released child, so one
+		// that died at boot lingers as a zombie for as long as run waits —
+		// and a zombie still answers kill(0). Either way there is nothing
+		// to wait out, and the reason is in its log.
+		if pid, ok := readLivePid(pidFile); ok {
+			data, err := os.ReadFile(statusFile)
+			if err == nil {
+				var st workerStatus
+				if json.Unmarshal(data, &st) == nil && st.PID == pid {
+					fmt.Printf("worker %s is up (pid %d)\n", name, pid)
+					return nil
+				}
+			}
+		} else {
+			return fmt.Errorf("worker preflight: worker %s exited during startup — check its log: %s", name, logFile)
+		}
+	}
+	return fmt.Errorf("worker preflight: worker %s stayed up but never became ready within %s — check its log: %s", name, workerBootWait, logFile)
+}
+
 // startPipeline triggers the named workflow for the given issue on the
-// configured task queue. branchPrefix names the run's preserved branch;
-// agent, when set by -cli/--cli, overrides the config's jailed agent for
-// this run. Unless detach is set, it then blocks until the pipeline
-// finishes.
-func startPipeline(cfg config.Config, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string) error {
+// configured task queue. configPath is the resolved config file the run
+// loaded (the preflight-started daemon is re-executed with it).
+// branchPrefix names the run's preserved branch; agent, when set by
+// -cli/--cli, overrides the config's jailed agent for this run. Unless
+// detach is set, it then blocks until the pipeline finishes.
+func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string) error {
 	spec, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
 	}
 	repoPath, err := resolveRepoPath(repoPath)
 	if err != nil {
+		return err
+	}
+	if err := confirmCleanRepo(repoPath); err != nil {
+		return err
+	}
+	if err := ensureWorkerActive(cfg, configPath); err != nil {
 		return err
 	}
 

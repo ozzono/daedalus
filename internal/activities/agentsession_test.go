@@ -854,6 +854,7 @@ func TestRecordNewPiTranscript(t *testing.T) {
 // workflow-provided id — resumes it via pi's --session flag, not claude's
 // --resume.
 func TestRunJailedClaudeActivityPiRecordsKilledRoundSessionAndResumes(t *testing.T) {
+	scrubBugFilingEnv(t)
 	fakeHome(t)
 	wt := t.TempDir()
 	sessionsDir, err := piSessionsDir(wt)

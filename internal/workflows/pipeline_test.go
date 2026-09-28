@@ -238,6 +238,9 @@ func baseInput() PipelineInput {
 }
 
 func TestFeatureDevWorkflowHappyPath(t *testing.T) {
+	// The expected prompts below pin the no-bug-dir rendering; a worker host
+	// with bug_filing enabled exports DAEDALUS_BUG_DIR into this process.
+	t.Setenv(config.BugDirEnv, "")
 	env := newTestEnv(t)
 
 	var createdQueue string
