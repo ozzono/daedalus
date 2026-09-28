@@ -70,7 +70,9 @@ ARGUMENTS
 
 FLAGS
   -w, --workflow <name>   Workflow (flow) to run (default: feature-dev;
-                          available: ` + workflowNames() + `). investigate is
+                          available: ` + workflowNames() + `). dev-only runs
+                          implementation ↔ code review and lands without any
+                          test-phase execution; investigate is
                           docs-only (analysis written as documentation, no code
                           changes); test-only modifies test files only, with
                           coverage reported per round; refactor changes

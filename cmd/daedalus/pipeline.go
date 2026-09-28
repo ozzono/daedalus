@@ -215,13 +215,19 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 	if workflowName != defaultWorkflowName {
 		workflowID = fmt.Sprintf("%s-%s-%s", cfg.Temporal.TaskQueue, workflowName, issueID)
 	}
+	// The workflow starts by its registered type name (WorkflowTypeName) —
+	// the same name the worker registers the CompleteGreen-wrapped flow
+	// under. The registry's Fn is unwrapped and would reflect to that name
+	// by itself, but the string pins both ends to WorkflowTypeName as the
+	// single derivation, so a future wrapping of the registry's Fn cannot
+	// desynchronize start from registration.
 	run, err := c.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
 		ID:        workflowID,
 		TaskQueue: cfg.Temporal.TaskQueue,
 		// Allow re-running an issue whose previous pipeline succeeded
 		// instead of failing with an already-exists error.
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-	}, spec.Fn, workflows.PipelineInput{
+	}, workflows.WorkflowTypeName(spec.Fn), workflows.PipelineInput{
 		RepoPath:        repoPath,
 		TaskQueue:       cfg.Temporal.TaskQueue,
 		IssueID:         issueID,
@@ -354,7 +360,8 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		ID:                    workflowID,
 		TaskQueue:             cfg.Temporal.TaskQueue,
 		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-	}, spec.Fn, workflows.PipelineInput{
+		// By registered type name, like startPipeline — see its note.
+	}, workflows.WorkflowTypeName(spec.Fn), workflows.PipelineInput{
 		RepoPath:  prev.RepoPath,
 		TaskQueue: cfg.Temporal.TaskQueue,
 		IssueID:   prev.IssueID,
@@ -534,9 +541,8 @@ func attachPipeline(cfg config.Config, workflowID string) error {
 
 // errRunParked distinguishes a parked outcome from success for callers
 // gating on the exit code of `daedalus run`/`attach`/`continue`: the run
-// produced no deliverable and is FAILED in Temporal. awaitPipeline has
-// already printed the resume hint by the time it returns this; the error
-// only labels the outcome.
+// produced no deliverable. awaitPipeline has already printed the resume
+// hint by the time it returns this; the error only labels the outcome.
 var errRunParked = errors.New("run parked awaiting maintainer input")
 
 // awaitPipeline blocks until the run finishes (bounded by runWaitTimeout) and
@@ -548,7 +554,8 @@ func awaitPipeline(run client.WorkflowRun) error {
 	defer cancel()
 	var preservedBranch string
 	if err := run.Get(waitCtx, &preservedBranch); err != nil {
-		// A parked run arrives here as a workflow failure carrying
+		// A park of an older worker (before parked runs completed green)
+		// arrives here as a workflow failure carrying
 		// ErrAwaitingMaintainer — API exhausted past every heartbeat, or a
 		// reviewer halt on an impossible task. The failure already put the
 		// reason in the history and FAILED in `daedalus list`; here it just
@@ -561,6 +568,16 @@ func awaitPipeline(run client.WorkflowRun) error {
 			return errRunParked
 		}
 		return fmt.Errorf("workflow execution: %w", err)
+	}
+	// The current registration completes a parked run green, with the
+	// reason as the result (workflows.CompleteGreen). Same resume hint as
+	// the failure-shaped parks above; the orchestrator's history already
+	// shows the run green with the reason in the completion payload.
+	if workflows.IsParkedResult(preservedBranch) {
+		fmt.Printf("Workflow parked: %s\n",
+			strings.TrimPrefix(preservedBranch, workflows.ParkedResultPrefix))
+		fmt.Printf("The attempt's work is preserved on its aborted/ branch — resume with: daedalus continue %s \"<prompt>\"\n", run.GetID())
+		return errRunParked
 	}
 	fmt.Printf("Workflow completed successfully — approved work committed to branch %s\n", preservedBranch)
 	return nil

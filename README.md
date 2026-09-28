@@ -241,12 +241,13 @@ session id, status, and last interaction time.
   becomes the new run's starting point, and that attempt's last review
   feedback is folded into the opening prompt. A run that exhausts the
   provider quota first heartbeats — sleeping an hour and retrying the same
-  round, up to five times — and then parks itself: it fails with a `run
-  parked awaiting maintainer restart` error (the reason visible in the
-  workflow history and as FAILED in `daedalus list`) so you can tell
+  round, up to five times — and then parks itself: it completes with a `run
+  parked awaiting maintainer restart` result (the reason visible in the
+  workflow history, and the run shows green in the orchestrator — a park
+  is a designed outcome, not a failure) so you can tell
   "continue later" apart from a code failure. A reviewer that judges the
   task impossible ends with NEEDS_MAINTAINER and parks the run the same
-  way, with its comments carried in the error.
+  way, with its comments carried in the result.
 - **Wake a sleeping one**: `daedalus worker wakeup <workflow-id>` ends a
   RUNNING session's quota-heartbeat sleep immediately, so the round retries
   right away instead of at the top of the hour — the lever for when you have
@@ -282,6 +283,7 @@ invoked from inside it. `daedalus init` writes a fully commented
 | `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself |
 | `fallback.enabled/url/key/model/heartbeat_model` | `enabled: false` | Independent secondary provider: when a jailed round fails with the primary's quota exhausted, the worker retries it on the fallback until the primary recovers |
 | `fallback.type`       | `anthropic`        | Fallback wire style: `anthropic` or `openai`; governs the `worker status` probe and which env failover values travel on. A round's wire is chosen by the agent (claude dials `ANTHROPIC_*`), so `openai` serves only agents that dial `OPENAI_BASE_URL` |
+| `reviewer.url/key`    | `""` (share primary) | Reviewer rounds' own provider endpoint: overrides `ANTHROPIC_*`/`OPENAI_*` URL and key for reviewer rounds only, while implementing and test rounds keep the primary's. Models are not overridable |
 | `bug_filing.enabled/dir/mirror` | `enabled: false` | Out-of-scope-bug filing. Off (the default), no bug files are written: out-of-scope bugs surface in round replies and review comments only. On, the round prompts instruct the agent to file every out-of-scope bug under `dir` — worktree-relative, resolved against the run's worktree root (`dir` empty keeps the historical `backlog/bugs` path). Without `mirror` the files are ordinary committed content of the branch. `mirror`, when set (absolute, or `~/…`; a relative path, the filesystem root, or a colon is rejected), is a host directory bind-mounted read-write into each jailed round's sandbox at `dir`, so the agent's writes land on the host directly and never ride the branch — a configured mirror is a read-write window the jailed agent holds onto a host path, so point it at a dedicated directory; on an ai-jail that rejects the mount the round fails loudly rather than running unmounted. `test_output.mirror` mirrors suite dumps worker-side the same way (copy, not mount) |
 
 Provider settings that are set are exported into the worker's environment
@@ -345,7 +347,10 @@ issue never share live state). Re-running
 - **Workflows are selectable**: `daedalus run -w feature-dev ...` (the
   default) picks from a name registry; adding another flow later is one
   registry entry. The other flows reassemble the same review-gated loop
-  machinery with a different gate: `investigate` is docs-only (no code
+  machinery with a different gate: `dev-only` is feature-dev's
+  implementation ↔ code-review phase alone, landing without any test-phase
+  execution (selection is CLI-only — no config key picks a flow);
+  `investigate` is docs-only (no code
   changes, no test phase); `test-only` modifies test files only, records Go
   statement coverage per suite round, and parks on a reviewer REBUILD (there
   is no implementation loop to rebuild into); `refactor` changes production

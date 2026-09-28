@@ -58,6 +58,11 @@ func TestMain(m *testing.M) {
 		"OPENAI_API_KEY",
 		"OPENAI_MODEL",
 		"OPENAI_API_BASE",
+		// reviewerEnv reads these from the process env: a live worker host
+		// exporting them (runWorker sets them from config.yaml's reviewer
+		// section) would silently arm the reviewer override in every test.
+		config.ReviewerURLEnv,
+		config.ReviewerKeyEnv,
 		config.ContextTokensEnv,
 		config.MaxOutputTokensEnv,
 		config.TopPEnv,
@@ -583,5 +588,161 @@ func TestSlimAiderEnv(t *testing.T) {
 	})
 	if envValue(explicit, "AIDER_WEAK_MODEL") != "kept-weak" || envValue(explicit, "AIDER_EDITOR_MODEL") != "kept-editor" {
 		t.Errorf("pinning overrode explicit operator exports: %v", explicit)
+	}
+}
+
+// reviewerRoundBaseEnv is the serving provider's environment a round
+// arrives with: primary url/key on both wire families plus a model var
+// the override must never touch.
+func reviewerRoundBaseEnv() []string {
+	return []string{
+		"ANTHROPIC_BASE_URL=https://primary.example",
+		"ANTHROPIC_API_KEY=sk-primary",
+		"ANTHROPIC_MODEL=claude-opus-5",
+		"OPENAI_BASE_URL=https://oai.example",
+		"OPENAI_API_BASE=https://oai.example",
+		"OPENAI_API_KEY=sk-oai",
+	}
+}
+
+// countEnv returns how many entries of env carry name — the replace-in-place
+// probe: execve/getenv hand the last duplicate to the child, so an appended
+// (rather than replaced) override would leave the stale primary value
+// shadowed but still present.
+func countEnv(env []string, name string) int {
+	n := 0
+	for _, kv := range env {
+		if _, _, ok := cutEnv(kv); ok && strings.HasPrefix(kv, name+"=") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestReviewerEnvOverridesReviewerRoundsOnly pins the reviewer override's
+// role gate: the two reviewer roles get every provider base-url/key var
+// pointed at the config's reviewer endpoint (both wire families, replaced
+// in place) while dev and test rounds — and role-less one-shot rounds —
+// keep the serving provider's environment untouched, and model vars travel
+// through everywhere.
+func TestReviewerEnvOverridesReviewerRoundsOnly(t *testing.T) {
+	t.Setenv(config.ReviewerURLEnv, "https://review.example")
+	t.Setenv(config.ReviewerKeyEnv, "sk-review")
+
+	untouched := reviewerRoundBaseEnv()
+	for _, role := range []SessionRole{RoleDev, RoleTest, ""} {
+		if got := reviewerEnv(slices.Clone(untouched), role); !slices.Equal(got, untouched) {
+			t.Errorf("reviewerEnv(%q) rewired a non-reviewer round: %v", role, got)
+		}
+	}
+
+	for _, role := range []SessionRole{RoleDevReview, RoleTestReview} {
+		got := reviewerEnv(reviewerRoundBaseEnv(), role)
+		for name, want := range map[string]string{
+			"ANTHROPIC_BASE_URL": "https://review.example",
+			"ANTHROPIC_API_KEY":  "sk-review",
+			"OPENAI_BASE_URL":    "https://review.example",
+			"OPENAI_API_BASE":    "https://review.example",
+			"OPENAI_API_KEY":     "sk-review",
+			"ANTHROPIC_MODEL":    "claude-opus-5",
+		} {
+			if v := envValue(got, name); v != want {
+				t.Errorf("reviewerEnv(%q) %s = %q, want %q", role, name, v, want)
+			}
+			if n := countEnv(got, name); n != 1 {
+				t.Errorf("reviewerEnv(%q) left %d entries for %s, want exactly one", role, n, name)
+			}
+		}
+	}
+}
+
+// TestReviewerEnvPartialOverride pins the per-value arming: url and key
+// override independently, so a reviewer endpoint that reuses the primary's
+// credential (or vice versa) overrides only what is set — and with both
+// absent (the default) even a reviewer round's environment passes through
+// byte-identical.
+func TestReviewerEnvPartialOverride(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		url  string
+		key  string
+		// wantURL/Key hold the anthropic family's expected values; the
+		// openai family starts from its own primary values (oai/sk-oai).
+		wantURL, wantKey       string
+		wantOAIURL, wantOAIKey string
+	}{
+		{"nothing set", "", "", "https://primary.example", "sk-primary", "https://oai.example", "sk-oai"},
+		{"url only", "https://review.example", "", "https://review.example", "sk-primary", "https://review.example", "sk-oai"},
+		{"key only", "", "sk-review", "https://primary.example", "sk-review", "https://oai.example", "sk-review"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv(config.ReviewerURLEnv, c.url)
+			t.Setenv(config.ReviewerKeyEnv, c.key)
+			got := reviewerEnv(reviewerRoundBaseEnv(), RoleDevReview)
+			for name, want := range map[string]string{
+				"ANTHROPIC_BASE_URL": c.wantURL,
+				"ANTHROPIC_API_KEY":  c.wantKey,
+				"OPENAI_BASE_URL":    c.wantOAIURL,
+				"OPENAI_API_KEY":     c.wantOAIKey,
+				"ANTHROPIC_MODEL":    "claude-opus-5",
+			} {
+				if v := envValue(got, name); v != want {
+					t.Errorf("%s = %q, want %q", name, v, want)
+				}
+			}
+		})
+	}
+}
+
+// TestReviewerRoundDialsReviewerEndpoint pins the override at the round
+// boundary: runJailedRound composes reviewerEnv into the child environment
+// for a reviewer role — the url/key the jailed CLI actually sees are the
+// reviewer endpoint's on both wire families, with the model untouched —
+// while a dev round spawned through the same invoker keeps the primary's.
+func TestReviewerRoundDialsReviewerEndpoint(t *testing.T) {
+	t.Setenv(config.ReviewerURLEnv, "https://review.example")
+	t.Setenv(config.ReviewerKeyEnv, "sk-review")
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", "exit 0\n")
+
+	// A fixed env, not os.Environ()+overrides: production round envs never
+	// carry a name twice (os.Environ() is unique, fallbackEnv starts from
+	// it), and a duplicate would let the appended primary shadow the
+	// first-occurrence replacement setEnvVar performs.
+	base := append(reviewerRoundBaseEnv(),
+		"PATH="+os.Getenv("PATH"),
+		"STUB_LOG="+log,
+	)
+	for _, role := range []SessionRole{RoleDevReview, RoleDev} {
+		if _, err := runJailedRound(context.Background(), slices.Clone(base), role, "claude", t.TempDir(), "round prompt"); err != nil {
+			t.Fatalf("%s: runJailedRound: %v", role, err)
+		}
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 2 {
+		t.Fatalf("got %d jailed calls, want 2 (reviewer then dev)", len(calls))
+	}
+	wantReviewer := map[string]string{
+		"ANTHROPIC_BASE_URL": "https://review.example",
+		"ANTHROPIC_API_KEY":  "sk-review",
+		"OPENAI_BASE_URL":    "https://review.example",
+		"OPENAI_API_KEY":     "sk-review",
+		"ANTHROPIC_MODEL":    "claude-opus-5",
+	}
+	for name, want := range wantReviewer {
+		if got := calls[0].Env[name]; got != want {
+			t.Errorf("reviewer round %s = %q, want %q", name, got, want)
+		}
+	}
+	wantDev := map[string]string{
+		"ANTHROPIC_BASE_URL": "https://primary.example",
+		"ANTHROPIC_API_KEY":  "sk-primary",
+		"OPENAI_BASE_URL":    "https://oai.example",
+		"OPENAI_API_KEY":     "sk-oai",
+	}
+	for name, want := range wantDev {
+		if got := calls[1].Env[name]; got != want {
+			t.Errorf("dev round %s = %q, want %q", name, got, want)
+		}
 	}
 }

@@ -330,6 +330,23 @@ fallback:
   model: ""
   heartbeat_model: ""
 
+# Reviewer rounds' own provider endpoint. Absent (the default): the
+# reviewer rounds (code reviewer, test reviewer, docs reviewer)
+# authenticate exactly like the implementing agent's rounds — the serving
+# provider's endpoint and key. Setting url and/or key overrides just those
+# values for reviewer rounds: they dial url with key while implementing and
+# test rounds keep the primary's (and a failover stint keeps the reviewer
+# on its own endpoint too — the override applies on both provider sides).
+# The values travel worker env only (never workflow history, activity
+# inputs, or argv). Models are not overridable: the reviewer endpoint must
+# serve the already-configured model names. pi's staging bridge reads the
+# overridden OPENAI_* values, so pi reviewer rounds stage the reviewer
+# endpoint; amp authenticates through AMP_API_KEY alone and ignores the
+# section.
+reviewer:
+  url: ""
+  key: ""
+
 # Out-of-scope-bug filing. Off by default (the section absent, or
 # enabled: false): jailed rounds report out-of-scope bugs in their reply or
 # review comments only, and no bug files are written into your repos. When
