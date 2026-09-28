@@ -67,7 +67,8 @@ func commitAuthorArgs(authorship bool) []string {
 // --prefix) marks approved work committed by FinalizeWorktreeActivity,
 // which is kept. aborted/ carries a run that closed without approval —
 // committed and kept so `daedalus continue` can resume it; each abort
-// replaces the previous snapshot.
+// replaces the previous snapshot (a suffixed name when a checkout elsewhere
+// holds the canonical one).
 const (
 	// InFlightBranchPrefix is the in-flight branch namespace. Exported so
 	// the CLI's wipe command globs the run's in-flight branches by the same
@@ -417,18 +418,60 @@ func preserveAbortedWork(ctx context.Context, input WorktreeInput, worktreePath 
 			return fmt.Errorf("preserve aborted work (commit): %w: %s", err, out)
 		}
 	}
-	_, _ = runGit(ctx, "-C", input.RepoPath, "branch", "-D", aborted)
-	if _, err := runGit(ctx, "-C", worktreePath, "branch", "-m", aborted); err != nil {
+	// The aborted ref may be checked out in another worktree — an operator
+	// inspecting the previous run's remains. Git bars both the delete and
+	// the force-update of a checked-out branch, so every path to the
+	// canonical name is closed; detect that up front and land the snapshot
+	// under a free suffixed name instead of failing the run.
+	target := aborted
+	if branchCheckedOut(ctx, input.RepoPath, aborted) {
+		target = freeAbortedName(ctx, input.RepoPath, aborted)
+	} else {
+		_, _ = runGit(ctx, "-C", input.RepoPath, "branch", "-D", target)
+	}
+	if _, err := runGit(ctx, "-C", worktreePath, "branch", "-m", target); err != nil {
 		// The rename can fail with nothing at stake — detached HEAD, or
 		// the best-effort delete above left the old aborted ref in place
 		// ("already exists"). The commit is what holds the work: point the
 		// aborted ref straight at it instead. Only a failure of that too
 		// (and of the rename) means the snapshot is not saved.
-		if _, ferr := runGit(ctx, "-C", worktreePath, "branch", "-f", aborted, "HEAD"); ferr != nil {
-			return fmt.Errorf("preserve aborted work (rename to %s): %w: %w", aborted, err, ferr)
+		if _, ferr := runGit(ctx, "-C", worktreePath, "branch", "-f", target, "HEAD"); ferr != nil {
+			return fmt.Errorf("preserve aborted work (rename to %s): %w: %w", target, err, ferr)
 		}
 	}
 	return nil
+}
+
+// branchCheckedOut reports whether the branch is checked out in any worktree
+// of the repository, via one `git worktree list --porcelain` call. A listing
+// failure reads as "not checked out", preserving the historical behavior
+// (the rename then fails loudly against the held ref) rather than guessing.
+func branchCheckedOut(ctx context.Context, repoPath, branch string) bool {
+	out, err := runGit(ctx, "-C", repoPath, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false
+	}
+	for line := range strings.SplitSeq(out, "\n") {
+		if name, ok := strings.CutPrefix(line, "branch refs/heads/"); ok && name == branch {
+			return true
+		}
+	}
+	return false
+}
+
+// freeAbortedName derives the first not-yet-existing suffixed variant of the
+// aborted branch name (base-2, base-3, …) — a preserved snapshot name no
+// checkout can be holding. Existence is probed by exact ref resolution, not
+// a --list pattern, so glob metacharacters in the issue id cannot widen the
+// match; a probe failure for a non-existence reason (a broken repo) reads as
+// free, and the rename against the misread name then fails loudly as before.
+func freeAbortedName(ctx context.Context, repoPath, base string) string {
+	for n := 2; ; n++ {
+		name := fmt.Sprintf("%s-%d", base, n)
+		if _, err := runGit(ctx, "-C", repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+name); err != nil {
+			return name
+		}
+	}
 }
 
 // removeStaleIndexLock deletes the worktree's index.lock when present,

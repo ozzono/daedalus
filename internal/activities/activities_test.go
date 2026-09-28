@@ -323,8 +323,8 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 9 {
-		t.Fatalf("git called %d times, want 9 (preserve list, add, commit, drop aborted, rename, remove, prune, stale sweep, worktree add)", len(calls))
+	if len(calls) != 10 {
+		t.Fatalf("git called %d times, want 10 (preserve list, add, commit, checkout probe, drop aborted, rename, remove, prune, stale sweep, worktree add)", len(calls))
 	}
 	// A stale worktree from a crashed run is preserved, not discarded: its
 	// contents are committed and its branch renamed to aborted/issue-42.
@@ -334,12 +334,13 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	// worker's git config, not a forced identity.
 	assertArgs(t, calls[2].Args, []string{"-C", worktreePath,
 		"commit", "-m", "daedalus: run closed without approval, work preserved for continue"}, "preserve commit")
-	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
-	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
-	assertArgs(t, calls[5].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "pre-clean remove")
-	assertArgs(t, calls[6].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
-	assertArgs(t, calls[7].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "pre-clean stale branch sweep")
-	assertArgs(t, calls[8].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123"}, "worktree add")
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "worktree", "list", "--porcelain"}, "aborted checkout probe")
+	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
+	assertArgs(t, calls[5].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	assertArgs(t, calls[6].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "pre-clean remove")
+	assertArgs(t, calls[7].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
+	assertArgs(t, calls[8].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "pre-clean stale branch sweep")
+	assertArgs(t, calls[9].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123"}, "worktree add")
 }
 
 // TestCreateWorktreeFromAbortedBase pins the continued-run path: the new
@@ -437,8 +438,8 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 9 {
-		t.Fatalf("git called %d times, want 9", len(calls))
+	if len(calls) != 10 {
+		t.Fatalf("git called %d times, want 10", len(calls))
 	}
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Errorf("stale directory should be removed even when git remove failed (stat err = %v)", err)
@@ -521,17 +522,92 @@ func TestCleanupPreservesAbortedWork(t *testing.T) {
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 8 {
-		t.Fatalf("git called %d times, want 8 (list, add, commit, drop aborted, rename, remove, prune, sweep)", len(calls))
+	if len(calls) != 9 {
+		t.Fatalf("git called %d times, want 9 (list, add, commit, checkout probe, drop aborted, rename, remove, prune, sweep)", len(calls))
 	}
 	assertArgs(t, calls[1].Args, []string{"-C", worktreePath, "add", "-A"}, "preserve stage")
 	if !contains(calls[2].Args, "work preserved for continue") {
 		t.Errorf("commit %v should carry the preservation message", calls[2].Args)
 	}
-	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
-	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "worktree", "list", "--porcelain"}, "aborted checkout probe")
+	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop previous aborted")
+	assertArgs(t, calls[5].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Errorf("worktree dir should be removed after preservation (stat err = %v)", err)
+	}
+}
+
+// TestCleanupPreservesAbortedWorkForeignCheckout pins the collision path:
+// when the canonical aborted branch is checked out in another worktree, git
+// bars both its deletion and its force-update, so the snapshot must land
+// under the first free suffixed name instead — and the held branch must be
+// left untouched.
+func TestCleanupPreservesAbortedWorkForeignCheckout(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitStub string
+		want    string
+	}{
+		{
+			name: "first free suffix",
+			// worktree list reports the canonical aborted branch checked
+			// out elsewhere; every rev-parse probe fails, i.e. no suffixed
+			// ref exists yet, so -2 is free. (argv: -C repo <sub> … — the
+			// probed ref is $6, after --verify --quiet.)
+			gitStub: `case "$3" in
+  worktree) printf 'worktree /elsewhere\nbranch refs/heads/aborted/issue-42\n'; exit 0 ;;
+  rev-parse) exit 1 ;;
+esac
+exit 0`,
+			want: "aborted/issue-42-2",
+		},
+		{
+			name: "taken suffixes are skipped",
+			// rev-parse answers "exists" only for -2, so the probe walks
+			// past it to -3.
+			gitStub: `case "$3" in
+  worktree) printf 'branch refs/heads/aborted/issue-42\n'; exit 0 ;;
+  rev-parse) [ "$6" = "refs/heads/aborted/issue-42-2" ] && exit 0; exit 1 ;;
+esac
+exit 0`,
+			want: "aborted/issue-42-3",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := fakeHome(t)
+			log := newStubLog(t)
+			stubBin(t, "git", c.gitStub)
+			worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+				RepoPath:   "/repo",
+				TaskQueue:  "daedalus",
+				IssueID:    "42",
+				BranchName: "feat/issue-42-7",
+			}); err != nil {
+				t.Fatalf("CleanupWorktreeActivity: %v", err)
+			}
+
+			var renamed bool
+			for _, call := range readCalls(t, log) {
+				if reflect.DeepEqual(call.Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}) {
+					t.Errorf("the held canonical aborted branch must not be deleted: %v", call.Args)
+				}
+				if contains(call.Args, "-m") && contains(call.Args, c.want) {
+					renamed = true
+				}
+			}
+			if !renamed {
+				t.Errorf("snapshot should be renamed to the free suffixed name %s", c.want)
+			}
+			if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+				t.Errorf("worktree dir should be removed after preservation (stat err = %v)", err)
+			}
+		})
 	}
 }
 
@@ -1723,11 +1799,11 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 8 {
-		t.Fatalf("git called %d times, want 8 (list, add, commit, drop aborted, rename, remove, prune, sweep)", len(calls))
+	if len(calls) != 9 {
+		t.Fatalf("git called %d times, want 9 (list, add, commit, checkout probe, drop aborted, rename, remove, prune, sweep)", len(calls))
 	}
 	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "team/ship/issue-42-*", "--format=%(refname:short)"}, "finalized check")
-	assertArgs(t, calls[4].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
+	assertArgs(t, calls[5].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
 }
 
 // TestCleanupRejectsReservedBranchPrefix pins the trust boundary: a workflow
