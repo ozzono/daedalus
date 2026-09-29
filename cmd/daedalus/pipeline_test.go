@@ -286,3 +286,108 @@ func TestStartPipelinePreflight(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveFolderGrants pins the submit-time folder-grant validation: the
+// -folder grants plus the -f task file's containing folder resolve to
+// cleaned absolute paths, keep argument order (flags first, the task
+// folder last), and collapse duplicates (the same folder via -f and
+// -folder included). Every unusable grant fails here rather than at the
+// first round: a missing path, a plain file, the filesystem root, a colon
+// (the path composes into ai-jail's --rw-map <source>:<dest> spec), two
+// grants sharing a basename (the second would shadow the first inside
+// .daedalus-folders), and a glob-metachar task directory — taken
+// literally, it cannot be granted.
+func TestResolveFolderGrants(t *testing.T) {
+	host := t.TempDir()
+	shared := filepath.Join(host, "shared")
+	notes := filepath.Join(host, "notes")
+	other := filepath.Join(host, "other")
+	for _, dir := range []string{shared, notes, other, filepath.Join(other, "notes")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relShared, err := filepath.Rel(cwd, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Flag grants plus the task file's folder, in order; a relative flag
+	// grant resolves against the process working directory.
+	got, err := resolveFolderGrants([]string{shared, relShared}, filepath.Join(notes, "task.md"))
+	if err != nil {
+		t.Fatalf("resolveFolderGrants: %v", err)
+	}
+	if want := []string{shared, notes}; !reflect.DeepEqual(got, want) {
+		t.Errorf("resolveFolderGrants = %v, want %v", got, want)
+	}
+
+	// The task file's folder dedupes against an explicit grant of the same
+	// folder.
+	got, err = resolveFolderGrants([]string{notes}, filepath.Join(notes, "task.md"))
+	if err != nil {
+		t.Fatalf("resolveFolderGrants: %v", err)
+	}
+	if want := []string{notes}; !reflect.DeepEqual(got, want) {
+		t.Errorf("resolveFolderGrants = %v, want the single collapsed grant %v", got, want)
+	}
+
+	// No grants and no task file — the no-grants run.
+	if got, err := resolveFolderGrants(nil, ""); err != nil || got != nil {
+		t.Errorf("resolveFolderGrants(nil, \"\") = %v, %v, want nil/nil", got, err)
+	}
+
+	const (
+		basenameErr = "share the basename"
+		rootErr     = "filesystem root"
+		colonErr    = "--rw-map"
+		notDirErr   = "is not a directory"
+		metaErr     = "glob metachars"
+	)
+	for _, c := range []struct {
+		name       string
+		flagDirs   []string
+		taskFile   string
+		wantSubstr string
+	}{
+		{"two grants sharing a basename", []string{notes, filepath.Join(other, "notes")}, "", basenameErr},
+		{"filesystem root", []string{"/"}, "", rootErr},
+		{"missing folder", []string{filepath.Join(host, "gone")}, "", "no such file or directory"},
+		{"plain file", nil, "", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dirs := c.flagDirs
+			if c.name == "plain file" {
+				file := filepath.Join(host, "brief.md")
+				if err := os.WriteFile(file, []byte("x\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				dirs = []string{file}
+				c.wantSubstr = notDirErr
+			}
+			_, err := resolveFolderGrants(dirs, c.taskFile)
+			if err == nil || !strings.Contains(err.Error(), c.wantSubstr) {
+				t.Errorf("resolveFolderGrants(%v, %q) err = %v, want it to name %q", dirs, c.taskFile, err, c.wantSubstr)
+			}
+		})
+	}
+
+	// A colon in a grant composes into the mount spec and is refused.
+	coloned := filepath.Join(host, "co:lon")
+	if err := os.MkdirAll(coloned, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveFolderGrants([]string{coloned}, ""); err == nil || !strings.Contains(err.Error(), colonErr) {
+		t.Errorf("resolveFolderGrants(colon dir) err = %v, want it to name %q", err, colonErr)
+	}
+
+	// A glob-metachar task directory is taken literally and refused.
+	if _, err := resolveFolderGrants(nil, filepath.Join(notes, "[x]/task.md")); err == nil || !strings.Contains(err.Error(), metaErr) {
+		t.Errorf("resolveFolderGrants(metachar task dir) err = %v, want it to name %q", err, metaErr)
+	}
+}

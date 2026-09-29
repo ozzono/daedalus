@@ -231,8 +231,12 @@ func main() {
 			if err != nil {
 				usageFail("%v", err)
 			}
-			err = startPipeline(cfg, configPath.configPath, configPath.workflow, args[1], args[2], prompt, configPath.detach,
-				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI)
+			folders, err := resolveFolderGrants(configPath.folders, configPath.taskFile)
+			if err != nil {
+				usageFail("%v", err)
+			}
+			err = startPipelineFolders(cfg, configPath.configPath, configPath.workflow, args[1], args[2], prompt, configPath.detach,
+				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI, folders)
 			if err != nil {
 				fail("run", err)
 			}

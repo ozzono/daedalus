@@ -794,3 +794,288 @@ func TestRunJailedBugMirrorMount(t *testing.T) {
 		}
 	})
 }
+
+// TestFolderMounts pins the worker-side grant resolution behind the folder
+// mounts: no grants mounts nothing; each grant resolves to an absolute
+// path (a relative one against the process working directory) appearing at
+// <worktree>/.daedalus-folders/<basename>; identical duplicates collapse;
+// and every unusable grant fails with the offending shape named — a
+// missing path, a plain file, the filesystem root, a colon (the path
+// composes into ai-jail's --rw-map <source>:<dest> spec), and two grants
+// sharing a basename, the second shadowing the first inside the sandbox.
+func TestFolderMounts(t *testing.T) {
+	host := t.TempDir()
+	shared := filepath.Join(host, "shared")
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wt := t.TempDir()
+
+	t.Run("no grants mounts nothing", func(t *testing.T) {
+		mounts, err := FolderMounts(wt, nil)
+		if err != nil || mounts != nil {
+			t.Errorf("FolderMounts(wt, nil) = %v, %v, want nil/nil", mounts, err)
+		}
+	})
+
+	t.Run("grant resolves to its basename under the mount root", func(t *testing.T) {
+		// A relative grant resolves against the process working directory —
+		// the same dir Stat sees, so the grant exists from both spellings.
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		relShared, err := filepath.Rel(cwd, shared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mounts, err := FolderMounts(wt, []string{shared, relShared})
+		if err != nil {
+			t.Fatalf("FolderMounts: %v", err)
+		}
+		// The two spellings resolve to the same grant and collapse to one
+		// mount.
+		want := []FolderMount{{Source: shared, Dest: filepath.Join(wt, foldersMountRoot, "shared")}}
+		if !slices.Equal(mounts, want) {
+			t.Errorf("FolderMounts = %v, want %v", mounts, want)
+		}
+	})
+
+	for _, c := range []struct{ name, wantSubstr string }{
+		{"missing grant", "no such file or directory"},
+		{"filesystem root", "filesystem root"},
+		{"colon in grant", "--rw-map"},
+	} {
+		t.Run(c.name+" fails", func(t *testing.T) {
+			bad := filepath.Join(host, "gone")
+			switch c.name {
+			case "filesystem root":
+				bad = "/"
+			case "colon in grant":
+				bad = filepath.Join(host, "co:lon")
+				if err := os.MkdirAll(bad, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mounts, err := FolderMounts(wt, []string{bad})
+			if err == nil || !strings.Contains(err.Error(), c.wantSubstr) {
+				t.Errorf("FolderMounts(%q) = %v, %v, want it to name %q", bad, mounts, err, c.wantSubstr)
+			}
+		})
+	}
+
+	t.Run("plain file rejected", func(t *testing.T) {
+		file := filepath.Join(host, "brief.md")
+		if err := os.WriteFile(file, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FolderMounts(wt, []string{file}); err == nil || !strings.Contains(err.Error(), "is not a directory") {
+			t.Errorf("FolderMounts(file) err = %v, want a not-a-directory rejection", err)
+		}
+	})
+
+	t.Run("shared basename rejected", func(t *testing.T) {
+		second := filepath.Join(t.TempDir(), "shared")
+		if err := os.MkdirAll(second, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_, err := FolderMounts(wt, []string{shared, second})
+		if err == nil || !strings.Contains(err.Error(), "share the basename") {
+			t.Errorf("FolderMounts(two basenames) err = %v, want a basename-collision rejection", err)
+		}
+	})
+}
+
+// TestRunJailedClaudeActivityFolderGrants pins the folder-grant round seam
+// in runJailedRound: with grants, the argv gains one --rw-map
+// <source>:<dest> pair per grant before the "--" terminator and each
+// mountpoint is created host-side before spawn (an empty dir is invisible
+// to git), while a fresh conversation's prompt is told where the mounts
+// landed. A resumed round still mounts but skips the note (it already
+// lives in that conversation), a rotted grant fails the round before
+// spawn, and the broken-resume fresh retry — which drops the resume flag —
+// relays the note its resumed first launch skipped.
+func TestRunJailedClaudeActivityFolderGrants(t *testing.T) {
+	grant := func(t *testing.T) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "shared")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	t.Run("grants mount and a fresh prompt is told", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+		first, second := grant(t), grant(t)
+		second = filepath.Join(filepath.Dir(second), "notes")
+		if err := os.MkdirAll(second, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		wt := t.TempDir()
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+			Folders:      []string{first, second},
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		args := calls[0].Args
+		for _, src := range []string{first, second} {
+			want := src + ":" + filepath.Join(wt, foldersMountRoot, filepath.Base(src))
+			i := slices.Index(args, want)
+			if i == -1 {
+				t.Fatalf("args %v carry no --rw-map spec %q", args, want)
+			}
+			if args[i-1] != "--rw-map" {
+				t.Errorf("spec %q at %d is not a --rw-map value in %v", want, i, args)
+			}
+			if term := slices.Index(args, "--"); term == -1 || term < i {
+				t.Errorf("--rw-map spec at %d is not before the -- terminator in %v", i, args)
+			}
+			info, err := os.Stat(filepath.Join(wt, foldersMountRoot, filepath.Base(src)))
+			if err != nil || !info.IsDir() {
+				t.Errorf("mountpoint for %s not created before spawn: %v", src, err)
+			}
+			// The prompt names the addressable mount path and the host
+			// folder behind it — the agent cannot see host paths.
+			if !strings.Contains(calls[0].Stdin, filepath.Join(foldersMountRoot, filepath.Base(src))) ||
+				!strings.Contains(calls[0].Stdin, src) {
+				t.Errorf("prompt %q says nothing about the mount of %s", calls[0].Stdin, src)
+			}
+		}
+		if !strings.HasPrefix(calls[0].Stdin, "fix the bug") {
+			t.Errorf("prompt %q does not start with the round's own prompt", calls[0].Stdin)
+		}
+	})
+
+	t.Run("no grants mounts nothing", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+		wt := t.TempDir()
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+
+		for _, call := range readCalls(t, log) {
+			if slices.Contains(call.Args, "--rw-map") {
+				t.Errorf("args %v carry --rw-map without grants", call.Args)
+			}
+			if call.Stdin != "fix the bug" {
+				t.Errorf("stdin = %q, want the bare prompt", call.Stdin)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(wt, foldersMountRoot)); !os.IsNotExist(err) {
+			t.Errorf("mount root created in the worktree without grants: %v", err)
+		}
+	})
+
+	t.Run("a resumed round mounts but skips the note", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+		src := grant(t)
+		wt := t.TempDir()
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+			SessionID:    "sess-7",
+			Folders:      []string{src},
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 1 || !slices.Contains(calls[0].Args, "--rw-map") {
+			t.Fatalf("resumed args %v carry no folder mount (%d calls)", calls[0].Args, len(calls))
+		}
+		if calls[0].Stdin != "fix the bug" {
+			t.Errorf("resumed prompt = %q, want the bare prompt — the note already lives in the conversation", calls[0].Stdin)
+		}
+	})
+
+	t.Run("rotted grant fails before spawn", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		log := newStubLog(t)
+		// Pre-create the log so a round that fails before spawn — never
+		// invoking ai-jail, hence never appending — parses as zero calls.
+		if err := os.WriteFile(log, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stubBin(t, "ai-jail", "exit 0")
+		wt := t.TempDir()
+
+		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+			Folders:      []string{filepath.Join(t.TempDir(), "gone")},
+		})
+		if err == nil {
+			t.Fatal("RunJailedClaudeActivity on a rotted grant should fail")
+		}
+		if calls := readCalls(t, log); len(calls) != 0 {
+			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
+		}
+		if _, serr := os.Stat(filepath.Join(wt, foldersMountRoot)); !os.IsNotExist(serr) {
+			t.Errorf("mount root created in the real worktree for a failed round: %v", serr)
+		}
+	})
+
+	t.Run("broken resume's fresh retry relays the note", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		src := grant(t)
+		wt := t.TempDir()
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", `for a in "$@"; do
+  if [ "$a" = "sess-dead" ]; then
+    echo 'claude: no conversation found with session ID sess-dead' >&2
+    exit 1
+  fi
+done
+exit 0`)
+		// Live-looking record: the pre-flight passes, claude rejects the
+		// resume.
+		recordSession(context.Background(), wt, RoleDev, "sess-dead")
+		plantTranscript(t, wt, "sess-dead")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+			Role:         RoleDev,
+			Folders:      []string{src},
+		}); err != nil {
+			t.Fatalf("broken resume must get one fresh start, got %v", err)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 2 {
+			t.Fatalf("ai-jail called %d times, want 2 (failed resume, fresh retry)", len(calls))
+		}
+		if calls[0].Stdin != "fix the bug" {
+			t.Errorf("resumed attempt prompt = %q, want the bare prompt", calls[0].Stdin)
+		}
+		if !strings.Contains(calls[1].Stdin, filepath.Join(foldersMountRoot, filepath.Base(src))) {
+			t.Errorf("fresh retry prompt %q carries no mounts note", calls[1].Stdin)
+		}
+		for i, call := range calls {
+			if !slices.Contains(call.Args, "--rw-map") {
+				t.Errorf("attempt %d args %v carry no folder mount", i, call.Args)
+			}
+		}
+	})
+}

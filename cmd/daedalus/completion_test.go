@@ -150,7 +150,7 @@ func TestCompleteFlags(t *testing.T) {
 		{[]string{"wipe", "wf-1", "--yes", "-"}, withoutNames(allFlags, "yes")},
 		// -c already used: neither spelling is offered again, every other
 		// long spelling is.
-		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, []string{"--append", "--cli", "--cot", "--detach", "--file", "--prefix", "--status", "--type", "--workflow", "--yes"}},
+		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, []string{"--append", "--cli", "--cot", "--detach", "--file", "--folder", "--prefix", "--status", "--type", "--workflow", "--yes"}},
 		// The word after a value-taking flag is being completed as that
 		// flag's value — no candidates.
 		{[]string{"-f", ""}, nil},

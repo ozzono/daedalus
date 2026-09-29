@@ -77,6 +77,10 @@ type flags struct {
 	// for that run: the selection travels with the run's workflow input, so
 	// it applies on whichever worker serves the queue.
 	agentCLI string
+	// folders, set via -folder/--folder on `run` (repeatable), grants the
+	// run read-write access to host folders: each path travels with the
+	// run's workflow input and is mounted into the jailed rounds' sandbox.
+	folders []string
 	// status, set via --status on `log`, prints the task's status brief
 	// instead of the raw log.
 	status bool
@@ -117,6 +121,8 @@ var flagTable = map[string]flagSpec{
 	"--prefix":   {name: "prefix", value: true},
 	"-cli":       {name: "cli", value: true},
 	"--cli":      {name: "cli", value: true},
+	"-folder":    {name: "folder", value: true},
+	"--folder":   {name: "folder", value: true},
 	"-t":         {name: "type", value: true},
 	"--type":     {name: "type", value: true},
 	"-d":         {name: "detach"},
@@ -156,6 +162,8 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 				return err
 			}
 			f.agentCLI = value
+		case "folder":
+			f.folders = append(f.folders, value)
 		case "type":
 			if value != workerTypeDev && value != workerTypeTest {
 				return fmt.Errorf("unknown worker type %q (valid: %s, %s)", value, workerTypeDev, workerTypeTest)
@@ -226,6 +234,12 @@ parse:
 	// targets a pipeline whose agent is already fixed.
 	if f.agentCLI != "" && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
 		return f, nil, errors.New("-cli/--cli only applies to run")
+	}
+	// Likewise -folder/--folder: the grants travel with a run's workflow
+	// input, so only a fresh `run` can honor them — append mode steers a
+	// pipeline whose trust surface (grants included) is already fixed.
+	if len(f.folders) > 0 && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
+		return f, nil, errors.New("-folder/--folder only applies to a fresh run")
 	}
 	// The record-driven worker commands (`worker restart all`, `worker
 	// restart <name>`, `worker status`) work from the recorded configs

@@ -204,7 +204,24 @@ up.
    ```
 
    The path may also be a glob (`notes/*.md`, `/path/to/specs/*`): every
-   matching file is read in lexical order and joined into the prompt.
+   matching file is read in lexical order and joined into the prompt. A glob
+   whose *directory* part carries metachars (`*?[\`) is rejected, because
+   that directory is granted to the run read-write (below) and is taken
+   literally, never globbed.
+
+   `-folder/--folder <path>` (repeatable) grants the run read-write access
+   to a host folder: each is mounted into the jailed rounds' sandbox at
+   `.daedalus-folders/<basename>` and named in the agent's opening prompt,
+   so the run can do bookkeeping outside the repo — update a shared
+   done-index, retire its own task file. Passing `-f` grants the task file's
+   containing folder automatically, so the run above can remove
+   `issue-42.md` itself. Grants are fresh-run only (rejected in append
+   mode), validated at submit, and are the same accepted operator trade as
+   the bug-filing mirror: a read-write window onto a host path you chose.
+
+   ```sh
+   daedalus run -folder ~/Projects/tasks/daedalus /path/to/repo 42 -f issue-42.md
+   ```
 
    `-cli/--cli <agent>` overrides the config's jailed agent (`claude`,
    `opencode`, `amp`, `pi`, `aider`) for this run — the selection travels
