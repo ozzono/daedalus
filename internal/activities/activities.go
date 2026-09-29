@@ -196,6 +196,25 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 			logger.Info("Resuming the previous attempt's recorded agent session", "SessionID", id)
 		}
 	}
+	// pi session hygiene, gated to pi so every other agent's resume path is
+	// byte-identical: a transcript that already embeds tool-call JSON is
+	// the self-reinforcing degenerate pattern a small model imitates, so
+	// the session is not resumed at all; a transcript ending in a
+	// failed-edit loop keeps its session but gets the next round steered
+	// (piEditSteer rides the round's prompt as the newest user message).
+	steer := false
+	if agent == "pi" && resume != "" {
+		health := scanPiSession(input.WorktreePath, resume)
+		if health.embeddedToolJSON {
+			activityLogger(ctx).Warn("pi session transcript embeds tool-call JSON; starting a fresh session",
+				"SessionID", resume)
+			resume = ""
+		} else if health.editLoop {
+			activityLogger(ctx).Warn("pi session ends in a failed-edit loop; steering the next round",
+				"SessionID", resume)
+			steer = true
+		}
+	}
 	runArgs := agentArgs
 	if resume != "" && canResume {
 		runArgs = append([]string{resumeFlag, resume}, agentArgs...)
@@ -219,6 +238,9 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 		if resume == "" || !canResume {
 			prompt += foldersNote
 		}
+	}
+	if steer {
+		prompt = piEditSteer + "\n\n" + prompt
 	}
 	start := time.Now()
 	res, err := runJailedKindFolders(ctx, input.Role, input.Agent, input.WorktreePath, prompt, input.Folders, runArgs...)
@@ -319,6 +341,16 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 			resume = id
 			logger.Info("Resuming the previous attempt's recorded reviewer session", "SessionID", id)
 		}
+	}
+	// pi session hygiene for reviewer rounds, same gating and reasoning as
+	// the agent rounds above: a transcript that embeds tool-call JSON is
+	// not resumed. The failed-edit steering does not apply — reviewers do
+	// not edit.
+	if agent == "pi" && resume != "" &&
+		scanPiSession(input.WorktreePath, resume).embeddedToolJSON {
+		activityLogger(ctx).Warn("pi session transcript embeds tool-call JSON; starting a fresh session",
+			"SessionID", resume)
+		resume = ""
 	}
 	runArgs := agentArgs
 	if resume != "" && canResume {

@@ -170,20 +170,8 @@ func piSessionsDir(worktree string) (string, error) {
 // piTranscriptExists reports whether pi holds a session file for session id
 // in this worktree's session dir.
 func piTranscriptExists(worktree, id string) bool {
-	dir, err := piSessionsDir(worktree)
-	if err != nil {
-		return false
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if pid, ok := piSessionID(e.Name()); ok && pid == id {
-			return true
-		}
-	}
-	return false
+	_, ok := piSessionFile(worktree, id)
+	return ok
 }
 
 // workflowRunID returns the workflow execution run id of the running

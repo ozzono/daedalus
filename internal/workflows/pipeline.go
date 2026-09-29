@@ -128,6 +128,21 @@ const maxConsecutiveTimeouts = 3
 // rounds forever, never converging and never parking.
 const maxVerdictlessReviews = 3
 
+// maxIdenticalVerdicts caps how many review rounds in a row — per review
+// role, so a code-review approval between a test reviewer's repeated
+// REBUILD findings does not reset the count — may return a byte-identical
+// comments body (whitespace-normalized) before the run parks: the timeout
+// and verdictless streaks above do not cover a steady stream of well-formed
+// non-approved verdicts, which is the one remaining unbounded review loop —
+// an implementer that cannot act on the feedback at all (e.g. a small
+// self-hosted model retrying a hallucinated edit forever) produces reviews
+// that differ in no way round to round, so identical verdicts in a row mean
+// the loop cannot converge and a maintainer must arbitrate. Only verdicts
+// carrying a real marker count; marker-less rounds have
+// maxVerdictlessReviews, and an approval ends that role's loop (and resets
+// its streak) before it could ever park.
+const maxIdenticalVerdicts = 3
+
 // quotaHeartbeatInterval is how long a run sleeps when the agent API is
 // exhausted (hard cap, rate limit, overload) before retrying the same
 // round unchanged.

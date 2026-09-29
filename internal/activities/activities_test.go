@@ -3439,8 +3439,11 @@ func TestRunJailedClaudeActivityPi(t *testing.T) {
 		"json",
 		"-p",
 	}, "ai-jail")
-	if calls[0].Stdin != "fix the bug" {
-		t.Errorf("ai-jail stdin = %q, want the prompt", calls[0].Stdin)
+	// pi implementing rounds carry the edit-discipline guardrail, appended
+	// to the round's prompt (reviewers and every other agent get the bare
+	// prompt).
+	if calls[0].Stdin != "fix the bug"+piEditGuardrail {
+		t.Errorf("ai-jail stdin = %q, want the prompt with the pi edit guardrail", calls[0].Stdin)
 	}
 }
 
