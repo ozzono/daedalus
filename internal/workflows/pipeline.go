@@ -100,6 +100,17 @@ type PipelineInput struct {
 	// deployment's worker may run the suite, and env would apply the
 	// wrong deployment's dir.
 	TestOutputDir string
+	// Folders are the run's granted host folders (`run -folder/--folder`,
+	// plus the -f task file's folder; resolved to cleaned absolute paths at
+	// submit). Each is mounted read-write into the implementing rounds'
+	// sandbox under <worktree>/.daedalus-folders/<basename>
+	// (activities.FolderMounts) and named in a fresh conversation's opening
+	// prompt, so brief-mandated bookkeeping outside the repo is executable
+	// by the run itself. A continued run keeps the aborted attempt's grants,
+	// frozen at start like its write-scope policy; reviewer rounds carry
+	// none by design. Empty — no grants, or a run whose input predates the
+	// field — mounts nothing, replay-safe like every other input field.
+	Folders []string
 }
 
 // maxConsecutiveTimeouts caps how many timed-out rounds in a row the

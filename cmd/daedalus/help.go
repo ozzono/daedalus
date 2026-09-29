@@ -92,14 +92,27 @@ FLAGS
                           with the run's workflow input, so it applies on
                           whichever worker serves the queue. Fresh runs only —
                           rejected in append mode.
+  -folder, --folder <path>
+                          Grant this run read-write access to a host folder
+                          (repeatable). Each is mounted into the jailed
+                          rounds' sandbox at .daedalus-folders/<basename> and
+                          named in the opening prompt, so the run can do
+                          brief-mandated bookkeeping outside the repo (update
+                          a shared done-index, retire its own task file).
+                          Fresh runs only — rejected in append mode; a
+                          running pipeline's grants are already fixed.
   -f, --file <path>       Read the task description from a file. A glob pattern
                           (e.g. notes/*.md) expands to every matching file,
-                          concatenated in lexical order.
+                          concatenated in lexical order. The file's containing
+                          folder is also granted read-write (see -folder), so
+                          the run can retire the brief itself; a glob whose
+                          directory part carries metachars cannot be granted.
   -a, --append <id>       Append mode: target an already-running pipeline instead
                           of starting a new run — the prompt is folded into the
                           agent's next fix round (same as "daedalus guide").
-                          -f works here too; -d has no effect and -p is rejected:
-                          the run keeps the branch prefix it started with.
+                          -f works here too (the prompt only — it grants no
+                          folder); -d has no effect and -p and -folder are
+                          rejected: the run keeps what it started with.
 
 PREFLIGHT
 Before dispatching, run checks two things, in order. First, the target

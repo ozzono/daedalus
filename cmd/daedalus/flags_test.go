@@ -203,3 +203,48 @@ func TestParseFlagsYes(t *testing.T) {
 		}
 	}
 }
+
+// TestParseFlagsFolder pins the folder-grant flag surface: -folder/--folder
+// is repeatable and accumulates in argument order (the "=" spelling
+// included), a missing value is a parse error, and the grants are refused
+// outside a fresh `run` — the worker no longer takes them (they travel with
+// the run's workflow input), and append mode targets a pipeline whose
+// write scope is already fixed.
+func TestParseFlagsFolder(t *testing.T) {
+	for _, c := range []struct {
+		args     []string
+		want     []string
+		wantRest []string
+	}{
+		{[]string{"run", "-folder", "/a", "/repo", "42", "do it"}, []string{"/a"}, []string{"run", "/repo", "42", "do it"}},
+		{[]string{"run", "--folder", "/a", "--folder", "/b", "/repo", "42", "do it"}, []string{"/a", "/b"}, []string{"run", "/repo", "42", "do it"}},
+		{[]string{"run", "-folder", "/b", "--folder=/a", "/repo", "42", "do it"}, []string{"/b", "/a"}, []string{"run", "/repo", "42", "do it"}},
+		{[]string{"--folder=/a", "run", "/repo", "42", "do it"}, []string{"/a"}, []string{"run", "/repo", "42", "do it"}},
+	} {
+		f, rest, err := parseFlags(c.args)
+		if err != nil {
+			t.Errorf("parseFlags(%v): %v", c.args, err)
+			continue
+		}
+		if !reflect.DeepEqual(f.folders, c.want) {
+			t.Errorf("parseFlags(%v) folders = %v, want %v", c.args, f.folders, c.want)
+		}
+		if !reflect.DeepEqual(rest, c.wantRest) {
+			t.Errorf("parseFlags(%v) rest = %v, want %v", c.args, rest, c.wantRest)
+		}
+	}
+
+	if _, _, err := parseFlags([]string{"run", "-folder"}); err == nil {
+		t.Error("-folder without a value should error")
+	}
+	// Grants name a fresh-run option; the worker would silently ignore them.
+	if _, _, err := parseFlags([]string{"worker", "start", "-folder", "/a"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to a fresh run") {
+		t.Errorf("parseFlags(worker -folder) err = %v, want a fresh-run-only rejection", err)
+	}
+	// Append mode targets a pipeline whose grants are already fixed.
+	if _, _, err := parseFlags([]string{"run", "-a", "wf-1", "-folder", "/a", "steer it"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to a fresh run") {
+		t.Errorf("parseFlags(run -a -folder) err = %v, want a fresh-run-only rejection", err)
+	}
+}

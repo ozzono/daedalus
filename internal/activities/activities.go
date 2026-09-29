@@ -46,6 +46,15 @@ type AgentRunInput struct {
 	// session watcher recorded for this role, if any. Empty role (one-shot
 	// callers) skips the fallback.
 	Role SessionRole
+	// Folders are the run's granted host folders (PipelineInput.Folders,
+	// resolved to absolute paths at submit): each is mounted read-write into
+	// this round's jail under <worktree>/.daedalus-folders/<basename>
+	// (FolderMounts), and a fresh conversation's prompt is told where each
+	// landed. Empty — no grants, or a run whose input predates the field —
+	// mounts nothing, replay-safe like every other input field. Reviewer
+	// rounds carry no grants by design: grants serve the working agent's
+	// task (bookkeeping), not the review.
+	Folders []string
 }
 
 // AgentRunResult carries the agent's visible text and chain of thought into
@@ -191,8 +200,28 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 	if resume != "" && canResume {
 		runArgs = append([]string{resumeFlag, resume}, agentArgs...)
 	}
+	prompt := input.Prompt
+	// Granted host folders: a fresh conversation — any round that will not
+	// resume one — is told where the mounts landed; a resumed round skips
+	// it, the note already lives in that conversation. Rendered from the
+	// same FolderMounts call the argv builder (runJailedRound) makes, so
+	// the relayed paths can never drift from the mounted ones. The
+	// broken-resume fresh retry below starts a new conversation too (it
+	// drops the resume flag), so it appends the note before its second
+	// launch.
+	foldersNote := ""
+	if len(input.Folders) > 0 {
+		mounts, err := FolderMounts(input.WorktreePath, input.Folders)
+		if err != nil {
+			return AgentRunResult{}, err
+		}
+		foldersNote = folderMountNote(mounts)
+		if resume == "" || !canResume {
+			prompt += foldersNote
+		}
+	}
 	start := time.Now()
-	res, err := runJailedKind(ctx, input.Role, input.Agent, input.WorktreePath, input.Prompt, runArgs...)
+	res, err := runJailedKindFolders(ctx, input.Role, input.Agent, input.WorktreePath, prompt, input.Folders, runArgs...)
 	if err != nil && resume != "" && canResume && brokenResume(err) {
 		// The resumed session died anyway — a missing, pruned, or corrupt
 		// transcript the pre-flight check missed, or a conversation claude
@@ -202,7 +231,9 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 		// it never gets that far, a stale record only costs another
 		// classification pass, never a wrong resume of a live session.
 		activityLogger(ctx).Warn("Resumed agent session is broken; retrying the round with a fresh session", "SessionID", resume, "Error", err)
-		res, err = runJailedKind(ctx, input.Role, input.Agent, input.WorktreePath, input.Prompt, agentArgs...)
+		// The retry launches fresh (no resume flag), so it needs the mounts
+		// note the resumed first launch skipped.
+		res, err = runJailedKindFolders(ctx, input.Role, input.Agent, input.WorktreePath, prompt+foldersNote, input.Folders, agentArgs...)
 	}
 	if err != nil {
 		return AgentRunResult{}, err

@@ -170,6 +170,68 @@ func ensureWorkerActive(cfg config.Config, configPath string) error {
 	return fmt.Errorf("worker preflight: worker %s stayed up but never became ready within %s — check its log: %s", name, workerBootWait, logFile)
 }
 
+// resolveFolderGrants validates a fresh run's folder grants: each
+// -folder/--folder occurrence plus the containing folder of the -f/--file
+// task file (the file itself is the prompt; the grant is its folder, so the
+// run can retire the brief and update shared indexes through the mount).
+// Each grant resolves to a cleaned absolute path that must exist, be a
+// directory, not be the filesystem root, and carry no colon — it composes
+// into ai-jail's --rw-map <source>:<dest> mount spec — and two grants
+// sharing a basename are rejected, the second shadowing the first inside
+// .daedalus-folders. A bad grant should fail here at submit, not at the
+// first round. Duplicates — the same folder granted twice, or via both -f
+// and --folder — collapse to one grant. A glob
+// task file's directory part is taken literally, never globbed, so one
+// carrying metachars is rejected instead of granting a path that does not
+// exist. (The worker re-validates all of this through
+// activities.FolderMounts; this is the submit-time mirror.)
+func resolveFolderGrants(flagFolders []string, taskFile string) ([]string, error) {
+	grants := flagFolders
+	if taskFile != "" {
+		dir := filepath.Dir(taskFile)
+		if strings.ContainsAny(dir, `*?[\`) {
+			return nil, fmt.Errorf("-f %s: its folder %q carries glob metachars and is taken literally, so it cannot be granted — pass --folder with a plain path instead", taskFile, dir)
+		}
+		grants = append(grants, dir)
+	}
+	var out []string
+	seen := map[string]bool{}
+	bases := map[string]bool{}
+	for _, grant := range grants {
+		abs, err := filepath.Abs(grant)
+		if err != nil {
+			return nil, fmt.Errorf("folder grant %s: %w", grant, err)
+		}
+		if abs == string(filepath.Separator) {
+			return nil, errors.New("folder grant must not be the filesystem root")
+		}
+		if strings.ContainsRune(abs, ':') {
+			return nil, fmt.Errorf("folder grant %s must not contain %q — it composes into the jail's --rw-map <source>:<dest> mount spec", abs, ":")
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return nil, fmt.Errorf("folder grant %s: %w", abs, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("folder grant %s is not a directory", abs)
+		}
+		if seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		// Same shadow check the worker's FolderMounts applies: two distinct
+		// folders mounting under one basename would silently hide the
+		// first from the agent.
+		base := filepath.Base(abs)
+		if bases[base] {
+			return nil, fmt.Errorf("two folder grants share the basename %q — the second would shadow the first inside .daedalus-folders", base)
+		}
+		bases[base] = true
+		out = append(out, abs)
+	}
+	return out, nil
+}
+
 // startPipeline triggers the named workflow for the given issue on the
 // configured task queue. configPath is the resolved config file the run
 // loaded (the preflight-started daemon is re-executed with it).
@@ -177,6 +239,13 @@ func ensureWorkerActive(cfg config.Config, configPath string) error {
 // -cli/--cli, overrides the config's jailed agent for this run. Unless
 // detach is set, it then blocks until the pipeline finishes.
 func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string) error {
+	return startPipelineFolders(cfg, configPath, workflowName, repoPath, issueID, prompt, detach, branchPrefix, agent, nil)
+}
+
+// startPipelineFolders is startPipeline with the run's validated folder
+// grants (resolveFolderGrants). (Split so startPipeline's existing
+// signature — and the tests pinning it — stays untouched.)
+func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string, folders []string) error {
 	spec, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
@@ -197,6 +266,11 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 		return err
 	}
 	defer c.Close()
+
+	// Best-effort alert, never an error: a shared grant with another
+	// running pipeline means concurrent, uncoordinated writes to that
+	// folder.
+	warnFolderOverlap(c, cfg, folders)
 
 	// The workflow ID is scoped by task queue so different projects or flows
 	// on one Temporal server never collide on issue IDs. Flow-scoped runs
@@ -244,6 +318,7 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 		CleanupTimeout:  cfg.CleanupTimeout,
 		SharedTestQueue: sharedTestQueueInput(cfg),
 		TestOutputDir:   cfg.TestOutputDir(),
+		Folders:         folders,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -258,6 +333,60 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 		return nil
 	}
 	return awaitPipeline(run)
+}
+
+// warnFolderOverlap prints a best-effort warning when this run's folder
+// grants overlap a currently running pipeline's on the same task queue:
+// concurrent append-one-row edits to a shared folder (a done-index) are
+// hand-fixable, so this is an alert naming the shared folder and the other
+// run — not an error, since refusing the run would turn a bookkeeping
+// convenience into a scheduling constraint. Any failure enumerating (an
+// unreachable visibility store, an unreadable history) degrades to silence,
+// never a failure. The workflow has not started yet, so the run's own grants
+// cannot match themselves.
+func warnFolderOverlap(c client.Client, cfg config.Config, folders []string) {
+	if len(folders) == 0 {
+		return
+	}
+	granted := make(map[string]bool, len(folders))
+	for _, f := range folders {
+		granted[f] = true
+	}
+	resp, err := c.ListWorkflow(context.Background(), &workflowservice.ListWorkflowExecutionsRequest{
+		Namespace: "default",
+		Query:     fmt.Sprintf("TaskQueue = '%s' AND ExecutionStatus = 'Running'", cfg.Temporal.TaskQueue),
+	})
+	if err != nil {
+		return
+	}
+	dc := converter.GetDefaultDataConverter()
+	for _, ex := range resp.GetExecutions() {
+		var prev workflows.PipelineInput
+		iter := c.GetWorkflowHistory(context.Background(),
+			ex.GetExecution().GetWorkflowId(), ex.GetExecution().GetRunId(),
+			false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+		for iter.HasNext() {
+			ev, err := iter.Next()
+			if err != nil {
+				break
+			}
+			if att := ev.GetWorkflowExecutionStartedEventAttributes(); att != nil {
+				// Only the started event carries the input; stop walking as
+				// soon as it is seen (or undecodable).
+				if ps := att.GetInput().GetPayloads(); len(ps) > 0 {
+					if dc.FromPayload(ps[0], &prev) == nil {
+						for _, f := range prev.Folders {
+							if granted[f] {
+								fmt.Printf("warning: folder %s is also granted to running pipeline %s — writes to it are not coordinated across runs\n",
+									f, ex.GetExecution().GetWorkflowId())
+							}
+						}
+					}
+				}
+				break
+			}
+		}
+	}
 }
 
 // writeExampleConfig writes the fully-commented example configuration —
@@ -376,7 +505,10 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		BranchPrefix: resolveBranchPrefix(prev.BranchPrefix, cfg.BranchPrefix),
 		// The continued run keeps the agent the aborted attempt ran with —
 		// a pre-field attempt's empty value falls back to the worker's.
-		Agent:           prev.Agent,
+		Agent: prev.Agent,
+		// The continued run keeps the aborted attempt's folder grants,
+		// frozen at start like its write-scope policy.
+		Folders:         prev.Folders,
 		Authorship:      cfg.Authorship,
 		TestTimeout:     cfg.TestsTimeout,
 		AgentRunTimeout: cfg.AgentRunTimeout,

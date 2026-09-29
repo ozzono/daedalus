@@ -317,6 +317,92 @@ func heartbeatLoop(ctx context.Context, done <-chan struct{}) {
 	}
 }
 
+// foldersMountRoot is the worktree-relative folder each granted host folder
+// is mounted into inside a round's jail, named by the folder's basename so
+// the paths in the opening prompt stay meaningful. A dot-folder keeps the
+// worktree root visually clean (same convention as .daedalus-aider/), and it
+// only ever exists as empty mountpoint dirs, which git does not see.
+const foldersMountRoot = ".daedalus-folders"
+
+// FolderMount is one granted host folder's read-write window into a round's
+// jail: Source is the host absolute path, Dest the worktree-absolute
+// mountpoint it appears at inside the sandbox.
+type FolderMount struct {
+	Source string
+	Dest   string
+}
+
+// FolderMounts resolves a run's folder grants (PipelineInput.Folders) into
+// the jail mount list: one read-write mount per grant, the host folder
+// appearing at <worktree>/.daedalus-folders/<basename>. It revalidates every
+// grant the way the CLI did at submit (exists, is a directory, not the
+// filesystem root, colon-free — the path composes into ai-jail's
+// --rw-map <source>:<dest> spec, and the worktree root naming Dest is not
+// load-validated), so a grant that rotted between submit and the round fails
+// it before spawn instead of half-mounting; identical duplicates collapse,
+// and two grants sharing a basename are rejected — the second would silently
+// shadow the first inside the sandbox. This is the one helper both the argv
+// builder (runJailedRound) and the prompt relay (RunJailedClaudeActivity)
+// render from, so the paths the agent is told can never drift from the
+// mounted ones.
+func FolderMounts(worktreePath string, folders []string) ([]FolderMount, error) {
+	if len(folders) == 0 {
+		return nil, nil
+	}
+	var mounts []FolderMount
+	seen, byBase := map[string]bool{}, map[string]bool{}
+	for _, folder := range folders {
+		abs, err := filepath.Abs(folder)
+		if err != nil {
+			return nil, fmt.Errorf("folder grant %s: %w", folder, err)
+		}
+		if abs == string(filepath.Separator) {
+			return nil, errors.New("folder grant must not be the filesystem root")
+		}
+		if strings.ContainsRune(abs, ':') {
+			return nil, fmt.Errorf("folder grant %s must not contain %q — it composes into the jail's --rw-map <source>:<dest> mount spec", abs, ":")
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return nil, fmt.Errorf("folder grant %s: %w", abs, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("folder grant %s is not a directory", abs)
+		}
+		if seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		base := filepath.Base(abs)
+		dest := filepath.Join(worktreePath, foldersMountRoot, base)
+		if byBase[base] {
+			return nil, fmt.Errorf("two folder grants share the basename %q — the second would shadow the first inside %s", base, foldersMountRoot)
+		}
+		byBase[base] = true
+		if strings.ContainsRune(dest, ':') {
+			return nil, fmt.Errorf("folder mountpoint %s must not contain %q — it is composed into the jail's --rw-map <source>:<dest> mount spec", dest, ":")
+		}
+		mounts = append(mounts, FolderMount{Source: abs, Dest: dest})
+	}
+	return mounts, nil
+}
+
+// folderMountNote renders the prompt paragraph mapping the run's sandbox
+// mount paths to their host folders: the agent cannot see host paths, and
+// the note is what makes brief-mandated bookkeeping (a shared done-index,
+// retiring the brief itself) executable inside the jail. The agent's working
+// directory is the worktree root, so the worktree-relative mountpoint is the
+// addressable path.
+func folderMountNote(mounts []FolderMount) string {
+	var b strings.Builder
+	b.WriteString("\n\nGRANTED HOST FOLDERS — read-write mounts inside this sandbox; edits through these paths land directly on the host and never appear in this worktree's git tree:\n")
+	for _, m := range mounts {
+		fmt.Fprintf(&b, "- %s — host %s\n",
+			filepath.Join(foldersMountRoot, filepath.Base(m.Source)), m.Source)
+	}
+	return b.String()
+}
+
 // runJailed runs one autonomous agent invocation inside an ai-jail sandbox
 // rooted at the worktree, with provider failover (see providerAvailability):
 // the round runs on the primary provider unless it is in a dry hold, in
@@ -348,11 +434,20 @@ func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArg
 // role — discovery, and every direct caller that does not chain — skips
 // the tracking.
 func runJailedKind(ctx context.Context, role SessionRole, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
+	return runJailedKindFolders(ctx, role, agent, worktreePath, prompt, nil, agentArgs...)
+}
+
+// runJailedKindFolders is runJailedKind with the run's granted host folders
+// (AgentRunInput.Folders); nil for every caller but the implementing agent —
+// reviewer rounds carry no grants by design. (Split from runJailedKind so
+// that function's and runJailedRound's existing signatures — and the tests
+// pinning them — stay untouched.)
+func runJailedKindFolders(ctx context.Context, role SessionRole, agent, worktreePath, prompt string, folders []string, agentArgs ...string) (jailResult, error) {
 	env, side := selectProvider()
 	if env == nil {
 		return jailResult{}, fmt.Errorf("%w: primary and fallback providers are both in dry holds", ErrAPIExhausted)
 	}
-	res, err := runJailedRound(ctx, env, role, agent, worktreePath, prompt, agentArgs...)
+	res, err := runJailedRoundFolders(ctx, env, role, agent, worktreePath, prompt, folders, agentArgs...)
 	if err == nil || !errors.Is(err, ErrAPIExhausted) {
 		return res, err
 	}
@@ -368,7 +463,7 @@ func runJailedKind(ctx context.Context, role SessionRole, agent, worktreePath, p
 			return res, err
 		}
 		logger.Info("failing round over to fallback provider", "side", otherSide)
-		res2, err2 := runJailedRound(ctx, other, role, agent, worktreePath, prompt, agentArgs...)
+		res2, err2 := runJailedRoundFolders(ctx, other, role, agent, worktreePath, prompt, folders, agentArgs...)
 		if err2 == nil {
 			return res2, nil
 		}
@@ -394,6 +489,13 @@ func runJailedKind(ctx context.Context, role SessionRole, agent, worktreePath, p
 // the conversation id is on record for retry resume within seconds of the
 // session starting, before any ceiling can land.
 func runJailedRound(ctx context.Context, env []string, role SessionRole, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
+	return runJailedRoundFolders(ctx, env, role, agent, worktreePath, prompt, nil, agentArgs...)
+}
+
+// runJailedRoundFolders is runJailedRound with the run's granted host
+// folders (AgentRunInput.Folders); nil mounts nothing (see
+// runJailedKindFolders for the split).
+func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, agent, worktreePath, prompt string, folders []string, agentArgs ...string) (jailResult, error) {
 	// Reviewer rounds dial the config's own reviewer endpoint when one is
 	// configured (see reviewerEnv); every other role keeps the serving
 	// provider's environment untouched. Applied before anything reads the
@@ -503,6 +605,34 @@ func runJailedRound(ctx context.Context, env []string, role SessionRole, agent, 
 			return jailResult{}, fmt.Errorf("prepare bug dir mountpoint %s: %w", dest, err)
 		}
 		args = append(args, "--rw-map", mirror+":"+dest)
+	}
+	// Granted host folders (AgentRunInput.Folders, `run -folder/--folder`
+	// plus the -f task file's folder): one read-write mount per grant under
+	// <worktree>/.daedalus-folders/<basename>, so a jailed round can reach
+	// operator-chosen host folders — the task-brief bookkeeping (a shared
+	// done-index, retiring the brief itself) that the worktree-only jail
+	// makes unsatisfiable. Same accepted operator trade as the bug mirror
+	// above: a read-write window onto a host path, chosen by the operator's
+	// own argv and validated at submit. Fail-fast like the mirror: the
+	// mountpoints are created host-side before spawn (an empty dir is
+	// invisible to git) and an unusable grant fails the round here — a round
+	// that ran unmounted would write the bookkeeping into the real worktree
+	// and stage it into the branch. ai-jail itself failing the mount exits
+	// nonzero before the agent runs, which the wait below already surfaces
+	// as a failed round; there is no proceed-unmounted path.
+	// ponytail: the repeated --rw-map form below is assembled but never
+	// probed against a real ai-jail (no binary in this sandbox) — pin the
+	// accepted argv shape on the first live probe, alongside the mirror
+	// block's own.
+	mounts, ferr := FolderMounts(worktreePath, folders)
+	if ferr != nil {
+		return jailResult{}, ferr
+	}
+	for _, m := range mounts {
+		if err := os.MkdirAll(m.Dest, 0o755); err != nil {
+			return jailResult{}, fmt.Errorf("prepare folder mountpoint %s: %w", m.Dest, err)
+		}
+		args = append(args, "--rw-map", m.Source+":"+m.Dest)
 	}
 	// "--" ends ai-jail's own flags: everything after it is the jailed
 	// command, verbatim — otherwise ai-jail rejects child flags that

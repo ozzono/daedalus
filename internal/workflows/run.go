@@ -321,6 +321,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			Agent:        r.input.Agent,
 			SessionID:    *session,
 			Role:         role,
+			Folders:      r.input.Folders,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.consecutiveTimeouts = 0
