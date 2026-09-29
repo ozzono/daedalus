@@ -162,6 +162,14 @@ const (
 	// suite on a foreign deployment's worker, and each deployment
 	// mirrors onto its own host.
 	TestOutputMirrorEnv = "DAEDALUS_TEST_OUTPUT_MIRROR"
+	// ReviewerURLEnv and ReviewerKeyEnv carry the reviewer section's
+	// endpoint (reviewer.url / reviewer.key) into the jailed-round
+	// builder, which pins reviewer rounds' provider endpoint to them while
+	// implementing and test rounds keep the serving provider's. Exported
+	// only when set — absent means reviewers share the implementing
+	// agent's endpoint exactly as before.
+	ReviewerURLEnv = "DAEDALUS_REVIEWER_BASE_URL"
+	ReviewerKeyEnv = "DAEDALUS_REVIEWER_API_KEY"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -245,6 +253,19 @@ type FallbackConfig struct {
 	// HeartbeatModel mirrors AnthropicConfig.HeartbeatModel for fallback
 	// rounds; empty falls back to Model, then to the agent's default.
 	HeartbeatModel string `yaml:"heartbeat_model"`
+}
+
+// ReviewerConfig optionally points the reviewer rounds (code reviewer in
+// the dev loop, test reviewer, docs reviewer) at their own provider
+// endpoint, independently of the implementing agent's anthropic/openai
+// sections. Setting url and/or key overrides just those values for
+// reviewer rounds; absent (the default) means reviewers authenticate
+// exactly like every other round. Values travel the env-only channel
+// (ReviewerURLEnv / ReviewerKeyEnv — never workflow history, activity
+// inputs, or argv); see activities.reviewerEnv for the override rules.
+type ReviewerConfig struct {
+	URL string `yaml:"url"`
+	Key string `yaml:"key"`
 }
 
 // ThinkingDisabled reports an explicit thinking: false — the only setting
@@ -483,6 +504,9 @@ type Config struct {
 	// Fallback is the independent secondary provider failover uses when
 	// the primary is API-exhausted. Inactive unless Enabled.
 	Fallback FallbackConfig `yaml:"fallback"`
+	// Reviewer is the reviewer rounds' own provider endpoint; empty (the
+	// section absent) means reviewers share the implementing agent's.
+	Reviewer ReviewerConfig `yaml:"reviewer"`
 	// BugFiling is the out-of-scope-bug filing toggle; inactive unless
 	// Enabled (see BugFilingConfig).
 	BugFiling BugFilingConfig `yaml:"bug_filing"`
@@ -551,6 +575,7 @@ type renderConfig struct {
 	Anthropic              AnthropicConfig  `yaml:"anthropic"`
 	OpenAI                 OpenAIConfig     `yaml:"openai"`
 	Fallback               FallbackConfig   `yaml:"fallback"`
+	Reviewer               ReviewerConfig   `yaml:"reviewer"`
 	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
 	TestOutput             TestOutputConfig `yaml:"test_output"`
 }
@@ -578,6 +603,7 @@ func (c Config) RenderYAML() (string, error) {
 		Anthropic:              c.Anthropic,
 		OpenAI:                 c.OpenAI,
 		Fallback:               c.Fallback,
+		Reviewer:               c.Reviewer,
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
 	})
@@ -741,6 +767,8 @@ func (c Config) AgentEnv() []string {
 		add("DAEDALUS_FALLBACK_MODEL", f.Model)
 		add("DAEDALUS_FALLBACK_HEARTBEAT_MODEL", f.HeartbeatModel)
 	}
+	add(ReviewerURLEnv, c.Reviewer.URL)
+	add(ReviewerKeyEnv, c.Reviewer.Key)
 	return env
 }
 
@@ -774,6 +802,8 @@ func ProviderEnvVars() []string {
 		"DAEDALUS_FALLBACK_API_KEY",
 		"DAEDALUS_FALLBACK_MODEL",
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
+		ReviewerURLEnv,
+		ReviewerKeyEnv,
 		BugDirEnv,
 		BugMirrorEnv,
 		TestOutputMirrorEnv,

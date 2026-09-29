@@ -187,6 +187,40 @@ func fallbackEnv() []string {
 	return env
 }
 
+// reviewerEnv pins a reviewer round's endpoint to the config's reviewer
+// section (ReviewerURLEnv / ReviewerKeyEnv, exported by runWorker when
+// reviewer.url/key are set): reviewers dial their own url/key while dev
+// and test rounds keep the serving provider's. Applied to the round's
+// assembled environment — primary or fallback side alike — in
+// runJailedRound, the one invoker every jailed round goes through. Both
+// wire families are overridden so the section serves regardless of which
+// provider is up; model vars travel untouched, so a reviewer endpoint must
+// serve the already-configured model names. Both vars absent (the default)
+// leaves the environment untouched — reviewers share the implementing
+// agent's endpoint exactly as before.
+func reviewerEnv(env []string, role SessionRole) []string {
+	if role != RoleDevReview && role != RoleTestReview {
+		return env
+	}
+	url := os.Getenv(config.ReviewerURLEnv)
+	key := os.Getenv(config.ReviewerKeyEnv)
+	if url == "" && key == "" {
+		return env
+	}
+	if url != "" {
+		env = setEnvVar(env, "ANTHROPIC_BASE_URL", url)
+		// OPENAI_API_BASE rides the same value as OPENAI_BASE_URL, per
+		// fallbackEnv.
+		env = setEnvVar(env, "OPENAI_BASE_URL", url)
+		env = setEnvVar(env, "OPENAI_API_BASE", url)
+	}
+	if key != "" {
+		env = setEnvVar(env, "ANTHROPIC_API_KEY", key)
+		env = setEnvVar(env, "OPENAI_API_KEY", key)
+	}
+	return env
+}
+
 // lookupEnv returns the value of name in env, "" when absent.
 func lookupEnv(env []string, name string) string {
 	for _, kv := range env {

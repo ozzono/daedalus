@@ -814,3 +814,140 @@ func TestFlowsAgentErrorFails(t *testing.T) {
 		})
 	}
 }
+
+// TestDevOnlyWorkflowHappyPath pins the dev-only flow's shape: the
+// implement prompt opens the run, a single approving code review leads
+// straight to finalize, and the flow never touches the test phase — no
+// suite executions, no command discovery — including no preflight gate,
+// whose baseline suite run would show up here. Every derived name scopes
+// under the flow.
+func TestDevOnlyWorkflowHappyPath(t *testing.T) {
+	// The expected prompt below pins the no-bug-dir rendering; a worker host
+	// with bug_filing enabled exports DAEDALUS_BUG_DIR into this process.
+	t.Setenv(config.BugDirEnv, "")
+	env := newTestEnv(t)
+
+	var created activities.WorktreeInput
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.WorktreeInput); ok {
+					created = in
+				}
+			}
+		}).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil).Once()
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	disc, suite := stubTestPhase(env)
+
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/dev-only-issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.Flow = "dev-only"
+	env.ExecuteWorkflow(DevOnlyWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if created.Flow != "dev-only" {
+		t.Errorf("WorktreeInput.Flow = %q, want dev-only", created.Flow)
+	}
+	if !strings.HasPrefix(created.BranchName, "feat/dev-only-issue-42-") {
+		t.Errorf("BranchName = %q, want the flow-scoped in-flight branch", created.BranchName)
+	}
+	if len(rec.inputs) != 1 {
+		t.Fatalf("agent ran %d times, want 1 (implement only)", len(rec.inputs))
+	}
+	want, err := template.Implement("implement the feature", "")
+	if err != nil {
+		t.Fatalf("build expected implement prompt: %v", err)
+	}
+	if rec.inputs[0].Prompt != want {
+		t.Errorf("implement prompt = %q, want %q", rec.inputs[0].Prompt, want)
+	}
+	if got := rec.inputs[0].Role; got != activities.RoleDev {
+		t.Errorf("implement round Role = %q, want %q", got, activities.RoleDev)
+	}
+	if len(rev.inputs) != 1 {
+		t.Fatalf("reviewer ran %d times, want 1 (code review)", len(rev.inputs))
+	}
+	ri := rev.inputs[0]
+	if ri.Focus != "the implementation" || ri.TestLogs != "" || ri.TestsInScope || ri.ReproInScope || ri.AgentReply != "" {
+		t.Errorf("code review input = %+v, want the implementation focus with no test machinery", ri)
+	}
+	if got := ri.Role; got != activities.RoleDevReview {
+		t.Errorf("code review Role = %q, want %q", got, activities.RoleDevReview)
+	}
+	if len(disc.agents) != 0 || len(suite.runs) != 0 {
+		t.Errorf("test phase ran: discovery %d, suites %d — dev-only must land without any suite execution",
+			len(disc.agents), len(suite.runs))
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/dev-only-issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestDevOnlyWorkflowReviewLoopParks pins the dev-only review loop and its
+// only halt path: a changes-requested round drives an implement-fix round
+// carrying the comments, a following NEEDS_MAINTAINER verdict parks the run
+// with the halting round's comments — and no fix round after the halt.
+func TestDevOnlyWorkflowReviewLoopParks(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "")
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "rename foo to bar"},
+		{NeedsMaintainer: true, Comments: "the fix needs a secret only the maintainer can provide"},
+	}}
+	rev.record()
+
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.Flow = "dev-only"
+	env.ExecuteWorkflow(DevOnlyWorkflow, in)
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from a NEEDS_MAINTAINER verdict")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"code review halted the run",
+		"the fix needs a secret only the maintainer can provide",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "rename foo to bar") {
+		t.Errorf("park error %q should carry the halting round's comments, not an earlier round's", err)
+	}
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (implement plus one fix round; no fix round after a halt)", len(rec.inputs))
+	}
+	fixPrompt := rec.inputs[1].Prompt
+	if !strings.Contains(fixPrompt, "rename foo to bar") {
+		t.Errorf("implement-fix prompt %q should carry the review comments", fixPrompt)
+	}
+	if got := rec.inputs[1].Role; got != activities.RoleDev {
+		t.Errorf("implement-fix round Role = %q, want %q (one dev conversation)", got, activities.RoleDev)
+	}
+	env.AssertExpectations(t)
+}

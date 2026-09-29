@@ -893,6 +893,9 @@ fallback:
   key: fb-key
   model: fb-model
   heartbeat_model: fb-haiku
+reviewer:
+  url: https://review.example
+  key: sk-review
 `))
 	if err != nil {
 		t.Fatalf("LoadRaw: %v", err)
@@ -909,7 +912,7 @@ fallback:
 		"agent:", "branch_prefix:", "authorship:", "worker_id:",
 		"tests_timeout:", "agent_run_timeout:", "review_timeout:", "cleanup_timeout:",
 		"max_concurrent_agent_runs:", "max_concurrent_tests:",
-		"temporal:", "anthropic:", "openai:", "fallback:",
+		"temporal:", "anthropic:", "openai:", "fallback:", "reviewer:",
 	} {
 		i := strings.Index(out, key)
 		if i < 0 {
@@ -940,7 +943,7 @@ fallback:
 
 	// Keys print unredacted by design: the operator's own file, their own
 	// terminal.
-	for _, want := range []string{"key: sk-secret", "key: sk-oai", "key: fb-key"} {
+	for _, want := range []string{"key: sk-secret", "key: sk-oai", "key: fb-key", "key: sk-review"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderYAML output is missing unredacted %q:\n%s", want, out)
 		}
@@ -1507,5 +1510,46 @@ func TestResolveMirrorBareTilde(t *testing.T) {
 	}
 	if got != home {
 		t.Errorf("ResolveMirror(\"~\") = %q, want %q", got, home)
+	}
+}
+
+// TestAgentEnvReviewerEndpoint pins the reviewer section's env-only
+// channel: a set url/key load through and export as the reviewer env vars
+// runJailedRound's override reads, while an absent section exports nothing
+// — reviewers then share the implementing agent's endpoint exactly as
+// before.
+func TestAgentEnvReviewerEndpoint(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "reviewer:\n  url: https://review.example\n  key: sk-review\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	env := cfg.AgentEnv()
+	if got := agentEnvValue(t, env, ReviewerURLEnv); got != "https://review.example" {
+		t.Errorf("AgentEnv() %s = %q, want https://review.example", ReviewerURLEnv, got)
+	}
+	if got := agentEnvValue(t, env, ReviewerKeyEnv); got != "sk-review" {
+		t.Errorf("AgentEnv() %s = %q, want sk-review", ReviewerKeyEnv, got)
+	}
+
+	cfg, err = Load(writeConfig(t, "anthropic:\n  key: sk-only\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, kv := range cfg.AgentEnv() {
+		if strings.HasPrefix(kv, "DAEDALUS_REVIEWER_") {
+			t.Errorf("AgentEnv() leaked %q with no reviewer section configured", kv)
+		}
+	}
+}
+
+// TestProviderEnvVarsIncludesReviewerEnvs pins that the reviewer vars are
+// in the scrub/restore list: the worker must treat them as config-derived
+// exports, or a stale inherited value would arm (or mis-arm) the reviewer
+// override next to the config it is supposed to mirror.
+func TestProviderEnvVarsIncludesReviewerEnvs(t *testing.T) {
+	for _, name := range []string{ReviewerURLEnv, ReviewerKeyEnv} {
+		if !slices.Contains(ProviderEnvVars(), name) {
+			t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), name)
+		}
 	}
 }

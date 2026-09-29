@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/version"
+	"github.com/ozzono/daedalus/internal/workflows"
 )
 
 // workerStopGrace is the daemon's graceful-drain window (SDK
@@ -195,8 +197,13 @@ func runWorker(cfg config.Config, workerType string) error {
 	var workers []worker.Worker
 	if wantsPipelineWorker(workerType) {
 		w := worker.New(c, cfg.Temporal.TaskQueue, opts)
+		// Each flow registers under its unwrapped function's own type name
+		// (WorkflowTypeName), wrapped so a parked run completes green
+		// (workflows.CompleteGreen) — the name keeps every past run's
+		// history and every start (by the same name) in agreement.
 		for _, spec := range workflowRegistry {
-			w.RegisterWorkflow(spec.Fn)
+			w.RegisterWorkflowWithOptions(workflows.CompleteGreen(spec.Fn),
+				workflow.RegisterOptions{Name: workflows.WorkflowTypeName(spec.Fn)})
 		}
 		w.RegisterActivity(activities.CreateWorktreeActivity)
 		w.RegisterActivity(activities.RunJailedClaudeActivity)

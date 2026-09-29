@@ -394,6 +394,11 @@ func runJailedKind(ctx context.Context, role SessionRole, agent, worktreePath, p
 // the conversation id is on record for retry resume within seconds of the
 // session starting, before any ceiling can land.
 func runJailedRound(ctx context.Context, env []string, role SessionRole, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
+	// Reviewer rounds dial the config's own reviewer endpoint when one is
+	// configured (see reviewerEnv); every other role keeps the serving
+	// provider's environment untouched. Applied before anything reads the
+	// round env — pi's provider staging included.
+	env = reviewerEnv(env, role)
 	selected, headless, _ := jailedAgentCLI(agent)
 	lim := agentLimiter()
 	hbDone := make(chan struct{})

@@ -13,6 +13,7 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
@@ -26,6 +27,20 @@ var (
 	errReviewStub   = errors.New("reviewer exploded")
 )
 
+// registerPipelineActivities registers the pipeline's activities with a
+// test workflow environment (the mocks below stub their outcomes).
+func registerPipelineActivities(env *testsuite.TestWorkflowEnvironment) {
+	env.RegisterActivity(activities.CreateWorktreeActivity)
+	env.RegisterActivity(activities.RunJailedClaudeActivity)
+	env.RegisterActivity(activities.RunJailedReviewerActivity)
+	env.RegisterActivity(activities.ResolveTestCommandActivity)
+	env.RegisterActivity(activities.RunTestSuiteActivity)
+	env.RegisterActivity(activities.ReproFirstGateActivity)
+	env.RegisterActivity(activities.VerifyWriteScopeActivity)
+	env.RegisterActivity(activities.FinalizeWorktreeActivity)
+	env.RegisterActivity(activities.CleanupWorktreeActivity)
+}
+
 // newTestEnv builds an in-process workflow environment with the pipeline's
 // activities mocked out.
 func newTestEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
@@ -37,16 +52,24 @@ func newTestEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	env.RegisterWorkflow(BugFixWorkflow)
 	env.RegisterWorkflow(InvestigateWorkflow)
 	env.RegisterWorkflow(RefactorWorkflow)
-	env.RegisterActivity(activities.CreateWorktreeActivity)
-	env.RegisterActivity(activities.RunJailedClaudeActivity)
-	env.RegisterActivity(activities.RunJailedReviewerActivity)
-	env.RegisterActivity(activities.ResolveTestCommandActivity)
-	env.RegisterActivity(activities.RunTestSuiteActivity)
-	env.RegisterActivity(activities.ReproFirstGateActivity)
-	env.RegisterActivity(activities.VerifyWriteScopeActivity)
-	env.RegisterActivity(activities.FinalizeWorktreeActivity)
-	env.RegisterActivity(activities.CleanupWorktreeActivity)
+	env.RegisterWorkflow(DevOnlyWorkflow)
+	registerPipelineActivities(env)
 	return env
+}
+
+// newCompleteGreenEnv builds an environment with feature-dev registered the
+// way the worker registers it — wrapped in CompleteGreen under the
+// unwrapped flow's type name — and nothing else under that name. The SDK
+// registry rejects re-registering a name, so the wrapped-registration tests
+// cannot reuse newTestEnv.
+func newCompleteGreenEnv(t *testing.T) (*testsuite.TestWorkflowEnvironment, string) {
+	t.Helper()
+	s := &testsuite.WorkflowTestSuite{}
+	env := s.NewTestWorkflowEnvironment()
+	registerPipelineActivities(env)
+	name := WorkflowTypeName(FeatureDevWorkflow)
+	env.RegisterWorkflowWithOptions(CompleteGreen(FeatureDevWorkflow), workflow.RegisterOptions{Name: name})
+	return env, name
 }
 
 // discoveryStep is one scripted test-command-discovery outcome: the
@@ -2588,5 +2611,129 @@ func TestSuiteQueueRouting(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// registerCompleteGreen re-registers fn the way runWorker registers every
+// flow: wrapped in CompleteGreen, under the unwrapped flow's own type name
+// (WorkflowTypeName) — the registration contract the parked-green behavior
+// lives or dies by.
+// TestCompleteGreenParkedRunCompletesGreen pins the registration contract
+// end to end: with the flow registered the way the worker registers it
+// (CompleteGreen under WorkflowTypeName), a NEEDS_MAINTAINER park does not
+// fail the workflow — it completes successfully with a result carrying the
+// parked marker plus the full reason (halting round's comments included),
+// while the deferred cleanup still preserves the attempt's work.
+func TestCompleteGreenParkedRunCompletesGreen(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "")
+	env, name := newCompleteGreenEnv(t)
+
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "rename foo to bar"},
+		{NeedsMaintainer: true, Comments: "the fix needs a secret only the maintainer can provide"},
+	}}
+	rev.record()
+
+	stubTestPhase(env)
+	var cleanups int
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { cleanups++ }).
+		Return(nil).Once()
+
+	env.ExecuteWorkflow(name, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("parked run failed the workflow: %v", err)
+	}
+	var result string
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if !IsParkedResult(result) {
+		t.Fatalf("result = %q, want the parked marker prefix %q", result, ParkedResultPrefix)
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"code review halted the run",
+		"the fix needs a secret only the maintainer can provide",
+	} {
+		if !strings.Contains(result, want) {
+			t.Errorf("parked result %q should contain %q", result, want)
+		}
+	}
+	if strings.Contains(result, "rename foo to bar") {
+		t.Errorf("parked result %q should carry the halting round's comments, not an earlier round's", result)
+	}
+	if cleanups != 1 {
+		t.Errorf("cleanup ran %d times, want 1 (the attempt's work is preserved either way)", cleanups)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestCompleteGreenFailureStillFails pins the wrapper's restraint: only an
+// ErrAwaitingMaintainer park completes green — every other error fails the
+// workflow exactly as the unwrapped registration would, so the failure
+// signal is not blanket-suppressed.
+func TestCompleteGreenFailureStillFails(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "")
+	env, name := newCompleteGreenEnv(t)
+
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{}, errWorktreeStub).Once()
+
+	env.ExecuteWorkflow(name, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("a genuine failure completed green; want the workflow error")
+	}
+	if strings.Contains(err.Error(), ParkedResultPrefix) {
+		t.Errorf("failure error %q masqueraded as a park", err)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestWorkflowTypeName pins the registration/start agreement: the derived
+// name is the flow's bare function name — no package path, no closure or
+// method suffix — so a start and a wrapped registration name the same
+// workflow type.
+func TestWorkflowTypeName(t *testing.T) {
+	for name, fn := range map[string]func(workflow.Context, PipelineInput) (string, error){
+		"FeatureDevWorkflow":  FeatureDevWorkflow,
+		"TestOnlyWorkflow":    TestOnlyWorkflow,
+		"InvestigateWorkflow": InvestigateWorkflow,
+		"RefactorWorkflow":    RefactorWorkflow,
+		"BugFixWorkflow":      BugFixWorkflow,
+		"DevOnlyWorkflow":     DevOnlyWorkflow,
+	} {
+		got := WorkflowTypeName(fn)
+		if got != name {
+			t.Errorf("WorkflowTypeName = %q, want %q", got, name)
+		}
+	}
+}
+
+// TestParkedResultMarkers pins the park marker the CLI gates on
+// (awaitPipeline, wipe): the prefix marks exactly the results CompleteGreen
+// produces — any other completion payload, a preserved branch name above
+// all — must never read as a park.
+func TestParkedResultMarkers(t *testing.T) {
+	reason := ErrAwaitingMaintainer.Error() + ": code review halted the run"
+	result := ParkedResult(reason)
+	if !IsParkedResult(result) {
+		t.Errorf("IsParkedResult(%q) = false, want true", result)
+	}
+	if got := strings.TrimPrefix(result, ParkedResultPrefix); got != reason {
+		t.Errorf("parked result stripped = %q, want the full reason %q", got, reason)
+	}
+	for _, notPark := range []string{"", "daedalus/issue-42-1", "feat/dev-only-issue-42-abc1234", ParkedResultPrefix[:len(ParkedResultPrefix)-1]} {
+		if IsParkedResult(notPark) {
+			t.Errorf("IsParkedResult(%q) = true, want false", notPark)
+		}
 	}
 }

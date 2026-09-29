@@ -45,6 +45,12 @@ func TestParseFlagsWorkflowRegistry(t *testing.T) {
 		!strings.Contains(err.Error(), "feature-dev") {
 		t.Errorf("parseFlags(-w nope) err = %v, want an unknown-workflow rejection naming the registry", err)
 	}
+
+	// The other registered entries dispatch too — dev-only is selection
+	// only: no config key picks a flow.
+	if _, _, err := parseFlags([]string{"run", "-w", "dev-only", "/repo", "42", "do it"}); err != nil {
+		t.Errorf("parseFlags(-w dev-only): %v", err)
+	}
 }
 
 // TestWorkflowRegistryFlowPolicies pins the flow registry as the CLI's
@@ -52,7 +58,7 @@ func TestParseFlagsWorkflowRegistry(t *testing.T) {
 // per-flow write-scope policies are exactly what the workflows verify
 // structurally before finalize — docs-only for investigate, the shared
 // test-path policy allowed for test-only and frozen for refactor, and no
-// policy at all for feature-dev and bug-fix.
+// policy at all for feature-dev, bug-fix, and dev-only.
 func TestWorkflowRegistryFlowPolicies(t *testing.T) {
 	for name, spec := range workflowRegistry {
 		if spec.Fn == nil {
@@ -71,7 +77,7 @@ func TestWorkflowRegistryFlowPolicies(t *testing.T) {
 	if len(rf.AllowedPaths) != 0 || !reflect.DeepEqual(rf.FrozenPaths, activities.TestPathPatterns) {
 		t.Errorf("refactor policy = %+v, want the shared test-path patterns frozen", rf)
 	}
-	for _, name := range []string{"feature-dev", "bug-fix"} {
+	for _, name := range []string{"feature-dev", "bug-fix", "dev-only"} {
 		if spec := workflowRegistry[name]; len(spec.AllowedPaths) != 0 || len(spec.FrozenPaths) != 0 {
 			t.Errorf("%s policy = %+v, want unrestricted", name, spec)
 		}

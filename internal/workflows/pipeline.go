@@ -5,6 +5,8 @@ package workflows
 import (
 	"errors"
 	"fmt"
+	"reflect"
+	"runtime"
 	"strings"
 	"time"
 
@@ -135,12 +137,61 @@ const maxQuotaHeartbeats = 5
 
 // ErrAwaitingMaintainer parks a run instead of failing it with a raw error:
 // the API stayed exhausted past every heartbeat, or the reviewer halted with
-// NEEDS_MAINTAINER on a task that cannot be completed as stated. A park is
-// reported as a workflow failure carrying this error, so the reason lands
-// in the workflow history and `daedalus list` shows the run as FAILED —
-// the attempt's work is already preserved on its aborted/ branch by the
-// deferred cleanup, so `daedalus continue` restarts from it.
+// NEEDS_MAINTAINER on a task that cannot be completed as stated. The
+// registration wraps every flow in CompleteGreen, so a parked run does not
+// fail the workflow — it completes successfully with ParkedResult carrying
+// the reason, and the orchestrator's history shows the run green (COMPLETED)
+// with the reason in the completion payload, distinguishable from a genuine
+// failure (which still fails the workflow). The attempt's work is already
+// preserved on its aborted/ branch by the deferred cleanup, so
+// `daedalus continue` restarts from it either way.
 var ErrAwaitingMaintainer = errors.New("run parked awaiting maintainer restart")
+
+// ParkedResultPrefix marks a completed workflow's result as a park: the
+// registration's CompleteGreen wrapper turns a parked run's
+// ErrAwaitingMaintainer failure into a successful completion whose result
+// carries the marker plus the full reason, so the orchestrator's history
+// records the run green with the park reason visible in the completion
+// payload. Preserved branch names never carry the prefix, so the marker is
+// unambiguous.
+const ParkedResultPrefix = "PARKED: "
+
+// ParkedResult renders a park's outcome as the completed workflow's result.
+func ParkedResult(reason string) string { return ParkedResultPrefix + reason }
+
+// IsParkedResult reports whether a completed workflow's result string is a
+// park — the green completion CompleteGreen produces for ErrAwaitingMaintainer.
+func IsParkedResult(result string) bool { return strings.HasPrefix(result, ParkedResultPrefix) }
+
+// CompleteGreen wraps a flow function so a parked run completes the
+// workflow successfully instead of failing it: an ErrAwaitingMaintainer
+// error is logged with its reason and returned as ParkedResult, while every
+// other error — a genuine failure — still fails the run, so the failure
+// signal is not blanket-suppressed. The worker registers every flow through
+// this wrapper under the wrapped function's own type name (WorkflowTypeName),
+// keeping the workflow type every past run's history and every start agrees
+// on unchanged.
+func CompleteGreen(fn func(workflow.Context, PipelineInput) (string, error)) func(workflow.Context, PipelineInput) (string, error) {
+	return func(ctx workflow.Context, input PipelineInput) (string, error) {
+		branch, err := fn(ctx, input)
+		if err == nil || !errors.Is(err, ErrAwaitingMaintainer) {
+			return branch, err
+		}
+		workflow.GetLogger(ctx).Info("Run parked for the maintainer; completing green",
+			"Reason", err.Error())
+		return ParkedResult(err.Error()), nil
+	}
+}
+
+// WorkflowTypeName returns the Temporal workflow type name the SDK derives
+// for fn — the same runtime.FuncForPC short-naming RegisterWorkflow and
+// ExecuteWorkflow apply by default — so a CompleteGreen-wrapped flow can be
+// registered and started under the name its unwrapped form always carried.
+func WorkflowTypeName(fn func(workflow.Context, PipelineInput) (string, error)) string {
+	full := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+	elements := strings.Split(full, ".")
+	return strings.TrimSuffix(elements[len(elements)-1], "-fm")
+}
 
 // FeatureDevWorkflow drives a full issue-development cycle in two
 // review-gated phases: (1) implementation ↔ code review until the reviewer
@@ -153,10 +204,9 @@ var ErrAwaitingMaintainer = errors.New("run parked awaiting maintainer restart")
 // run for a maintainer restart rather than failing it with a raw error (see
 // ErrAwaitingMaintainer): the provider API staying exhausted past every
 // quota heartbeat, or a reviewer NEEDS_MAINTAINER verdict on a task that
-// cannot be completed as stated. A parked run fails with ErrAwaitingMaintainer
-// (and so with the reason in the history and FAILED in `daedalus list`);
-// the deferred cleanup preserves the attempt's work on its aborted/ branch
-// either way.
+// cannot be completed as stated. The registration's CompleteGreen wrapper
+// completes a parked run green with the reason as its result; the deferred
+// cleanup preserves the attempt's work on its aborted/ branch either way.
 func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	run, cleanup := startRun(ctx, input)
 	defer cleanup()

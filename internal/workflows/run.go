@@ -235,13 +235,13 @@ func (r *pipelineRun) createWorktree() error {
 	return nil
 }
 
-// park fails the run with ErrAwaitingMaintainer carrying the full reason: a
-// reviewer NEEDS_MAINTAINER verdict, a structural gate the agent cannot
-// satisfy, or anything else only a maintainer can resolve. A park is
-// reported as a workflow failure with the reason in the history and FAILED
-// in `daedalus list`; the deferred cleanup has already preserved the
-// attempt's work on its aborted/ branch, so `daedalus continue` restarts
-// from it.
+// park returns the run's park error carrying the full reason: a reviewer
+// NEEDS_MAINTAINER verdict, a structural gate the agent cannot satisfy, or
+// anything else only a maintainer can resolve. The registration's
+// CompleteGreen wrapper turns this error into a green completion whose
+// result carries the reason (see ErrAwaitingMaintainer); the deferred
+// cleanup has already preserved the attempt's work on its aborted/ branch,
+// so `daedalus continue` restarts from it.
 func (r *pipelineRun) park(reason string) error {
 	return fmt.Errorf("%w: %s", ErrAwaitingMaintainer, reason)
 }

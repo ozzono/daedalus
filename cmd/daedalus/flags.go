@@ -35,6 +35,11 @@ const defaultWorkflowName = "feature-dev"
 // entry here (plus its workflow function and files) — no CLI changes.
 var workflowRegistry = map[string]workflows.Flow{
 	"feature-dev": {Fn: workflows.FeatureDevWorkflow},
+	// dev-only is feature-dev's phase 1 alone: implementation ↔ code
+	// review, landing without any test-phase execution (and without the
+	// preflight suite gate — see DevOnlyWorkflow). Selection is CLI-only;
+	// no config key picks a flow.
+	"dev-only": {Fn: workflows.DevOnlyWorkflow},
 	"investigate": {Fn: workflows.InvestigateWorkflow,
 		AllowedPaths: []string{"*.md", "docs/"}},
 	"test-only": {Fn: workflows.TestOnlyWorkflow,

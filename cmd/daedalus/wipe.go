@@ -110,17 +110,20 @@ func wipePipeline(cfg config.Config, workflowID string, yes bool) error {
 	abortedGlob := aborted + "-*"
 
 	// A parked run's preserved work is resumable via `daedalus continue`;
-	// wipe destroys that path permanently. A park shows only as the failed
-	// execution's message (the same text awaitPipeline matches), so probe
-	// the outcome of an already-closed run for it — a running run cannot
-	// be parked yet.
+	// wipe destroys that path permanently. Probe the outcome of an
+	// already-closed run for it — a running run cannot be parked yet. The
+	// current registration completes a parked run green with the marker
+	// result (workflows.CompleteGreen); a park of an older worker shows
+	// only as the failed execution's message (the same text awaitPipeline
+	// matches), so both shapes are recognized.
 	parked := false
 	if status != enums.WORKFLOW_EXECUTION_STATUS_RUNNING {
 		pctx, cancel := context.WithTimeout(ctx, time.Minute)
 		var out string
-		if err := c.GetWorkflow(pctx, workflowID, "").Get(pctx, &out); err != nil &&
-			strings.Contains(err.Error(), workflows.ErrAwaitingMaintainer.Error()) {
-			parked = true
+		if err := c.GetWorkflow(pctx, workflowID, "").Get(pctx, &out); err != nil {
+			parked = strings.Contains(err.Error(), workflows.ErrAwaitingMaintainer.Error())
+		} else {
+			parked = workflows.IsParkedResult(out)
 		}
 		cancel()
 	}
