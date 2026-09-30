@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
@@ -404,10 +405,56 @@ func writeExampleConfig(dir string) error {
 	return nil
 }
 
+// runVisibility is the decoded pair of run-visibility search attributes the
+// workflow upserts (workflows.DaedalusStatusAttr, LastActivityAttr). Named
+// fields, so no render site indexes a payload map.
+type runVisibility struct {
+	Status string
+	LastAt time.Time
+}
+
+// decodeRunVisibility reads the attributes from a listed execution's search
+// attributes with the default data converter. Undecodable or absent values —
+// old runs never backfilled, history is immutable — degrade to zero values,
+// never fail the table.
+func decodeRunVisibility(sa *commonpb.SearchAttributes, dc converter.DataConverter) runVisibility {
+	var vis runVisibility
+	if sa == nil {
+		return vis
+	}
+	if p, ok := sa.GetIndexedFields()[workflows.DaedalusStatusAttr]; ok {
+		_ = dc.FromPayload(p, &vis.Status)
+	}
+	if p, ok := sa.GetIndexedFields()[workflows.LastActivityAttr]; ok {
+		_ = dc.FromPayload(p, &vis.LastAt)
+	}
+	return vis
+}
+
+// dur renders a human duration for the runs table: whole seconds under an
+// hour, one decimal in hours under a day, one decimal in days beyond.
+// Negative elapsed (clock skew between server and client) clamps to zero.
+func dur(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Hour {
+		return d.Round(time.Second).String()
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%.1fh", d.Hours())
+	}
+	return fmt.Sprintf("%.1fd", d.Hours()/24)
+}
+
 // listPipelines prints the most recent sessions on this task queue, newest
-// first: workflow ID (= daedalus session id), status, and the last
-// interaction datetime (close time when the session has ended, start time
-// while it is running).
+// first. STATUS prefers the workflow's upserted DaedalusStatus over the raw
+// Temporal enum — parks and approvals are both Completed there — falling
+// back to the enum for old runs without the attribute. TIME is one merged
+// cell: while running, elapsed since the last completed round next to the
+// run's age (staleness while sleeping is the liveness signal); once closed,
+// total runtime next to how long ago it ended. A run predating the
+// attributes shows `-` for the elapsed half.
 func listPipelines(cfg config.Config, max int) error {
 	c, err := newClient(cfg)
 	if err != nil {
@@ -425,19 +472,38 @@ func listPipelines(cfg config.Config, max int) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "SESSION ID\tSTATUS\tLAST INTERACTION")
+	fmt.Fprintln(w, "SESSION ID\tSTATUS\tTIME")
+	dc := converter.GetDefaultDataConverter()
+	now := time.Now()
 	for _, info := range resp.GetExecutions() {
-		when := info.GetCloseTime()
-		note := ""
-		if !when.IsValid() {
-			when = info.GetStartTime()
-			note = " (started)"
+		id := info.GetExecution().GetWorkflowId()
+		vis := decodeRunVisibility(info.GetSearchAttributes(), dc)
+		status := info.GetStatus().String()
+		started := info.GetStartTime().AsTime()
+		if closed := info.GetCloseTime(); closed.IsValid() {
+			// Closed: the enum is overridden only by a terminal
+			// DaedalusStatus — CompleteGreen stamps those alone. A run
+			// closed by other means keeps a live-state attribute (a wipe
+			// cancel mid-heartbeat carries waiting, a killed worker leaves
+			// running on a TimedOut run), which must not shadow what
+			// Temporal recorded.
+			switch workflows.RunStatus(vis.Status) {
+			case workflows.StatusApproved, workflows.StatusParked, workflows.StatusFailed:
+				status = vis.Status
+			}
+			fmt.Fprintf(w, "%s\t%s\t[%s | ended %s ago]\n",
+				id, status, dur(closed.AsTime().Sub(started)), dur(now.Sub(closed.AsTime())))
+			continue
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s%s\n",
-			info.GetExecution().GetWorkflowId(),
-			info.GetStatus(),
-			when.AsTime().Local().Format("2006-01-02 15:04:05"),
-			note)
+		if vis.Status != "" {
+			status = vis.Status
+		}
+		elapsed := "-"
+		if !vis.LastAt.IsZero() {
+			elapsed = dur(now.Sub(vis.LastAt))
+		}
+		fmt.Fprintf(w, "%s\t%s\t[%s | started %s ago]\n",
+			id, status, elapsed, dur(now.Sub(started)))
 	}
 	return w.Flush()
 }

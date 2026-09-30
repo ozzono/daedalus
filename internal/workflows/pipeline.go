@@ -174,6 +174,49 @@ func ParkedResult(reason string) string { return ParkedResultPrefix + reason }
 // park — the green completion CompleteGreen produces for ErrAwaitingMaintainer.
 func IsParkedResult(result string) bool { return strings.HasPrefix(result, ParkedResultPrefix) }
 
+// The run-visibility search attributes the pipeline upserts (registered on
+// the namespace by `make custom-columns`): DaedalusStatus distinguishes a
+// parked run from an approved one — both are Completed in ExecutionStatus —
+// and waiting from running, while LastActivityAt carries the last completed
+// round's time, the liveness signal a quota-heartbeat sleep lacks.
+const (
+	DaedalusStatusAttr = "DaedalusStatus"
+	LastActivityAttr   = "LastActivityAt"
+)
+
+// RunStatus is the value space of the DaedalusStatus keyword attribute.
+type RunStatus string
+
+const (
+	StatusRunning  RunStatus = "running"
+	StatusWaiting  RunStatus = "waiting"
+	StatusApproved RunStatus = "approved"
+	StatusParked   RunStatus = "parked"
+	StatusFailed   RunStatus = "failed"
+)
+
+// visibilityChangeID gates every upsert behind workflow.GetVersion: replay
+// strictly matches upsert commands against recorded history events, so a
+// worker upgraded mid-run would wedge every in-flight workflow with a
+// nondeterminism failure if the new code emitted upserts unconditionally.
+// GetVersion is memoized per execution, so calling it from both CompleteGreen
+// and startRun is safe — the marker records once. Pre-marker replays get
+// DefaultVersion and skip every upsert; old runs never backfill (history is
+// immutable) and fall back to the system status.
+const visibilityChangeID = "visibility-search-attrs"
+
+func visibilityEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, visibilityChangeID, workflow.DefaultVersion, 1) == 1
+}
+
+func setRunStatus(ctx workflow.Context, s RunStatus) {
+	workflow.UpsertSearchAttributes(ctx, map[string]interface{}{DaedalusStatusAttr: string(s)})
+}
+
+func touchLastActivity(ctx workflow.Context) {
+	workflow.UpsertSearchAttributes(ctx, map[string]interface{}{LastActivityAttr: workflow.Now(ctx)})
+}
+
 // CompleteGreen wraps a flow function so a parked run completes the
 // workflow successfully instead of failing it: an ErrAwaitingMaintainer
 // error is logged with its reason and returned as ParkedResult, while every
@@ -184,7 +227,24 @@ func IsParkedResult(result string) bool { return strings.HasPrefix(result, Parke
 // on unchanged.
 func CompleteGreen(fn func(workflow.Context, PipelineInput) (string, error)) func(workflow.Context, PipelineInput) (string, error) {
 	return func(ctx workflow.Context, input PipelineInput) (string, error) {
+		// Every flow registers through this wrapper, so this is the one call
+		// site whose event-stream position every flow replays identically —
+		// the version marker is recorded here for the whole execution.
+		vis := visibilityEnabled(ctx)
 		branch, err := fn(ctx, input)
+		if vis {
+			// Terminal status stamped at the single choke point: parks and
+			// approvals are both Completed in ExecutionStatus — that gap is
+			// why the column exists.
+			switch {
+			case errors.Is(err, ErrAwaitingMaintainer):
+				setRunStatus(ctx, StatusParked)
+			case err != nil:
+				setRunStatus(ctx, StatusFailed)
+			default:
+				setRunStatus(ctx, StatusApproved)
+			}
+		}
 		if err == nil || !errors.Is(err, ErrAwaitingMaintainer) {
 			return branch, err
 		}

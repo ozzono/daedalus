@@ -78,6 +78,12 @@ type pipelineRun struct {
 	// statement coverage (TestResult.Coverage) for the reviewer.
 	cover bool
 
+	// vis records whether this execution recorded the visibility version
+	// marker; every setStatus/touch is a no-op without it, so a pre-marker
+	// run replayed by an upgraded worker never emits a command its history
+	// lacks.
+	vis bool
+
 	quotaHeartbeats     int
 	consecutiveTimeouts int
 	reviewTimeouts      int
@@ -210,6 +216,9 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 		Flow:         flowScope,
 		Authorship:   input.Authorship,
 	}
+	r.vis = visibilityEnabled(ctx)
+	r.setStatus(StatusRunning)
+	r.touch()
 	return r, func() {
 		// NewDisconnectedContext returns (Context, CancelFunc) — the second
 		// value is not an error. Detach the cancel from this deferred func's
@@ -244,6 +253,24 @@ func (r *pipelineRun) createWorktree() error {
 // so `daedalus continue` restarts from it.
 func (r *pipelineRun) park(reason string) error {
 	return fmt.Errorf("%w: %s", ErrAwaitingMaintainer, reason)
+}
+
+// setStatus upserts the DaedalusStatus visibility attribute; a no-op
+// without the version marker (see r.vis).
+func (r *pipelineRun) setStatus(s RunStatus) {
+	if !r.vis {
+		return
+	}
+	setRunStatus(r.ctx, s)
+}
+
+// touch stamps the LastActivityAt visibility attribute at each completed
+// round; a no-op without the version marker (see r.vis).
+func (r *pipelineRun) touch() {
+	if !r.vis {
+		return
+	}
+	touchLastActivity(r.ctx)
 }
 
 // drainGuidance returns the operator guidance sent since the last round
@@ -282,6 +309,7 @@ func (r *pipelineRun) heartbeat(err error, stage string) error {
 	}
 	r.logger.Warn("Agent API exhausted; sleeping one hour before retrying the round",
 		"Stage", stage, "Heartbeat", r.quotaHeartbeats, "Of", maxQuotaHeartbeats)
+	r.setStatus(StatusWaiting)
 	// The sleep races the "wakeup" signal (`daedalus worker wakeup`): the
 	// timer branch resumes the round when the hour is out, the signal branch
 	// the moment the operator — who has verified the provider recovered —
@@ -299,6 +327,7 @@ func (r *pipelineRun) heartbeat(err error, stage string) error {
 			"Stage", stage, "Heartbeat", r.quotaHeartbeats, "Of", maxQuotaHeartbeats)
 	})
 	sel.Select(r.ctx)
+	r.setStatus(StatusRunning)
 	return nil
 }
 
@@ -326,6 +355,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 		if err == nil {
 			r.consecutiveTimeouts = 0
 			r.quotaHeartbeats = 0
+			r.touch()
 			*session = result.SessionID
 			r.logger.Info("Agent run completed", "Stage", stage,
 				"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
@@ -349,9 +379,11 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			// prompt would fabricate partial work).
 			r.logger.Warn("All jailed-agent slots busy; backing off before re-queuing the round",
 				"Stage", stage, "Backoff", slotBackoffInterval)
+			r.setStatus(StatusWaiting)
 			if serr := workflow.Sleep(r.ctx, slotBackoffInterval); serr != nil {
 				return activities.AgentRunResult{}, fmt.Errorf("slot backoff sleep (stage %q): %w", stage, serr)
 			}
+			r.setStatus(StatusRunning)
 			continue
 		}
 		// An abruptly killed round is as recoverable as a timed-out
@@ -416,6 +448,7 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 		if err == nil {
 			r.reviewTimeouts = 0
 			r.quotaHeartbeats = 0
+			r.touch()
 			*session = result.SessionID
 			if result.NoVerdict {
 				r.verdictlessReviews++
@@ -456,9 +489,11 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			// launched, so the focus is retried as-is.
 			r.logger.Warn("All jailed-agent slots busy; backing off before re-queuing the review",
 				"Focus", focus, "Backoff", slotBackoffInterval)
+			r.setStatus(StatusWaiting)
 			if serr := workflow.Sleep(r.ctx, slotBackoffInterval); serr != nil {
 				return result, fmt.Errorf("slot backoff sleep (review %q): %w", focus, serr)
 			}
+			r.setStatus(StatusRunning)
 			continue
 		}
 		if !killed && !temporal.IsTimeoutError(err) {
@@ -492,6 +527,10 @@ func (r *pipelineRun) resolveTestCommand() (string, error) {
 		err := workflow.ExecuteActivity(r.discoverCtx, activities.ResolveTestCommandActivity,
 			r.worktree.WorktreePath, r.input.Agent).Get(r.ctx, &command)
 		if err == nil {
+			// A discovery round is an agent round (same slot semaphore, same
+			// quota absorption), so its completion refreshes activity like
+			// any other.
+			r.touch()
 			return command, nil
 		}
 		if isSlotWait(err) {
@@ -499,9 +538,11 @@ func (r *pipelineRun) resolveTestCommand() (string, error) {
 			// every other jailed round and can give up on it too.
 			r.logger.Warn("All jailed-agent slots busy; backing off before re-queuing test-command discovery",
 				"Backoff", slotBackoffInterval)
+			r.setStatus(StatusWaiting)
 			if serr := workflow.Sleep(r.ctx, slotBackoffInterval); serr != nil {
 				return "", fmt.Errorf("resolve test command: %w", serr)
 			}
+			r.setStatus(StatusRunning)
 			continue
 		}
 		if isAPIExhaustion(err) {
@@ -533,6 +574,7 @@ func (r *pipelineRun) runSuite(command string) (activities.TestResult, error) {
 		// like any other completed round — even a red one, since the
 		// provider was reachable for it.
 		r.quotaHeartbeats = 0
+		r.touch()
 		// The dump relay: wherever Logs already travels — every fix
 		// prompt and reviewer round — a successful dump adds one line
 		// naming the file (worktree-relative, so a jailed agent can open

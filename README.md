@@ -84,6 +84,11 @@ up.
 - Go 1.26+
 - A Temporal server: `temporal server start-dev` — all defaults match
   (frontend `127.0.0.1:7233`, UI :8233)
+- The `temporal` CLI on your `PATH`, and the run-visibility search
+  attributes registered once per namespace via `make custom-columns` —
+  before starting an upgraded worker: with the attributes missing, the
+  server rejects every new run's first status upsert and the run wedges
+  (old, already-running runs are unaffected)
 - The `ai-jail` CLI on your `PATH`
 - One supported jailed-agent CLI:
   - `claude` (the default, invoked by the jail)
