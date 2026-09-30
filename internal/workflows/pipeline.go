@@ -146,6 +146,18 @@ const slotBackoffInterval = time.Minute
 // maintainer restart instead of failing.
 const maxQuotaHeartbeats = 5
 
+// maxTestPhaseRebuilds caps how many REBUILD verdicts the green stage may
+// absorb before parking the run: each rebuild cycle is a full suite run
+// plus two agent rounds on the provider budget, and a loop that cannot
+// converge within this many — even with every round legitimate — would
+// otherwise cycle until provider quota death takes the deployment's other
+// runs down with it. The count is monotonic (no reset when failures drop):
+// with the rebuild batching demanding the whole failure inventory per
+// cycle, a healthy convergence needs only a handful of cycles, so
+// resetting could only ever serve a loop slow enough to be worth a
+// maintainer's eyes anyway.
+const maxTestPhaseRebuilds = 8
+
 // ErrAwaitingMaintainer parks a run instead of failing it with a raw error:
 // the API stayed exhausted past every heartbeat, or the reviewer halted with
 // NEEDS_MAINTAINER on a task that cannot be completed as stated. The
@@ -209,15 +221,18 @@ func WorkflowTypeName(fn func(workflow.Context, PipelineInput) (string, error)) 
 // approves, then (2) tests ↔ test review until the reviewer approves AND the
 // native test suite passes. On success the approved work is committed and
 // the run's branch renamed to its preserved prefix; the workflow
-// returns that branch name. Both loops are intentionally unbounded — they
-// run until approval, with no attempt cap; each round is durable, auditable,
-// and individually timed-out via activity options. Two conditions park the
-// run for a maintainer restart rather than failing it with a raw error (see
+// returns that branch name. The loops run until approval with no cap on
+// ordinary fix rounds — each round is durable, auditable, and individually
+// timed-out via activity options — with one bound: the green stage parks
+// the run after maxTestPhaseRebuilds REBUILD cycles instead of cycling on
+// the provider budget forever. Conditions that park the run for a
+// maintainer restart rather than failing it with a raw error (see
 // ErrAwaitingMaintainer): the provider API staying exhausted past every
-// quota heartbeat, or a reviewer NEEDS_MAINTAINER verdict on a task that
-// cannot be completed as stated. The registration's CompleteGreen wrapper
-// completes a parked run green with the reason as its result; the deferred
-// cleanup preserves the attempt's work on its aborted/ branch either way.
+// quota heartbeat, a reviewer NEEDS_MAINTAINER verdict on a task that
+// cannot be completed as stated, or the rebuild cap above. The
+// registration's CompleteGreen wrapper completes a parked run green with
+// the reason as its result; the deferred cleanup preserves the attempt's
+// work on its aborted/ branch either way.
 func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	run, cleanup := startRun(ctx, input)
 	defer cleanup()
@@ -309,6 +324,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("test-phase agent run: %w", err)
 	}
+	rebuilds := 0
 	for {
 		command, err := run.resolveTestCommand()
 		if err != nil {
@@ -328,7 +344,14 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				verdict.Comments))
 		}
 		if verdict.Rebuild {
-			run.logger.Info("Test review requested a rebuild; returning to the dev cycle")
+			rebuilds++
+			if rebuilds > maxTestPhaseRebuilds {
+				run.logger.Info("Green stage exceeded the rebuild cap; parking the run")
+				return "", run.park(fmt.Sprintf("green stage failed to converge — the test review issued rebuild %d and suite green and review approval never coincided; last finding: %s",
+					rebuilds, verdict.Comments))
+			}
+			run.logger.Info("Test review requested a rebuild; returning to the dev cycle",
+				"Rebuilds", rebuilds, "Of", maxTestPhaseRebuilds)
 			if err := rebuild(verdict.Comments); err != nil {
 				return "", err
 			}
