@@ -44,6 +44,12 @@ type Usage struct {
 type streamMessage struct {
 	Type   string `json:"type"`
 	Result string `json:"result"`
+	// TerminalReason rides the result event when the run ended on a
+	// provider error: terminal_reason "api_error" marks a request the
+	// API rejected outright (the arete-img-upload incident — a healthy
+	// 167-turn round ending in a single 400, exit 1), distinct from a
+	// genuine task-level failure. Read only by agentAPIError.
+	TerminalReason string `json:"terminal_reason"`
 	// SessionID is the conversation id claude reports on every event of a
 	// run (and the json format's result object carries); resuming a later
 	// round with it continues the same conversation.
@@ -161,6 +167,12 @@ type piStreamMessage struct {
 			Text     string `json:"text"`
 			Thinking string `json:"thinking"`
 		} `json:"content"`
+		// StopReason "error" + ErrorMessage mark a message pi folded on a
+		// provider/API failure — pi still exits 0, so without reading this
+		// the round would count as a success carrying an error-shaped
+		// body. Read only by agentAPIError.
+		StopReason   string `json:"stopReason"`
+		ErrorMessage string `json:"errorMessage"`
 	} `json:"message"`
 }
 
@@ -235,6 +247,70 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 	}
 	thinking, text, session = parseAgentStream(stdout)
 	return thinking, text, session, parseAgentUsage(stdout)
+}
+
+// agentAPIError reports the API-level failure a round's structured output
+// declares, "" when none: claude's terminal result event carries
+// terminal_reason "api_error" when the CLI died on a provider error
+// (shape verified against the arete-img-upload incident stdout), and pi's
+// json stream folds the same failures into a message whose stopReason is
+// "error" — with pi still exiting 0, so without reading it the round
+// would count as a success carrying an error-shaped body (shape verified
+// against pi's published source; no pi binary on this host to probe
+// live). The classification is the CLI's own machine-readable report, not
+// chat text, so the caller can route it into the ErrAPIExhausted rescue
+// (immediate provider failover, then the workflow's hourly heartbeat)
+// wherever the CLI chose to put the report. amp rides the claude branch
+// on the assumption its reused schema carries the same field — unverifiable
+// here (no binary) and the diff declares amp unmaintained, so it stays an
+// assumption: if the shape differs, amp's face degrades to "" (inert).
+// Agents without a structured stream (opencode, aider) report "" here;
+// their plain-text face is matched separately (apiErrorTextMarkers).
+func agentAPIError(agent, stdout string) string {
+	switch agent {
+	case "pi":
+		// The last message_end decides, mirroring parsePiStream's own
+		// authority rule: pi writes an error-stopReason message_end the
+		// moment one completion fails — before its own auto-retry has had
+		// its chance — so the first hit must not decide; a later
+		// message_end (any stopReason but error, the empty shape of a
+		// clean end included) clears it. Only an error still standing at
+		// the end of the stream means the round folded.
+		errMsg := ""
+		for line := range strings.SplitSeq(stdout, "\n") {
+			var m piStreamMessage
+			if json.Unmarshal([]byte(line), &m) != nil {
+				continue
+			}
+			if m.Type != "message_end" {
+				continue
+			}
+			if m.Message.StopReason == "error" {
+				if m.Message.ErrorMessage != "" {
+					errMsg = m.Message.ErrorMessage
+				} else {
+					errMsg = "stopReason error"
+				}
+			} else {
+				errMsg = ""
+			}
+		}
+		return errMsg
+	case "claude", "amp":
+		for line := range strings.SplitSeq(stdout, "\n") {
+			var m streamMessage
+			if json.Unmarshal([]byte(line), &m) != nil {
+				continue
+			}
+			if m.Type == "result" && m.TerminalReason == "api_error" {
+				if m.Result != "" {
+					return "terminal_reason api_error: " + m.Result
+				}
+				return "terminal_reason api_error"
+			}
+		}
+	}
+	return ""
 }
 
 // parseReviewVerdict extracts the verdict from reviewer output: the last

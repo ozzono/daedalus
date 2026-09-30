@@ -11,8 +11,9 @@ Daedalus turns an issue into working, reviewed, tested code. Given a
 repository, an issue ID, and a prompt, it spins up an isolated git worktree
 and runs two review-gated loops inside it: a jailed agent —
 [Claude Code](https://claude.com/claude-code) by default,
-[opencode](https://opencode.ai), [Amp](https://ampcode.com),
-[pi](https://pi.dev), or [aider](https://aider.chat) — implements the change
+[opencode](https://opencode.ai), [Amp](https://ampcode.com) (deprecated —
+see below), [pi](https://pi.dev), or [aider](https://aider.chat) —
+implements the change
 while a jailed reviewer approves the code; the agent then writes the test
 suite while the reviewer — and the repository's own test suite — approve the
 tests. Each loop runs until its reviewer approves. When the test reviewer
@@ -89,7 +90,9 @@ up.
   - `opencode` when `agent: opencode` is set in config.yaml
   - `amp` when `agent: amp` is — authenticates via `AMP_API_KEY` in the
     worker's environment, which daedalus passes into the jail when set;
-    amp's own host login does not reach the jail
+    amp's own host login does not reach the jail. **Amp support is
+    deprecated:** it keeps working exactly as it does today, but it is no
+    longer changed or maintained — no new flags, fixes, or probes.
   - `pi` when `agent: pi` is — authenticates via the provider env vars
     (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) that daedalus already
     exports; the jail bridges pi's host `~/.pi/agent/auth.json` read-write
@@ -288,7 +291,7 @@ invoked from inside it. `daedalus init` writes a fully commented
 
 | Field                 | Default            | Purpose                              |
 | --------------------- | ------------------ | ------------------------------------ |
-| `agent`               | `claude`           | Jailed agent CLI: `claude`, `opencode`, `amp`, `pi`, or `aider` (`run -cli/--cli` overrides per run). Only claude and pi chain conversations (`--resume`/`--session`); the others start each round fresh |
+| `agent`               | `claude`           | Jailed agent CLI: `claude`, `opencode`, `amp` (deprecated, unmaintained), `pi`, or `aider` (`run -cli/--cli` overrides per run). Only claude and pi chain conversations (`--resume`/`--session`); the others start each round fresh |
 | `branch_prefix`       | `daedalus`         | Prefix for preserved branches (`<prefix>/issue-<id>-<ts>`); `run -p/--prefix` overrides per run |
 | `authorship`          | `false`            | When true, daedalus's own commits (the approved deliverable and the aborted-work snapshot) are authored "daedalus `<daedalus@local>`"; false leaves them to the worker's git config |
 | `temporal.host`       | `127.0.0.1:7233`   | Temporal frontend address            |

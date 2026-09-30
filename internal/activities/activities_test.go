@@ -695,6 +695,203 @@ func TestRunJailedKillMarkerInOutputNotForged(t *testing.T) {
 	}
 }
 
+// TestRunJailedClaudeAPIErrorResultRescued pins the arete-img-upload face:
+// a claude round that exits 1 with a structured result event declaring
+// terminal_reason "api_error" — a provider rejection, not a task failure —
+// is classified ErrAPIExhausted so the flow is rescued (failover, then the
+// hourly heartbeat) instead of failing the run and wiping the worktree.
+func TestRunJailedClaudeAPIErrorResultRescued(t *testing.T) {
+	scrubBugFilingEnv(t)
+	newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","terminal_reason":"api_error","result":"API Error: 400 this model always engages in thinking"}'; exit 1`)
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if !errors.Is(err, ErrAPIExhausted) {
+		t.Fatalf("error %v should wrap ErrAPIExhausted — an api_error result must route to the rescue, not a fatal wipe", err)
+	}
+	if !strings.Contains(err.Error(), "API Error: 400") {
+		t.Errorf("error %q should keep the provider's message", err)
+	}
+}
+
+// TestRunJailedKilledAPIErrorResultNotForged pins the ranking: a signaled
+// death outranks even the structured api_error report, exactly as it
+// outranks the output-text markers — a killed round that printed an
+// api_error result mid-run stays in the kill classification, not the
+// rescue heartbeat.
+func TestRunJailedKilledAPIErrorResultNotForged(t *testing.T) {
+	scrubBugFilingEnv(t)
+	newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","terminal_reason":"api_error"}'; kill -9 $$`)
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if !errors.Is(err, ErrAgentKilled) {
+		t.Fatalf("error %v should wrap ErrAgentKilled", err)
+	}
+	if errors.Is(err, ErrAPIExhausted) {
+		t.Errorf("signal death must outrank the structured api_error report: %v", err)
+	}
+}
+
+// TestRunJailedPiAPIErrorCleanExitRescued pins pi's face: pi folds a
+// provider failure into a message_end with stopReason "error" and still
+// exits 0 — the round must be classified a failed round (ErrAPIExhausted),
+// not today's silent success carrying an error-shaped body.
+func TestRunJailedPiAPIErrorCleanExitRescued(t *testing.T) {
+	scrubBugFilingEnv(t)
+	fakeHome(t)
+	t.Setenv("DAEDALUS_AGENT", "pi")
+	newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"message_end","message":{"content":[{"type":"text","text":"working"}]}}' '{"type":"message_end","message":{"stopReason":"error","errorMessage":"provider 500"}}'; exit 0`)
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if !errors.Is(err, ErrAPIExhausted) {
+		t.Fatalf("error %v should wrap ErrAPIExhausted — pi's error stopReason on a clean exit must not pass as success", err)
+	}
+	if !strings.Contains(err.Error(), "provider 500") {
+		t.Errorf("error %q should keep pi's errorMessage", err)
+	}
+}
+
+// TestRunJailedPiAutoRetriedErrorCleared pins the authority rule: pi writes
+// an error message_end the moment one completion fails — before its own
+// auto-retry has had its chance — so an error followed by a clean end is a
+// healthy round (the last message_end decides), not a rescue.
+func TestRunJailedPiAutoRetriedErrorCleared(t *testing.T) {
+	scrubBugFilingEnv(t)
+	fakeHome(t)
+	t.Setenv("DAEDALUS_AGENT", "pi")
+	newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"message_end","message":{"stopReason":"error","errorMessage":"transient 500"}}' '{"type":"message_end","message":{"content":[{"type":"text","text":"recovered"}]}}'; exit 0`)
+
+	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if err != nil {
+		t.Fatalf("round with a cleared error = %v, want success", err)
+	}
+	if res.Text != "recovered" {
+		t.Errorf("res.Text = %q, want the clean end's text", res.Text)
+	}
+}
+
+// TestRunJailedAPIErrorCleanExitOnlyPlainFaces pins the success-path rule:
+// aider and opencode — plain-text faces whose API failures surface as
+// litellm/connection error text in otherwise-successful output — get
+// classified on a clean exit; claude and pi, structured faces, must not:
+// text an agent printed cannot decide their healthy rounds.
+func TestRunJailedAPIErrorCleanExitOnlyPlainFaces(t *testing.T) {
+	scrubBugFilingEnv(t)
+	fakeHome(t)
+	cases := []struct {
+		name  string
+		agent string
+		out   string
+		want  bool
+	}{
+		{"aider litellm marker", "aider", "litellm.ratelimiterror: provider 429", true},
+		{"opencode connection error", "opencode", "api connection error: dial failed", true},
+		{"claude text must not forge", "claude", "api connection error: dial failed", false},
+		{"pi text must not forge", "pi", "litellm.ratelimiterror: provider 429", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("DAEDALUS_AGENT", c.agent)
+			wt := t.TempDir()
+			if c.agent == "aider" {
+				// The aider face pre-resolves the real install
+				// (aiderJailMounts) and stages a git scratch dir; fake both so
+				// the round reaches ai-jail.
+				fakeAiderInstall(t, "tree")
+				wt = gitRepo(t)
+			}
+			newStubLog(t)
+			stubBin(t, "ai-jail", "printf '%s\\n' '"+c.out+"'; exit 0")
+
+			_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+				WorktreePath: wt,
+				Prompt:       "do things",
+			})
+			if got := errors.Is(err, ErrAPIExhausted); got != c.want {
+				t.Fatalf("errors.Is(err, ErrAPIExhausted) = %v (%v), want %v", got, err, c.want)
+			}
+		})
+	}
+}
+
+// TestRunJailedGenuineFailureNotRescued pins the boundary: a plain task
+// failure — no structured api_error report, no marker hit — keeps today's
+// outcome, a generic error that fails the run, so the rescue never masks a
+// genuine agent failure.
+func TestRunJailedGenuineFailureNotRescued(t *testing.T) {
+	scrubBugFilingEnv(t)
+	newStubLog(t)
+	stubBin(t, "ai-jail", "echo 'tests failed: 3 broken'; exit 1")
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "do things",
+	})
+	if err == nil {
+		t.Fatal("want error from a genuinely failing round")
+	}
+	if errors.Is(err, ErrAPIExhausted) {
+		t.Errorf("a plain failure must not route into the api-error rescue: %v", err)
+	}
+}
+
+// TestAgentAPIErrorClassify pins agentAPIError's classification table:
+// only a structured report decides — pi's last message_end (an error still
+// standing at stream end, its errorMessage or a shape fallback), the
+// claude/amp result event — and chat text or unstructured agents never do.
+func TestAgentAPIErrorClassify(t *testing.T) {
+	cases := []struct {
+		name   string
+		agent  string
+		stdout string
+		want   string
+	}{
+		{"claude api_error result", "claude",
+			`{"type":"result","terminal_reason":"api_error","result":"boom"}`,
+			"terminal_reason api_error: boom"},
+		{"claude healthy result", "claude",
+			`{"type":"result","result":"done"}`, ""},
+		{"claude non-result events ignored", "claude",
+			"not json\n" + `{"type":"system","subtype":"init"}`, ""},
+		{"amp rides the claude face", "amp",
+			`{"type":"result","terminal_reason":"api_error"}`,
+			"terminal_reason api_error"},
+		{"pi error standing", "pi",
+			`{"type":"message_end","message":{"stopReason":"error","errorMessage":"p500"}}`, "p500"},
+		{"pi error standing without a message", "pi",
+			`{"type":"message_end","message":{"stopReason":"error"}}`, "stopReason error"},
+		{"pi error then clean end", "pi",
+			`{"type":"message_end","message":{"stopReason":"error"}}` + "\n" +
+				`{"type":"message_end","message":{}}`, ""},
+		{"pi clean stream", "pi",
+			`{"type":"message_end","message":{"content":[{"type":"text","text":"done"}]}}`, ""},
+		{"aider has no structured face", "aider", "litellm.apitimeouterror", ""},
+		{"opencode has no structured face", "opencode", "api connection error", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := agentAPIError(c.agent, c.stdout); got != c.want {
+				t.Errorf("agentAPIError(%q, %q) = %q, want %q", c.agent, c.stdout, got, c.want)
+			}
+		})
+	}
+}
+
 // TestReferencesPath pins the straggler matcher's boundary rule: the
 // per-issue worktree path matches itself, its files, and argument
 // boundaries — never a longer sibling (issue-4 vs issue-42) or a word that
