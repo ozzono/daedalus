@@ -854,6 +854,17 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	}
 	appendTaskLog(ctx, fmt.Sprintf("jailed %s round exited after %s",
 		selected, time.Since(start).Round(time.Second)), body)
+	// Structured api_error classification: the CLI's own machine-readable
+	// report (claude/amp result JSON, pi json stream) of a round that died
+	// on a provider error. It routes into ErrAPIExhausted — whose path is
+	// the rescue: immediate failover to the other provider here, then the
+	// workflow's hourly heartbeat and, past its ceiling, a park to the
+	// preserved aborted/ branch — instead of today's outcomes (a fatal
+	// wipe for claude's exit 1, a silent success for pi's exit 0). The
+	// worktree survives until the rescue decision: only the cleanup that
+	// runs after the workflow ends touches it. A signaled death below
+	// still outranks this report, exactly as it outranks the text markers.
+	apiErr := agentAPIError(selected, res.Stdout)
 	if err != nil && !isWaitDelay(err) {
 		if sig := deathSignal(err); sig != "" {
 			logDeath(logger, cmd, err, start, sig)
@@ -866,10 +877,38 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			// the workflow-side classification.
 			return res, fmt.Errorf("%w: %w", ErrAgentKilled, err)
 		}
-		if out := res.Stdout + res.Stderr; matchesAny(out, apiExhaustionMarkers) {
+		if apiErr != "" {
+			return res, fmt.Errorf("%w: %s round died on an api error: %s", ErrAPIExhausted, selected, apiErr)
+		}
+		out := res.Stdout + res.Stderr
+		if matchesAny(out, apiExhaustionMarkers) || matchesAny(out, apiErrorTextMarkers) {
 			return res, fmt.Errorf("%w: %w: %s", ErrAPIExhausted, err, out)
 		}
-		return res, fmt.Errorf("ai-jail agent run: %w: %s", err, res.Stdout+res.Stderr)
+		return res, fmt.Errorf("ai-jail agent run: %w: %s", err, out)
+	}
+	// A clean exit can still carry a structured api_error report (pi folds
+	// provider failures and exits 0) — same rescue routing as above.
+	if apiErr != "" {
+		return res, fmt.Errorf("%w: %s round died on an api error: %s", ErrAPIExhausted, selected, apiErr)
+	}
+	// Exit-0 plain-text faces (aider, opencode): their API failures surface
+	// only as litellm/connection error text in otherwise-successful output,
+	// so classify a marker hit as a failed round instead of a silent
+	// success. Both streams are read, symmetric with the failed path above
+	// — which CLI prints its failure face where is its business, not this
+	// check's. The structured faces never reach this branch
+	// (agentAPIError handled them above), which is what keeps the
+	// forgeable match off claude and pi.
+	// ponytail: this match IS forgeable — chat text an agent printed can
+	// park a healthy run in the heartbeat; accepted because the markers
+	// are litellm-internal shapes an agent has no honest reason to print,
+	// and the cost is bounded (failover, heartbeat, park), never silent
+	// wrong work.
+	if selected == "aider" || selected == "opencode" {
+		if out := res.Stdout + res.Stderr; matchesAny(out, apiErrorTextMarkers) {
+			return res, fmt.Errorf("%w: %s round reported an api error and exited clean: %s",
+				ErrAPIExhausted, selected, out)
+		}
 	}
 	return res, nil
 }
@@ -1107,6 +1146,23 @@ func groupSnapshot(pgid int) string {
 // with `daedalus continue` later" apart from a code failure.
 var apiExhaustionMarkers = []string{
 	"rate limit", "rate_limit", "quota", "credit balance", "insufficient", "usage limit", "402", "429", "overloaded",
+}
+
+// apiErrorTextMarkers are the plain-text faces of an API-level failure —
+// the litellm error classes and connection failures aider (and, in plain
+// text mode, opencode) print into their output when the provider fails,
+// with no structured event and often a clean exit 0. They extend the
+// exhaustion match on a failed round's output and are the only
+// classification a clean-exiting plain-text round can get (see the
+// success-path check in runJailedRoundFolders). The structured faces
+// (claude/amp result JSON, pi json stream) never depend on these — text an
+// agent printed cannot decide their rounds.
+var apiErrorTextMarkers = []string{
+	"litellm.internalservererror",
+	"litellm.serviceunavailableerror",
+	"litellm.apitimeouterror",
+	"litellm.ratelimiterror",
+	"api connection error",
 }
 
 // errAgentStart marks a jailed round whose agent process never launched —
