@@ -502,6 +502,15 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// round env — pi's provider staging included.
 	env = reviewerEnv(env, role)
 	selected, headless, _ := jailedAgentCLI(agent)
+	// pi-served implementing rounds carry a small-model edit-discipline
+	// guardrail (self-hosted models otherwise retry failing edits without
+	// re-reading; wa-termo 2026-09-29). Gated to pi and the edit-carrying
+	// roles — reviewer rounds do not edit — so every flagship prompt stays
+	// byte-identical. Appended per invocation, so a provider-failover retry
+	// (which re-enters with the original prompt) is not double-prefixed.
+	if selected == "pi" && role != RoleDevReview && role != RoleTestReview {
+		prompt += piEditGuardrail
+	}
 	lim := agentLimiter()
 	hbDone := make(chan struct{})
 	defer close(hbDone)

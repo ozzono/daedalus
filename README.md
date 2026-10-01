@@ -102,7 +102,14 @@ up.
     (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) that daedalus already
     exports; the jail bridges pi's host `~/.pi/agent/auth.json` read-write
     and that login takes priority over the env vars, so a stale host login
-    wins — keep it clean or aligned
+    wins — keep it clean or aligned. pi-served implementing rounds also
+    carry an edit-discipline guardrail in their prompt (read before edit,
+    read again after a failed edit — cheap insurance for small self-hosted
+    models); a resumed pi session whose transcript embeds tool-call JSON as
+    assistant text is not resumed (the pattern is self-reinforcing poison),
+    and one ending in repeated failed `edit` calls gets its next round
+    steered toward read-then-retry. Flagship agents' prompts and resume
+    paths are byte-for-byte untouched.
   - `aider` when `agent: aider` is — authenticates via the same provider
     env vars; the repo's `.env` is masked to empty inside the jail, so it
     cannot override the exported env
@@ -336,16 +343,23 @@ issue never share live state). Re-running
   agent ↔ reviewer until the reviewer approves; the test phase loops
   agent ↔ (test suite + reviewer) until the reviewer approves *and* the
   suite passes. Review rounds are intentionally **unbounded** — the workflow
-  ends only on approval, with every round durable and auditable — except for
-  one bound: the green stage parks the run once the test reviewer has issued
-  more than 8 `REBUILD` verdicts while suite green and review approval never
+  ends only on approval, with every round durable and auditable — but two
+  runaway guards keep a stalled stage from churning forever. The green
+  stage parks the run once the test reviewer has issued more than 8
+  `REBUILD` verdicts while suite green and review approval never
   coincided, instead of cycling on the provider budget until quota death
   takes the deployment's other runs down too. A rebuild round's finding
   carries the review's full failure inventory (the test reviewer must
   enumerate every implementation defect found that round), and the
   implementing agent is required to address every item per cycle (reporting
   any it cannot satisfy), so convergence normally takes a handful of cycles
-  and the cap fires only on a genuinely stalled stage.
+  and the cap fires only on a genuinely stalled stage. Separately, verdict
+  runaway guards are tracked per review role (a code-review approval
+  between a test reviewer's repeated rebuild findings does not reset the
+  test reviewer's count): a reviewer that ends without any verdict marker
+  three times in a row, or repeats a whitespace-identical rejection verdict
+  three times in a row, parks the run for a maintainer — an implementer
+  that cannot act on the feedback cannot churn forever.
 - **Reviewer protocol**: the reviewer sees the diff of the worktree (plus
   the latest test output and the test agent's latest reply in phase 2) and
   must end its response with a final line `APPROVED`, `CHANGES_REQUESTED`,
