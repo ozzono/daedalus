@@ -219,6 +219,22 @@ func fakeHome(t *testing.T) string {
 	return home
 }
 
+// fakeGitWorktree creates the stale-worktree fixture the cleanup tests use:
+// the per-issue worktree directory with a .git entry, so preserveAbortedWork
+// treats it as a real worktree and the preservation sequence runs. A
+// directory without .git is a husk — cleanup skips preservation for it, a
+// shape TestCleanupSkipsGitlessHusk pins on its own.
+func fakeGitWorktree(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git := filepath.Join(path, ".git")
+	if err := os.WriteFile(git, []byte("gitdir: /repo/.git/worktrees/issue-42\n"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", git, err)
+	}
+}
+
 // samePath compares two paths up to symlinks: macOS temp directories are
 // reachable as both /var/folders/... and /private/var/folders/..., and a
 // subprocess may report either form as its working directory.
@@ -308,9 +324,7 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	stubBin(t, "git", "exit 0")
 
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 	stale := filepath.Join(worktreePath, "stale.txt")
 	if err := os.WriteFile(stale, []byte("leftover"), 0o644); err != nil {
 		t.Fatal(err)
@@ -392,9 +406,7 @@ func TestAuthorshipIdentityForced(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "git", "exit 0")
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 	identity := []string{"-c", "user.name=daedalus", "-c", "user.email=daedalus@local"}
 
 	in := WorktreeInput{
@@ -432,9 +444,7 @@ func TestCreateWorktreeActivityHealsStaleRegistration(t *testing.T) {
 exit 0`)
 
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 
 	out, err := CreateWorktreeActivity(context.Background(), WorktreeInput{
 		RepoPath:   "/repo",
@@ -520,9 +530,7 @@ func TestCleanupPreservesAbortedWork(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "git", "exit 0")
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 
 	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
 		RepoPath:   "/repo",
@@ -546,6 +554,45 @@ func TestCleanupPreservesAbortedWork(t *testing.T) {
 	assertArgs(t, calls[5].Args, []string{"-C", worktreePath, "branch", "-m", "aborted/issue-42"}, "preserve rename")
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Errorf("worktree dir should be removed after preservation (stat err = %v)", err)
+	}
+}
+
+// TestCleanupSkipsGitlessHusk pins the stale-husk contract: a worktree
+// directory left without .git (only .daedalus/ litter, say) is stale state
+// itself — there is no git work in it to preserve, and staging there would
+// fail every later run of the issue with "not a git repository". Cleanup
+// must skip preservation entirely and sweep the husk away before the
+// worktree is recreated.
+func TestCleanupSkipsGitlessHusk(t *testing.T) {
+	home := fakeHome(t)
+	log := newStubLog(t)
+	stubBin(t, "git", "exit 0")
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".daedalus"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:   "/repo",
+		TaskQueue:  "daedalus",
+		IssueID:    "42",
+		BranchName: "feat/issue-42-7",
+	}); err != nil {
+		t.Fatalf("CleanupWorktreeActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	// Finalized check, remove, prune, stale sweep — and crucially no
+	// stage/commit/rename: nothing in the husk is git work worth saving.
+	if len(calls) != 4 {
+		t.Fatalf("git called %d times, want 4 (finalized check, remove, prune, sweep)", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{"-C", "/repo", "branch", "--list", "daedalus/issue-42-*", "--format=%(refname:short)"}, "finalized check")
+	assertArgs(t, calls[1].Args, []string{"-C", "/repo", "worktree", "remove", worktreePath, "--force"}, "pre-clean remove")
+	assertArgs(t, calls[2].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
+	assertArgs(t, calls[3].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "stale branch sweep")
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Errorf("gitless husk should be swept away (stat err = %v)", err)
 	}
 }
 
@@ -591,9 +638,7 @@ exit 0`,
 			log := newStubLog(t)
 			stubBin(t, "git", c.gitStub)
 			worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-				t.Fatal(err)
-			}
+			fakeGitWorktree(t, worktreePath)
 
 			if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
 				RepoPath:   "/repo",
@@ -933,9 +978,7 @@ func TestCleanupPreserveRecoversFromStaleIndexLock(t *testing.T) {
 	home := fakeHome(t)
 	log := newStubLog(t)
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 	lock := filepath.Join(t.TempDir(), "index.lock")
 	if err := os.WriteFile(lock, []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
@@ -981,9 +1024,7 @@ func TestCleanupPreserveRenameFallback(t *testing.T) {
 	home := fakeHome(t)
 	newStubLog(t)
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 	// argv: -C <path> branch <flag> …; every rename (-m) fails, forcing
 	// the -f fallback.
 	stubBin(t, "git", `case "$3" in
@@ -1041,9 +1082,7 @@ exit 0`,
 			home := fakeHome(t)
 			log := newStubLog(t)
 			worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-				t.Fatal(err)
-			}
+			fakeGitWorktree(t, worktreePath)
 			stubBin(t, "git", c.gitStub)
 
 			err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
@@ -1084,9 +1123,7 @@ func TestCleanupPreserveToleratesNothingToCommit(t *testing.T) {
 esac
 exit 0`)
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 
 	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
 		RepoPath:   "/repo",
@@ -2018,9 +2055,7 @@ exit 0`)
 	// The real worktree path CleanupWorktreeActivity stats, so the preserve
 	// sequence is genuinely reachable and only the prefix check can suppress it.
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 
 	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
 		RepoPath:     "/repo",
@@ -2058,9 +2093,7 @@ exit 0`)
 	// The real worktree path, so the preserve sequence is genuinely reachable
 	// and only the prefix check could suppress it.
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
-	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	fakeGitWorktree(t, worktreePath)
 
 	if err := CleanupWorktreeActivity(context.Background(), WorktreeInput{
 		RepoPath:     "/repo",
