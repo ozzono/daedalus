@@ -1021,13 +1021,13 @@ func TestLoadMaxOutputTokens(t *testing.T) {
 	}
 }
 
-// TestLoadSamplerKnobs pins the openai section's five sampler knobs: a set
+// TestLoadSamplerKnobs pins the openai section's six sampler knobs: a set
 // value loads through and exports under its DAEDALUS_* name (the aider
 // staging's only channel), zero/unset exports nothing — absent means the
 // field is omitted from the staged request, never sent as a default — a
-// negative value is rejected for the four whose API range is non-negative,
+// negative value is rejected for the five whose API range is non-negative,
 // while presence_penalty's legal [-2, 2] range makes a negative value a
-// valid load, and NaN/Inf are rejected for all five (they would render as
+// valid load, and NaN/Inf are rejected for all six (they would render as
 // non-float literals in the staged aider settings).
 func TestLoadSamplerKnobs(t *testing.T) {
 	knobs := []struct {
@@ -1036,6 +1036,7 @@ func TestLoadSamplerKnobs(t *testing.T) {
 		value   string
 		negOK   bool
 	}{
+		{"temperature", TemperatureEnv, "0.2", false},
 		{"top_p", TopPEnv, "0.95", false},
 		{"presence_penalty", PresencePenaltyEnv, "-0.5", true},
 		{"top_k", TopKEnv, "40", false},
@@ -1122,7 +1123,7 @@ func TestStreamSetting(t *testing.T) {
 	}
 }
 
-// TestProviderEnvVarsIncludesKnobExports pins that the six new knob exports
+// TestProviderEnvVarsIncludesKnobExports pins that the seven new knob exports
 // are in the scrub/restore list: a daemon must clear ambient values (real
 // worker shells carry them once a config sets the knobs), or an unset
 // config's knobs would be silently overridden by whatever the invoking
@@ -1132,6 +1133,7 @@ func TestProviderEnvVarsIncludesKnobExports(t *testing.T) {
 	for _, name := range []string{
 		MaxOutputTokensEnv,
 		TopPEnv,
+		TemperatureEnv,
 		PresencePenaltyEnv,
 		TopKEnv,
 		MinPEnv,

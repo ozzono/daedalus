@@ -22,7 +22,7 @@ func RefactorWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	if err := run.createWorktree(); err != nil {
 		return "", err
 	}
-	if err := run.preFlightGate(); err != nil {
+	if _, err := run.preFlightGate(); err != nil {
 		return "", err
 	}
 

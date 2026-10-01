@@ -134,6 +134,14 @@ max_concurrent_agent_runs: 2
 # keepRecentTokens) in ~/.pi/agent/settings.json. The jail bridges all of
 # these: aider reads the worker's exported environment, and the jail's pi
 # preset mounts ~/.pi read-write.
+# slim also gates the run flow: with slim: true, a "daedalus run" without
+# an explicit -w/--workflow starts the slim flow — the micro-stepped
+# atomic loop for limited models (a planner round atomizes the task into
+# an ordered queue of 1–2-file sub-tasks, then each sub-task runs its own
+# implement ↔ review loop with a fresh reviewer session per round and the
+# native suite as ground truth) — instead of feature-dev. An explicit -w
+# always wins. The flow targets the pi agent (aider is deprecated for
+# it).
 slim: false
 # How many native test-suite executions may run at once on the test worker
 # (the deployment's suite task queue); further suites queue until a slot
@@ -288,16 +296,22 @@ openai:
   timeout_ms: 0
   # Sampler knobs for rounds served by this section — sampler behavior is
   # a property of the backend behind url, shared by every agent that dials
-  # it. Consumed today by aider's staged model settings (top_p,
-  # presence_penalty, and repetition_penalty as standard litellm params,
-  # top_k and min_p under extra_body — litellm's syntax for params it does
-  # not map natively) and by pi's staged models.json entry (all five as
-  # top-level OpenAI-completions request params, sent straight to url).
-  # claude and amp are out of scope. Zero/unset means the
+  # it. Consumed today by aider's staged model settings (temperature,
+  # top_p, presence_penalty, and repetition_penalty as standard litellm
+  # params, top_k and min_p under extra_body — litellm's syntax for params
+  # it does not map natively) and by pi's staged models.json entry (all
+  # six as top-level OpenAI-completions request params, sent straight to
+  # url). claude and amp are out of scope. Zero/unset means the
   # field is omitted from the request entirely — never sent as a default,
   # so the backend's own sampler values stand (an explicit 0 above is
   # therefore the same as unset).
   top_p: 0
+  # Sampling temperature for rounds served by this section. Slim's design
+  # target is a low-temperature planner (0.2) with top_p 0.9, but samplers
+  # are deployment-level — there is no per-phase machinery — so set them
+  # here and they apply to every round of every run served by this
+  # section.
+  temperature: 0
   presence_penalty: 0
   top_k: 0
   min_p: 0

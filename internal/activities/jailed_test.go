@@ -371,6 +371,7 @@ func TestRunJailedClaudeActivityAiderSamplers(t *testing.T) {
 			t.Setenv("OPENAI_MODEL", "glm-selfhost")
 			t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 			t.Setenv(config.TopPEnv, c.topP)
+			t.Setenv(config.TemperatureEnv, "0.3")
 			t.Setenv(config.TopKEnv, "40")
 			wt := gitRepo(t)
 
@@ -415,6 +416,9 @@ func TestRunJailedClaudeActivityAiderSamplers(t *testing.T) {
 				}
 			} else if got, ok := parsed[0].ExtraParams["top_p"].(float64); !ok || got != 0.95 {
 				t.Errorf("staged extra_params top_p = %#v, want the float 0.95", parsed[0].ExtraParams["top_p"])
+			}
+			if got, ok := parsed[0].ExtraParams["temperature"].(float64); !ok || got != 0.3 {
+				t.Errorf("staged extra_params temperature = %#v, want the float 0.3 (temperature stages independently of top_p)", parsed[0].ExtraParams["temperature"])
 			}
 			body, ok := parsed[0].ExtraParams["extra_body"].(map[string]any)
 			if !ok {
