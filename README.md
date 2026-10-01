@@ -422,6 +422,38 @@ issue never share live state). Re-running
   argv — no `ps` visibility, no per-argument size limit on review prompts
   that embed the full diff. Verdicts are parsed from stdout only, so
   trailing stderr noise cannot flip an `APPROVED`.
+- **`.ai-jail` prompt carve-out**: the round prompts scope the agent to the
+  task and name `.ai-jail` — the sandbox's own permission spec — as an
+  untouchable artifact. For a run whose task text mentions `.ai-jail`, that
+  exclusion is keyed off at submit time (`template.TaskTouchesJail`, derived
+  from the task text only, never the diff — a diff-keyed carve-out would let
+  an out-of-scope round-1 edit legitimize itself and unlock `.ai-jail` for
+  every later round; a mention is not a command — the carve-out branches
+  only stop barring changes the task or review comments actually ask for).
+  In the feature-dev/dev-only phase-1 loop the implementer may edit
+  `.ai-jail` as the task directs, the fix prompt acts on `.ai-jail`
+  comments, and the code reviewer audits it: since git never shows the file
+  (the repo ignores it; the jail drops it untracked), the reviewer prompt
+  relays the worktree's current `.ai-jail` content as its own labeled
+  section (agent output under audit, not trusted config; an emptied spec is
+  relayed as an explicit "(the spec file is empty)" marker so the audit is
+  never blind). At delivery, feature-dev and dev-only — the only flows whose
+  prompts unlock jail edits — force-stage a non-empty `.ai-jail`: plain
+  `git add -A` would silently drop the deliverable where the repo ignores
+  the file (the jail's untouched drop is empty, so non-empty content is
+  agent-authored). Other flows keep `add -A`'s fail-safe discard of any
+  out-of-scope jail edit. Known limitation: an intentionally-emptied spec
+  (a "clear the permissions" task) fails the non-empty check at finalize and
+  is silently dropped while the run reports success — the reviewer saw and
+  approved it, but the commit does not carry it. Runs whose task does not
+  name `.ai-jail` keep
+  the exclusion wording byte-identical. ALERT: the other flows'
+  opener/fix templates (`continue`, `bugfix`, `investigate`, `refactor`,
+  `tests`, `rebuild` and their fix/review-feed prompts) still bar `.ai-jail`
+  edits unconditionally — their reviewers deliberately keep the blanket
+  exclusion too (a jail audit mandate there would demand what their agents
+  are forbidden to do), so a jail-touching task must run feature-dev or
+  dev-only (filed out-of-scope 2026-09-30).
 - **History diet**: the agent's visible text and chain of thought come back
   in the activity result tail-bounded to 16 KiB each (visible per round in
   the Temporal UI), test logs likewise; the worker log keeps the full

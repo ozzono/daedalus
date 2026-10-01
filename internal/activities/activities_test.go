@@ -1945,6 +1945,64 @@ func TestFinalizeWorktreeActivityCustomPrefix(t *testing.T) {
 	assertArgs(t, calls[2].Args, []string{"-C", worktreePath, "branch", "-m", "team/ship/issue-42-123"}, "branch rename")
 }
 
+// TestFinalizeWorktreeActivityJailStage pins finalize's jail opt-in: only a
+// TaskTouchesJail run force-stages the worktree's .ai-jail (invisible to
+// `add -A` where the repo ignores the file), and only when it carries
+// content — the jail's untouched empty drop must not ship as a commit. Any
+// other run keeps the plain staging, discarding an out-of-scope jail edit.
+func TestFinalizeWorktreeActivityJailStage(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		touchesJail  bool
+		writeSpec    bool
+		spec         string
+		wantForceAdd bool
+	}{
+		{name: "authored spec force-staged", touchesJail: true, writeSpec: true, spec: "grant read /etc\n", wantForceAdd: true},
+		{name: "empty untouched drop not staged", touchesJail: true, writeSpec: true},
+		{name: "missing spec not staged", touchesJail: true},
+		{name: "no flag keeps plain staging", touchesJail: false, writeSpec: true, spec: "out-of-scope edit\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := fakeHome(t)
+			log := newStubLog(t)
+			stubBin(t, "git", "exit 0")
+			worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.writeSpec {
+				if err := os.WriteFile(filepath.Join(worktreePath, ".ai-jail"), []byte(tc.spec), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if _, err := FinalizeWorktreeActivity(context.Background(), WorktreeInput{
+				RepoPath:        "/repo",
+				TaskQueue:       "daedalus",
+				IssueID:         "42",
+				BranchName:      "feat/issue-42-123",
+				TaskTouchesJail: tc.touchesJail,
+			}); err != nil {
+				t.Fatalf("FinalizeWorktreeActivity: %v", err)
+			}
+
+			calls := readCalls(t, log)
+			want := 3
+			if tc.wantForceAdd {
+				want = 4
+			}
+			if len(calls) != want {
+				t.Fatalf("git called %d times, want %d (add, [force add,] commit, branch -m)", len(calls), want)
+			}
+			assertArgs(t, calls[0].Args, []string{"-C", worktreePath, "add", "-A"}, "plain stage")
+			if tc.wantForceAdd {
+				assertArgs(t, calls[1].Args, []string{"-C", worktreePath, "add", "-f", "--", ".ai-jail"}, "force stage")
+			}
+		})
+	}
+}
+
 // TestCleanupFinalizedCheckUsesRunPrefix pins that the is-this-run-finalized
 // check looks under the run's own prefix: a deliverable preserved under a
 // custom prefix still suppresses the aborted-work snapshot.

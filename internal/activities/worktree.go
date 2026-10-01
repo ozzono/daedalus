@@ -43,6 +43,13 @@ type WorktreeInput struct {
 	// "daedalus <daedalus@local>"; false leaves the commits to the
 	// worker's git config.
 	Authorship bool
+	// TaskTouchesJail marks a task whose own text names .ai-jail
+	// (submit-time derivation — template.TaskTouchesJail on the run's
+	// prompt): finalize then force-stages a non-empty .ai-jail, which
+	// plain `git add -A` would silently drop where the repo ignores the
+	// file (the jail drops an empty untracked one into every worktree, so
+	// non-empty content is agent-authored).
+	TaskTouchesJail bool
 }
 
 // WorktreeOutput reports the location of a created worktree.
@@ -558,6 +565,18 @@ func FinalizeWorktreeActivity(ctx context.Context, input WorktreeInput) (string,
 	}
 	if _, err := runGit(ctx, "-C", worktreePath, "add", "-A"); err != nil {
 		return "", fmt.Errorf("stage approved work: %w", err)
+	}
+	// A jail-touching task's deliverable may be the .ai-jail spec itself,
+	// invisible to `add -A` where the repo ignores it (see WorktreeInput).
+	// Force-stage it only when it carries content — the jail's own
+	// untouched drop is an empty file, and committing that uninvited would
+	// ship sandbox litter for a task that never edited the spec.
+	if input.TaskTouchesJail {
+		if spec, serr := os.Stat(filepath.Join(worktreePath, ".ai-jail")); serr == nil && spec.Size() > 0 {
+			if _, err := runGit(ctx, "-C", worktreePath, "add", "-f", "--", ".ai-jail"); err != nil {
+				return "", fmt.Errorf("stage .ai-jail: %w", err)
+			}
+		}
 	}
 	msg := fmt.Sprintf("daedalus: issue %s", input.IssueID)
 	if _, err := runGit(ctx, append(commitAuthorArgs(input.Authorship),

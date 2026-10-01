@@ -111,6 +111,12 @@ type ReviewInput struct {
 	// empty, the round resumes the conversation the session watcher
 	// recorded for this role, if any. Empty role skips the fallback.
 	Role SessionRole
+	// TaskTouchesJail marks a task whose own text names .ai-jail
+	// (submit-time derivation — template.TaskTouchesJail on the run's
+	// prompt, never the diff). Only the phase-1 implementation code
+	// review passes it true: the reviewer prompt then audits .ai-jail
+	// (with the spec content relayed) instead of blanket-ignoring it.
+	TaskTouchesJail bool
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -288,10 +294,27 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 		// startup iff bug_filing is enabled; empty drops the file-filing
 		// instruction from the reviewer's bug policy.
 		bugDir := os.Getenv(config.BugDirEnv)
-		if input.ReproInScope {
-			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir)
+		// A jail-touching task's audit target never appears in the git
+		// diff — the repo ignores .ai-jail and the jail drops it untracked
+		// — so relay the worktree's spec content as its own labeled
+		// section. An emptied spec is a deliverable shape too ("clear the
+		// permissions"): relay the emptiness explicitly instead of
+		// omitting the section and leaving the audit blind.
+		jailSpec := ""
+		if input.TaskTouchesJail {
+			if b, rerr := os.ReadFile(filepath.Join(input.WorktreePath, ".ai-jail")); rerr == nil {
+				jailSpec = string(b)
+				if jailSpec == "" {
+					jailSpec = "(the spec file is empty)"
+				}
+			}
 		}
-		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir)
+		if input.ReproInScope {
+			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir,
+				template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
+		}
+		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir,
+			template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
 	}()
 	if err != nil {
 		return ReviewResult{}, err

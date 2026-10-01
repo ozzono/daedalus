@@ -490,3 +490,104 @@ func TestReviewRepro(t *testing.T) {
 		t.Error("ReviewRepro must not carry the tester-relay section when no reply is given")
 	}
 }
+
+// TestTaskTouchesJail pins the submit-time derivation: a coarse substring
+// test on the maintainer-authored task text only — never the diff — so a
+// task that names .ai-jail unlocks the carve-out and everything else keeps
+// the blanket exclusion.
+func TestTaskTouchesJail(t *testing.T) {
+	for task, want := range map[string]bool{
+		"tighten the .ai-jail grants for the tmp folder": true,
+		"add the feature": false,
+		"":                false,
+	} {
+		if got := TaskTouchesJail(task); got != want {
+			t.Errorf("TaskTouchesJail(%q) = %v, want %v", task, got, want)
+		}
+	}
+}
+
+// TestImplementJailCarveout pins the opener's jail branch: a task whose own
+// text names .ai-jail gets the in-scope wording instead of the blanket
+// exclusion — and states the fence the carve-out keeps (only jail changes
+// the task asks for are in scope).
+func TestImplementJailCarveout(t *testing.T) {
+	got, err := Implement("tighten the .ai-jail grants", "")
+	if err != nil {
+		t.Fatalf("Implement: %v", err)
+	}
+	for _, want := range []string{
+		"This task mentions .ai-jail",
+		"make exactly those and no others",
+		"if the task asks for no .ai-jail changes, leave .ai-jail untouched",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Implement = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "sandbox or tooling artifacts such as .ai-jail") {
+		t.Errorf("Implement = %q, jail task must not carry the blanket exclusion wording", got)
+	}
+}
+
+// TestImplementFixJailCarveout pins the fix prompt's jail branch: a
+// jail-touching task's fix round may act on .ai-jail comments; the zero
+// Jail (a non-jail task threaded through the variadic) keeps the blanket
+// exclusion.
+func TestImplementFixJailCarveout(t *testing.T) {
+	got, err := ImplementFix("tighten the jail entry", Jail{Touches: true})
+	if err != nil {
+		t.Fatalf("ImplementFix: %v", err)
+	}
+	if !strings.Contains(got, "a comment about .ai-jail is yours to act on") {
+		t.Errorf("ImplementFix = %q, want the jail carve-out wording", got)
+	}
+	if strings.Contains(got, "sandbox or tooling artifacts such as .ai-jail") {
+		t.Errorf("ImplementFix = %q, jail task must not carry the blanket exclusion wording", got)
+	}
+
+	got, err = ImplementFix("rename foo to bar", Jail{})
+	if err != nil {
+		t.Fatalf("ImplementFix (no jail): %v", err)
+	}
+	if !strings.Contains(got, "sandbox or tooling artifacts such as .ai-jail") {
+		t.Errorf("ImplementFix = %q, zero Jail must keep the blanket exclusion wording", got)
+	}
+}
+
+// TestReviewJailCarveout pins the reviewer's jail branch: a jail-touching
+// task switches the scope clause from blanket-ignoring .ai-jail to auditing
+// it, with the worktree's spec content relayed as its own labeled section;
+// with no spec content relayed the audit mandate still stands but the
+// section is omitted. The no-jail default is byte-pinned by TestReview.
+func TestReviewJailCarveout(t *testing.T) {
+	got, err := Review("the implementation", "M foo.go", "", false, "", "",
+		Jail{Touches: true, Spec: "grant read /etc/hosts\n"})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	for _, want := range []string{
+		"The worktree's current .ai-jail",
+		"relayed here because git ignores it",
+		"grant read /etc/hosts",
+		"deserve the harshest scrutiny",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Review = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "ignore them and never flag them, no matter how wrong they look") {
+		t.Errorf("Review = %q, jail task must not carry the blanket exclusion wording", got)
+	}
+
+	got, err = Review("the implementation", "M foo.go", "", false, "", "", Jail{Touches: true})
+	if err != nil {
+		t.Fatalf("Review (no spec): %v", err)
+	}
+	if !strings.Contains(got, "deserve the harshest scrutiny") {
+		t.Errorf("Review = %q, audit mandate must stand without relayed content", got)
+	}
+	if strings.Contains(got, "relayed here because git ignores it") {
+		t.Errorf("Review = %q, relay section must be omitted when no spec content is given", got)
+	}
+}

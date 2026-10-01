@@ -29,13 +29,42 @@ func render(name string, data any) (string, error) {
 	return strings.TrimSpace(b.String()), nil
 }
 
+// TaskTouchesJail reports whether the maintainer-authored task text
+// mentions .ai-jail — a deliberately coarse substring test, and the only
+// input the jail carve-out may key on (a diff-keyed carve-out would let an
+// out-of-scope round-1 edit to .ai-jail legitimize itself and unlock it for
+// every later round — the agent deciding its own permissions). A mention is
+// not a command: the carve-out branches are worded so a task that merely
+// names .ai-jail (or forbids touching it) never orders edits — they only
+// stop barring changes the task or the review comments actually ask for.
+func TaskTouchesJail(task string) bool {
+	return strings.Contains(task, ".ai-jail")
+}
+
+// Jail carries the reviewer-side jail carve-out: Touches marks a task whose
+// own text names .ai-jail (switching the reviewer's scope clause from
+// blanket-ignoring .ai-jail to auditing it), and Spec is the worktree's
+// current .ai-jail content, relayed as its own labeled section — git never
+// shows it (the repo ignores the file; the jail drops it untracked), so the
+// audit mandate would have no data without it. The zero value keeps the
+// default exclusion, byte-identical.
+type Jail struct {
+	Touches bool
+	Spec    string
+}
+
 // Implement builds the phase-1 opener: the issue task, framed so the
 // implementation phase excludes tests — the test suite gets its own reviewed
 // phase. bugDir is the configured out-of-scope-bug filing folder; empty
 // drops the file-filing instruction from the bug policy (the Arete Memory
-// note and reply-reporting duty stay).
+// note and reply-reporting duty stay). A task that itself names .ai-jail
+// gets the carve-out branch: editing .ai-jail is in scope instead of
+// barred.
 func Implement(task, bugDir string) (string, error) {
-	return render("implement", struct{ Task, BugDir string }{task, bugDir})
+	return render("implement", struct {
+		Task, BugDir string
+		TouchesJail  bool
+	}{task, bugDir, TaskTouchesJail(task)})
 }
 
 // Continue builds the phase-1 opener for a resumed run: the new task, the
@@ -49,9 +78,19 @@ func Continue(task, priorFeedback string) (string, error) {
 }
 
 // ImplementFix feeds code-review comments back to the implementing agent
-// inside the phase-1 (implementation ↔ code review) loop.
-func ImplementFix(comments string) (string, error) {
-	return render("implement_fix", struct{ Comments string }{comments})
+// inside the phase-1 (implementation ↔ code review) loop. jail.Touches,
+// when set, marks a task whose own text names .ai-jail: the fix prompt's
+// scope clause then allows acting on .ai-jail comments. It trails as
+// variadic so existing single-argument callers stay valid.
+func ImplementFix(comments string, jail ...Jail) (string, error) {
+	j := Jail{}
+	if len(jail) > 0 {
+		j = jail[0]
+	}
+	return render("implement_fix", struct {
+		Comments    string
+		TouchesJail bool
+	}{comments, j.Touches})
 }
 
 // Tests opens phase 2: the agent writes or improves the test suite covering
@@ -96,23 +135,31 @@ func TestsFix(testLogs, comments string) (string, error) {
 // configured out-of-scope-bug filing folder; empty drops the file-filing
 // instruction from the bug policy. For the bug-fix
 // framing — the diff's own repro test in the deliverable — see ReviewRepro.
-func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string) (string, error) {
-	return review(focus, diff, testLogs, testsInScope, false, agentReply, bugDir)
+// jail, when set, marks a task whose own text names .ai-jail: the reviewer's
+// scope clause then audits .ai-jail changes (with the spec content relayed)
+// instead of blanket-ignoring them. It trails as variadic so existing
+// callers stay valid.
+func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string, jail ...Jail) (string, error) {
+	return review(focus, diff, testLogs, testsInScope, false, agentReply, bugDir, jail...)
 }
 
 // ReviewRepro is Review's bug-fix framing: the diff's own tests are part of
 // its deliverable, and the reviewer must judge whether the repro actually
 // captures the reported bug — something the repro-first gate cannot. No
 // REBUILD verdict exists in this framing.
-func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string) (string, error) {
-	return review(focus, diff, testLogs, false, true, agentReply, bugDir)
+func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, jail ...Jail) (string, error) {
+	return review(focus, diff, testLogs, false, true, agentReply, bugDir, jail...)
 }
 
 // review renders the shared reviewer template for all three framings.
-func review(focus, diff, testLogs string, testsInScope, reproInScope bool, agentReply, bugDir string) (string, error) {
+func review(focus, diff, testLogs string, testsInScope, reproInScope bool, agentReply, bugDir string, jail ...Jail) (string, error) {
+	j := Jail{}
+	if len(jail) > 0 {
+		j = jail[0]
+	}
 	return render("review", struct {
-		Focus, Diff, TestLogs, AgentReply, BugDir string
-		TestsInScope, ReproInScope                bool
+		Focus, Diff, TestLogs, AgentReply, BugDir, JailSpec string
+		TestsInScope, ReproInScope, TouchesJail             bool
 	}{
 		Focus:        focus,
 		Diff:         diff,
@@ -121,6 +168,8 @@ func review(focus, diff, testLogs string, testsInScope, reproInScope bool, agent
 		ReproInScope: reproInScope,
 		AgentReply:   agentReply,
 		BugDir:       bugDir,
+		TouchesJail:  j.Touches,
+		JailSpec:     j.Spec,
 	})
 }
 

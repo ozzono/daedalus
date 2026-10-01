@@ -215,6 +215,11 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 		BaseBranch:   input.BaseBranch,
 		Flow:         flowScope,
 		Authorship:   input.Authorship,
+		// TaskTouchesJail stays false here: force-staging .ai-jail at
+		// finalize is opt-in per flow — only the workflows that unlock
+		// jail edits (feature-dev, dev-only) set it, so every other
+		// flow keeps the fail-safe discard of any out-of-scope jail
+		// edit `git add -A` gives for free.
 	}
 	r.vis = visibilityEnabled(ctx)
 	r.setStatus(StatusRunning)
@@ -428,8 +433,13 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 
 // review asks the reviewer for a verdict on the worktree's current state,
 // retrying the same round across timeouts — there is no partial work to
-// continue, the verdict simply never arrived.
-func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string) (activities.ReviewResult, error) {
+// continue, the verdict simply never arrived. touchesJail marks the
+// phase-1 implementation code review of a task whose text names .ai-jail —
+// the only review whose agent can act on jail findings (test, docs, bugfix,
+// and refactor rounds pass false: their agents are barred from touching
+// .ai-jail, so an audit mandate there would be a demand no round can
+// satisfy).
+func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string, touchesJail bool) (activities.ReviewResult, error) {
 	// Same lost-session fallback as the agent rounds: one fresh retry.
 	freshFallback := false
 	for {
@@ -441,9 +451,13 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			TestsInScope: testsInScope,
 			ReproInScope: reproInScope,
 			AgentReply:   agentReply,
-			Agent:        r.input.Agent,
-			SessionID:    *session,
-			Role:         role,
+			// Explicitly threaded from the workflow's submit-time
+			// derivation — never the diff (template.TaskTouchesJail
+			// documents why), never re-derived here.
+			TaskTouchesJail: touchesJail,
+			Agent:           r.input.Agent,
+			SessionID:       *session,
+			Role:            role,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.reviewTimeouts = 0
