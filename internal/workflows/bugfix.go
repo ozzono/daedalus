@@ -68,7 +68,7 @@ func BugFixWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 			}
 		}
 		if reviewRound {
-			verdict, err = run.review("the bug fix and its reproducing test", result.Logs, false, true, "", activities.RoleDevReview, &run.devReviewSession)
+			verdict, err = run.review("the bug fix and its reproducing test", result.Logs, false, true, "", activities.RoleDevReview, &run.devReviewSession, false)
 			if err != nil {
 				return "", fmt.Errorf("code review: %w", err)
 			}

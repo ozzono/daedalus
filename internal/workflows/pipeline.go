@@ -281,6 +281,14 @@ func WorkflowTypeName(fn func(workflow.Context, PipelineInput) (string, error)) 
 func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	run, cleanup := startRun(ctx, input)
 	defer cleanup()
+	// Submit-time jail carve-out: a task whose own text names .ai-jail
+	// gets fix prompts where acting on .ai-jail comments is in scope, and
+	// its phase-1 code review audits the jail spec (the flag is threaded
+	// into run.review). Setting WorktreeInput.TaskTouchesJail is this
+	// flow's opt-in to finalize's .ai-jail force-stage — feature-dev is
+	// one of only two flows whose prompts unlock jail edits.
+	touchesJail := template.TaskTouchesJail(input.Prompt)
+	run.worktreeInput.TaskTouchesJail = touchesJail
 	if err := run.createWorktree(); err != nil {
 		return "", err
 	}
@@ -294,7 +302,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// same reviewer conversation instead of starting cold.
 	codeReviewLoop := func() error {
 		for {
-			verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession)
+			verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
 			if err != nil {
 				return fmt.Errorf("code review: %w", err)
 			}
@@ -308,7 +316,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				return nil
 			}
 			run.logger.Info("Code review requested changes")
-			fixPrompt, err := template.ImplementFix(verdict.Comments)
+			fixPrompt, err := template.ImplementFix(verdict.Comments, template.Jail{Touches: touchesJail})
 			if err != nil {
 				return fmt.Errorf("build implement-fix prompt: %w", err)
 			}
@@ -378,7 +386,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		if err != nil {
 			return "", err
 		}
-		verdict, err := run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession)
+		verdict, err := run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}

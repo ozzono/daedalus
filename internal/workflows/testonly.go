@@ -63,7 +63,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 		if result.Coverage != "" {
 			lastCoverage = result.Coverage
 		}
-		verdict, err := run.review("the test suite", logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession)
+		verdict, err := run.review("the test suite", logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}

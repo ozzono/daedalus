@@ -951,3 +951,190 @@ func TestDevOnlyWorkflowReviewLoopParks(t *testing.T) {
 	}
 	env.AssertExpectations(t)
 }
+
+// TestDevOnlyWorkflowJailTaskThreaded pins the dev-only jail carve-out
+// threading: a task whose own text names .ai-jail drives the code review
+// with TaskTouchesJail (so the reviewer audits the spec), feeds review
+// comments back through a fix prompt whose jail branch is unlocked, and
+// opts the run's finalize into force-staging a non-empty .ai-jail.
+func TestDevOnlyWorkflowJailTaskThreaded(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "")
+	env := newTestEnv(t)
+
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil).Once()
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: activities.ReviewResult{Approved: false, Comments: "duplicate grant entry"}},
+		{result: activities.ReviewResult{Approved: true}},
+	}}
+	rev.record()
+
+	var finalized activities.WorktreeInput
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.WorktreeInput); ok {
+					finalized = in
+				}
+			}
+		}).
+		Return("daedalus/dev-only-issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.Flow = "dev-only"
+	in.Prompt = "tighten the .ai-jail grants"
+	env.ExecuteWorkflow(DevOnlyWorkflow, in)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rev.inputs) != 2 {
+		t.Fatalf("reviewer ran %d times, want 2 (changes, approve)", len(rev.inputs))
+	}
+	for i, ri := range rev.inputs {
+		if !ri.TaskTouchesJail {
+			t.Errorf("code review %d TaskTouchesJail = false, want the jail task threaded through", i)
+		}
+	}
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (implement, implement-fix)", len(rec.inputs))
+	}
+	wantFix, err := template.ImplementFix("duplicate grant entry", template.Jail{Touches: true})
+	if err != nil {
+		t.Fatalf("build expected fix prompt: %v", err)
+	}
+	if rec.inputs[1].Prompt != wantFix {
+		t.Errorf("fix prompt = %q, want %q", rec.inputs[1].Prompt, wantFix)
+	}
+	if !finalized.TaskTouchesJail {
+		t.Errorf("FinalizeWorktreeInput.TaskTouchesJail = false, want the finalize force-stage opt-in")
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowJailTaskThreaded pins the feature-dev jail
+// carve-out threading — pipeline.go's own wiring, distinct from dev-only's:
+// a task whose own text names .ai-jail drives the phase-1 code review with
+// TaskTouchesJail (so the reviewer audits the spec), feeds review comments
+// back through a fix prompt whose jail branch is unlocked, keeps the
+// phase-2 test review locked (its agent is barred from jail edits), and
+// opts the run's finalize into force-staging a non-empty .ai-jail.
+func TestFeatureDevWorkflowJailTaskThreaded(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "")
+	env := newTestEnv(t)
+
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil).Once()
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	// Code review demands changes once, then approves; test review approves.
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "duplicate grant entry"},
+		{Approved: true},
+		{Approved: true},
+	}}
+	rev.record()
+
+	stubTestPhase(env)
+
+	var finalized activities.WorktreeInput
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.WorktreeInput); ok {
+					finalized = in
+				}
+			}
+		}).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.Prompt = "tighten the .ai-jail grants"
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement, implement-fix, tests)", len(rec.inputs))
+	}
+	wantFix, err := template.ImplementFix("duplicate grant entry", template.Jail{Touches: true})
+	if err != nil {
+		t.Fatalf("build expected fix prompt: %v", err)
+	}
+	if rec.inputs[1].Prompt != wantFix {
+		t.Errorf("fix prompt = %q, want %q", rec.inputs[1].Prompt, wantFix)
+	}
+	if len(rev.inputs) != 3 {
+		t.Fatalf("reviewer ran %d times, want 3 (two code reviews, test review)", len(rev.inputs))
+	}
+	for i, ri := range rev.inputs[:2] {
+		if !ri.TaskTouchesJail {
+			t.Errorf("code review %d TaskTouchesJail = false, want the jail task threaded through", i)
+		}
+	}
+	if rev.inputs[2].TaskTouchesJail {
+		t.Error("test review TaskTouchesJail = true, want phase 2 locked — its agent is barred from jail edits")
+	}
+	if !finalized.TaskTouchesJail {
+		t.Errorf("FinalizeWorktreeInput.TaskTouchesJail = false, want the finalize force-stage opt-in")
+	}
+	env.AssertExpectations(t)
+}
+
+// TestInvestigateWorkflowJailTaskStaysLocked pins the locked-flow side of
+// the carve-out: a jail-touching task routed into a flow whose prompts bar
+// .ai-jail edits keeps the flag false everywhere — the reviewer never
+// audits the jail (a mandate no round could satisfy) and finalize never
+// force-stages the file.
+func TestInvestigateWorkflowJailTaskStaysLocked(t *testing.T) {
+	env := newTestEnv(t)
+
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/investigate-issue-42"}, nil).Once()
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	scope := &scopeRecorder{env: env}
+	scope.record()
+	var finalized activities.WorktreeInput
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.WorktreeInput); ok {
+					finalized = in
+				}
+			}
+		}).
+		Return("daedalus/investigate-issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.Flow = "investigate"
+	in.Prompt = "document how the .ai-jail spec works"
+	in.AllowedPaths = []string{"*.md", "docs/"}
+	env.ExecuteWorkflow(InvestigateWorkflow, in)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rev.inputs) != 1 {
+		t.Fatalf("reviewer ran %d times, want 1", len(rev.inputs))
+	}
+	if rev.inputs[0].TaskTouchesJail {
+		t.Error("docs review TaskTouchesJail = true, want a locked flow to keep the blanket exclusion")
+	}
+	if finalized.TaskTouchesJail {
+		t.Error("FinalizeWorktreeInput.TaskTouchesJail = true, want a locked flow to keep plain staging")
+	}
+	env.AssertExpectations(t)
+}

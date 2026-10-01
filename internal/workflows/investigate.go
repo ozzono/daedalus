@@ -40,7 +40,7 @@ func InvestigateWorkflow(ctx workflow.Context, input PipelineInput) (string, err
 	}
 
 	for {
-		verdict, err := run.review("the documentation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession)
+		verdict, err := run.review("the documentation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, false)
 		if err != nil {
 			return "", fmt.Errorf("docs review: %w", err)
 		}
