@@ -2457,6 +2457,172 @@ func TestFeatureDevWorkflowTestReviewRebuildLoopsThroughDevCycle(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// rebuildScript builds the reviewer verdicts for a run that absorbs n
+// REBUILD cycles: the phase-1 code review approves, and every rebuild
+// cycle's inner code review approves immediately so the loop returns to
+// the test review. Call order is exactly the returned slice's order.
+func rebuildScript(n int, finding string) []activities.ReviewResult {
+	script := []activities.ReviewResult{{Approved: true}} // phase 1 code review
+	for i := 0; i < n; i++ {
+		script = append(script,
+			activities.ReviewResult{Rebuild: true, Comments: finding}, // test review
+			activities.ReviewResult{Approved: true})                   // rebuild's code review
+	}
+	return script
+}
+
+// TestFeatureDevWorkflowRebuildCapParks pins the green stage's one bound:
+// the 9th REBUILD verdict parks the run for a maintainer restart instead of
+// cycling on the provider budget forever. Eight rebuild rounds are absorbed
+// first; the park carries the round count and the last finding's comments,
+// and the attempt's work is preserved (cleanup, no finalize).
+func TestFeatureDevWorkflowRebuildCapParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: append(rebuildScript(8, "handler drops the error path"),
+		activities.ReviewResult{Rebuild: true, Comments: "the handler still drops the error path on the ninth pass"})}
+	rev.record()
+
+	stubTestPhase(env)
+	var cleanupCount int
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { cleanupCount++ }).
+		Return(nil).Once()
+
+	// If the cap regresses, the repeating stub would feed this loop forever
+	// — bound the test so the regression fails fast instead of hanging
+	// until the go-test timeout.
+	env.SetTestTimeout(30 * time.Second)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from the rebuild cap parking the run")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"green stage failed to converge",
+		"issued rebuild 9",
+		"the handler still drops the error path on the ninth pass",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	// Eight rebuild rounds ran (implement + tests + 8 rebuilds); the park
+	// precedes a ninth dev round.
+	if len(rec.inputs) != 10 {
+		t.Errorf("agent ran %d times, want 10 (implement + tests + 8 rebuilds; none after the park)", len(rec.inputs))
+	}
+	// Phase 1 code review, then per rebuild cycle a test review and its
+	// code review, then the ninth (parking) test review: 1 + 2*8 + 1.
+	if len(rev.inputs) != 18 {
+		t.Errorf("reviewer ran %d times, want 18 (1 code + 8×[test + code] + 1 parking test review)", len(rev.inputs))
+	}
+	if cleanupCount != 1 {
+		t.Errorf("cleanup ran %d times, want 1 (the attempt's work is preserved for continue)", cleanupCount)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowRebuildsUnderCapComplete pins the cap's boundary:
+// eight absorbed REBUILD rounds still converge — the ninth verdict is the
+// parker, not the eighth, so a healthy loop at the cap's edge is never
+// parked.
+func TestFeatureDevWorkflowRebuildsUnderCapComplete(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: append(rebuildScript(8, "handler drops the error path"),
+		activities.ReviewResult{Approved: true})}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	// implement + tests + 8 rebuilds — no park, no tests-fix round (the
+	// resumed review approves the passing suite directly).
+	if len(rec.inputs) != 10 {
+		t.Errorf("agent ran %d times, want 10 (implement + tests + 8 rebuilds)", len(rec.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowRebuildCountIgnoresFixRounds pins the cap's
+// monotonicity: a tests-fix round (changes requested, no REBUILD) does not
+// reset the rebuild counter — 8 rebuilds, one fix round, and one more
+// rebuild is already past the cap and parks. Without the monotonic count
+// the loop would keep cycling; the round-count assertions catch that
+// without waiting out the test timeout.
+func TestFeatureDevWorkflowRebuildCountIgnoresFixRounds(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: append(rebuildScript(8, "rebuild finding"),
+		activities.ReviewResult{Approved: false, Comments: "tests still fail"},     // a tests-fix round
+		activities.ReviewResult{Rebuild: true, Comments: "rebuild finding again"})} // rebuild 9 parks
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	env.SetTestTimeout(30 * time.Second)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from the rebuild cap parking the run")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"issued rebuild 9",
+		"rebuild finding again",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	// implement + tests + 8 rebuilds + 1 tests-fix; the park precedes a
+	// ninth rebuild round.
+	if len(rec.inputs) != 11 {
+		t.Errorf("agent ran %d times, want 11 (implement + tests + 8 rebuilds + 1 tests-fix)", len(rec.inputs))
+	}
+	// Phase 1 code review, 8 full rebuild cycles, the fix round's test
+	// review, and the parking test review: 1 + 2*8 + 1 + 1.
+	if len(rev.inputs) != 19 {
+		t.Errorf("reviewer ran %d times, want 19 (1 code + 8×[test + code] + fix-round test + parking test)", len(rev.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowTesterReplyRelayedToReview pins the tester→reviewer
 // leg of the rebuild path: the test reviewer's input carries the tester's
 // latest reply across both fix rounds, so the reviewer — not the tester —

@@ -336,7 +336,16 @@ issue never share live state). Re-running
   agent ↔ reviewer until the reviewer approves; the test phase loops
   agent ↔ (test suite + reviewer) until the reviewer approves *and* the
   suite passes. Review rounds are intentionally **unbounded** — the workflow
-  ends only on approval, with every round durable and auditable.
+  ends only on approval, with every round durable and auditable — except for
+  one bound: the green stage parks the run once the test reviewer has issued
+  more than 8 `REBUILD` verdicts while suite green and review approval never
+  coincided, instead of cycling on the provider budget until quota death
+  takes the deployment's other runs down too. A rebuild round's finding
+  carries the review's full failure inventory (the test reviewer must
+  enumerate every implementation defect found that round), and the
+  implementing agent is required to address every item per cycle (reporting
+  any it cannot satisfy), so convergence normally takes a handful of cycles
+  and the cap fires only on a genuinely stalled stage.
 - **Reviewer protocol**: the reviewer sees the diff of the worktree (plus
   the latest test output and the test agent's latest reply in phase 2) and
   must end its response with a final line `APPROVED`, `CHANGES_REQUESTED`,
@@ -347,7 +356,9 @@ issue never share live state). Re-running
   test-only agent cannot apply: an implementation-level defect — relayed by
   the tester or found by the reviewer — routes back through the
   implementation ↔ code-review cycle, and the test loop resumes once the
-  code reviewer approves again. Anything else — including a malformed
+  code reviewer approves again; past the 8th rebuild the run parks
+  (resumable with `daedalus continue`) rather than looping. Anything
+  else — including a malformed
   response — counts as changes requested, with the full output fed back to
   the implementing agent.
 - **The repo's own test suite**, whatever it is: the test command is
