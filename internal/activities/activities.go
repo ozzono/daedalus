@@ -111,6 +111,12 @@ type ReviewInput struct {
 	// empty, the round resumes the conversation the session watcher
 	// recorded for this role, if any. Empty role skips the fallback.
 	Role SessionRole
+	// TaskTouchesJail marks a task whose own text names .ai-jail
+	// (submit-time derivation — template.TaskTouchesJail on the run's
+	// prompt, never the diff). Only the phase-1 implementation code
+	// review passes it true: the reviewer prompt then audits .ai-jail
+	// (with the spec content relayed) instead of blanket-ignoring it.
+	TaskTouchesJail bool
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -196,6 +202,25 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 			logger.Info("Resuming the previous attempt's recorded agent session", "SessionID", id)
 		}
 	}
+	// pi session hygiene, gated to pi so every other agent's resume path is
+	// byte-identical: a transcript that already embeds tool-call JSON is
+	// the self-reinforcing degenerate pattern a small model imitates, so
+	// the session is not resumed at all; a transcript ending in a
+	// failed-edit loop keeps its session but gets the next round steered
+	// (piEditSteer rides the round's prompt as the newest user message).
+	steer := false
+	if agent == "pi" && resume != "" {
+		health := scanPiSession(input.WorktreePath, resume)
+		if health.embeddedToolJSON {
+			activityLogger(ctx).Warn("pi session transcript embeds tool-call JSON; starting a fresh session",
+				"SessionID", resume)
+			resume = ""
+		} else if health.editLoop {
+			activityLogger(ctx).Warn("pi session ends in a failed-edit loop; steering the next round",
+				"SessionID", resume)
+			steer = true
+		}
+	}
 	runArgs := agentArgs
 	if resume != "" && canResume {
 		runArgs = append([]string{resumeFlag, resume}, agentArgs...)
@@ -219,6 +244,9 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 		if resume == "" || !canResume {
 			prompt += foldersNote
 		}
+	}
+	if steer {
+		prompt = piEditSteer + "\n\n" + prompt
 	}
 	start := time.Now()
 	res, err := runJailedKindFolders(ctx, input.Role, input.Agent, input.WorktreePath, prompt, input.Folders, runArgs...)
@@ -288,10 +316,27 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 		// startup iff bug_filing is enabled; empty drops the file-filing
 		// instruction from the reviewer's bug policy.
 		bugDir := os.Getenv(config.BugDirEnv)
-		if input.ReproInScope {
-			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir)
+		// A jail-touching task's audit target never appears in the git
+		// diff — the repo ignores .ai-jail and the jail drops it untracked
+		// — so relay the worktree's spec content as its own labeled
+		// section. An emptied spec is a deliverable shape too ("clear the
+		// permissions"): relay the emptiness explicitly instead of
+		// omitting the section and leaving the audit blind.
+		jailSpec := ""
+		if input.TaskTouchesJail {
+			if b, rerr := os.ReadFile(filepath.Join(input.WorktreePath, ".ai-jail")); rerr == nil {
+				jailSpec = string(b)
+				if jailSpec == "" {
+					jailSpec = "(the spec file is empty)"
+				}
+			}
 		}
-		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir)
+		if input.ReproInScope {
+			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir,
+				template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
+		}
+		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir,
+			template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
 	}()
 	if err != nil {
 		return ReviewResult{}, err
@@ -319,6 +364,16 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 			resume = id
 			logger.Info("Resuming the previous attempt's recorded reviewer session", "SessionID", id)
 		}
+	}
+	// pi session hygiene for reviewer rounds, same gating and reasoning as
+	// the agent rounds above: a transcript that embeds tool-call JSON is
+	// not resumed. The failed-edit steering does not apply — reviewers do
+	// not edit.
+	if agent == "pi" && resume != "" &&
+		scanPiSession(input.WorktreePath, resume).embeddedToolJSON {
+		activityLogger(ctx).Warn("pi session transcript embeds tool-call JSON; starting a fresh session",
+			"SessionID", resume)
+		resume = ""
 	}
 	runArgs := agentArgs
 	if resume != "" && canResume {

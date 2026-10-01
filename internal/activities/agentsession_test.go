@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -922,5 +923,82 @@ exit 0`)
 	}
 	if contains(calls[1].Args, "--resume") {
 		t.Errorf("retry args %v must not use claude's --resume", calls[1].Args)
+	}
+}
+
+// TestRunJailedReviewerActivityJailSpecRelay pins the reviewer's jail
+// carve-out at the activity boundary: only a TaskTouchesJail review reads
+// the worktree's .ai-jail and relays it into the prompt (non-empty content
+// verbatim, an emptied spec as an explicit marker so the audit is never
+// blind), while a review without the flag leaves the file alone even when
+// it is present.
+func TestRunJailedReviewerActivityJailSpecRelay(t *testing.T) {
+	scrubBugFilingEnv(t)
+	fakeHome(t)
+	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-1"}'; exit 0`)
+
+	for _, tc := range []struct {
+		name        string
+		touchesJail bool
+		spec        string
+		want        string
+		wantAbsent  string
+	}{
+		{
+			name:        "spec relayed",
+			touchesJail: true,
+			spec:        "grant read /etc/hosts\n",
+			want:        "grant read /etc/hosts",
+			wantAbsent:  "(the spec file is empty)",
+		},
+		{
+			name:        "emptied spec relayed as marker",
+			touchesJail: true,
+			spec:        "",
+			want:        "(the spec file is empty)",
+		},
+		{
+			name:        "no flag leaves the file alone",
+			touchesJail: false,
+			spec:        "grant read /etc/hosts\n",
+			wantAbsent:  "relayed here because git ignores it",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wt := t.TempDir()
+			log := newStubLog(t)
+			if err := os.WriteFile(filepath.Join(wt, ".ai-jail"), []byte(tc.spec), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+				WorktreePath:    wt,
+				Focus:           "the implementation",
+				Role:            RoleDevReview,
+				TaskTouchesJail: tc.touchesJail,
+			})
+			if err != nil {
+				t.Fatalf("RunJailedReviewerActivity: %v", err)
+			}
+
+			var jail *stubCall
+			calls := readCalls(t, log)
+			for i, c := range calls {
+				if len(c.Args) > 0 && c.Args[0] == "--worktree" {
+					jail = &calls[i]
+				}
+			}
+			if jail == nil {
+				t.Fatal("no ai-jail call recorded")
+			}
+			if tc.want != "" && !strings.Contains(jail.Stdin, tc.want) {
+				t.Errorf("review prompt %q should contain %q", jail.Stdin, tc.want)
+			}
+			if tc.wantAbsent != "" && strings.Contains(jail.Stdin, tc.wantAbsent) {
+				t.Errorf("review prompt %q should not contain %q", jail.Stdin, tc.wantAbsent)
+			}
+		})
 	}
 }

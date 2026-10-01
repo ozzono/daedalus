@@ -21,6 +21,10 @@ import (
 func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	run, cleanup := startRun(ctx, input)
 	defer cleanup()
+	// Submit-time jail carve-out, same as feature-dev phase 1 — including
+	// the finalize force-stage opt-in.
+	touchesJail := template.TaskTouchesJail(input.Prompt)
+	run.worktreeInput.TaskTouchesJail = touchesJail
 	if err := run.createWorktree(); err != nil {
 		return "", err
 	}
@@ -42,7 +46,7 @@ func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) 
 	}
 
 	for {
-		verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession)
+		verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
 		}
@@ -56,7 +60,7 @@ func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) 
 			return run.finalize()
 		}
 		run.logger.Info("Code review requested changes")
-		fixPrompt, err := template.ImplementFix(verdict.Comments)
+		fixPrompt, err := template.ImplementFix(verdict.Comments, template.Jail{Touches: touchesJail})
 		if err != nil {
 			return "", fmt.Errorf("build implement-fix prompt: %w", err)
 		}

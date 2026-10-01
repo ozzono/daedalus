@@ -128,6 +128,21 @@ const maxConsecutiveTimeouts = 3
 // rounds forever, never converging and never parking.
 const maxVerdictlessReviews = 3
 
+// maxIdenticalVerdicts caps how many review rounds in a row — per review
+// role, so a code-review approval between a test reviewer's repeated
+// REBUILD findings does not reset the count — may return a byte-identical
+// comments body (whitespace-normalized) before the run parks: the timeout
+// and verdictless streaks above do not cover a steady stream of well-formed
+// non-approved verdicts, which is the one remaining unbounded review loop —
+// an implementer that cannot act on the feedback at all (e.g. a small
+// self-hosted model retrying a hallucinated edit forever) produces reviews
+// that differ in no way round to round, so identical verdicts in a row mean
+// the loop cannot converge and a maintainer must arbitrate. Only verdicts
+// carrying a real marker count; marker-less rounds have
+// maxVerdictlessReviews, and an approval ends that role's loop (and resets
+// its streak) before it could ever park.
+const maxIdenticalVerdicts = 3
+
 // quotaHeartbeatInterval is how long a run sleeps when the agent API is
 // exhausted (hard cap, rate limit, overload) before retrying the same
 // round unchanged.
@@ -145,6 +160,18 @@ const slotBackoffInterval = time.Minute
 // exhausted after this many heartbeats the run parks itself for a
 // maintainer restart instead of failing.
 const maxQuotaHeartbeats = 5
+
+// maxTestPhaseRebuilds caps how many REBUILD verdicts the green stage may
+// absorb before parking the run: each rebuild cycle is a full suite run
+// plus two agent rounds on the provider budget, and a loop that cannot
+// converge within this many — even with every round legitimate — would
+// otherwise cycle until provider quota death takes the deployment's other
+// runs down with it. The count is monotonic (no reset when failures drop):
+// with the rebuild batching demanding the whole failure inventory per
+// cycle, a healthy convergence needs only a handful of cycles, so
+// resetting could only ever serve a loop slow enough to be worth a
+// maintainer's eyes anyway.
+const maxTestPhaseRebuilds = 8
 
 // ErrAwaitingMaintainer parks a run instead of failing it with a raw error:
 // the API stayed exhausted past every heartbeat, or the reviewer halted with
@@ -269,18 +296,29 @@ func WorkflowTypeName(fn func(workflow.Context, PipelineInput) (string, error)) 
 // approves, then (2) tests ↔ test review until the reviewer approves AND the
 // native test suite passes. On success the approved work is committed and
 // the run's branch renamed to its preserved prefix; the workflow
-// returns that branch name. Both loops are intentionally unbounded — they
-// run until approval, with no attempt cap; each round is durable, auditable,
-// and individually timed-out via activity options. Two conditions park the
-// run for a maintainer restart rather than failing it with a raw error (see
+// returns that branch name. The loops run until approval with no cap on
+// ordinary fix rounds — each round is durable, auditable, and individually
+// timed-out via activity options — with one bound: the green stage parks
+// the run after maxTestPhaseRebuilds REBUILD cycles instead of cycling on
+// the provider budget forever. Conditions that park the run for a
+// maintainer restart rather than failing it with a raw error (see
 // ErrAwaitingMaintainer): the provider API staying exhausted past every
-// quota heartbeat, or a reviewer NEEDS_MAINTAINER verdict on a task that
-// cannot be completed as stated. The registration's CompleteGreen wrapper
-// completes a parked run green with the reason as its result; the deferred
-// cleanup preserves the attempt's work on its aborted/ branch either way.
+// quota heartbeat, a reviewer NEEDS_MAINTAINER verdict on a task that
+// cannot be completed as stated, or the rebuild cap above. The
+// registration's CompleteGreen wrapper completes a parked run green with
+// the reason as its result; the deferred cleanup preserves the attempt's
+// work on its aborted/ branch either way.
 func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	run, cleanup := startRun(ctx, input)
 	defer cleanup()
+	// Submit-time jail carve-out: a task whose own text names .ai-jail
+	// gets fix prompts where acting on .ai-jail comments is in scope, and
+	// its phase-1 code review audits the jail spec (the flag is threaded
+	// into run.review). Setting WorktreeInput.TaskTouchesJail is this
+	// flow's opt-in to finalize's .ai-jail force-stage — feature-dev is
+	// one of only two flows whose prompts unlock jail edits.
+	touchesJail := template.TaskTouchesJail(input.Prompt)
+	run.worktreeInput.TaskTouchesJail = touchesJail
 	if err := run.createWorktree(); err != nil {
 		return "", err
 	}
@@ -294,7 +332,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// same reviewer conversation instead of starting cold.
 	codeReviewLoop := func() error {
 		for {
-			verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession)
+			verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
 			if err != nil {
 				return fmt.Errorf("code review: %w", err)
 			}
@@ -308,7 +346,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				return nil
 			}
 			run.logger.Info("Code review requested changes")
-			fixPrompt, err := template.ImplementFix(verdict.Comments)
+			fixPrompt, err := template.ImplementFix(verdict.Comments, template.Jail{Touches: touchesJail})
 			if err != nil {
 				return fmt.Errorf("build implement-fix prompt: %w", err)
 			}
@@ -369,6 +407,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("test-phase agent run: %w", err)
 	}
+	rebuilds := 0
 	for {
 		command, err := run.resolveTestCommand()
 		if err != nil {
@@ -378,7 +417,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		if err != nil {
 			return "", err
 		}
-		verdict, err := run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession)
+		verdict, err := run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
@@ -388,7 +427,14 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				verdict.Comments))
 		}
 		if verdict.Rebuild {
-			run.logger.Info("Test review requested a rebuild; returning to the dev cycle")
+			rebuilds++
+			if rebuilds > maxTestPhaseRebuilds {
+				run.logger.Info("Green stage exceeded the rebuild cap; parking the run")
+				return "", run.park(fmt.Sprintf("green stage failed to converge — the test review issued rebuild %d and suite green and review approval never coincided; last finding: %s",
+					rebuilds, verdict.Comments))
+			}
+			run.logger.Info("Test review requested a rebuild; returning to the dev cycle",
+				"Rebuilds", rebuilds, "Of", maxTestPhaseRebuilds)
 			if err := rebuild(verdict.Comments); err != nil {
 				return "", err
 			}

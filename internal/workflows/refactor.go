@@ -49,7 +49,7 @@ func RefactorWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 		if err != nil {
 			return "", err
 		}
-		verdict, err := run.review("the refactoring", result.Logs, false, false, "", activities.RoleDevReview, &run.devReviewSession)
+		verdict, err := run.review("the refactoring", result.Logs, false, false, "", activities.RoleDevReview, &run.devReviewSession, false)
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
 		}

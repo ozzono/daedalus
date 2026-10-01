@@ -102,7 +102,14 @@ up.
     (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) that daedalus already
     exports; the jail bridges pi's host `~/.pi/agent/auth.json` read-write
     and that login takes priority over the env vars, so a stale host login
-    wins — keep it clean or aligned
+    wins — keep it clean or aligned. pi-served implementing rounds also
+    carry an edit-discipline guardrail in their prompt (read before edit,
+    read again after a failed edit — cheap insurance for small self-hosted
+    models); a resumed pi session whose transcript embeds tool-call JSON as
+    assistant text is not resumed (the pattern is self-reinforcing poison),
+    and one ending in repeated failed `edit` calls gets its next round
+    steered toward read-then-retry. Flagship agents' prompts and resume
+    paths are byte-for-byte untouched.
   - `aider` when `agent: aider` is — authenticates via the same provider
     env vars; the repo's `.env` is masked to empty inside the jail, so it
     cannot override the exported env
@@ -336,7 +343,23 @@ issue never share live state). Re-running
   agent ↔ reviewer until the reviewer approves; the test phase loops
   agent ↔ (test suite + reviewer) until the reviewer approves *and* the
   suite passes. Review rounds are intentionally **unbounded** — the workflow
-  ends only on approval, with every round durable and auditable.
+  ends only on approval, with every round durable and auditable — but two
+  runaway guards keep a stalled stage from churning forever. The green
+  stage parks the run once the test reviewer has issued more than 8
+  `REBUILD` verdicts while suite green and review approval never
+  coincided, instead of cycling on the provider budget until quota death
+  takes the deployment's other runs down too. A rebuild round's finding
+  carries the review's full failure inventory (the test reviewer must
+  enumerate every implementation defect found that round), and the
+  implementing agent is required to address every item per cycle (reporting
+  any it cannot satisfy), so convergence normally takes a handful of cycles
+  and the cap fires only on a genuinely stalled stage. Separately, verdict
+  runaway guards are tracked per review role (a code-review approval
+  between a test reviewer's repeated rebuild findings does not reset the
+  test reviewer's count): a reviewer that ends without any verdict marker
+  three times in a row, or repeats a whitespace-identical rejection verdict
+  three times in a row, parks the run for a maintainer — an implementer
+  that cannot act on the feedback cannot churn forever.
 - **Reviewer protocol**: the reviewer sees the diff of the worktree (plus
   the latest test output and the test agent's latest reply in phase 2) and
   must end its response with a final line `APPROVED`, `CHANGES_REQUESTED`,
@@ -347,7 +370,9 @@ issue never share live state). Re-running
   test-only agent cannot apply: an implementation-level defect — relayed by
   the tester or found by the reviewer — routes back through the
   implementation ↔ code-review cycle, and the test loop resumes once the
-  code reviewer approves again. Anything else — including a malformed
+  code reviewer approves again; past the 8th rebuild the run parks
+  (resumable with `daedalus continue`) rather than looping. Anything
+  else — including a malformed
   response — counts as changes requested, with the full output fed back to
   the implementing agent.
 - **The repo's own test suite**, whatever it is: the test command is
@@ -411,6 +436,38 @@ issue never share live state). Re-running
   argv — no `ps` visibility, no per-argument size limit on review prompts
   that embed the full diff. Verdicts are parsed from stdout only, so
   trailing stderr noise cannot flip an `APPROVED`.
+- **`.ai-jail` prompt carve-out**: the round prompts scope the agent to the
+  task and name `.ai-jail` — the sandbox's own permission spec — as an
+  untouchable artifact. For a run whose task text mentions `.ai-jail`, that
+  exclusion is keyed off at submit time (`template.TaskTouchesJail`, derived
+  from the task text only, never the diff — a diff-keyed carve-out would let
+  an out-of-scope round-1 edit legitimize itself and unlock `.ai-jail` for
+  every later round; a mention is not a command — the carve-out branches
+  only stop barring changes the task or review comments actually ask for).
+  In the feature-dev/dev-only phase-1 loop the implementer may edit
+  `.ai-jail` as the task directs, the fix prompt acts on `.ai-jail`
+  comments, and the code reviewer audits it: since git never shows the file
+  (the repo ignores it; the jail drops it untracked), the reviewer prompt
+  relays the worktree's current `.ai-jail` content as its own labeled
+  section (agent output under audit, not trusted config; an emptied spec is
+  relayed as an explicit "(the spec file is empty)" marker so the audit is
+  never blind). At delivery, feature-dev and dev-only — the only flows whose
+  prompts unlock jail edits — force-stage a non-empty `.ai-jail`: plain
+  `git add -A` would silently drop the deliverable where the repo ignores
+  the file (the jail's untouched drop is empty, so non-empty content is
+  agent-authored). Other flows keep `add -A`'s fail-safe discard of any
+  out-of-scope jail edit. Known limitation: an intentionally-emptied spec
+  (a "clear the permissions" task) fails the non-empty check at finalize and
+  is silently dropped while the run reports success — the reviewer saw and
+  approved it, but the commit does not carry it. Runs whose task does not
+  name `.ai-jail` keep
+  the exclusion wording byte-identical. ALERT: the other flows'
+  opener/fix templates (`continue`, `bugfix`, `investigate`, `refactor`,
+  `tests`, `rebuild` and their fix/review-feed prompts) still bar `.ai-jail`
+  edits unconditionally — their reviewers deliberately keep the blanket
+  exclusion too (a jail audit mandate there would demand what their agents
+  are forbidden to do), so a jail-touching task must run feature-dev or
+  dev-only (filed out-of-scope 2026-09-30).
 - **History diet**: the agent's visible text and chain of thought come back
   in the activity result tail-bounded to 16 KiB each (visible per round in
   the Temporal UI), test logs likewise; the worker log keeps the full

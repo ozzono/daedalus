@@ -91,6 +91,15 @@ type pipelineRun struct {
 	// without any verdict marker (see maxVerdictlessReviews). Only a
 	// review carrying a real verdict resets it.
 	verdictlessReviews int
+	// lastVerdictBody and identicalVerdicts track consecutive review
+	// rounds returning a whitespace-identical comments body, per review
+	// role (see maxIdenticalVerdicts). Only real verdicts participate; an
+	// approval from that role resets its streak. Per-role is what keeps
+	// the rebuild cycle covered: a test reviewer repeating an identical
+	// REBUILD finding has a code-review approval between its rounds, and
+	// that other conversation's approval must not erase the churn count.
+	lastVerdictBody   map[activities.SessionRole]string
+	identicalVerdicts map[activities.SessionRole]int
 
 	devSession, testSession             string
 	devReviewSession, testReviewSession string
@@ -192,19 +201,21 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 		branchScope = flowScope + "-"
 	}
 	r := &pipelineRun{
-		input:           input,
-		logger:          logger,
-		ctx:             ctx,
-		agentCtx:        agentCtx,
-		reviewCtx:       reviewCtx,
-		cleanupCtx:      cleanupCtx,
-		testTimeout:     testTimeout,
-		agentRunTimeout: agentTimeout,
-		discoverCtx:     discoverCtx,
-		testExecCtx:     testExecCtx,
-		guideCh:         workflow.GetSignalChannel(ctx, "guide"),
-		wakeupCh:        workflow.GetSignalChannel(ctx, "wakeup"),
-		branchName:      fmt.Sprintf("feat/%sissue-%s-%d", branchScope, input.IssueID, workflow.Now(ctx).Unix()),
+		input:             input,
+		logger:            logger,
+		ctx:               ctx,
+		agentCtx:          agentCtx,
+		reviewCtx:         reviewCtx,
+		cleanupCtx:        cleanupCtx,
+		testTimeout:       testTimeout,
+		agentRunTimeout:   agentTimeout,
+		discoverCtx:       discoverCtx,
+		testExecCtx:       testExecCtx,
+		lastVerdictBody:   map[activities.SessionRole]string{},
+		identicalVerdicts: map[activities.SessionRole]int{},
+		guideCh:           workflow.GetSignalChannel(ctx, "guide"),
+		wakeupCh:          workflow.GetSignalChannel(ctx, "wakeup"),
+		branchName:        fmt.Sprintf("feat/%sissue-%s-%d", branchScope, input.IssueID, workflow.Now(ctx).Unix()),
 	}
 	r.worktreeInput = activities.WorktreeInput{
 		RepoPath:     input.RepoPath,
@@ -215,6 +226,11 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 		BaseBranch:   input.BaseBranch,
 		Flow:         flowScope,
 		Authorship:   input.Authorship,
+		// TaskTouchesJail stays false here: force-staging .ai-jail at
+		// finalize is opt-in per flow — only the workflows that unlock
+		// jail edits (feature-dev, dev-only) set it, so every other
+		// flow keeps the fail-safe discard of any out-of-scope jail
+		// edit `git add -A` gives for free.
 	}
 	r.vis = visibilityEnabled(ctx)
 	r.setStatus(StatusRunning)
@@ -428,8 +444,13 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 
 // review asks the reviewer for a verdict on the worktree's current state,
 // retrying the same round across timeouts — there is no partial work to
-// continue, the verdict simply never arrived.
-func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string) (activities.ReviewResult, error) {
+// continue, the verdict simply never arrived. touchesJail marks the
+// phase-1 implementation code review of a task whose text names .ai-jail —
+// the only review whose agent can act on jail findings (test, docs, bugfix,
+// and refactor rounds pass false: their agents are barred from touching
+// .ai-jail, so an audit mandate there would be a demand no round can
+// satisfy).
+func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string, touchesJail bool) (activities.ReviewResult, error) {
 	// Same lost-session fallback as the agent rounds: one fresh retry.
 	freshFallback := false
 	for {
@@ -441,9 +462,13 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			TestsInScope: testsInScope,
 			ReproInScope: reproInScope,
 			AgentReply:   agentReply,
-			Agent:        r.input.Agent,
-			SessionID:    *session,
-			Role:         role,
+			// Explicitly threaded from the workflow's submit-time
+			// derivation — never the diff (template.TaskTouchesJail
+			// documents why), never re-derived here.
+			TaskTouchesJail: touchesJail,
+			Agent:           r.input.Agent,
+			SessionID:       *session,
+			Role:            role,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.reviewTimeouts = 0
@@ -472,6 +497,26 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 				return result, nil
 			}
 			r.verdictlessReviews = 0
+			if result.Approved {
+				// The role's loop ends on approval — progress by definition.
+				r.lastVerdictBody[role], r.identicalVerdicts[role] = "", 0
+				return result, nil
+			}
+			// The identical-verdict streak, per role: a repeat of the last
+			// real verdict's comments body from the same reviewer means the
+			// implementer did not move that review an inch
+			// (maxIdenticalVerdicts); any different verdict restarts the
+			// count.
+			if body := normalizedVerdictBody(result.Comments); body == r.lastVerdictBody[role] {
+				r.identicalVerdicts[role]++
+			} else {
+				r.lastVerdictBody[role] = body
+				r.identicalVerdicts[role] = 1
+			}
+			if r.identicalVerdicts[role] >= maxIdenticalVerdicts {
+				return result, r.park(fmt.Sprintf("%d consecutive identical review verdicts (focus %q, role %s) — the implementing agent is not acting on the review comments, so the review loop cannot converge; a maintainer must arbitrate",
+					r.identicalVerdicts[role], focus, role))
+			}
 			return result, nil
 		}
 		// Same kill-first precedence as the agent rounds: a killed
@@ -514,6 +559,14 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 				r.reviewTimeouts, focus, err)
 		}
 	}
+}
+
+// normalizedVerdictBody collapses whitespace in a review's comments body so
+// two verdicts differing only in line wrapping count as identical (the
+// identical-verdict park cap compares bodies, not bytes). Workflow-code
+// string work is deterministic, so this is replay-safe.
+func normalizedVerdictBody(comments string) string {
+	return strings.Join(strings.Fields(comments), " ")
 }
 
 // resolveTestCommand resolves the worktree's test-suite entrypoint,
