@@ -112,6 +112,9 @@ func stagePiProvider(env []string) ([]string, error) {
 		if s.TopP != nil {
 			params["top_p"] = *s.TopP
 		}
+		if s.Temperature != nil {
+			params["temperature"] = *s.Temperature
+		}
 		if s.PresencePenalty != nil {
 			params["presence_penalty"] = *s.PresencePenalty
 		}

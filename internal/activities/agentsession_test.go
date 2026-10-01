@@ -1002,3 +1002,115 @@ exit 0`)
 		})
 	}
 }
+
+// TestRunJailedReviewerActivitySlimCriteria pins the slim routing at the
+// activity boundary: a review carrying acceptance criteria renders the
+// atomic sub-task framing judged against exactly those criteria, while a
+// review without them keeps the ordinary whole-change framing.
+func TestRunJailedReviewerActivitySlimCriteria(t *testing.T) {
+	scrubBugFilingEnv(t)
+	fakeHome(t)
+	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M adder.go\n'; fi
+exit 0`)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-1"}'; exit 0`)
+
+	for _, tc := range []struct {
+		name       string
+		criteria   []string
+		want       string
+		wantAbsent string
+	}{
+		{
+			name:     "criteria switch to the sub-task framing",
+			criteria: []string{"Add(2,2) returns 4", "adder.go defines Add"},
+			want:     "one atomized sub-task of a larger plan",
+		},
+		{
+			name:       "no criteria keeps the ordinary framing",
+			wantAbsent: "atomized sub-task",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wt := t.TempDir()
+			log := newStubLog(t)
+
+			if _, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+				WorktreePath:       wt,
+				Focus:              "subtask 1 (add the adder)",
+				Role:               RoleDevReview,
+				AcceptanceCriteria: tc.criteria,
+			}); err != nil {
+				t.Fatalf("RunJailedReviewerActivity: %v", err)
+			}
+
+			var jail *stubCall
+			calls := readCalls(t, log)
+			for i, c := range calls {
+				if len(c.Args) > 0 && c.Args[0] == "--worktree" {
+					jail = &calls[i]
+				}
+			}
+			if jail == nil {
+				t.Fatal("no ai-jail call recorded")
+			}
+			for _, crit := range tc.criteria {
+				if !strings.Contains(jail.Stdin, "- "+crit) {
+					t.Errorf("review prompt %q should carry criterion %q verbatim", jail.Stdin, crit)
+				}
+			}
+			if tc.want != "" && !strings.Contains(jail.Stdin, tc.want) {
+				t.Errorf("review prompt %q should contain %q", jail.Stdin, tc.want)
+			}
+			if tc.wantAbsent != "" && strings.Contains(jail.Stdin, tc.wantAbsent) {
+				t.Errorf("review prompt %q should not contain %q", jail.Stdin, tc.wantAbsent)
+			}
+		})
+	}
+}
+
+// TestRunJailedReviewerActivityFreshReviewSkipsResume pins the slim flow's
+// context isolation at the activity boundary: with FreshReview set, a
+// recorded reviewer session for the role is never resumed and the
+// recorded-session fallback never fires — every review is a brand-new
+// conversation, while without the flag the same state resumes (the
+// pre-slim contract, pinned by TestRunJailedReviewerActivityResumesRecordedSession).
+func TestRunJailedReviewerActivityFreshReviewSkipsResume(t *testing.T) {
+	fakeHome(t)
+	wt := t.TempDir()
+	log := newStubLog(t)
+	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-fresh"}'; exit 0`)
+	recordSession(context.Background(), wt, RoleDevReview, "rev-past")
+	plantTranscript(t, wt, "rev-past")
+
+	res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+		WorktreePath: wt,
+		Focus:        "subtask 1 (add the adder)",
+		Role:         RoleDevReview,
+		FreshReview:  true,
+	})
+	if err != nil {
+		t.Fatalf("RunJailedReviewerActivity: %v", err)
+	}
+	if !res.Approved {
+		t.Error("Approved = false, want true")
+	}
+
+	calls := readCalls(t, log)
+	var jail *stubCall
+	for i, c := range calls {
+		if len(c.Args) > 0 && c.Args[0] == "--worktree" {
+			jail = &calls[i]
+		}
+	}
+	if jail == nil {
+		t.Fatal("no ai-jail call recorded")
+	}
+	if len(calls) != 3 {
+		t.Errorf("%d subprocess calls, want 3 (git add, git diff, one fresh ai-jail) — no resume retry may fire", len(calls))
+	}
+	if contains(jail.Args, "--resume") || contains(jail.Args, "rev-past") {
+		t.Errorf("fresh review args %v must start clean, not resume rev-past", jail.Args)
+	}
+}

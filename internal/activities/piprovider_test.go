@@ -258,6 +258,7 @@ func TestStagePiProviderSamplingParams(t *testing.T) {
 			config.TopPEnv+"=0.9",
 			config.TopKEnv+"=40",
 			config.MinPEnv+"=0.05",
+			config.TemperatureEnv+"=0.2",
 			config.PresencePenaltyEnv+"=0.5",
 			config.RepetitionPenaltyEnv+"=1.1",
 		)); err != nil {
@@ -265,7 +266,7 @@ func TestStagePiProviderSamplingParams(t *testing.T) {
 		}
 		params := stagedPiProvider(t, home).Models[0].SamplingParams
 		for k, want := range map[string]float64{
-			"top_p": 0.9, "top_k": 40, "min_p": 0.05,
+			"top_p": 0.9, "top_k": 40, "min_p": 0.05, "temperature": 0.2,
 			"presence_penalty": 0.5, "repetition_penalty": 1.1,
 		} {
 			got, ok := params[k].(float64)

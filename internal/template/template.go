@@ -122,6 +122,20 @@ func TestsFix(testLogs, comments string) (string, error) {
 	return strings.Join(parts, "\n\n"), nil
 }
 
+// reviewData is the shared data of review.md. AcceptanceCriteria, when
+// non-empty, switches the template's framing to the slim flow's atomic
+// sub-task review (see SlimReview); the other framings leave it nil.
+type reviewData struct {
+	Focus, Diff, TestLogs, AgentReply, BugDir, JailSpec string
+	TestsInScope, ReproInScope, TouchesJail             bool
+	AcceptanceCriteria                                  []string
+}
+
+// review renders the shared reviewer template for all framings.
+func review(d reviewData) (string, error) {
+	return render("review", d)
+}
+
 // Review builds the reviewer prompt for either loop. The verdict protocol at
 // the end of the template is the contract parseReviewVerdict in
 // internal/activities relies on: the reviewer's final non-empty line must be
@@ -140,7 +154,16 @@ func TestsFix(testLogs, comments string) (string, error) {
 // instead of blanket-ignoring them. It trails as variadic so existing
 // callers stay valid.
 func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string, jail ...Jail) (string, error) {
-	return review(focus, diff, testLogs, testsInScope, false, agentReply, bugDir, jail...)
+	return review(reviewData{
+		Focus:        focus,
+		Diff:         diff,
+		TestLogs:     testLogs,
+		TestsInScope: testsInScope,
+		AgentReply:   agentReply,
+		BugDir:       bugDir,
+		TouchesJail:  len(jail) > 0 && jail[0].Touches,
+		JailSpec:     jailSpec(jail),
+	})
 }
 
 // ReviewRepro is Review's bug-fix framing: the diff's own tests are part of
@@ -148,29 +171,41 @@ func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir 
 // captures the reported bug — something the repro-first gate cannot. No
 // REBUILD verdict exists in this framing.
 func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, jail ...Jail) (string, error) {
-	return review(focus, diff, testLogs, false, true, agentReply, bugDir, jail...)
-}
-
-// review renders the shared reviewer template for all three framings.
-func review(focus, diff, testLogs string, testsInScope, reproInScope bool, agentReply, bugDir string, jail ...Jail) (string, error) {
-	j := Jail{}
-	if len(jail) > 0 {
-		j = jail[0]
-	}
-	return render("review", struct {
-		Focus, Diff, TestLogs, AgentReply, BugDir, JailSpec string
-		TestsInScope, ReproInScope, TouchesJail             bool
-	}{
+	return review(reviewData{
 		Focus:        focus,
 		Diff:         diff,
 		TestLogs:     testLogs,
-		TestsInScope: testsInScope,
-		ReproInScope: reproInScope,
+		ReproInScope: true,
 		AgentReply:   agentReply,
 		BugDir:       bugDir,
-		TouchesJail:  j.Touches,
-		JailSpec:     j.Spec,
+		TouchesJail:  len(jail) > 0 && jail[0].Touches,
+		JailSpec:     jailSpec(jail),
 	})
+}
+
+// SlimReview renders the reviewer prompt for the slim flow's atomic
+// sub-task review: the diff is one sub-task of a larger plan, and the
+// reviewer judges it against exactly the sub-task's acceptance criteria —
+// criteria belonging to later sub-tasks are not findings. No test-phase
+// framing exists (the slim loop runs the suite itself and relays it via
+// testLogs), and no REBUILD verdict.
+func SlimReview(focus, diff, testLogs, bugDir string, criteria []string) (string, error) {
+	return review(reviewData{
+		Focus:              focus,
+		Diff:               diff,
+		TestLogs:           testLogs,
+		BugDir:             bugDir,
+		AcceptanceCriteria: criteria,
+	})
+}
+
+// jailSpec extracts the relayed spec content from the variadic jail of
+// Review/ReviewRepro.
+func jailSpec(jail []Jail) string {
+	if len(jail) > 0 {
+		return jail[0].Spec
+	}
+	return ""
 }
 
 // Rebuild feeds a test-review REBUILD finding back to the implementing
@@ -217,4 +252,41 @@ func BugFix(task string) (string, error) {
 // both. Empty arguments are omitted.
 func BugFixFix(testLogs, comments string) (string, error) {
 	return render("bugfix_fix", struct{ Logs, Comments string }{testLogs, comments})
+}
+
+// SlimSubtask is one atomized unit of the slim flow's plan — the JSON
+// schema the planner round is told to emit and SlimStep renders into the
+// worker prompt. The struct doubles as the parse target for the planner's
+// raw JSON array reply (workflows.parseSlimPlan), so the wire schema and
+// the prompt schema can never drift.
+type SlimSubtask struct {
+	ID                 int      `json:"id"`
+	Type               string   `json:"type"`
+	TargetFiles        []string `json:"target_files"`
+	Description        string   `json:"description"`
+	AcceptanceCriteria []string `json:"acceptance_criteria"`
+}
+
+// SlimPlan builds the slim flow's planner opener: the task, deconstructed
+// into a strictly ordered queue of atomic sub-tasks emitted as a raw JSON
+// array of SlimSubtask objects.
+func SlimPlan(task string) (string, error) {
+	return render("slim_plan", struct{ Task string }{task})
+}
+
+// SlimStep builds the slim worker prompt for one sub-task (1-based index
+// of total): implement only this sub-task, in the dev conversation that
+// already carries the plan and every completed sub-task before it.
+func SlimStep(index, total int, st SlimSubtask) (string, error) {
+	return render("slim_step", struct {
+		Index, Total int
+		Subtask      SlimSubtask
+	}{index, total, st})
+}
+
+// SlimFix feeds a slim sub-task round's failure back to the worker: the
+// suite's red output, the reviewer's comments, or both. Empty arguments
+// are omitted.
+func SlimFix(description, testLogs, comments string) (string, error) {
+	return render("slim_fix", struct{ Description, Logs, Comments string }{description, testLogs, comments})
 }

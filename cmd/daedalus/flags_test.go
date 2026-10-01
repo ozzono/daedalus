@@ -51,6 +51,24 @@ func TestParseFlagsWorkflowRegistry(t *testing.T) {
 	if _, _, err := parseFlags([]string{"run", "-w", "dev-only", "/repo", "42", "do it"}); err != nil {
 		t.Errorf("parseFlags(-w dev-only): %v", err)
 	}
+
+	// slim dispatches like any flow, and workflowSet separates an explicit
+	// -w from the default: only a defaulted -w is subject to the config's
+	// slim gate, an explicit one always wins.
+	f, _, err = parseFlags([]string{"run", "-w", "slim", "/repo", "42", "do it"})
+	if err != nil {
+		t.Fatalf("parseFlags(-w slim): %v", err)
+	}
+	if f.workflow != "slim" || !f.workflowSet {
+		t.Errorf("parseFlags(-w slim) = (%q, %v), want (slim, true)", f.workflow, f.workflowSet)
+	}
+	f, _, err = parseFlags([]string{"run", "/repo", "42", "do it"})
+	if err != nil {
+		t.Fatalf("parseFlags(default): %v", err)
+	}
+	if f.workflow != "feature-dev" || f.workflowSet {
+		t.Errorf("parseFlags(default) = (%q, %v), want (feature-dev, false)", f.workflow, f.workflowSet)
+	}
 }
 
 // TestWorkflowRegistryFlowPolicies pins the flow registry as the CLI's
@@ -77,7 +95,7 @@ func TestWorkflowRegistryFlowPolicies(t *testing.T) {
 	if len(rf.AllowedPaths) != 0 || !reflect.DeepEqual(rf.FrozenPaths, activities.TestPathPatterns) {
 		t.Errorf("refactor policy = %+v, want the shared test-path patterns frozen", rf)
 	}
-	for _, name := range []string{"feature-dev", "bug-fix", "dev-only"} {
+	for _, name := range []string{"feature-dev", "bug-fix", "dev-only", "slim"} {
 		if spec := workflowRegistry[name]; len(spec.AllowedPaths) != 0 || len(spec.FrozenPaths) != 0 {
 			t.Errorf("%s policy = %+v, want unrestricted", name, spec)
 		}

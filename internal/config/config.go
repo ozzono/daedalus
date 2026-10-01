@@ -133,9 +133,10 @@ const ContextTokensEnv = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 const (
 	// MaxOutputTokensEnv carries anthropic.max_output_tokens.
 	MaxOutputTokensEnv = "DAEDALUS_MAX_OUTPUT_TOKENS"
-	// TopPEnv, PresencePenaltyEnv, TopKEnv, MinPEnv, and
+	// TopPEnv, TemperatureEnv, PresencePenaltyEnv, TopKEnv, MinPEnv, and
 	// RepetitionPenaltyEnv carry the openai section's sampler knobs.
 	TopPEnv              = "DAEDALUS_TOP_P"
+	TemperatureEnv       = "DAEDALUS_TEMPERATURE"
 	PresencePenaltyEnv   = "DAEDALUS_PRESENCE_PENALTY"
 	TopKEnv              = "DAEDALUS_TOP_K"
 	MinPEnv              = "DAEDALUS_MIN_P"
@@ -321,19 +322,21 @@ type OpenAIConfig struct {
 	// a property of the backend behind url, so they live at provider level
 	// and are shared by every agent that dials it. They export as the
 	// DAEDALUS_* vars named in the env-var block above and are consumed
-	// today only by the aider staging: top_p, presence_penalty, and
-	// repetition_penalty ride the staged settings' extra_params top level
-	// (litellm maps them natively), while top_k and min_p ride
-	// extra_body — litellm's syntax for params it does not map. pi's
-	// passthrough (if any) is unprobed, so pi ignores them until probed;
-	// claude and amp are out of scope by decision; opencode's
-	// provider.<id>.options may carry them but was never probed. Zero
+	// today only by the aider staging: temperature, top_p,
+	// presence_penalty, and repetition_penalty ride the staged settings'
+	// extra_params top level (litellm maps them natively), while top_k and
+	// min_p ride extra_body — litellm's syntax for params it does not map.
+	// pi's staging bridge sends them as top-level OpenAI-completions
+	// request params; claude and amp are out of scope by decision;
+	// opencode's provider.<id>.options may carry them but was never
+	// probed. Zero
 	// (unset) means the field is omitted from the request entirely —
 	// absent, never sent as null/0, because a sent default would override
 	// the backend's own sampler defaults (the exact bug class that
 	// motivated these knobs). An explicit 0 in the file is therefore
 	// indistinguishable from unset.
 	TopP            float64 `yaml:"top_p"`
+	Temperature     float64 `yaml:"temperature"`
 	PresencePenalty float64 `yaml:"presence_penalty"`
 	TopK            float64 `yaml:"top_k"`
 	MinP            float64 `yaml:"min_p"`
@@ -729,6 +732,7 @@ func (c Config) AgentEnv() []string {
 		}
 	}
 	addFloat(TopPEnv, c.OpenAI.TopP)
+	addFloat(TemperatureEnv, c.OpenAI.Temperature)
 	addFloat(PresencePenaltyEnv, c.OpenAI.PresencePenalty)
 	addFloat(TopKEnv, c.OpenAI.TopK)
 	addFloat(MinPEnv, c.OpenAI.MinP)
@@ -789,6 +793,7 @@ func ProviderEnvVars() []string {
 		ContextTokensEnv,
 		MaxOutputTokensEnv,
 		TopPEnv,
+		TemperatureEnv,
 		PresencePenaltyEnv,
 		TopKEnv,
 		MinPEnv,
@@ -932,6 +937,7 @@ func (c Config) validate(path string) error {
 		negOK bool
 	}{
 		{"top_p", c.OpenAI.TopP, false},
+		{"temperature", c.OpenAI.Temperature, false},
 		{"presence_penalty", c.OpenAI.PresencePenalty, true},
 		{"top_k", c.OpenAI.TopK, false},
 		{"min_p", c.OpenAI.MinP, false},

@@ -3,7 +3,13 @@ You are a maximally rigorous reviewer. Review {{.Focus}} in this repository and 
 The full diff of the change under review:
 
 {{.Diff}}
-{{if .TestLogs}}
+{{if .AcceptanceCriteria}}
+This diff is one atomized sub-task of a larger plan, implemented by a separate worker conversation. Judge it against exactly its own contract — these acceptance criteria:
+
+{{range .AcceptanceCriteria}}- {{.}}
+{{end}}
+Sub-tasks earlier in the plan are already in place; later ones are not written yet. A criterion belonging to a later sub-task is not a finding, and neither is the absence of work no criterion of this sub-task demands. Review the sub-task's diff plus the surrounding code it touches, with the same zero tolerance as any review.
+{{end}}{{if .TestLogs}}
 Latest test run output:
 
 {{.TestLogs}}

@@ -78,6 +78,23 @@ type pipelineRun struct {
 	// statement coverage (TestResult.Coverage) for the reviewer.
 	cover bool
 
+	// freshReviews, set by the slim flow, makes every review round a
+	// completely fresh reviewer session: no session id is ever stored
+	// back and the activity fires no recorded-session fallback, so no
+	// review ever resumes another's conversation — the REVIEW role must
+	// stay isolated from the WORKER role's accumulated context (a fresh
+	// review of the current diff, every time). The role itself still
+	// travels (reviewer endpoint, pi guardrail exclusion, tracking), and
+	// the caps are unaffected (verdict parsing and the
+	// identical-verdict/verdictless caps key on the role, not the
+	// session).
+	freshReviews bool
+	// reviewCriteria, set per sub-task by the slim flow, travels to the
+	// reviewer activity: a non-empty set switches the review prompt to
+	// the atomic sub-task framing judged against exactly these
+	// acceptance criteria.
+	reviewCriteria []string
+
 	// vis records whether this execution recorded the visibility version
 	// marker; every setStatus/touch is a no-op without it, so a pre-marker
 	// run replayed by an upgraded worker never emits a command its history
@@ -469,12 +486,22 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			Agent:           r.input.Agent,
 			SessionID:       *session,
 			Role:            role,
+			// Fresh-review mode (slim): the activity starts a brand-new
+			// reviewer conversation every round — no session id is ever
+			// stored back and no recorded-session fallback fires — while
+			// the role itself still selects the configured reviewer
+			// endpoint and keeps the pi edit guardrail excluded.
+			FreshReview: r.freshReviews,
+			// Slim's per-sub-task acceptance criteria; nil elsewhere.
+			AcceptanceCriteria: r.reviewCriteria,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.reviewTimeouts = 0
 			r.quotaHeartbeats = 0
 			r.touch()
-			*session = result.SessionID
+			if !r.freshReviews {
+				*session = result.SessionID
+			}
 			if result.NoVerdict {
 				r.verdictlessReviews++
 				// The reviewer's last non-empty line is what a fold and a

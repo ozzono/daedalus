@@ -72,7 +72,10 @@ FLAGS
   -w, --workflow <name>   Workflow (flow) to run (default: feature-dev;
                           available: ` + workflowNames() + `). dev-only runs
                           implementation ↔ code review and lands without any
-                          test-phase execution; investigate is
+                          test-phase execution; slim is the micro-stepped
+                          atomic loop for limited self-hosted models (also
+                          config-gated: slim: true reroutes a defaulted -w to
+                          it); investigate is
                           docs-only (analysis written as documentation, no code
                           changes); test-only modifies test files only, with
                           coverage reported per round; refactor changes

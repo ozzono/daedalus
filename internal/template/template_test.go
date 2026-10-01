@@ -591,3 +591,89 @@ func TestReviewJailCarveout(t *testing.T) {
 		t.Errorf("Review = %q, relay section must be omitted when no spec content is given", got)
 	}
 }
+
+// TestSlimReview pins the atomic sub-task review framing: the diff is
+// judged against exactly the sub-task's acceptance criteria — later
+// sub-tasks' criteria are explicitly not findings — the red suite logs
+// relay, and no test-phase framing (and so no REBUILD verdict) exists.
+func TestSlimReview(t *testing.T) {
+	got, err := SlimReview("subtask 1 (add the adder)", "M adder.go", "--- FAIL: TestAdd", "",
+		[]string{"Add(2,2) returns 4", "adder.go defines Add"})
+	if err != nil {
+		t.Fatalf("SlimReview: %v", err)
+	}
+	for _, want := range []string{
+		"Review subtask 1 (add the adder) in this repository",
+		"one atomized sub-task of a larger plan",
+		"- Add(2,2) returns 4",
+		"- adder.go defines Add",
+		"A criterion belonging to a later sub-task is not a finding",
+		"Latest test run output:\n\n--- FAIL: TestAdd",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("SlimReview = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "REBUILD") {
+		t.Error("SlimReview must not offer the REBUILD verdict (the slim loop runs the suite itself)")
+	}
+
+	// The ordinary framing stays untouched: without criteria, the same
+	// shared template carries no sub-task lens.
+	plain, err := Review("subtask 1 (add the adder)", "M adder.go", "", false, "", "")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if strings.Contains(plain, "atomized sub-task") || strings.Contains(plain, "acceptance criteria:") {
+		t.Errorf("Review = %q, want no sub-task framing without acceptance criteria", plain)
+	}
+}
+
+// TestSlimPlanStepFix pins the slim worker prompts: the planner opener
+// carries the task and the raw-JSON-array output contract, the step prompt
+// frames the sub-task inside the run's progress (index of total), and the
+// fix prompt relays only the failure inputs it was given.
+func TestSlimPlanStepFix(t *testing.T) {
+	plan, err := SlimPlan("ship the widget")
+	if err != nil {
+		t.Fatalf("SlimPlan: %v", err)
+	}
+	for _, want := range []string{"ship the widget", "raw JSON array", `"acceptance_criteria"`} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("SlimPlan = %q, want it to contain %q", plan, want)
+		}
+	}
+
+	step, err := SlimStep(2, 3, SlimSubtask{
+		ID: 2, Type: "fix", TargetFiles: []string{"a.go"},
+		Description: "patch it", AcceptanceCriteria: []string{"tests pass", "lint clean"},
+	})
+	if err != nil {
+		t.Fatalf("SlimStep: %v", err)
+	}
+	for _, want := range []string{"sub-tasks 2 of 3", "patch it", "[a.go]", "tests pass", "lint clean"} {
+		if !strings.Contains(step, want) {
+			t.Errorf("SlimStep = %q, want it to contain %q", step, want)
+		}
+	}
+
+	fix, err := SlimFix("patch it", "FAIL logs", "shape wrong")
+	if err != nil {
+		t.Fatalf("SlimFix: %v", err)
+	}
+	for _, want := range []string{"patch it", "Failing suite output", "FAIL logs", "Reviewer comments", "shape wrong"} {
+		if !strings.Contains(fix, want) {
+			t.Errorf("SlimFix = %q, want it to contain %q", fix, want)
+		}
+	}
+	commentsOnly, err := SlimFix("patch it", "", "shape wrong")
+	if err != nil {
+		t.Fatalf("SlimFix: %v", err)
+	}
+	if strings.Contains(commentsOnly, "Failing suite output") {
+		t.Errorf("SlimFix = %q, want the suite section omitted with no logs", commentsOnly)
+	}
+	if !strings.Contains(commentsOnly, "shape wrong") {
+		t.Errorf("SlimFix = %q, want the reviewer comments relayed", commentsOnly)
+	}
+}

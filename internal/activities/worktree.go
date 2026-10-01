@@ -399,6 +399,15 @@ func preserveAbortedWork(ctx context.Context, input WorktreeInput, worktreePath 
 		// still runs.
 		return nil
 	}
+	if _, err := os.Stat(filepath.Join(worktreePath, ".git")); err != nil {
+		// A directory husk without .git (e.g. only .daedalus/ left behind)
+		// is stale worktree state itself — there is no git work in it to
+		// preserve, and staging there would fail every later run for this
+		// issue with "not a git repository". Treat it like a missing
+		// worktree: the sweep below removes it before the worktree is
+		// recreated. A corrupt .git still fails loudly in the stage below.
+		return nil
+	}
 	aborted, err := AbortedBranchNameFor(input.IssueID, input.Flow)
 	if err != nil {
 		return err

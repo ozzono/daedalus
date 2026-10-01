@@ -53,6 +53,7 @@ func newTestEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	env.RegisterWorkflow(InvestigateWorkflow)
 	env.RegisterWorkflow(RefactorWorkflow)
 	env.RegisterWorkflow(DevOnlyWorkflow)
+	env.RegisterWorkflow(SlimWorkflow)
 	registerPipelineActivities(env)
 	return env
 }

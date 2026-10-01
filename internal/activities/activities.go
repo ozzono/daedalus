@@ -117,6 +117,19 @@ type ReviewInput struct {
 	// review passes it true: the reviewer prompt then audits .ai-jail
 	// (with the spec content relayed) instead of blanket-ignoring it.
 	TaskTouchesJail bool
+	// AcceptanceCriteria, when set, marks the slim flow's atomic
+	// sub-task review: the reviewer prompt frames the diff as one
+	// sub-task of a larger plan and judges it against exactly these
+	// criteria instead of the whole-task lens. Empty keeps the ordinary
+	// whole-change review prompt.
+	AcceptanceCriteria []string
+	// FreshReview marks the slim flow's context isolation: the reviewer
+	// starts a brand-new conversation every round — no session resume and
+	// no recorded-session fallback, ever. Everything else about the role
+	// is unchanged: the reviewer endpoint (reviewerEnv), the pi
+	// edit-guardrail exclusion, and session tracking all key on Role and
+	// behave exactly like a flagship review's.
+	FreshReview bool
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -335,6 +348,9 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir,
 				template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
 		}
+		if len(input.AcceptanceCriteria) > 0 {
+			return template.SlimReview(input.Focus, diff, input.TestLogs, bugDir, input.AcceptanceCriteria)
+		}
 		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir,
 			template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
 	}()
@@ -353,7 +369,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	// never deliver a verdict.
 	resumeFlag, canResume := agentResumeFlag(agent)
 	resume := input.SessionID
-	if resume == "" && canResume {
+	if resume == "" && canResume && !input.FreshReview {
 		logger := activityLogger(ctx)
 		id, stale := recordedAgentSession(ctx, agent, input.WorktreePath, input.Role)
 		if stale {

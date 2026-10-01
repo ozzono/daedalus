@@ -322,7 +322,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err := run.createWorktree(); err != nil {
 		return "", err
 	}
-	if err := run.preFlightGate(); err != nil {
+	if _, err := run.preFlightGate(); err != nil {
 		return "", err
 	}
 
@@ -459,29 +459,31 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 // preFlightGate resolves and runs the native suite on the untouched
 // worktree before the first agent round. A red baseline parks the run —
 // no session may start on a failing suite. Uses the same discovery and
-// test-queue execution the test session uses. A discovery concluding the
+// test-queue execution the test session uses, and returns the resolved
+// suite command for flows that keep executing it (slim re-runs the same
+// suite per sub-task; the others ignore it). A discovery concluding the
 // repository has no suite at all (activities.ErrNoSuite) passes vacuously:
 // nothing can be red when nothing exists — a greenfield repo is not a red
 // baseline — and the history records why no suite round ran.
-func (r *pipelineRun) preFlightGate() error {
+func (r *pipelineRun) preFlightGate() (string, error) {
 	command, err := r.resolveTestCommand()
 	if err != nil {
 		if isNoSuite(err) {
 			r.logger.Info("No suite discovered; gate passes vacuously")
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
 	result, err := r.runSuite(command)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if result.Passed {
 		r.logger.Info("Preflight suite green; opening the first session", "Command", command)
-		return nil
+		return command, nil
 	}
 	r.logger.Info("Preflight suite failed; parking before the first session")
-	return r.park(fmt.Sprintf("preflight gate failed — the suite must be green before a session starts: %s", command))
+	return "", r.park(fmt.Sprintf("preflight gate failed — the suite must be green before a session starts: %s", command))
 }
 
 // testFixPrompt builds the phase-2 fix prompt from whatever failed: test

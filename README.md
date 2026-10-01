@@ -400,6 +400,15 @@ issue never share live state). Re-running
   machinery with a different gate: `dev-only` is feature-dev's
   implementation ↔ code-review phase alone, landing without any test-phase
   execution (selection is CLI-only — no config key picks a flow);
+  `slim` is the micro-stepped atomic loop for context-limited self-hosted
+  models (target agent: pi): a planner round atomizes the task into an
+  ordered queue of 1–2-file sub-tasks, then each sub-task runs its own
+  implement ↔ review loop — the worker conversation chains across the run
+  (progressive context) while every review round is a completely fresh
+  reviewer session (no WORKER context leaks into REVIEW), the native suite
+  runs every round as terminal ground truth, and a sub-task parks after 8
+  non-converging rounds. It is config-gated: with `slim: true`, a run
+  without an explicit `-w` starts it (an explicit `-w` always wins);
   `investigate` is docs-only (no code
   changes, no test phase); `test-only` modifies test files only, records Go
   statement coverage per suite round, and parks on a reviewer REBUILD (there

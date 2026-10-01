@@ -235,7 +235,15 @@ func main() {
 			if err != nil {
 				usageFail("%v", err)
 			}
-			err = startPipelineFolders(cfg, configPath.configPath, configPath.workflow, args[1], args[2], prompt, configPath.detach,
+			// The slim flow's config gate: slim: true reroutes a run whose
+			// -w was left at its default to the slim flow — the
+			// micro-stepped atomic loop for limited models. An explicit
+			// -w/--workflow always wins.
+			workflowName := configPath.workflow
+			if workflowName == defaultWorkflowName && !configPath.workflowSet && cfg.Slim {
+				workflowName = "slim"
+			}
+			err = startPipelineFolders(cfg, configPath.configPath, workflowName, args[1], args[2], prompt, configPath.detach,
 				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI, folders)
 			if err != nil {
 				fail("run", err)

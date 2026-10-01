@@ -996,7 +996,7 @@ const (
 // defaults stand (a sent default overriding them was the exact bug class
 // that motivated these knobs).
 type aiderSampler struct {
-	TopP, PresencePenalty, TopK, MinP, RepetitionPenalty *float64
+	TopP, Temperature, PresencePenalty, TopK, MinP, RepetitionPenalty *float64
 }
 
 // samplerFromEnv parses the DAEDALUS_* sampler exports out of the round
@@ -1016,6 +1016,7 @@ func samplerFromEnv(env []string) aiderSampler {
 	}
 	return aiderSampler{
 		TopP:              parse(config.TopPEnv),
+		Temperature:       parse(config.TemperatureEnv),
 		PresencePenalty:   parse(config.PresencePenaltyEnv),
 		TopK:              parse(config.TopKEnv),
 		MinP:              parse(config.MinPEnv),
@@ -1047,10 +1048,10 @@ func yamlFloat(v float64) string {
 // prevent. Both files are needed: the metadata alone changes aider's
 // internal arithmetic (context budgeting, history trimming) but not the
 // wire request, so the completion cap must also ride
-// extra_params.max_tokens. Standard litellm params (top_p, presence_penalty,
-// repetition_penalty) sit at extra_params' top level; the provider-specific
-// top_k/min_p sit under extra_body — litellm's syntax for params it does
-// not map natively.
+// extra_params.max_tokens. Standard litellm params (temperature, top_p,
+// presence_penalty, repetition_penalty) sit at extra_params' top level;
+// the provider-specific top_k/min_p sit under extra_body — litellm's
+// syntax for params it does not map natively.
 func stageAiderModelFiles(worktreePath, prefixedModel string, maxInputTokens, maxOutputTokens int, sampler aiderSampler) error {
 	metadata, err := json.Marshal(map[string]any{
 		prefixedModel: map[string]int{
@@ -1066,6 +1067,9 @@ func stageAiderModelFiles(worktreePath, prefixedModel string, maxInputTokens, ma
 		prefixedModel, maxOutputTokens)
 	if sampler.TopP != nil {
 		fmt.Fprintf(&settings, "    top_p: %s\n", yamlFloat(*sampler.TopP))
+	}
+	if sampler.Temperature != nil {
+		fmt.Fprintf(&settings, "    temperature: %s\n", yamlFloat(*sampler.Temperature))
 	}
 	if sampler.PresencePenalty != nil {
 		fmt.Fprintf(&settings, "    presence_penalty: %s\n", yamlFloat(*sampler.PresencePenalty))

@@ -40,6 +40,14 @@ var workflowRegistry = map[string]workflows.Flow{
 	// preflight suite gate — see DevOnlyWorkflow). Selection is CLI-only;
 	// no config key picks a flow.
 	"dev-only": {Fn: workflows.DevOnlyWorkflow},
+	// slim is the micro-stepped atomic loop for context-limited
+	// self-hosted models (target agent: pi): a planner round atomizes the
+	// task into an ordered queue of 1–2-file sub-tasks, then each
+	// sub-task runs its own implement ↔ review loop — fresh reviewer
+	// session per round, native suite as terminal ground truth. Also
+	// config-gated: with slim: true, a run without an explicit -w starts
+	// this flow (see the run path in main.go).
+	"slim": {Fn: workflows.SlimWorkflow},
 	"investigate": {Fn: workflows.InvestigateWorkflow,
 		AllowedPaths: []string{"*.md", "docs/"}},
 	"test-only": {Fn: workflows.TestOnlyWorkflow,
@@ -65,8 +73,12 @@ type flags struct {
 	// an explicit (but ignored) -c can be told apart from the default.
 	configSet bool
 	workflow  string
-	taskFile  string
-	detach    bool
+	// workflowSet reports that -w/--workflow appeared on the command line:
+	// the config gate on the slim flow applies only to a defaulted -w, an
+	// explicit one always wins (see the run path in main.go).
+	workflowSet bool
+	taskFile    string
+	detach      bool
 	// branchPrefix, set via -p/--prefix on `run`, overrides the config's
 	// branch_prefix for that run's preserved branch.
 	branchPrefix string
@@ -152,6 +164,7 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 				return fmt.Errorf("unknown workflow %q (available: %s)", value, workflowNames())
 			}
 			f.workflow = value
+			f.workflowSet = true
 		case "prefix":
 			if err := config.ValidateBranchPrefix(value); err != nil {
 				return err
