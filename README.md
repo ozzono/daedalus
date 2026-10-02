@@ -312,7 +312,8 @@ invoked from inside it. `daedalus init` writes a fully commented
 | `anthropic.url`       | `""` (inherit env) | Anthropic API base URL — set only to override |
 | `anthropic.key`       | `""` (optional)    | API key for the jailed agent; if unset, the agent authenticates via the worker's inherited environment or its own login |
 | `anthropic.model`     | `""` (agent default) | Model for the jailed agent         |
-| `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself |
+| `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself — except pi, whose openai rounds are staged into `~/.pi/agent/models.json` per round (pi reads the key env var but no base-URL env var) |
+| `slim.enabled/parser_model` | `enabled: false` | Slim mode for small self-hosted models (aider/pi): one jailed-agent round at a time (no two provider requests in flight), aider's weak/editor models pinned to `AIDER_MODEL` under `DAEDALUS_SLIM`, and a defaulted `-w` rerouted to the slim flow. With `parser_model` also set, the worker starts a loopback tool-call relay (`internal/toolrelay`) that lifts text-encoded tool calls — fenced JSON in the message content, which pi executes only in its native `tool_calls` form — into a synthetic native stream, with the parser model normalizing the arguments via ollama structured output against the tool's own schema; prose is never converted and any relay failure degrades to the old inert-text behavior. Breaking reshape (2026-10-02): the former top-level `slim: true` boolean moved into this section — migrate by renaming it `slim.enabled` |
 | `fallback.enabled/url/key/model/heartbeat_model` | `enabled: false` | Independent secondary provider: when a jailed round fails with the primary's quota exhausted, the worker retries it on the fallback until the primary recovers |
 | `fallback.type`       | `anthropic`        | Fallback wire style: `anthropic` or `openai`; governs the `worker status` probe and which env failover values travel on. A round's wire is chosen by the agent (claude dials `ANTHROPIC_*`), so `openai` serves only agents that dial `OPENAI_BASE_URL` |
 | `reviewer.url/key`    | `""` (share primary) | Reviewer rounds' own provider endpoint: overrides `ANTHROPIC_*`/`OPENAI_*` URL and key for reviewer rounds only, while implementing and test rounds keep the primary's. Models are not overridable |
@@ -407,7 +408,7 @@ issue never share live state). Re-running
   (progressive context) while every review round is a completely fresh
   reviewer session (no WORKER context leaks into REVIEW), the native suite
   runs every round as terminal ground truth, and a sub-task parks after 8
-  non-converging rounds. It is config-gated: with `slim: true`, a run
+  non-converging rounds. It is config-gated: with `slim.enabled: true`, a run
   without an explicit `-w` starts it (an explicit `-w` always wins);
   `investigate` is docs-only (no code
   changes, no test phase); `test-only` modifies test files only, records Go

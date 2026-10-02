@@ -859,3 +859,28 @@ func TestMergePiNullShapes(t *testing.T) {
 		}
 	})
 }
+
+// TestStagePiProviderToolRelayURL pins the slim relay's staging win: when
+// the worker runs the tool-call relay (DAEDALUS_TOOL_RELAY_URL exported),
+// the staged pi provider dials the relay's loopback URL instead of the
+// openai upstream directly — same key and model, so the only observable
+// change is baseUrl. The model flag stays the round's own model: the relay
+// forwards it untouched.
+func TestStagePiProviderToolRelayURL(t *testing.T) {
+	home := piTestHome(t)
+	args, err := stagePiProvider(piEnv(
+		"OPENAI_BASE_URL=http://localhost:11434/v1",
+		"OPENAI_MODEL=qwen2.5-coder:3b",
+		config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1",
+	))
+	if err != nil {
+		t.Fatalf("stagePiProvider: %v", err)
+	}
+	if !slices.Equal(args, []string{"--model", piProviderID + "/qwen2.5-coder:3b"}) {
+		t.Errorf("args = %v, want the round's own model flag", args)
+	}
+	entry := stagedPiProvider(t, home)
+	if entry.BaseURL != "http://127.0.0.1:41238/v1" {
+		t.Errorf("baseUrl = %q, want the relay's staged URL (not the upstream)", entry.BaseURL)
+	}
+}

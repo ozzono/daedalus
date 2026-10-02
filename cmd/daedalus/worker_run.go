@@ -16,6 +16,7 @@ import (
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/toolrelay"
 	"github.com/ozzono/daedalus/internal/version"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
@@ -75,12 +76,38 @@ func runWorker(cfg config.Config, workerType string) error {
 	// is in the daemon spawn scrub, so a stale export in the invoking shell
 	// would otherwise survive into the daemon and silently beat a config
 	// that says off.
-	if cfg.Slim {
+	if cfg.Slim.Enabled {
 		if err := os.Setenv("DAEDALUS_SLIM", "1"); err != nil {
 			return fmt.Errorf("set DAEDALUS_SLIM: %w", err)
 		}
 	} else if err := os.Unsetenv("DAEDALUS_SLIM"); err != nil {
 		return fmt.Errorf("unset DAEDALUS_SLIM: %w", err)
+	}
+	// The slim tool-call relay: a loopback reverse proxy that lifts pi
+	// rounds' text-encoded tool calls into the native tool_calls wire pi
+	// executes (internal/toolrelay). Started only when slim is enabled
+	// with a parser model AND the openai section provides an upstream —
+	// absent any of the three, the relay never starts and the env var
+	// below stays unset, byte-identical to the pre-relay behavior. The
+	// staged URL (relay address plus the upstream's path prefix) travels
+	// the env channel like every other knob; unset symmetrically, and
+	// scrubbed from the daemon spawn via ProviderEnvVars, so a stale
+	// export can never point a new worker's rounds at a dead relay.
+	var relayURL string
+	if cfg.Slim.Enabled && cfg.Slim.ParserModel != "" && cfg.OpenAI.URL != "" {
+		r, err := toolrelay.Start(cfg.OpenAI.URL, cfg.Slim.ParserModel)
+		if err != nil {
+			return fmt.Errorf("start tool relay: %w", err)
+		}
+		defer r.Close()
+		relayURL = r.URL()
+	}
+	if relayURL != "" {
+		if err := os.Setenv(config.ToolRelayURLEnv, relayURL); err != nil {
+			return fmt.Errorf("set %s: %w", config.ToolRelayURLEnv, err)
+		}
+	} else if err := os.Unsetenv(config.ToolRelayURLEnv); err != nil {
+		return fmt.Errorf("unset %s: %w", config.ToolRelayURLEnv, err)
 	}
 	// The thinking toggle: only an explicit thinking: false is exported
 	// (as DAEDALUS_THINKING=off, the sole thinking signal daedalus ever

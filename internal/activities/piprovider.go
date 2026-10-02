@@ -59,7 +59,12 @@ type piProviderConfig struct {
 // unserveable.md). It returns the
 // --model args selecting the staged entry; pi rereads models.json at
 // startup. With none of the openai vars set, nothing is staged and no flag
-// is added — pi follows its own config untouched. With a key or model but
+// is added — pi follows its own config untouched. The slim relay URL
+// (ToolRelayURLEnv, when the worker started the tool-call relay) wins only
+// on a plain round: an explicit endpoint override — an openai-type
+// fallback (fallbackEnv) or a reviewer.url (reviewerEnv) — scrubs the var,
+// because the relay's upstream is pinned to the primary's openai.url and
+// must not swallow overridden endpoints. With a key or model but
 // no URL, the round fails before launch: that shape cannot be bridged, and
 // launching it would ship the ambient key to api.openai.com on pi's
 // built-in openai provider — the exact silent-dial trap this staging
@@ -89,9 +94,18 @@ func stagePiProvider(env []string) ([]string, error) {
 	if model == "" {
 		return nil, fmt.Errorf("pi round: openai.url exported without openai.model — pi cannot select a model to bridge the section; set openai.model")
 	}
+	// The slim relay: when the worker runs the tool-call relay
+	// (internal/toolrelay, started when slim.parser_model is set), pi dials
+	// the staged loopback URL instead of the upstream directly — same key
+	// and model, upstream path prefix preserved — and the relay lifts
+	// text-encoded tool calls into the native tool_calls wire pi executes.
+	baseURL := url
+	if relay := envLookup(env, config.ToolRelayURLEnv); relay != "" {
+		baseURL = relay
+	}
 	entry := piProviderConfig{
 		Name:    "Daedalus (openai section)",
-		BaseURL: url,
+		BaseURL: baseURL,
 		// openai-completions is pi's OpenAI-compatible chat-completions
 		// wire — what litellm/ollama/vLLM self-hosted endpoints serve.
 		API:    "openai-completions",

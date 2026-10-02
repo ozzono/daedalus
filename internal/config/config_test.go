@@ -182,13 +182,17 @@ func TestLoadMaxConcurrentAgentRuns(t *testing.T) {
 }
 
 // TestLoadSlimClampsAgentConcurrency pins slim mode's concurrency contract:
-// slim: true forces max_concurrent_agent_runs to 1 — normalization is the
-// single source, so the env export, the semaphore, and report's slot
+// slim.enabled: true forces max_concurrent_agent_runs to 1 — normalization
+// is the single source, so the env export, the semaphore, and report's slot
 // display all just see 1 — while max_concurrent_tests is untouched (native
 // suites dial no LLM). Validation precedes the clamp, so an invalid
-// negative max_concurrent_agent_runs still errors.
+// negative max_concurrent_agent_runs still errors. The section also loads
+// the relay's parser_model, and the historical top-level `slim: true`
+// boolean is rejected by the strict decode — the 2026-10-02 reshape moved
+// it to slim.enabled, and a silently-dropped (all-defaults) misread must
+// not be possible.
 func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
-	cfg, err := Load(writeConfig(t, "slim: true\nmax_concurrent_agent_runs: 4\nmax_concurrent_tests: 3\n"))
+	cfg, err := Load(writeConfig(t, "slim:\n  enabled: true\n  parser_model: qwen2.5-coder:3b-parser\nmax_concurrent_agent_runs: 4\nmax_concurrent_tests: 3\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -198,8 +202,11 @@ func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
 	if cfg.MaxConcurrentTests != 3 {
 		t.Errorf("slim MaxConcurrentTests = %d, want the explicit 3 (suites dial no LLM)", cfg.MaxConcurrentTests)
 	}
+	if cfg.Slim.ParserModel != "qwen2.5-coder:3b-parser" {
+		t.Errorf("slim parser_model = %q, want the configured parser", cfg.Slim.ParserModel)
+	}
 
-	cfg, err = Load(writeConfig(t, "slim: false\nmax_concurrent_agent_runs: 4\n"))
+	cfg, err = Load(writeConfig(t, "slim:\n  enabled: false\nmax_concurrent_agent_runs: 4\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -207,9 +214,16 @@ func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
 		t.Errorf("non-slim MaxConcurrentAgentRuns = %d, want 4", cfg.MaxConcurrentAgentRuns)
 	}
 
-	_, err = Load(writeConfig(t, "slim: true\nmax_concurrent_agent_runs: -1\n"))
+	_, err = Load(writeConfig(t, "slim:\n  enabled: true\nmax_concurrent_agent_runs: -1\n"))
 	if err == nil || !strings.Contains(err.Error(), "max_concurrent_agent_runs") {
 		t.Fatalf("want max_concurrent_agent_runs error under slim, got %v", err)
+	}
+
+	// The legacy boolean spelling must fail loudly, not load as an
+	// all-defaults slim section.
+	_, err = Load(writeConfig(t, "slim: true\n"))
+	if err == nil {
+		t.Error("Load(slim: true) = nil error, want the legacy boolean rejected by the strict decode")
 	}
 }
 

@@ -746,3 +746,48 @@ func TestReviewerRoundDialsReviewerEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestEndpointOverridesDropToolRelayURL pins the relay var's precedence
+// rule: the slim tool relay's upstream is pinned to the primary's
+// openai.url at worker boot, so any explicit endpoint override must remove
+// DAEDALUS_TOOL_RELAY_URL from the round env — otherwise a fallback or
+// reviewer round would silently dial the primary's upstream through the
+// relay. Absent an override the var survives untouched: the plain round is
+// exactly the leg the relay exists to serve.
+func TestEndpointOverridesDropToolRelayURL(t *testing.T) {
+	t.Run("fallback round", func(t *testing.T) {
+		t.Setenv("DAEDALUS_FALLBACK_TYPE", config.FallbackTypeOpenAI)
+		t.Setenv("DAEDALUS_FALLBACK_BASE_URL", "https://backup.example")
+		t.Setenv("DAEDALUS_FALLBACK_API_KEY", "sk-backup")
+		t.Setenv("DAEDALUS_FALLBACK_MODEL", "glm-backup")
+		t.Setenv(config.ToolRelayURLEnv, "http://127.0.0.1:41238/v1")
+		for _, kv := range fallbackEnv() {
+			if name, _, ok := cutEnv(kv); ok && name == config.ToolRelayURLEnv {
+				t.Errorf("fallback env still carries %q; the relay must not route a fallback round", kv)
+			}
+		}
+	})
+
+	t.Run("reviewer round with url override", func(t *testing.T) {
+		t.Setenv(config.ReviewerURLEnv, "https://review.example")
+		base := reviewerRoundBaseEnv()
+		base = append(base, config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1")
+		for _, role := range []SessionRole{RoleDevReview, RoleTestReview} {
+			for _, kv := range reviewerEnv(slices.Clone(base), role) {
+				if name, _, ok := cutEnv(kv); ok && name == config.ToolRelayURLEnv {
+					t.Errorf("reviewerEnv(%q) still carries %q; the relay must not swallow the reviewer endpoint", role, kv)
+				}
+			}
+		}
+	})
+
+	t.Run("reviewer round without url override keeps the relay", func(t *testing.T) {
+		base := reviewerRoundBaseEnv()
+		base = append(base, config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1")
+		for _, role := range []SessionRole{RoleDev, RoleTest, ""} {
+			if got := reviewerEnv(slices.Clone(base), role); !slices.Equal(got, base) {
+				t.Errorf("reviewerEnv(%q) rewired a plain round: %v", role, got)
+			}
+		}
+	})
+}

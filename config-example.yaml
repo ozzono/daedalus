@@ -106,7 +106,7 @@ cleanup_timeout: 30m
 # behavior is identical to aider/claude rounds.
 max_concurrent_agent_runs: 2
 # Slim mode for limited self-hosted models (small context window, low max
-# output tokens) on the aider and pi agents. When true: this worker runs a
+# output tokens) on the aider and pi agents. When enabled: this worker runs a
 # single jailed-agent round at a time — max_concurrent_agent_runs above is
 # forced to 1, so no two LLM requests are ever in flight (native test
 # suites are unaffected; they dial no LLM) — and jailed aider rounds pin
@@ -126,7 +126,7 @@ max_concurrent_agent_runs: 2
 # keepRecentTokens) in ~/.pi/agent/settings.json. The jail bridges all of
 # these: aider reads the worker's exported environment, and the jail's pi
 # preset mounts ~/.pi read-write.
-# slim also gates the run flow: with slim: true, a "daedalus run" without
+# slim also gates the run flow: with slim.enabled: true, a "daedalus run" without
 # an explicit -w/--workflow starts the slim flow — the micro-stepped
 # atomic loop for limited models (a planner round atomizes the task into
 # an ordered queue of 1–2-file sub-tasks, then each sub-task runs its own
@@ -134,7 +134,27 @@ max_concurrent_agent_runs: 2
 # native suite as ground truth) — instead of feature-dev. An explicit -w
 # always wins. The flow targets the pi agent (aider is deprecated for
 # it).
-slim: false
+slim:
+  # Turns slim mode on: the single-round concurrency clamp, the
+  # DAEDALUS_SLIM=1 export, and the run-flow default described above.
+  # Breaking reshape (2026-10-02): the former top-level "slim: true"
+  # boolean moved here.
+  enabled: false
+  # Model the tool-call relay (a worker-hosted loopback reverse proxy)
+  # uses to normalize lifted arguments: pi executes only native
+  # tool_calls, which text-emitting models like qwen2.5-coder never send —
+  # they emit fenced JSON in the message content instead. With a
+  # parser_model set (and the openai section above configured), the relay
+  # inspects pi's chat-completions traffic, and an answer that is exactly
+  # one JSON object naming one of the request's own tools is converted
+  # into a native tool call, its arguments normalized by this model via
+  # ollama structured output against the tool's own schema. Prose is never
+  # converted (reviewer verdicts are content), and any relay or parser
+  # failure degrades to the old inert-text behavior — never a new run
+  # failure. Resolved against the openai section's url; create the tag on
+  # the model host before setting it. Empty (the default) keeps the relay
+  # off.
+  parser_model: ""
 # How many native test-suite executions may run at once on the test worker
 # (the deployment's suite task queue); further suites queue until a slot
 # frees (heartbeating while they wait). Suites are CPU-bound host work,

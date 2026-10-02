@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,22 +88,26 @@ func restoreProcessEnv(t *testing.T, names ...string) {
 // ever sends), an explicit stream: true/false exports DAEDALUS_STREAM=
 // on/off, and a config that says off/absent clears each — none of the vars
 // is in the daemon spawn scrub, so a stale export in the invoking shell
-// must not survive into the daemon and silently beat the config. runWorker
+// must not survive into the daemon and silently beat the config. The slim
+// tool relay's DAEDALUS_TOOL_RELAY_URL obeys the same tri-state rule and
+// additionally needs slim.parser_model plus the openai section. runWorker
 // is driven to its first failure (an empty task queue fails worktree
 // preflight before any Temporal dial) purely to observe the exports.
 func TestRunWorkerSlimEnvExports(t *testing.T) {
 	// API_TIMEOUT_MS is in the list because a zero config still exports it
 	// (AgentEnv's strconv.Itoa(0) passes the non-empty gate) — a value
 	// production configs can never produce, since Load always defaults
-	// timeout_ms.
+	// timeout_ms. The OPENAI vars are in it because the relay segment
+	// below sets openai.url, which AgentEnv exports.
 	restoreProcessEnv(t, "DAEDALUS_SLIM", "DAEDALUS_THINKING", "DAEDALUS_STREAM", "DAEDALUS_AGENT",
 		"DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", "DAEDALUS_MAX_CONCURRENT_TESTS", "DAEDALUS_WORKER_NAME",
-		"API_TIMEOUT_MS")
+		"API_TIMEOUT_MS", config.ToolRelayURLEnv, "OPENAI_BASE_URL", "OPENAI_API_BASE")
 
 	// Stale exports must not outlive a config that says off.
 	t.Setenv("DAEDALUS_SLIM", "1")
 	t.Setenv("DAEDALUS_THINKING", "off")
 	t.Setenv("DAEDALUS_STREAM", "on")
+	t.Setenv(config.ToolRelayURLEnv, "http://127.0.0.1:1/stale-relay")
 	if err := runWorker(config.Config{}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -115,10 +120,15 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	if got := os.Getenv("DAEDALUS_STREAM"); got != "" {
 		t.Errorf("DAEDALUS_STREAM = %q after a stream-absent config, want the stale export cleared", got)
 	}
+	if got := os.Getenv(config.ToolRelayURLEnv); got != "" {
+		t.Errorf("%s = %q after a relay-off config, want the stale export cleared", config.ToolRelayURLEnv, got)
+	}
 
-	// The on-config exports all three.
+	// The on-config exports all three — but slim alone never starts the
+	// relay: without a parser model (and an openai upstream) the staged
+	// URL stays unset, the pre-relay behavior.
 	off := false
-	if err := runWorker(config.Config{Slim: true, Thinking: &off}, ""); err == nil {
+	if err := runWorker(config.Config{Slim: config.SlimConfig{Enabled: true}, Thinking: &off}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	if got := os.Getenv("DAEDALUS_SLIM"); got != "1" {
@@ -126,6 +136,31 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	}
 	if got := os.Getenv("DAEDALUS_THINKING"); got != "off" {
 		t.Errorf("DAEDALUS_THINKING = %q after a thinking-false config, want off", got)
+	}
+	if got := os.Getenv(config.ToolRelayURLEnv); got != "" {
+		t.Errorf("%s = %q after a slim config without parser_model, want it unset (relay off)", config.ToolRelayURLEnv, got)
+	}
+
+	// The full relay arming — slim enabled, a parser model, and an openai
+	// upstream — starts the loopback relay and stages its URL: the relay's
+	// own 127.0.0.1 port plus the upstream's path prefix, so pi's request
+	// paths land on the relay exactly as they would land on the upstream.
+	if err := runWorker(config.Config{
+		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
+		OpenAI:   config.OpenAIConfig{URL: "http://127.0.0.1:11434/v1"},
+		Thinking: &off,
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	staged, err := url.Parse(os.Getenv(config.ToolRelayURLEnv))
+	if err != nil {
+		t.Fatalf("parse staged %s: %v", config.ToolRelayURLEnv, err)
+	}
+	if staged.Scheme != "http" || staged.Hostname() != "127.0.0.1" {
+		t.Errorf("staged relay URL %q, want a loopback http address", staged)
+	}
+	if staged.Path != "/v1" {
+		t.Errorf("staged relay URL %q, want the upstream's /v1 path prefix preserved", staged)
 	}
 
 	// The stream toggle exports both spellings, and an explicit false is

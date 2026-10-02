@@ -240,7 +240,7 @@ func main() {
 			// micro-stepped atomic loop for limited models. An explicit
 			// -w/--workflow always wins.
 			workflowName := configPath.workflow
-			if workflowName == defaultWorkflowName && !configPath.workflowSet && cfg.Slim {
+			if workflowName == defaultWorkflowName && !configPath.workflowSet && cfg.Slim.Enabled {
 				workflowName = "slim"
 			}
 			err = startPipelineFolders(cfg, configPath.configPath, workflowName, args[1], args[2], prompt, configPath.detach,
