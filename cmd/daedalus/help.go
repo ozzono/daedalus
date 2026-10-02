@@ -74,8 +74,8 @@ FLAGS
                           implementation ↔ code review and lands without any
                           test-phase execution; slim is the micro-stepped
                           atomic loop for limited self-hosted models (also
-                          config-gated: slim: true reroutes a defaulted -w to
-                          it); investigate is
+                          config-gated: slim.enabled: true reroutes a
+                          defaulted -w to it); investigate is
                           docs-only (analysis written as documentation, no code
                           changes); test-only modifies test files only, with
                           coverage reported per round; refactor changes
@@ -382,14 +382,18 @@ CONFIGURATION REFERENCE
   cleanup_timeout       Ceiling for one worktree cleanup (default 30m)
   max_concurrent_agent_runs
                         Jailed-agent rounds this worker runs at once; further
-                        rounds queue (default 2; slim: true forces 1)
-  slim                  Slim mode for small self-hosted models (aider/pi):
-                        one jailed-agent round at a time (no two provider
-                        requests in flight) and aider's weak/editor models
-                        pinned to AIDER_MODEL under DAEDALUS_SLIM; the
-                        per-model limits stay operator-side — see
-                        config-example.yaml for the per-agent prerequisites
-                        (default false)
+                        rounds queue (default 2; slim.enabled: true forces 1)
+  slim                  Slim mode section for small self-hosted models
+                        (aider/pi): enabled: true gives one jailed-agent
+                        round at a time (no two provider requests in
+                        flight) and aider's weak/editor models pinned to
+                        AIDER_MODEL under DAEDALUS_SLIM; parser_model, when
+                        set, starts the worker's loopback tool-call relay,
+                        which lifts text-encoded tool calls into the native
+                        wire pi executes (the parser model is resolved
+                        against the openai section's url); the per-model
+                        limits stay operator-side — see config-example.yaml
+                        for the per-agent prerequisites
   max_concurrent_tests  Native test suites the test worker (the
                         deployment's suite queue) runs at once; further
                         suites queue (default 2)

@@ -170,6 +170,12 @@ func fallbackEnv() []string {
 		// must not survive the override.
 		env = setEnvVar(env, "OPENAI_API_BASE", os.Getenv("DAEDALUS_FALLBACK_BASE_URL"))
 		env = setEnvVar(env, "OPENAI_API_KEY", os.Getenv("DAEDALUS_FALLBACK_API_KEY"))
+		// The slim tool relay's upstream is pinned to the primary's
+		// openai.url (fixed at worker boot), so it must not route a
+		// fallback round — the relay var loses to any explicit endpoint
+		// override (removed here and in reviewerEnv), putting the round
+		// back on the overridden OPENAI_BASE_URL directly.
+		env = removeEnvVar(env, config.ToolRelayURLEnv)
 		return setEnvVar(env, "OPENAI_MODEL", os.Getenv("DAEDALUS_FALLBACK_MODEL"))
 	}
 	hb := os.Getenv("DAEDALUS_FALLBACK_HEARTBEAT_MODEL")
@@ -213,6 +219,11 @@ func reviewerEnv(env []string, role SessionRole) []string {
 		// fallbackEnv.
 		env = setEnvVar(env, "OPENAI_BASE_URL", url)
 		env = setEnvVar(env, "OPENAI_API_BASE", url)
+		// The relay var loses to this override (see fallbackEnv): the
+		// relay's upstream is the primary's openai.url, and a
+		// reviewer.url override would silently dial it instead of the
+		// reviewer endpoint.
+		env = removeEnvVar(env, config.ToolRelayURLEnv)
 	}
 	if key != "" {
 		env = setEnvVar(env, "ANTHROPIC_API_KEY", key)

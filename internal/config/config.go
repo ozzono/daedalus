@@ -171,6 +171,15 @@ const (
 	// agent's endpoint exactly as before.
 	ReviewerURLEnv = "DAEDALUS_REVIEWER_BASE_URL"
 	ReviewerKeyEnv = "DAEDALUS_REVIEWER_API_KEY"
+	// ToolRelayURLEnv carries the staged base URL of the worker's slim
+	// tool-call relay (internal/toolrelay) — the relay's loopback address
+	// plus the openai upstream's path prefix, so pi's request paths land
+	// on the relay exactly as they would land on the upstream. Exported
+	// only while the relay is running; absent means pi dials the upstream
+	// directly, the pre-relay behavior. Unset symmetrically and scrubbed
+	// from the daemon spawn (ProviderEnvVars) so a stale export can never
+	// point a new worker's rounds at a dead relay.
+	ToolRelayURLEnv = "DAEDALUS_TOOL_RELAY_URL"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -397,6 +406,26 @@ type TestOutputConfig struct {
 	Mirror string `yaml:"mirror"`
 }
 
+// SlimConfig is the slim mode section. Intentionally breaking reshape
+// (2026-10-02): the historical top-level `slim: true/false` boolean became
+// this section — existing configs migrate by renaming the value to
+// slim.enabled.
+type SlimConfig struct {
+	// Enabled carries the historical slim boolean's semantics: the slot
+	// clamp to 1, the DAEDALUS_SLIM=1 export (aider weak/editor pinning),
+	// and the run flow's slim default (a defaulted -w reroutes to the slim
+	// flow).
+	Enabled bool `yaml:"enabled"`
+	// ParserModel names the model the worker's tool-call relay
+	// (internal/toolrelay) uses to normalize lifted arguments, resolved
+	// against the openai section's upstream via ollama structured output.
+	// Empty — the default — means the relay never starts and slim rounds
+	// behave exactly as before the relay existed: text-encoded tool calls
+	// from text-emitting models stay inert (pi executes only native
+	// tool_calls).
+	ParserModel string `yaml:"parser_model"`
+}
+
 // Config holds the runtime configuration for a Daedalus process, loaded
 // from a YAML file (see config-example.yaml).
 type Config struct {
@@ -453,17 +482,20 @@ type Config struct {
 	// DefaultMaxConcurrentAgentRuns when unset.
 	MaxConcurrentAgentRuns int `yaml:"max_concurrent_agent_runs"`
 	// Slim targets small self-hosted models (small context window, low max
-	// output tokens) on the aider and pi agents: when true, the worker runs
-	// a single jailed-agent round at a time (MaxConcurrentAgentRuns is
+	// output tokens) on the aider and pi agents: when enabled, the worker
+	// runs a single jailed-agent round at a time (MaxConcurrentAgentRuns is
 	// clamped to 1, so no two provider requests are ever in flight) and
 	// exports DAEDALUS_SLIM=1, under which jailed aider rounds pin
 	// AIDER_WEAK_MODEL/AIDER_EDITOR_MODEL to the effective AIDER_MODEL.
-	// Applies to the deployment, not to an agent: valid regardless of
-	// `agent`, so a `run --cli aider` override needs no config edit. The
-	// per-value limits (model ids, context/output budgets) stay operator-
-	// side — see config-example.yaml's slim entry for the per-agent
-	// prerequisites.
-	Slim bool `yaml:"slim"`
+	// With parser_model also set (and the openai section configured), the
+	// worker additionally starts the loopback tool-call relay
+	// (internal/toolrelay), which lifts text-encoded tool calls into the
+	// native tool_calls wire pi executes. Applies to the deployment, not
+	// to an agent: valid regardless of `agent`, so a `run --cli aider`
+	// override needs no config edit. The per-value limits (model ids,
+	// context/output budgets) stay operator-side — see
+	// config-example.yaml's slim entry for the per-agent prerequisites.
+	Slim SlimConfig `yaml:"slim"`
 	// Thinking is the agents' thinking toggle, independent of Slim: nil
 	// (the key absent, the default) and an explicit true mean daedalus
 	// sends no thinking signal at all and every agent follows its own
@@ -574,6 +606,7 @@ type renderConfig struct {
 	MaxConcurrentAgentRuns int              `yaml:"max_concurrent_agent_runs"`
 	MaxConcurrentTests     int              `yaml:"max_concurrent_tests"`
 	SharedTestQueue        *bool            `yaml:"shared_test_queue"`
+	Slim                   SlimConfig       `yaml:"slim"`
 	Temporal               TemporalConfig   `yaml:"temporal"`
 	Anthropic              AnthropicConfig  `yaml:"anthropic"`
 	OpenAI                 OpenAIConfig     `yaml:"openai"`
@@ -602,6 +635,7 @@ func (c Config) RenderYAML() (string, error) {
 		MaxConcurrentAgentRuns: c.MaxConcurrentAgentRuns,
 		MaxConcurrentTests:     c.MaxConcurrentTests,
 		SharedTestQueue:        c.SharedTestQueue,
+		Slim:                   c.Slim,
 		Temporal:               c.Temporal,
 		Anthropic:              c.Anthropic,
 		OpenAI:                 c.OpenAI,
@@ -809,6 +843,7 @@ func ProviderEnvVars() []string {
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
 		ReviewerURLEnv,
 		ReviewerKeyEnv,
+		ToolRelayURLEnv,
 		BugDirEnv,
 		BugMirrorEnv,
 		TestOutputMirrorEnv,
@@ -834,7 +869,7 @@ func Load(path string) (Config, error) {
 	// — native suites dial no LLM. Kept after validation so an invalid
 	// negative max_concurrent_agent_runs still errors. LoadRaw deliberately
 	// skips this — the raw view must stay raw.
-	if c.Slim {
+	if c.Slim.Enabled {
 		c.MaxConcurrentAgentRuns = 1
 	}
 	return c, nil
