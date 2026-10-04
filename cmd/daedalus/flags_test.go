@@ -266,3 +266,46 @@ func TestParseFlagsFolder(t *testing.T) {
 		t.Errorf("parseFlags(run -a -folder) err = %v, want a fresh-run-only rejection", err)
 	}
 }
+
+// TestParseFlagsDepends pins the -dep/--depends surface: it parses in any
+// argument position, in both spelling forms (the = form included), and is
+// a fresh-run option like -folder — the chain is decided at submit, so
+// append mode and the worker commands reject it at parse time.
+func TestParseFlagsDepends(t *testing.T) {
+	for _, c := range []struct {
+		args     []string
+		want     string
+		wantRest []string
+	}{
+		{[]string{"run", "-dep", "wf-1", "/repo", "42", "do it"}, "wf-1", []string{"run", "/repo", "42", "do it"}},
+		{[]string{"run", "--depends", "wf-1", "/repo", "42", "do it"}, "wf-1", []string{"run", "/repo", "42", "do it"}},
+		{[]string{"run", "--depends=wf-1", "/repo", "42", "do it"}, "wf-1", []string{"run", "/repo", "42", "do it"}},
+		{[]string{"--depends=wf-1", "run", "/repo", "42", "do it"}, "wf-1", []string{"run", "/repo", "42", "do it"}},
+	} {
+		f, rest, err := parseFlags(c.args)
+		if err != nil {
+			t.Errorf("parseFlags(%v): %v", c.args, err)
+			continue
+		}
+		if f.depends != c.want {
+			t.Errorf("parseFlags(%v) depends = %q, want %q", c.args, f.depends, c.want)
+		}
+		if !reflect.DeepEqual(rest, c.wantRest) {
+			t.Errorf("parseFlags(%v) rest = %v, want %v", c.args, rest, c.wantRest)
+		}
+	}
+
+	if _, _, err := parseFlags([]string{"run", "-dep"}); err == nil {
+		t.Error("-dep without a value should error")
+	}
+	// The chain is decided at submit; a worker command can never honor it.
+	if _, _, err := parseFlags([]string{"worker", "start", "-dep", "wf-1"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to a fresh run") {
+		t.Errorf("parseFlags(worker -dep) err = %v, want a fresh-run-only rejection", err)
+	}
+	// Append mode steers a pipeline whose dependency was already resolved.
+	if _, _, err := parseFlags([]string{"run", "-a", "wf-1", "--depends", "wf-2", "steer it"}); err == nil ||
+		!strings.Contains(err.Error(), "only applies to a fresh run") {
+		t.Errorf("parseFlags(run -a -dep) err = %v, want a fresh-run-only rejection", err)
+	}
+}

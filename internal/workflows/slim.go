@@ -50,7 +50,10 @@ const maxSlimStepRounds = 8
 //  3. Finalize: the inherited deliverable contract — approved work is
 //     committed and the branch preserved.
 func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
-	run, cleanup := startRun(ctx, input)
+	run, cleanup, err := startRun(ctx, input)
+	if err != nil {
+		return "", err
+	}
 	defer cleanup()
 	run.freshReviews = true
 	if err := run.createWorktree(); err != nil {

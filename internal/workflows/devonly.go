@@ -19,7 +19,10 @@ import (
 // run without tests). Selection is CLI-only (`daedalus run -w dev-only`);
 // no config key picks a flow.
 func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
-	run, cleanup := startRun(ctx, input)
+	run, cleanup, err := startRun(ctx, input)
+	if err != nil {
+		return "", err
+	}
 	defer cleanup()
 	// Submit-time jail carve-out, same as feature-dev phase 1 — including
 	// the finalize force-stage opt-in.
@@ -32,7 +35,6 @@ func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) 
 	// A continued run opens on the aborted attempt's preserved work — the
 	// same Continue framing feature-dev phase 1 uses.
 	var initialPrompt string
-	var err error
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {

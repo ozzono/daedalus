@@ -111,6 +111,19 @@ type PipelineInput struct {
 	// none by design. Empty — no grants, or a run whose input predates the
 	// field — mounts nothing, replay-safe like every other input field.
 	Folders []string
+	// DependsOn chains this run behind another (`run -dep/--depends`,
+	// fresh runs only): the run waits — in the pending status, before any
+	// worktree, branch, or round exists — until the dependency reaches an
+	// approving terminal state, then starts its worktree from the
+	// dependency's preserved branch. The base is injected into
+	// WorktreeInput.BaseBranch by the gate, never into this struct's
+	// BaseBranch: that one would flip the opening prompt to
+	// template.Continue, but a dependent is a fresh Implement task. The
+	// dependency stopping without approval (failed, parked, canceled,
+	// timed out, wiped, never existed) fails the run before anything was
+	// started. Empty — no chain, or a run whose input predates the field —
+	// skips the gate entirely, replay-safe like every other input field.
+	DependsOn string
 }
 
 // maxConsecutiveTimeouts caps how many timed-out rounds in a row the
@@ -155,6 +168,12 @@ const quotaHeartbeatInterval = time.Hour
 // is itself bounded by its StartToClose, so backing off cannot wedge a
 // healthy run — a cap would fail legitimately queued ones.
 const slotBackoffInterval = time.Minute
+
+// depPollInterval is how often a dependent run's gate re-probes its
+// dependency (awaitDependency). A package const, not config: the wait
+// schedules no work and spends nothing, so a minute's lag in starting an
+// approved chain is invisible next to a pipeline's runtime.
+const depPollInterval = time.Minute
 
 // maxQuotaHeartbeats caps the hourly retries; once the API is still
 // exhausted after this many heartbeats the run parks itself for a
@@ -206,17 +225,25 @@ func IsParkedResult(result string) bool { return strings.HasPrefix(result, Parke
 // parked run from an approved one — both are Completed in ExecutionStatus —
 // and waiting from running, while LastActivityAt carries the last completed
 // round's time, the liveness signal a quota-heartbeat sleep lacks.
+// DaedalusDependsOn names a dependent run's dependency workflow id, upserted
+// once when the dependency gate engages.
 const (
-	DaedalusStatusAttr = "DaedalusStatus"
-	LastActivityAttr   = "LastActivityAt"
+	DaedalusStatusAttr    = "DaedalusStatus"
+	LastActivityAttr      = "LastActivityAt"
+	DaedalusDependsOnAttr = "DaedalusDependsOn"
 )
 
 // RunStatus is the value space of the DaedalusStatus keyword attribute.
 type RunStatus string
 
 const (
-	StatusRunning  RunStatus = "running"
-	StatusWaiting  RunStatus = "waiting"
+	StatusRunning RunStatus = "running"
+	StatusWaiting RunStatus = "waiting"
+	// pending is a dependent run's live wait for its dependency (the gate
+	// in awaitDependency): no work exists yet, nothing is retrying.
+	// waiting stays the transient-retry pause — quota heartbeat, slot
+	// backoff — of a run whose rounds are already underway.
+	StatusPending  RunStatus = "pending"
 	StatusApproved RunStatus = "approved"
 	StatusParked   RunStatus = "parked"
 	StatusFailed   RunStatus = "failed"
@@ -309,7 +336,10 @@ func WorkflowTypeName(fn func(workflow.Context, PipelineInput) (string, error)) 
 // the reason as its result; the deferred cleanup preserves the attempt's
 // work on its aborted/ branch either way.
 func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
-	run, cleanup := startRun(ctx, input)
+	run, cleanup, err := startRun(ctx, input)
+	if err != nil {
+		return "", err
+	}
 	defer cleanup()
 	// Submit-time jail carve-out: a task whose own text names .ai-jail
 	// gets fix prompts where acting on .ai-jail comments is in scope, and
@@ -378,7 +408,6 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// Phase 1: implementation ↔ code review, until the reviewer approves.
 	// A continued run opens on the aborted attempt's preserved work.
 	var initialPrompt string
-	var err error
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {

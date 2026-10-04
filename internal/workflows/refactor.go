@@ -17,7 +17,10 @@ import (
 // The unedited suite gating every round carries the semantics; the reviewer
 // judges structure.
 func RefactorWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
-	run, cleanup := startRun(ctx, input)
+	run, cleanup, err := startRun(ctx, input)
+	if err != nil {
+		return "", err
+	}
 	defer cleanup()
 	if err := run.createWorktree(); err != nil {
 		return "", err
@@ -27,7 +30,6 @@ func RefactorWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	}
 
 	var initialPrompt string
-	var err error
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {

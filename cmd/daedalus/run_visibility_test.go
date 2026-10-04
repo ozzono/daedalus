@@ -85,4 +85,17 @@ func TestDecodeRunVisibility(t *testing.T) {
 			t.Errorf("decodeRunVisibility = %+v, want an empty status but the decoded time %v", vis, last)
 		}
 	})
+
+	t.Run("the dependency attribute decodes alone", func(t *testing.T) {
+		depPayload, err := dc.ToPayload("wf-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		vis := decodeRunVisibility(&commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
+			"DaedalusDependsOn": depPayload,
+		}}, dc)
+		if vis.DependsOn != "wf-1" || vis.Status != "" || !vis.LastAt.IsZero() {
+			t.Errorf("decodeRunVisibility = %+v, want only DependsOn set to %q", vis, "wf-1")
+		}
+	})
 }

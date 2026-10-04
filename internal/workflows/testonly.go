@@ -18,7 +18,10 @@ import (
 // record Go statement coverage, and the reviewer sees the delta across
 // rounds.
 func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
-	run, cleanup := startRun(ctx, input)
+	run, cleanup, err := startRun(ctx, input)
+	if err != nil {
+		return "", err
+	}
 	defer cleanup()
 	run.cover = true
 	if err := run.createWorktree(); err != nil {
@@ -33,7 +36,6 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	// whole workflow. A continued run opens on the aborted attempt's
 	// preserved work.
 	var initialPrompt string
-	var err error
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {

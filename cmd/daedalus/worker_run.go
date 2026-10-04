@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 
@@ -241,6 +242,11 @@ func runWorker(cfg config.Config, workerType string) error {
 		w.RegisterActivity(activities.CleanupWorktreeActivity)
 		w.RegisterActivity(activities.VerifyWriteScopeActivity)
 		w.RegisterActivity(activities.ReproFirstGateActivity)
+		// The dependency probe is a closure over this daemon's client (c is
+		// dialed above, before registration) — no second dial, no env
+		// channel. Its name is pinned as a string on both ends.
+		w.RegisterActivityWithOptions(activities.NewCheckDependencyActivity(c),
+			activity.RegisterOptions{Name: activities.CheckDependencyActivityName})
 		workers = append(workers, w)
 	}
 

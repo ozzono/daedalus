@@ -93,6 +93,10 @@ type flags struct {
 	// run read-write access to host folders: each path travels with the
 	// run's workflow input and is mounted into the jailed rounds' sandbox.
 	folders []string
+	// depends, set via -dep/--depends on `run`, chains the fresh run
+	// behind another workflow: the id travels with the run's workflow
+	// input and the gate inside it blocks until the dependency resolves.
+	depends string
 	// status, set via --status on `log`, prints the task's status brief
 	// instead of the raw log.
 	status bool
@@ -135,6 +139,8 @@ var flagTable = map[string]flagSpec{
 	"--cli":      {name: "cli", value: true},
 	"-folder":    {name: "folder", value: true},
 	"--folder":   {name: "folder", value: true},
+	"-dep":       {name: "depends", value: true},
+	"--depends":  {name: "depends", value: true},
 	"-t":         {name: "type", value: true},
 	"--type":     {name: "type", value: true},
 	"-d":         {name: "detach"},
@@ -177,6 +183,8 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 			f.agentCLI = value
 		case "folder":
 			f.folders = append(f.folders, value)
+		case "depends":
+			f.depends = value
 		case "type":
 			if value != workerTypeDev && value != workerTypeTest {
 				return fmt.Errorf("unknown worker type %q (valid: %s, %s)", value, workerTypeDev, workerTypeTest)
@@ -253,6 +261,13 @@ parse:
 	// pipeline whose trust surface (grants included) is already fixed.
 	if len(f.folders) > 0 && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
 		return f, nil, errors.New("-folder/--folder only applies to a fresh run")
+	}
+	// Likewise -dep/--depends: the chain is decided at submit (the
+	// dependency preflight runs once, at start), so only a fresh `run`
+	// can carry one — append mode steers a pipeline whose dependency was
+	// already resolved or never existed.
+	if f.depends != "" && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
+		return f, nil, errors.New("-dep/--depends only applies to a fresh run")
 	}
 	// The record-driven worker commands (`worker restart all`, `worker
 	// restart <name>`, `worker status`) work from the recorded configs

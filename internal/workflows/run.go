@@ -130,7 +130,10 @@ type pipelineRun struct {
 // not cancel the cleanup itself, and tolerates state that never came to
 // exist. It deletes only the in-flight feat/ branch; approved work was
 // renamed to the preserved prefix by FinalizeWorktreeActivity and survives.
-func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) {
+// A run carrying DependsOn blocks here — ahead of the worktree, the single
+// choke point every flow passes through — until its dependency resolves; a
+// broken chain is the returned error, with nothing ever scheduled.
+func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func(), error) {
 	logger := workflow.GetLogger(ctx)
 
 	ao := workflow.ActivityOptions{
@@ -250,6 +253,11 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 		// edit `git add -A` gives for free.
 	}
 	r.vis = visibilityEnabled(ctx)
+	if input.DependsOn != "" {
+		if err := r.awaitDependency(); err != nil {
+			return nil, nil, err
+		}
+	}
 	r.setStatus(StatusRunning)
 	r.touch()
 	return r, func() {
@@ -261,7 +269,7 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func()) 
 		if err := workflow.ExecuteActivity(dctx, activities.CleanupWorktreeActivity, r.worktreeInput).Get(dctx, nil); err != nil {
 			logger.Error("Failed to clean up worktree", "Error", err)
 		}
-	}
+	}, nil
 }
 
 // createWorktree creates the run's worktree, recording its location and
@@ -724,4 +732,60 @@ func (r *pipelineRun) finalize() (string, error) {
 	}
 	r.logger.Info("Approved work committed", "Branch", preservedBranch)
 	return preservedBranch, nil
+}
+
+// awaitDependency is the dependency gate every flow inherits through
+// startRun: the run — nothing scheduled yet, no worktree, no branch, no
+// round — polls its dependency until the probe reports an approving
+// terminal state, then injects the dependency's preserved branch as the
+// worktree base (WorktreeInput.BaseBranch only — the input's own BaseBranch
+// would flip the opening prompt to a continuation). A dependency that stops
+// without approval (failed, parked, canceled, timed out, wiped — a vanished
+// id reads the same) fails the run before anything was started: an aborted
+// chain has nothing to preserve, so the interrupt is a failure, not a park,
+// and re-submitting the chain is a human decision. Transient probe errors
+// back off and retry, capped like the round timeouts: a permanently failing
+// check (a worker too old to know the activity) must fail loudly instead of
+// pending forever. The first probe races nothing — a dependency already
+// approved at submit resolves here without a single sleep.
+func (r *pipelineRun) awaitDependency() error {
+	dep := r.input.DependsOn
+	if r.vis {
+		workflow.UpsertSearchAttributes(r.ctx, map[string]interface{}{DaedalusDependsOnAttr: dep})
+	}
+	r.setStatus(StatusPending)
+	r.logger.Info("Waiting on dependency", "Dependency", dep)
+	failures := 0
+	for {
+		var probe activities.DependencyProbe
+		err := workflow.ExecuteActivity(r.ctx, activities.CheckDependencyActivityName, dep).Get(r.ctx, &probe)
+		if err == nil {
+			failures = 0
+			switch {
+			case probe.Completed && !IsParkedResult(probe.Result):
+				r.setStatus(StatusRunning)
+				r.logger.Info("Dependency approved; starting from its preserved branch",
+					"Dependency", dep, "Branch", probe.Result)
+				r.worktreeInput.BaseBranch = probe.Result
+				return nil
+			case probe.Terminal:
+				state := probe.Status
+				if probe.Completed {
+					state = "parked"
+				}
+				return fmt.Errorf("dependency %s %s — the chain is broken; this run failed before any worktree, branch, or round existed. Resolve the dependency (check the id against \"daedalus list\"; closed sessions resume with `daedalus continue`), then re-submit",
+					dep, state)
+			}
+		} else {
+			failures++
+			if failures >= maxConsecutiveTimeouts {
+				return fmt.Errorf("dependency check for %s failed %d probes in a row: %w", dep, failures, err)
+			}
+			r.logger.Warn("Dependency probe failed; retrying after the poll interval",
+				"Dependency", dep, "Failures", failures, "Error", err)
+		}
+		if serr := workflow.Sleep(r.ctx, depPollInterval); serr != nil {
+			return fmt.Errorf("dependency poll (%s): %w", dep, serr)
+		}
+	}
 }

@@ -59,6 +59,14 @@ func taskLogIdentity(ctx context.Context) (workflowID, runID string) {
 	return info.WorkflowExecution.ID, info.WorkflowExecution.RunID
 }
 
+// AppendSubmitNote writes one submit-time line to a run's task log before
+// any round exists — a dependent run's "waiting on dependency: <id>", the
+// only content the log carries while the gate holds it, so `daedalus log`
+// (and the idle --status brief) shows why nothing has started.
+func AppendSubmitNote(workflowID, line string) error {
+	return writeTaskLog(workflowID, "", "submit", line)
+}
+
 // writeTaskLog appends one block to the task's log file: the entire block
 // in a single O_APPEND open + one WriteString, so concurrent activities
 // (agent rounds, test suites, parallel workflows) interleave at block

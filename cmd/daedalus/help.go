@@ -52,7 +52,7 @@ var commandHelp = map[string]string{
 	"run": `daedalus run — start an implementation pipeline for an issue.
 
 USAGE
-  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] <repo-path> <issue-id> "<prompt>"
+  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] [-dep workflow-id] <repo-path> <issue-id> "<prompt>"
   daedalus [-c config.yaml] run -a <workflow-id> ["<prompt>"]   (append mode)
 
 ARGUMENTS
@@ -104,6 +104,21 @@ FLAGS
                           a shared done-index, retire its own task file).
                           Fresh runs only — rejected in append mode; a
                           running pipeline's grants are already fixed.
+  -dep, --depends <workflow-id>
+                          Chain this run behind another: the run waits in the
+                          pending status — no worktree, branch, or agent round,
+                          no spend — until the named dependency finishes
+                          approved, then starts its worktree from the
+                          dependency's preserved branch (the opening prompt
+                          stays a fresh task, not a continuation). A dependency
+                          that stops without approval (failed, parked,
+                          canceled, timed out, wiped) fails the run before
+                          anything was started. Chains compose (run-c depends
+                          on run-b, which depends on run-a); a dependency that
+                          is already approved at submit skips the wait
+                          entirely. The id is verbatim from "daedalus list";
+                          the dependency must run on this config's task queue.
+                          Fresh runs only — rejected in append mode.
   -f, --file <path>       Read the task description from a file. A glob pattern
                           (e.g. notes/*.md) expands to every matching file,
                           concatenated in lexical order. The file's containing

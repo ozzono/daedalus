@@ -244,7 +244,7 @@ func main() {
 				workflowName = "slim"
 			}
 			err = startPipelineFolders(cfg, configPath.configPath, workflowName, args[1], args[2], prompt, configPath.detach,
-				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI, folders)
+				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI, folders, configPath.depends)
 			if err != nil {
 				fail("run", err)
 			}
