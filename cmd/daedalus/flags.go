@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"go.temporal.io/sdk/client"
@@ -103,6 +104,10 @@ type flags struct {
 	// cot, set via -cot on `log`, prints the run's chain-of-thought logs
 	// from Temporal history instead of the raw log.
 	cot bool
+	// cotN, set via -cot-n <N> on `log` alongside -cot, limits the CoT
+	// view to the last N completed rounds. -1 (the zero shape parseFlags
+	// starts from) means the flag never appeared: every round prints.
+	cotN int
 	// workerType, set via -t/--type on the worker command, shapes that
 	// daemon process's pollers: a run config, not recorded anywhere —
 	// restarts of the same worker come back untyped (both pollers).
@@ -149,13 +154,15 @@ var flagTable = map[string]flagSpec{
 	"--status":   {name: "status"},
 	"-cot":       {name: "cot"},
 	"--cot":      {name: "cot"},
+	"-cot-n":     {name: "cot-n", value: true},
+	"--cot-n":    {name: "cot-n", value: true},
 }
 
 // parseFlags extracts -c/--config and -w/--workflow (which may appear
 // anywhere) from args and returns them plus the remaining subcommand
 // arguments.
 func parseFlags(args []string) (f flags, rest []string, err error) {
-	f = flags{configPath: defaultConfigPath, workflow: defaultWorkflowName}
+	f = flags{configPath: defaultConfigPath, workflow: defaultWorkflowName, cotN: -1}
 	set := func(name, value string) error {
 		switch name {
 		case "config":
@@ -190,6 +197,12 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 				return fmt.Errorf("unknown worker type %q (valid: %s, %s)", value, workerTypeDev, workerTypeTest)
 			}
 			f.workerType = value
+		case "cot-n":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 {
+				return fmt.Errorf("-cot-n wants a non-negative round count, got %q", value)
+			}
+			f.cotN = n
 		}
 		return nil
 	}
@@ -313,6 +326,11 @@ parse:
 	// subcommand ignores, exactly like --status above.
 	if f.cot && !isTaskLog(rest) {
 		return f, nil, errors.New("-cot only applies to daedalus log <workflow-id>")
+	}
+	// -cot-n shapes only the -cot view — without it there is nothing to
+	// tail — so it is rejected anywhere -cot itself would be.
+	if f.cotN >= 0 && !f.cot {
+		return f, nil, errors.New("-cot-n only applies to daedalus log <workflow-id> -cot")
 	}
 	// One log invocation prints one view: the raw file, the brief, or the
 	// CoT — never a mixture.

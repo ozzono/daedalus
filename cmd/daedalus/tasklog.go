@@ -54,7 +54,12 @@ func runTaskLog(workflowID string, status bool) {
 // runTaskLogCot implements `daedalus log <workflow-id> -cot`: print the
 // run's chain-of-thought logs instead of the task
 // log — one complete section per jailed round (implementation and review),
-// never truncated. Rounds with a native thinking channel (claude, amp, pi)
+// never truncated. Each section opens with a `=====` divider and stamps
+// the round's Temporal completion time in its header, so consecutive
+// rounds read as separate blocks. cotN tails the completed sections to
+// the last N rounds (-1 means every round); a live in-flight section,
+// when one exists, always follows — it is the newest material there is.
+// Rounds with a native thinking channel (claude, amp, pi)
 // show their captured Thinking; openai-wire rounds whose reasoning arrived
 // inline show the <think>-fenced part; rounds with no CoT at all say so
 // rather than rendering an empty section. The Temporal address comes from
@@ -63,7 +68,7 @@ func runTaskLog(workflowID string, status bool) {
 // wherever the Temporal service is reachable. When a round is in flight
 // right now, a live section rendered from the agent's host-side transcript
 // follows the completed ones (see liveCotSection).
-func runTaskLogCot(workflowID string) {
+func runTaskLogCot(workflowID string, cotN int) {
 	host := config.DefaultTemporalHost
 	if path, err := resolveConfigPath(defaultConfigPath); err == nil {
 		host = loadConfig(path).Temporal.Host
@@ -95,6 +100,7 @@ func runTaskLogCot(workflowID string) {
 		agent string
 	}
 	rounds := 0
+	var sections []string
 	for _, runID := range runs {
 		scheduled := map[int64]scheduledRound{}
 		iter := c.GetWorkflowHistory(context.Background(), workflowID, runID,
@@ -165,20 +171,37 @@ func runTaskLogCot(workflowID string) {
 			if sr.agent != "" {
 				header += fmt.Sprintf(" (%s)", sr.agent)
 			}
-			fmt.Println(header + " ===")
+			// The completed event's time is when this attempt's CoT
+			// became final — the honest per-round stamp.
+			header += fmt.Sprintf(" @ %s ===", ev.GetEventTime().AsTime().Format("2006-01-02 15:04:05 MST"))
+			var b strings.Builder
+			b.WriteString("=====================================\n")
+			b.WriteString(header + "\n")
 			if cot == "" {
-				fmt.Println("no CoT captured for this round")
+				b.WriteString("no CoT captured for this round\n")
 			} else {
-				fmt.Println(cot)
+				b.WriteString(cot + "\n")
 			}
-			fmt.Println()
+			b.WriteString("\n")
+			sections = append(sections, b.String())
 		}
+	}
+	// cotN tails the completed sections to the last N; whole sections
+	// only — the no-truncation rule is per section, never per byte.
+	shown := sections
+	if cotN >= 0 && len(sections) > cotN {
+		shown = sections[len(sections)-cotN:]
+	}
+	for _, s := range shown {
+		fmt.Print(s)
 	}
 	// The in-flight section replaces, never accompanies, the no-rounds
 	// message: a round running with zero completed rounds is exactly the
-	// case the live view exists for.
+	// case the live view exists for. It rides outside the tail: the round
+	// it renders is newer than every completed one.
 	live := liveCotSection(workflowID)
 	if live != "" {
+		fmt.Print("=====================================\n")
 		fmt.Print(live)
 	}
 	if rounds == 0 && live == "" {

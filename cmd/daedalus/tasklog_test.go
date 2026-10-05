@@ -572,6 +572,70 @@ func TestTaskLogCotFlags(t *testing.T) {
 	}
 }
 
+// TestTaskLogCotNFlags pins -cot-n's parse-time surface: it defaults to -1
+// (every round prints), parses on the same invocation as -cot in both
+// spellings plus the "--cot-n=" form, keeps 0 distinct from unset (0 tails
+// to no completed sections), and is refused anywhere -cot itself would be —
+// without -cot, off `log`, and for a negative or non-numeric count. Note the
+// unset sentinel itself is rejected as explicit input: -cot-n -1 is an error,
+// not a synonym for omitting the flag.
+func TestTaskLogCotNFlags(t *testing.T) {
+	f, _, err := parseFlags([]string{"run"})
+	if err != nil || f.cotN != -1 {
+		t.Errorf("parseFlags(run) cotN = %d, %v, want the unset sentinel -1 with no error", f.cotN, err)
+	}
+
+	f, _, err = parseFlags([]string{"log", "wf-1", "-cot", "-cot-n", "3"})
+	if err != nil || !f.cot || f.cotN != 3 {
+		t.Errorf("parseFlags(log wf-1 -cot -cot-n 3) = (%v, %d), %v, want cot set and cotN 3", f.cot, f.cotN, err)
+	}
+
+	f, _, err = parseFlags([]string{"log", "wf-1", "-cot", "--cot-n", "3"})
+	if err != nil || f.cotN != 3 {
+		t.Errorf("parseFlags(log wf-1 -cot --cot-n 3) cotN = %d, %v, want 3 with no error", f.cotN, err)
+	}
+
+	f, _, err = parseFlags([]string{"log", "wf-1", "--cot-n=2", "-cot"})
+	if err != nil || f.cotN != 2 {
+		t.Errorf("parseFlags(log wf-1 --cot-n=2 -cot) cotN = %d, %v, want 2 with no error", f.cotN, err)
+	}
+
+	// 0 is a real value, not "unset": the tail shows no completed sections
+	// (a live in-flight section still follows — untestable in-suite, since
+	// runTaskLogCot dials Temporal directly).
+	f, _, err = parseFlags([]string{"log", "wf-1", "-cot", "-cot-n", "0"})
+	if err != nil || f.cotN != 0 {
+		t.Errorf("parseFlags(log wf-1 -cot -cot-n 0) cotN = %d, %v, want 0 with no error", f.cotN, err)
+	}
+
+	// Without -cot there is nothing to tail.
+	if _, _, err := parseFlags([]string{"log", "wf-1", "-cot-n", "3"}); err == nil ||
+		err.Error() != "-cot-n only applies to daedalus log <workflow-id> -cot" {
+		t.Errorf("parseFlags(log wf-1 -cot-n 3) err = %v, want the cot-n-needs-cot rejection", err)
+	}
+
+	// Anywhere -cot itself would be rejected, -cot-n rides along.
+	if _, _, err := parseFlags([]string{"-cot-n", "3", "worker", "status"}); err == nil ||
+		err.Error() != "-cot-n only applies to daedalus log <workflow-id> -cot" {
+		t.Errorf("parseFlags(-cot-n 3 worker status) err = %v, want the cot-n-only-on-log rejection", err)
+	}
+
+	if _, _, err := parseFlags([]string{"log", "wf-1", "-cot", "-cot-n", "-1"}); err == nil ||
+		err.Error() != `-cot-n wants a non-negative round count, got "-1"` {
+		t.Errorf("parseFlags(log wf-1 -cot -cot-n -1) err = %v, want the negative-count rejection", err)
+	}
+
+	if _, _, err := parseFlags([]string{"log", "wf-1", "-cot", "-cot-n", "three"}); err == nil ||
+		err.Error() != `-cot-n wants a non-negative round count, got "three"` {
+		t.Errorf("parseFlags(log wf-1 -cot -cot-n three) err = %v, want the non-numeric-count rejection", err)
+	}
+
+	if _, _, err := parseFlags([]string{"log", "wf-1", "-cot", "-cot-n"}); err == nil ||
+		err.Error() != "-cot-n requires a value" {
+		t.Errorf("parseFlags(log wf-1 -cot -cot-n) err = %v, want the missing-value rejection", err)
+	}
+}
+
 // TestMainLogCotDispatch pins the `-cot` dispatch through the CLI
 // (subprocess: runTaskLogCot dials Temporal, and exitf exits): with a
 // resolved config pointing at a dead host, the invocation fails with that
@@ -598,6 +662,35 @@ func TestMainLogCotDispatch(t *testing.T) {
 	}
 	if strings.Contains(stderr, "no task log") {
 		t.Errorf("daedalus log <id> -cot stderr = %q, must not fall through to the raw log", stderr)
+	}
+}
+
+// TestMainLogCotNDispatch pins the `-cot -cot-n` pair through the CLI
+// (subprocess, same dead-host trick as TestMainLogCotDispatch): the tail
+// count parses and dispatches with -cot to the CoT view — the connect error
+// proves the pair reached runTaskLogCot rather than a usage failure or the
+// raw-log fall-through. How many sections the tail itself keeps is
+// observable only against a live Temporal (runTaskLogCot dials directly),
+// so it is pinned by live probe, not here.
+func TestMainLogCotNDispatch(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfg, []byte("agent: claude\ntemporal:\n  host: 127.0.0.1:1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runMainIn(t, dir, "log", "daedalus-cotn-dial-probe", "-cot", "-cot-n", "2")
+	if code != 1 {
+		t.Errorf("daedalus log <id> -cot -cot-n 2 exit code = %d, want 1", code)
+	}
+	if stdout != "" {
+		t.Errorf("daedalus log <id> -cot -cot-n 2 stdout = %q, want empty", stdout)
+	}
+	if !strings.HasPrefix(stderr, "connect to temporal at 127.0.0.1:1: ") {
+		t.Errorf("daedalus log <id> -cot -cot-n 2 stderr = %q, want the config-host connect error", stderr)
+	}
+	if strings.Contains(stderr, "only applies") || strings.Contains(stderr, "no task log") {
+		t.Errorf("daedalus log <id> -cot -cot-n 2 stderr = %q, want the CoT dial, not a rejection or raw-log fall-through", stderr)
 	}
 }
 
