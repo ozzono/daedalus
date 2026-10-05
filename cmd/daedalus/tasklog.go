@@ -371,6 +371,13 @@ func taskStatusBrief(log string) {
 	agent, worktree := runningRound(log)
 	fmt.Printf("current agent: %s\n", agent)
 	if worktree == "" {
+		// An idle run with no worktree has either never started or is a
+		// dependent held in pending by its dependency gate — the submit
+		// note is the only line its log carries, and the only "why" the
+		// brief can give.
+		if line, ok := lastSubmitNote(log); ok {
+			fmt.Println(line)
+		}
 		return
 	}
 	path, _, mtime, ok, err := newestTranscript(worktree)
@@ -388,6 +395,20 @@ func taskStatusBrief(log string) {
 	}
 	fmt.Printf("last update: %s\n", mtime.UTC().Format(time.RFC3339))
 	fmt.Printf("last update text: %s\n", digest)
+}
+
+// lastSubmitNote returns the run's submit-time dependency note, if any —
+// the one line a dependent's task log carries while the gate holds it in
+// pending, before any round exists. Plain-prefix match: the line is
+// writer-produced (AppendSubmitNote), and the brief only displays it.
+func lastSubmitNote(log string) (string, bool) {
+	var found string
+	for line := range strings.SplitSeq(log, "\n") {
+		if strings.HasPrefix(line, "waiting on dependency: ") {
+			found = line
+		}
+	}
+	return found, found != ""
 }
 
 // runningRound derives the current agent from the task log: the last

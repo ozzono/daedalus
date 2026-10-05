@@ -17,7 +17,10 @@ import (
 // (docs paths only) travels in the input's path policy and is verified
 // structurally before finalize: a diff that leaves it parks the run.
 func InvestigateWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
-	run, cleanup := startRun(ctx, input)
+	run, cleanup, err := startRun(ctx, input)
+	if err != nil {
+		return "", err
+	}
 	defer cleanup()
 	if err := run.createWorktree(); err != nil {
 		return "", err
@@ -26,7 +29,6 @@ func InvestigateWorkflow(ctx workflow.Context, input PipelineInput) (string, err
 	// A continued run opens on the aborted attempt's preserved work — the
 	// same Continue framing feature-dev phase 1 uses.
 	var initialPrompt string
-	var err error
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {

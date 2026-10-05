@@ -15,9 +15,11 @@ test-coverage:
 
 # custom-columns registers the visibility search attributes the pipeline
 # upserts (internal/workflows visibilityChangeID: DaedalusStatus keyword,
-# LastActivityAt datetime) on the default namespace. The list-guard makes
-# the rule idempotent — an already-registered attribute is left alone
-# rather than erroring, so repeated calls are safe.
+# LastActivityAt datetime, DaedalusDependsOn keyword) on the default
+# namespace. The list-guard makes the rule idempotent — an
+# already-registered attribute is left alone rather than erroring, so
+# repeated calls are safe.
 custom-columns:
 	@temporal operator search-attribute list --namespace default | grep -qw DaedalusStatus || temporal operator search-attribute create --namespace default --name DaedalusStatus --type Keyword
 	@temporal operator search-attribute list --namespace default | grep -qw LastActivityAt || temporal operator search-attribute create --namespace default --name LastActivityAt --type Datetime
+	@temporal operator search-attribute list --namespace default | grep -qw DaedalusDependsOn || temporal operator search-attribute create --namespace default --name DaedalusDependsOn --type Keyword

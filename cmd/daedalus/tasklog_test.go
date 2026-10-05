@@ -1003,3 +1003,38 @@ func TestTaskLogFlags(t *testing.T) {
 		t.Error("isTaskLog accepted a non `log <id>` argument list")
 	}
 }
+
+// TestLastSubmitNote pins the brief's dependency-line lookup: the last
+// "waiting on dependency" line wins (an appended run's own note is the
+// truthful one), and a log without one reports absence — a plain-prefix
+// match on a writer-produced line, so nothing else can masquerade as it.
+func TestLastSubmitNote(t *testing.T) {
+	if _, ok := lastSubmitNote("=== round started ===\nround exited\n"); ok {
+		t.Error("lastSubmitNote(log without a note) = ok, want false")
+	}
+	log := "waiting on dependency: wf-old\n" +
+		"=== 2026-10-03T10:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===\n" +
+		"waiting on dependency: wf-new\n"
+	line, ok := lastSubmitNote(log)
+	if !ok || line != "waiting on dependency: wf-new" {
+		t.Errorf("lastSubmitNote = %q, %v; want the last note line, true", line, ok)
+	}
+	// A near-miss line is not a note: the prefix must span the whole
+	// leading segment.
+	if _, ok := lastSubmitNote("still waiting on dependency: wf-1\n"); ok {
+		t.Error("lastSubmitNote(near-miss prefix) = ok, want false")
+	}
+}
+
+// TestTaskStatusBriefDependent pins the idle dependent's brief: with no
+// worktree and only the submit note in the log, the note is the one "why"
+// the brief can give — printed after the agent line, nothing else.
+func TestTaskStatusBriefDependent(t *testing.T) {
+	out := captureStdout(t, func() {
+		taskStatusBrief("waiting on dependency: wf-1\n")
+	})
+	want := "current agent: idle\nwaiting on dependency: wf-1\n"
+	if out != want {
+		t.Errorf("brief = %q, want the idle agent line plus the dependency note", out)
+	}
+}

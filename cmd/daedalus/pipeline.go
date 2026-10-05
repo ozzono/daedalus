@@ -240,13 +240,14 @@ func resolveFolderGrants(flagFolders []string, taskFile string) ([]string, error
 // -cli/--cli, overrides the config's jailed agent for this run. Unless
 // detach is set, it then blocks until the pipeline finishes.
 func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string) error {
-	return startPipelineFolders(cfg, configPath, workflowName, repoPath, issueID, prompt, detach, branchPrefix, agent, nil)
+	return startPipelineFolders(cfg, configPath, workflowName, repoPath, issueID, prompt, detach, branchPrefix, agent, nil, "")
 }
 
 // startPipelineFolders is startPipeline with the run's validated folder
-// grants (resolveFolderGrants). (Split so startPipeline's existing
+// grants (resolveFolderGrants) and, when set, the workflow id the run is
+// chained behind (-dep/--depends). (Split so startPipeline's existing
 // signature — and the tests pinning it — stays untouched.)
-func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string, folders []string) error {
+func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string, folders []string, depends string) error {
 	spec, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
@@ -290,6 +291,11 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 	if workflowName != defaultWorkflowName {
 		workflowID = fmt.Sprintf("%s-%s-%s", cfg.Temporal.TaskQueue, workflowName, issueID)
 	}
+	if depends != "" {
+		if err := preflightDependency(c, cfg, workflowID, depends); err != nil {
+			return err
+		}
+	}
 	// The workflow starts by its registered type name (WorkflowTypeName) —
 	// the same name the worker registers the CompleteGreen-wrapped flow
 	// under. The registry's Fn is unwrapped and would reflect to that name
@@ -320,9 +326,19 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 		SharedTestQueue: sharedTestQueueInput(cfg),
 		TestOutputDir:   cfg.TestOutputDir(),
 		Folders:         folders,
+		DependsOn:       depends,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
+	}
+	if depends != "" {
+		// The pre-round note: while the gate holds the run in pending, no
+		// round has ever written to the task log — this line is what
+		// `daedalus log` (and the idle --status brief) shows meanwhile.
+		// Best-effort: a failed write never fails the run.
+		if err := activities.AppendSubmitNote(workflowID, "waiting on dependency: "+depends); err != nil {
+			fmt.Printf("warning: could not write the task-log dependency note: %v\n", err)
+		}
 	}
 
 	fmt.Printf("Started workflow:\n")
@@ -334,6 +350,59 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 		return nil
 	}
 	return awaitPipeline(run)
+}
+
+// preflightDependency is the submit-time half of the dependency gate: the
+// dependency is named by workflow id verbatim (the same convention as
+// continue/attach/wipe) and must exist on this config's task queue, so a
+// typo or a foreign-queue id fails before dispatch instead of pending
+// forever. A dependency already terminal without approval (failed,
+// canceled, wiped — or completed with a park marker) means the chain is
+// already broken: the run would fail at its first probe anyway, so the
+// refusal happens here. Terminal-approved passes straight through — the
+// workflow's first probe sees the approved completion and skips the wait
+// (idempotent re-submits). Anything still in flight dispatches and lets
+// the workflow gate block.
+func preflightDependency(c client.Client, cfg config.Config, workflowID, depID string) error {
+	if depID == workflowID {
+		return fmt.Errorf("dependency %s is this run's own id — a run cannot depend on itself", depID)
+	}
+	resp, err := c.DescribeWorkflowExecution(context.Background(), depID, "")
+	if err != nil {
+		// Only a genuinely absent id is a usage error; an unreachable
+		// server or any other failure returns plainly — the "check the id
+		// against daedalus list" advice needs the server that just failed.
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			usageFail("dependency %s: not found — check the id against \"daedalus list\"", depID)
+		}
+		return fmt.Errorf("describe dependency %s: %w", depID, err)
+	}
+	info := resp.GetWorkflowExecutionInfo()
+	// Same queue-ownership check as wakeup: chaining across queues would
+	// couple deployments whose workers cannot even see each other's
+	// activities coherently — the id says which queue owns the dependency.
+	if q := info.GetTaskQueue(); q != cfg.Temporal.TaskQueue {
+		return fmt.Errorf("dependency %s runs on task queue %q, not this config's %q — point -c at the config of the queue that owns it",
+			depID, q, cfg.Temporal.TaskQueue)
+	}
+	switch s := info.GetStatus(); s {
+	case enums.WORKFLOW_EXECUTION_STATUS_RUNNING, enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
+		return nil
+	case enums.WORKFLOW_EXECUTION_STATUS_COMPLETED:
+		var result string
+		if err := c.GetWorkflow(context.Background(), depID, "").Get(context.Background(), &result); err != nil {
+			return fmt.Errorf("read result of dependency %s: %w", depID, err)
+		}
+		if workflows.IsParkedResult(result) {
+			return fmt.Errorf("dependency %s completed parked — the chain is already broken; resume it with `daedalus continue %s \"<prompt>\"` first",
+				depID, depID)
+		}
+		return nil
+	default:
+		return fmt.Errorf("dependency %s is %s — the chain is already broken; resolve it first (closed sessions resume with: daedalus continue %s \"<prompt>\")",
+			depID, s, depID)
+	}
 }
 
 // warnFolderOverlap prints a best-effort warning when this run's folder
@@ -405,12 +474,14 @@ func writeExampleConfig(dir string) error {
 	return nil
 }
 
-// runVisibility is the decoded pair of run-visibility search attributes the
-// workflow upserts (workflows.DaedalusStatusAttr, LastActivityAttr). Named
-// fields, so no render site indexes a payload map.
+// runVisibility is the decoded trio of run-visibility search attributes the
+// workflow upserts (workflows.DaedalusStatusAttr, LastActivityAttr,
+// DaedalusDependsOnAttr). Named fields, so no render site indexes a payload
+// map.
 type runVisibility struct {
-	Status string
-	LastAt time.Time
+	Status    string
+	LastAt    time.Time
+	DependsOn string
 }
 
 // decodeRunVisibility reads the attributes from a listed execution's search
@@ -427,6 +498,9 @@ func decodeRunVisibility(sa *commonpb.SearchAttributes, dc converter.DataConvert
 	}
 	if p, ok := sa.GetIndexedFields()[workflows.LastActivityAttr]; ok {
 		_ = dc.FromPayload(p, &vis.LastAt)
+	}
+	if p, ok := sa.GetIndexedFields()[workflows.DaedalusDependsOnAttr]; ok {
+		_ = dc.FromPayload(p, &vis.DependsOn)
 	}
 	return vis
 }
@@ -472,13 +546,17 @@ func listPipelines(cfg config.Config, max int) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "SESSION ID\tSTATUS\tTIME")
+	fmt.Fprintln(w, "SESSION ID\tSTATUS\tDEPENDS_ON\tTIME")
 	dc := converter.GetDefaultDataConverter()
 	now := time.Now()
 	for _, info := range resp.GetExecutions() {
 		id := info.GetExecution().GetWorkflowId()
 		vis := decodeRunVisibility(info.GetSearchAttributes(), dc)
 		status := info.GetStatus().String()
+		dependsOn := vis.DependsOn
+		if dependsOn == "" {
+			dependsOn = "-"
+		}
 		started := info.GetStartTime().AsTime()
 		if closed := info.GetCloseTime(); closed.IsValid() {
 			// Closed: the enum is overridden only by a terminal
@@ -491,8 +569,8 @@ func listPipelines(cfg config.Config, max int) error {
 			case workflows.StatusApproved, workflows.StatusParked, workflows.StatusFailed:
 				status = vis.Status
 			}
-			fmt.Fprintf(w, "%s\t%s\t[%s | ended %s ago]\n",
-				id, status, dur(closed.AsTime().Sub(started)), dur(now.Sub(closed.AsTime())))
+			fmt.Fprintf(w, "%s\t%s\t%s\t[%s | ended %s ago]\n",
+				id, status, dependsOn, dur(closed.AsTime().Sub(started)), dur(now.Sub(closed.AsTime())))
 			continue
 		}
 		if vis.Status != "" {
@@ -502,8 +580,8 @@ func listPipelines(cfg config.Config, max int) error {
 		if !vis.LastAt.IsZero() {
 			elapsed = dur(now.Sub(vis.LastAt))
 		}
-		fmt.Fprintf(w, "%s\t%s\t[%s | started %s ago]\n",
-			id, status, elapsed, dur(now.Sub(started)))
+		fmt.Fprintf(w, "%s\t%s\t%s\t[%s | started %s ago]\n",
+			id, status, dependsOn, elapsed, dur(now.Sub(started)))
 	}
 	return w.Flush()
 }
