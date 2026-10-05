@@ -912,6 +912,8 @@ exit 0`)
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"pi",
 		"--mode",

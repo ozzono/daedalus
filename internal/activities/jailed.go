@@ -546,8 +546,31 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// unconditional. ponytail: appended-mask resolution itself is unprobed
 	// on this host (no ai-jail binary here) — confirm once against a real
 	// jail if a repo settings file is ever seen reaching a round.
+	// Mask the user-level ~/.claude/settings.json too: the jail's
+	// home-dotdir passthrough mounts it, and Claude Code applies a settings
+	// file's env block over process env — the exact precedence the
+	// worktree masks above guard against — so the operator's own
+	// ANTHROPIC_BASE_URL/API_KEY/MODEL there override AgentEnv's injected
+	// values and every jailed claude round dials the operator's config
+	// instead of the worker's (live 2026-10-05: maestro workflows served
+	// by Mistral model names nothing in the worker config produces). It
+	// also removes the AUTH_TOKEN trap: claude prefers
+	// ANTHROPIC_AUTH_TOKEN over ANTHROPIC_API_KEY when both are set, and
+	// operator home files typically carry the former while daedalus only
+	// ever injects the latter. Masking (not unmounting) keeps the settings
+	// loader happy, and the rest of ~/.claude — session state, the
+	// transcripts the watcher reads — stays mounted. Other jailed agents
+	// ignore .claude/, so this mask is unconditional like the worktree
+	// ones. ponytail: an absolute mask outside the worktree root is
+	// probe-owed on the same real-jail pass as the appended masks above,
+	// as is --mask's tolerance for a home path that does not exist.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return jailResult{}, fmt.Errorf("resolve home directory: %w", err)
+	}
 	args = append(args, "--mask", ".claude/settings.json",
-		"--mask", ".claude/settings.local.json")
+		"--mask", ".claude/settings.local.json",
+		"--mask", filepath.Join(home, ".claude", "settings.json"))
 	// amp's host login state (~/.config/amp) is not among ai-jail's
 	// agent-state dirs and AMP_API_KEY is not in its default env allowlist,
 	// so neither documented auth route reaches the jailed child on a stock
@@ -847,7 +870,7 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// log alone.
 	appendTaskLog(ctx, fmt.Sprintf("jailed %s round started: stage=%s worktree=%s pgid=%d",
 		selected, role, worktreePath, cmd.Process.Pid), "")
-	err := waitCommand(ctx, cmd)
+	err = waitCommand(ctx, cmd)
 	if known != nil {
 		close(watchStop)
 		<-watchDone

@@ -1,0 +1,22 @@
+# ai-jail sandbox configuration
+# https://github.com/akitaonrails/ai-jail
+# Edit freely. Regenerate with: ai-jail --clean --init
+
+command = [
+    "claude",
+    "--output-format",
+    "json",
+    "-p",
+    "--dangerously-skip-permissions",
+]
+rw_maps = [
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-mask-home-claude/backlog/bugs",
+    "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-mask-home-claude/.daedalus-folders/daedalus",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-mask-home-claude/backlog/bugs",
+]
+mask = [
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+]
+network = true
+no_worktree = false
