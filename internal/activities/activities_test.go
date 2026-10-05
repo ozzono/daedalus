@@ -266,6 +266,18 @@ func contains(args []string, substr string) bool {
 	return false
 }
 
+// homeClaudeMask returns the argv value expected for the operator-level
+// ~/.claude/settings.json mask that runJailedRoundFolders appends, resolved
+// from the ambient $HOME the same way the implementation resolves it.
+func homeClaudeMask(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve home: %v", err)
+	}
+	return filepath.Join(home, ".claude", "settings.json")
+}
+
 func TestWorktreePathFor(t *testing.T) {
 	home := fakeHome(t)
 
@@ -1251,6 +1263,8 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"claude",
 		"--output-format",
@@ -1310,6 +1324,8 @@ func TestRunJailedClaudeActivityResume(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"claude",
 		"--resume",
@@ -1319,6 +1335,69 @@ func TestRunJailedClaudeActivityResume(t *testing.T) {
 		"-p",
 		"--dangerously-skip-permissions",
 	}, "ai-jail")
+}
+
+// TestRunJailedClaudeActivityMasksHomeSettings pins that the operator-level
+// ~/.claude/settings.json mask resolves from $HOME at invocation time — not
+// a build-host constant — and is appended after the worktree-relative
+// masks: the jail's home passthrough would otherwise let the operator's own
+// settings env block override the worker-injected provider env in every
+// jailed round.
+func TestRunJailedClaudeActivityMasksHomeSettings(t *testing.T) {
+	scrubBugFilingEnv(t)
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", "echo AGENT-OUTPUT; exit 0")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-test")
+	home := filepath.Join(t.TempDir(), "operator-home")
+	t.Setenv("HOME", home)
+
+	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "fix the bug",
+	}); err != nil {
+		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("ai-jail called %d times, want 1", len(calls))
+	}
+	args := calls[0].Args
+	cutoff := slices.Index(args, "--")
+	if cutoff < 0 {
+		t.Fatalf("ai-jail args have no -- separator: %q", args)
+	}
+	assertArgs(t, args[:cutoff], []string{
+		"--worktree",
+		"--network",
+		"--mask",
+		".claude/settings.json",
+		"--mask",
+		".claude/settings.local.json",
+		"--mask",
+		filepath.Join(home, ".claude", "settings.json"),
+	}, "ai-jail pre-agent flags")
+}
+
+// TestRunJailedClaudeActivityHomeUnresolved pins the fail-fast path: an
+// unresolvable home directory fails the round before ai-jail launches,
+// rather than starting a jail without the home settings mask.
+func TestRunJailedClaudeActivityHomeUnresolved(t *testing.T) {
+	scrubBugFilingEnv(t)
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", "echo AGENT-OUTPUT; exit 0")
+	t.Setenv("HOME", "")
+
+	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "fix the bug",
+	})
+	if err == nil || !strings.Contains(err.Error(), "resolve home directory") {
+		t.Fatalf("err = %v, want a resolve-home-directory failure", err)
+	}
+	if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+		t.Errorf("ai-jail launched despite unresolved home (stub log exists)")
+	}
 }
 
 // TestRunJailedClaudeActivityResumeOtherAgents pins that opencode and amp
@@ -1462,6 +1541,8 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"opencode",
 		"run",
@@ -1501,6 +1582,8 @@ func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"opencode",
 		"run",
@@ -1557,6 +1640,8 @@ func TestRunJailedClaudeActivityAmp(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"amp",
 		"--stream-json-thinking",
@@ -1570,6 +1655,8 @@ func TestRunJailedClaudeActivityAmp(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--env",
 		"AMP_API_KEY",
 		"--",
@@ -1840,6 +1927,8 @@ exit 0`)
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"opencode",
 		"run",
@@ -1911,6 +2000,8 @@ exit 0`)
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"claude",
 		"--resume",
@@ -2307,6 +2398,8 @@ func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"opencode",
 		"run",
@@ -3721,6 +3814,8 @@ func TestRunJailedClaudeActivityPi(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"pi",
 		"--mode",
@@ -4123,6 +4218,8 @@ func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 		".claude/settings.json",
 		"--mask",
 		".claude/settings.local.json",
+		"--mask",
+		homeClaudeMask(t),
 		"--",
 		"pi",
 		"-p",
