@@ -144,13 +144,13 @@ func TestCompleteFlags(t *testing.T) {
 		want  []string
 	}{
 		{[]string{"-"}, allFlags},
-		{[]string{"--co"}, []string{"--config", "--cot"}},
+		{[]string{"--co"}, []string{"--config", "--cot", "--cot-n"}},
 		{[]string{"run", "--det"}, []string{"--detach"}},
 		// --yes already used: neither spelling is offered again.
 		{[]string{"wipe", "wf-1", "--yes", "-"}, withoutNames(allFlags, "yes")},
 		// -c already used: neither spelling is offered again, every other
 		// long spelling is.
-		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, []string{"--append", "--cli", "--cot", "--depends", "--detach", "--file", "--folder", "--prefix", "--status", "--type", "--workflow", "--yes"}},
+		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, []string{"--append", "--cli", "--cot", "--cot-n", "--depends", "--detach", "--file", "--folder", "--prefix", "--status", "--type", "--workflow", "--yes"}},
 		// The new dependency flag completes like any value-taking flag: by
 		// prefix, and its value position answers with nothing.
 		{[]string{"run", "--dep"}, []string{"--depends"}},
@@ -162,6 +162,9 @@ func TestCompleteFlags(t *testing.T) {
 		{[]string{"-f", ""}, nil},
 		{[]string{"--file", ""}, nil},
 		{[]string{"run", "-cli", ""}, nil},
+		// -cot-n is value-taking too: its value position answers with
+		// nothing.
+		{[]string{"log", "wf-1", "-cot", "--cot-n", ""}, nil},
 	} {
 		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("complete(%q) = %q, want %q", c.words, got, c.want)

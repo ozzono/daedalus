@@ -221,6 +221,7 @@ USAGE
   daedalus log <workflow-id>
   daedalus log <workflow-id> --status
   daedalus log <workflow-id> -cot
+  daedalus log <workflow-id> -cot -cot-n <N>
 
 Prints the task log /tmp/daedalus/<workflow-id>.log: one block per jailed
 agent or reviewer round — full stdout and stderr, untruncated — and one per
@@ -246,7 +247,11 @@ every agent.
 
 With -cot, prints the run's chain-of-thought logs instead of the task
 log: one complete section per jailed round (implementation and review),
-read from Temporal history, never truncated. Rounds with a native
+read from Temporal history, never truncated. Every section opens with a
+"=====================================" divider, and its header stamps
+the round's Temporal completion time ("=== round 2: dev-review (claude) @
+2026-10-05 14:32:11 UTC ==="), so consecutive rounds read as separate
+blocks instead of one unbroken blob. Rounds with a native
 thinking channel (claude, amp, pi) show their captured thinking;
 openai-wire rounds whose reasoning arrived inline in the answer show the
 <think>-fenced part when the model fenced it (tagless inline CoT cannot
@@ -257,6 +262,13 @@ config is found. Reviewer rounds' native thinking is not in history (the
 reviewer activity discards it at capture), so review sections surface
 only fenced inline CoT. A retry of a round appears as its own section —
 each attempt's CoT is its own.
+
+-cot-n <N> (only with -cot) tails the view to the last N completed
+rounds' sections — whole sections only, never truncated mid-section.
+Round numbers keep their place in the run's full history, so a tailed
+view can open above round 1. 0 prints no completed sections; a negative
+value is a usage error. A live in-flight section, when one exists, always
+follows regardless of the tail — it is newer than every completed round.
 
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
@@ -281,6 +293,7 @@ EXAMPLES
   $ daedalus log daedalus-42
   $ daedalus log daedalus-42 --status
   $ daedalus log daedalus-42 -cot
+  $ daedalus log daedalus-42 -cot -cot-n 3
 `,
 	"worker": `daedalus worker — manage the Temporal worker daemon.
 

@@ -298,7 +298,7 @@ func main() {
 			usageFail("log takes <workflow-id>")
 		}
 		if configPath.cot {
-			runTaskLogCot(args[1])
+			runTaskLogCot(args[1], configPath.cotN)
 			return
 		}
 		runTaskLog(args[1], configPath.status)
