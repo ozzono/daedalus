@@ -7,9 +7,16 @@ package template
 
 import (
 	"embed"
+	"errors"
 	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"text/template"
+	"text/template/parse"
 )
 
 //go:embed prompts/*.md
@@ -19,11 +26,246 @@ var promptFiles embed.FS
 // a packaging bug that must fail fast, not surface mid-workflow.
 var parsed = template.Must(template.ParseFS(promptFiles, "prompts/*.md"))
 
-// render executes the named template (without its .md suffix) and returns its
-// output with surrounding whitespace trimmed.
+// installed holds the configured prompt overrides, keyed by prompt name.
+// LoadOverrides writes it once at worker startup, before any poller can
+// render, and everything afterwards only reads it — no lock. Nil (the
+// default deployment) leaves every render byte-identical to the embedded
+// template.
+var installed map[string]*template.Template
+
+// Prompts lists the overridable prompt names — the embedded prompts/*.md
+// file stems — sorted. This is the exact vocabulary a config's prompt
+// section keys on.
+func Prompts() []string {
+	var names []string
+	for _, t := range parsed.Templates() {
+		if n, ok := strings.CutSuffix(t.Name(), ".md"); ok {
+			names = append(names, n)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// LoadOverrides installs the per-deployment prompt replacements: dir holds
+// one <prompt-name>.md file per replaced prompt, every stem naming a prompt
+// (see Prompts). The path is absolute, ~/…, or relative to baseDir (the
+// config file's directory, so a deployment's prompts travel with its
+// config). Every failure — an unknown stem, a missing directory, an
+// unreadable file, a template that does not parse, a data-field reference
+// the prompt's data does not carry, a {{template}} action, a review
+// override that dropped the verdict protocol — errors here, at worker
+// startup, instead of surfacing as a broken prompt mid-round. Overrides
+// resolve once per process like the embedded set itself: rendered prompts
+// are recorded in workflow history, so a mid-run edit plus worker restart
+// is the same divergence class as upgrading the binary mid-run, which the
+// pipeline already accepts.
+func LoadOverrides(dir, baseDir string) error {
+	if dir == "" {
+		return nil
+	}
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("prompt overrides: resolve home directory: %w", err)
+		}
+		dir = filepath.Join(home, strings.TrimPrefix(dir, "~"))
+	} else if !filepath.IsAbs(dir) {
+		dir = filepath.Join(baseDir, dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("prompt overrides: read %s: %w", dir, err)
+	}
+	// An empty directory is the unset case — no overrides, and no wiping of
+	// anything previously installed in this process.
+	if len(entries) == 0 {
+		return nil
+	}
+	loaded := make(map[string]*template.Template, len(entries))
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".md")
+		if !ok {
+			continue
+		}
+		emb := parsed.Lookup(name + ".md")
+		if emb == nil {
+			return fmt.Errorf("prompt overrides: %s does not name a prompt (available: %s)", e.Name(), strings.Join(Prompts(), ", "))
+		}
+		path := filepath.Join(dir, e.Name())
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("prompt overrides: read %s: %w", path, err)
+		}
+		// An empty replacement would install an empty prompt — every round
+		// of that kind would launch the jailed agent with nothing (the
+		// review override is the only one the verdict-word check happens to
+		// catch). An empty or whitespace-only source parses cleanly with no
+		// field references, so the check is on the source text.
+		if strings.TrimSpace(string(src)) == "" {
+			return fmt.Errorf("prompt overrides: %s is empty — a replacement prompt must have content", path)
+		}
+		ov, err := template.New(name + ".md").Parse(string(src))
+		if err != nil {
+			return fmt.Errorf("prompt overrides: parse %s: %w", path, err)
+		}
+		// A {{define}} body is dead content in an override: the parser
+		// hoists it out of the root tree, where it would dodge the field
+		// validation below and render nothing, and the only action that
+		// could invoke it ({{template}}) is rejected. A define whose name
+		// equals the file's own template name is the one form that renders:
+		// the parser makes it the root tree, so the set stays size 1 and
+		// every check below sees the real content.
+		if len(ov.Templates()) > 1 {
+			return fmt.Errorf("prompt overrides: %s contains a {{define}} block — a define body can never render in an override; put the content in the file body", path)
+		}
+		if err := checkOverride(name, emb, ov); err != nil {
+			return err
+		}
+		if name == "review" {
+			// The wholesale-replacement guard: a review override that
+			// dropped any verdict word would silently break every review
+			// loop — the reviewer would stop ending with a parseable
+			// verdict and each round would burn a NoVerdict strike.
+			for _, v := range reviewVerdicts {
+				if !strings.Contains(string(src), v) {
+					return fmt.Errorf("prompt overrides: review.md is missing %q — the verdict protocol is the machine contract the review loop parses (the reviewer's final line must be exactly one of %s); keep all four verdict words in the text", v, strings.Join(reviewVerdicts, " / "))
+				}
+			}
+		}
+		loaded[name] = ov
+	}
+	installed = loaded
+	return nil
+}
+
+// reviewVerdicts is the verdict protocol of review.md — the machine
+// contract parseReviewVerdict in internal/activities reads (the reviewer's
+// final non-empty line must be exactly one of these). REBUILD is offered
+// to the test reviewer only, but the same template serves both review
+// loops, so a replacement must carry all four even in a deployment that
+// believes it will never run a test phase.
+var reviewVerdicts = []string{"APPROVED", "CHANGES_REQUESTED", "NEEDS_MAINTAINER", "REBUILD"}
+
+// checkOverride validates a parsed override against the embedded prompt it
+// replaces: its data-field references must stay within the embedded
+// template's (the render funcs pass fixed data, so a typo'd field would
+// otherwise fail only mid-round), and it must not use {{template}} — an
+// override parses alone, so a reference could only fail (or recurse into
+// itself) at render time.
+func checkOverride(name string, emb, ov *template.Template) error {
+	allowed, err := dataFields(emb.Tree.Root)
+	if err != nil {
+		return err
+	}
+	referenced, err := dataFields(ov.Tree.Root)
+	if err != nil {
+		return fmt.Errorf("prompt override %q: %w", name, err)
+	}
+	var unknown []string
+	for _, f := range slices.Sorted(maps.Keys(referenced)) {
+		if !allowed[f] {
+			unknown = append(unknown, f)
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("prompt override %q: references data field(s) %s, which the prompt's data does not carry (its fields: %s)",
+			name, quotedList(unknown), quotedList(slices.Sorted(maps.Keys(allowed))))
+	}
+	return nil
+}
+
+// dataFields walks a parsed template collecting every root-level data-field
+// name it references — the X of each .X and .X.Y, and of each $.X and
+// $.X.Y (the $ root is the render data, so those are data lookups exactly
+// like .X; the parser folds them into a VariableNode, not a ChainNode).
+// Other variables are skipped: $x and $x.Y carry values, not data lookups.
+// {{template}} actions are rejected — overrides run alone. The walk is
+// scope-flat by design: a field read off a range or with variable
+// ({{range .Xs}}{{.Typo}}{{end}}) is collected as a root field and checked
+// against the root's data — ponytail: that can reject a legitimate
+// override, and the error names the fix (write it as .Xs.Typo). Tracking
+// dot's real type through range/with needs the data structs' types, which
+// the render funcs keep anonymous.
+func dataFields(n parse.Node) (map[string]bool, error) {
+	fields := map[string]bool{}
+	var walk func(parse.Node) error
+	walkBranch := func(b parse.BranchNode) error {
+		if err := walk(b.Pipe); err != nil {
+			return err
+		}
+		return errors.Join(walk(b.List), walk(b.ElseList))
+	}
+	walk = func(n parse.Node) error {
+		switch n := n.(type) {
+		case *parse.ListNode:
+			if n == nil {
+				return nil
+			}
+			for _, c := range n.Nodes {
+				if err := walk(c); err != nil {
+					return err
+				}
+			}
+		case *parse.ActionNode:
+			return walk(n.Pipe)
+		case *parse.IfNode:
+			return walkBranch(n.BranchNode)
+		case *parse.RangeNode:
+			return walkBranch(n.BranchNode)
+		case *parse.WithNode:
+			return walkBranch(n.BranchNode)
+		case *parse.PipeNode:
+			for _, c := range n.Cmds {
+				if err := walk(c); err != nil {
+					return err
+				}
+			}
+		case *parse.CommandNode:
+			for _, a := range n.Args {
+				if err := walk(a); err != nil {
+					return err
+				}
+			}
+		case *parse.FieldNode:
+			fields[n.Ident[0]] = true
+		case *parse.ChainNode:
+			return walk(n.Node)
+		case *parse.VariableNode:
+			// Only the $ root names the render data: $.X validates like
+			// .X, while $x and $x.Y reference a declared variable, not the
+			// data. ({{$.X}} parses to Ident ["$" "X"]; {{$x.Y}} to
+			// ["$x" "Y"].)
+			if len(n.Ident) > 1 && n.Ident[0] == "$" {
+				fields[n.Ident[1]] = true
+			}
+		case *parse.TemplateNode:
+			return fmt.Errorf("{{template %q}}: overrides run alone and may not reference other templates", n.Name)
+		}
+		return nil
+	}
+	return fields, walk(n)
+}
+
+// quotedList renders names as a comma-separated quoted list for error text.
+func quotedList(names []string) string {
+	q := make([]string, len(names))
+	for i, n := range names {
+		q[i] = strconv.Quote(n)
+	}
+	return strings.Join(q, ", ")
+}
+
+// render executes the named template (without its .md suffix) — the
+// installed override when one was loaded, else the embedded prompt — and
+// returns its output with surrounding whitespace trimmed.
 func render(name string, data any) (string, error) {
+	t := parsed.Lookup(name + ".md")
+	if o, ok := installed[name]; ok {
+		t = o
+	}
 	var b strings.Builder
-	if err := parsed.ExecuteTemplate(&b, name+".md", data); err != nil {
+	if err := t.Execute(&b, data); err != nil {
 		return "", fmt.Errorf("render prompt %q: %w", name, err)
 	}
 	return strings.TrimSpace(b.String()), nil

@@ -3,6 +3,7 @@ package activities
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1082,4 +1083,345 @@ exit 0`)
 			}
 		}
 	})
+}
+
+// opencodeTestEnv points XDG_DATA_HOME at a fresh temp dir and returns the
+// jail args the opencode bridge composes from it: the read-write state-dir
+// mount (session database and auth) plus the var pass-through that keeps
+// the child's own resolution on the mounted root. Exact-argv pins call it
+// so a host's real data home can never leak into the expectation.
+func opencodeTestEnv(t *testing.T) []string {
+	t.Helper()
+	dataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	dir := filepath.Join(dataHome, "opencode")
+	return []string{"--rw-map", dir + ":" + dir, "--env", "XDG_DATA_HOME"}
+}
+
+// codexTestEnv points CODEX_HOME at a fresh temp dir and returns the jail
+// args the codex bridge composes from it — same shape as opencodeTestEnv.
+func codexTestEnv(t *testing.T) []string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	return []string{"--rw-map", home + ":" + home, "--env", "CODEX_HOME"}
+}
+
+// TestCodexJailMounts pins the state-dir resolution behind the codex jail
+// mount: CODEX_HOME wins when the operator set it, ~/.codex otherwise, the
+// dir is created before spawn (a fresh host has none yet — the mount cannot
+// fail on it), the mount is read-write at the host path, and a colon in the
+// dir is rejected before it can compose into the --rw-map spec.
+func TestCodexJailMounts(t *testing.T) {
+	t.Run("CODEX_HOME honored and created", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "operator-codex-home")
+		t.Setenv("CODEX_HOME", dir)
+		args, err := codexJailMounts()
+		if err != nil {
+			t.Fatalf("codexJailMounts: %v", err)
+		}
+		want := []string{"--rw-map", dir + ":" + dir}
+		if !slices.Equal(args, want) {
+			t.Errorf("codexJailMounts() = %v, want %v", args, want)
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Errorf("codex state dir stat err = %v, want the dir created before spawn", err)
+		}
+	})
+
+	t.Run("default is ~/.codex under the home", func(t *testing.T) {
+		t.Setenv("CODEX_HOME", "")
+		home := fakeHome(t)
+		args, err := codexJailMounts()
+		if err != nil {
+			t.Fatalf("codexJailMounts: %v", err)
+		}
+		dir := filepath.Join(home, ".codex")
+		want := []string{"--rw-map", dir + ":" + dir}
+		if !slices.Equal(args, want) {
+			t.Errorf("codexJailMounts() = %v, want %v", args, want)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("default codex state dir stat err = %v, want it created", err)
+		}
+	})
+
+	t.Run("colon in the dir rejected", func(t *testing.T) {
+		t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "weird:dir"))
+		if _, err := codexJailMounts(); err == nil || !strings.Contains(err.Error(), "must not contain") {
+			t.Errorf("codexJailMounts() err = %v, want the colon-guard rejection", err)
+		}
+	})
+
+	t.Run("unresolvable home fails", func(t *testing.T) {
+		t.Setenv("CODEX_HOME", "")
+		t.Setenv("HOME", "")
+		if _, err := codexJailMounts(); err == nil || !strings.Contains(err.Error(), "resolve codex state dir") {
+			t.Errorf("codexJailMounts() err = %v, want a resolution failure", err)
+		}
+	})
+}
+
+// TestOpencodeJailMounts pins the state-dir resolution behind the opencode
+// jail mount: XDG_DATA_HOME wins when the operator set it, the home's
+// .local/share otherwise, the <data home>/opencode dir is created before
+// spawn, and a colon is rejected before composing the --rw-map spec.
+func TestOpencodeJailMounts(t *testing.T) {
+	t.Run("XDG_DATA_HOME honored and created", func(t *testing.T) {
+		dataHome := t.TempDir()
+		t.Setenv("XDG_DATA_HOME", dataHome)
+		args, err := opencodeJailMounts()
+		if err != nil {
+			t.Fatalf("opencodeJailMounts: %v", err)
+		}
+		dir := filepath.Join(dataHome, "opencode")
+		want := []string{"--rw-map", dir + ":" + dir}
+		if !slices.Equal(args, want) {
+			t.Errorf("opencodeJailMounts() = %v, want %v", args, want)
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Errorf("opencode state dir stat err = %v, want the dir created before spawn", err)
+		}
+	})
+
+	t.Run("default is the home's .local/share", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "")
+		home := fakeHome(t)
+		args, err := opencodeJailMounts()
+		if err != nil {
+			t.Fatalf("opencodeJailMounts: %v", err)
+		}
+		dir := filepath.Join(home, ".local", "share", "opencode")
+		want := []string{"--rw-map", dir + ":" + dir}
+		if !slices.Equal(args, want) {
+			t.Errorf("opencodeJailMounts() = %v, want %v", args, want)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("default opencode state dir stat err = %v, want it created", err)
+		}
+	})
+
+	t.Run("colon in the dir rejected", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "weird:root"))
+		if _, err := opencodeJailMounts(); err == nil || !strings.Contains(err.Error(), "must not contain") {
+			t.Errorf("opencodeJailMounts() err = %v, want the colon-guard rejection", err)
+		}
+	})
+
+	t.Run("unresolvable home fails", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "")
+		t.Setenv("HOME", "")
+		if _, err := opencodeJailMounts(); err == nil || !strings.Contains(err.Error(), "resolve opencode state dir") {
+			t.Errorf("opencodeJailMounts() err = %v, want a resolution failure", err)
+		}
+	})
+}
+
+// TestAgentResumeFlag pins the resume-capability table: claude, pi,
+// opencode, and codex take an id-addressable resume (codex via a
+// subcommand, so its flag is empty — agentResumeArgs composes that shape),
+// while amp and aider have none and their rounds ignore a set SessionID.
+func TestAgentResumeFlag(t *testing.T) {
+	for _, c := range []struct {
+		agent string
+		flag  string
+		ok    bool
+	}{
+		{"claude", "--resume", true},
+		{"pi", "--session", true},
+		{"opencode", "-s", true},
+		{"codex", "", true},
+		{"amp", "", false},
+		{"aider", "", false},
+	} {
+		flag, ok := agentResumeFlag(c.agent)
+		if flag != c.flag || ok != c.ok {
+			t.Errorf("agentResumeFlag(%s) = %q, %v; want %q, %v", c.agent, flag, ok, c.flag, c.ok)
+		}
+	}
+}
+
+// TestAgentResumeArgs pins the per-CLI resume compose: claude and pi take
+// the generic [flag, id] prefix ahead of their fixed args, while opencode
+// and codex resume only after their subcommand, so the whole post-`--`
+// argv is composed — subcommand, resume tokens, and the fixed headless set
+// embedded.
+func TestAgentResumeArgs(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		agent     string
+		id        string
+		agentArgs []string
+		want      []string
+	}{
+		{"claude", "claude", "sess-1", []string{"--output-format", "json"},
+			[]string{"--resume", "sess-1", "--output-format", "json"}},
+		{"pi", "pi", "sess-2", []string{"-p"},
+			[]string{"--session", "sess-2", "-p"}},
+		{"opencode", "opencode", "oc-3", nil,
+			[]string{"run", "-s", "oc-3", "--auto"}},
+		{"codex", "codex", "cx-4", nil,
+			[]string{"exec", "resume", "cx-4", "-", "--dangerously-bypass-approvals-and-sandbox"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := agentResumeArgs(c.agent, c.id, c.agentArgs)
+			if !slices.Equal(got, c.want) {
+				t.Errorf("agentResumeArgs(%s, %s) = %v, want %v", c.agent, c.id, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCodexRoundStagesProvider pins the runJailedRound wiring end to end:
+// a codex round served by the openai section launches ai-jail with the
+// state-dir bridge and the staged -c overrides (appended after the headless
+// set, where the exec subcommand defines them), a codex round with no
+// openai exports launches with no -c/-m at all, and a half-specified
+// section fails the round before launch.
+func TestCodexRoundStagesProvider(t *testing.T) {
+	t.Run("openai-served round carries the staged overrides", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		cxMount := codexTestEnv(t)
+		t.Setenv("DAEDALUS_AGENT", "codex")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "echo CODEX-OUTPUT; exit 0")
+
+		res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		})
+		if err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		if res.Text != "CODEX-OUTPUT\n" {
+			t.Errorf("result.Text = %q, want the raw plain-mode output", res.Text)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		want := slices.Concat(
+			[]string{"--worktree",
+				"--network",
+				"--mask",
+				".claude/settings.json",
+				"--mask",
+				".claude/settings.local.json",
+				"--mask",
+				homeClaudeMask(t)},
+			cxMount,
+			[]string{"--",
+				"codex",
+				"exec",
+				"--dangerously-bypass-approvals-and-sandbox"},
+			stagedCodexArgs("https://selfhost.example/v1", true, "glm-selfhost"),
+		)
+		assertArgs(t, calls[0].Args, want, "ai-jail")
+	})
+
+	t.Run("plain round launches with no overrides", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		cxMount := codexTestEnv(t)
+		t.Setenv("DAEDALUS_AGENT", "codex")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		assertArgs(t, calls[0].Args, slices.Concat(
+			[]string{"--worktree",
+				"--network",
+				"--mask",
+				".claude/settings.json",
+				"--mask",
+				".claude/settings.local.json",
+				"--mask",
+				homeClaudeMask(t)},
+			cxMount,
+			[]string{"--",
+				"codex",
+				"exec",
+				"--dangerously-bypass-approvals-and-sandbox"},
+		), "ai-jail")
+	})
+
+	t.Run("ambient key without url fails before launch", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		codexTestEnv(t)
+		t.Setenv("DAEDALUS_AGENT", "codex")
+		t.Setenv("OPENAI_API_KEY", "sk-ambient")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		})
+		if err == nil {
+			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-shape failure")
+		}
+		if !strings.Contains(err.Error(), "without a base URL") {
+			t.Errorf("error = %q, want the codex no-base-URL guard message", err)
+		}
+		if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+			calls := readCalls(t, log)
+			t.Errorf("ai-jail called %d times, want the round failed before launch (%v)", len(calls), calls)
+		}
+	})
+
+	t.Run("url without model fails before launch", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		codexTestEnv(t)
+		t.Setenv("DAEDALUS_AGENT", "codex")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		})
+		if err == nil {
+			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-shape failure")
+		}
+		if !strings.Contains(err.Error(), "without openai.model") {
+			t.Errorf("error = %q, want the codex no-model guard message", err)
+		}
+		if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+			calls := readCalls(t, log)
+			t.Errorf("ai-jail called %d times, want the round failed before launch (%v)", len(calls), calls)
+		}
+	})
+}
+
+// TestCodexRoundAPIErrorText pins the plain-text face classification: a
+// codex round that exits 0 with a litellm marker in its output is a failed
+// round (ErrAPIExhausted), never a silent success — codex joined aider and
+// opencode in the exit-0 marker match.
+func TestCodexRoundAPIErrorText(t *testing.T) {
+	codexTestEnv(t)
+	t.Setenv("DAEDALUS_AGENT", "codex")
+	newStubLog(t)
+	stubBin(t, "ai-jail", "printf 'litellm.ratelimiterror: 429\n'; exit 0")
+
+	_, err := runJailed(context.Background(), "codex", t.TempDir(), "do things")
+	if !errors.Is(err, ErrAPIExhausted) {
+		t.Fatalf("runJailed error = %v, want ErrAPIExhausted", err)
+	}
+	if !strings.Contains(err.Error(), "codex round reported an api error and exited clean") {
+		t.Errorf("error = %q, want the exit-0 marker classification", err)
+	}
 }

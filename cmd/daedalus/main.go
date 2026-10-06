@@ -9,10 +9,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/template"
 	"github.com/ozzono/daedalus/internal/version"
 )
 
@@ -187,7 +189,15 @@ func main() {
 			}
 		case "foreground":
 			// Run attached to this terminal — the daemon child's mode, and
-			// the way to debug a worker that will not start.
+			// the way to debug a worker that will not start. Prompt
+			// overrides resolve and validate here, the one place that knows
+			// the config file's directory: a bad override fails the start
+			// before any poller registers, never mid-round.
+			if cfg.Prompt != "" {
+				if err := template.LoadOverrides(cfg.Prompt, filepath.Dir(configPath.configPath)); err != nil {
+					fail("worker", err)
+				}
+			}
 			if err := runWorker(cfg, configPath.workerType); err != nil {
 				fail("worker", err)
 			}

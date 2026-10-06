@@ -995,6 +995,21 @@ func TestLiveCotSection(t *testing.T) {
 		}
 	})
 
+	t.Run("codex round notes the unread rollout transcript", func(t *testing.T) {
+		useTaskLogDir(t)
+		writeTaskLogFile(t, "wf-live-codex", startedLine("codex", "dev"))
+		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
+
+		// codex does keep a host transcript (its rollout tree), so the
+		// no-transcript note would be false for it — its own note says the
+		// live view does not read it.
+		want := "=== in-flight round (stage=dev, live) ===\n" +
+			"codex keeps a host transcript the live view does not read; CoT appears here when the round completes\n\n"
+		if got := liveCotSection("wf-live-codex"); got != want {
+			t.Errorf("liveCotSection = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("an empty stage reads as unknown in the header", func(t *testing.T) {
 		useTaskLogDir(t)
 		writeTaskLogFile(t, "wf-live-unknown", startedLine("aider", ""))

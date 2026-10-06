@@ -21,7 +21,15 @@ const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; eve
 # the openai section; its host
 # ~/.pi/agent/auth.json is bridged into the jail read-write and takes
 # priority over them, so a stale host login wins — keep it clean or
-# aligned), or aider (authenticates via the provider env vars below; the
+# aligned), codex (OpenAI's codex CLI — authenticates like pi via its host
+# login state (~/.codex, bridged into the jail read-write) plus the
+# provider env vars below, but reads no OPENAI_* var natively and speaks
+# only OpenAI wire formats: an openai-section round is bridged per
+# invocation through codex's own "-c" config overrides (see the openai
+# section), while an anthropic-section round has no codex channel at all),
+# or aider (DEPRECATED — it keeps working exactly as it does, but accepts
+# no new flags, fixes, or probes; authenticates via the provider env vars
+# below; the
 # jail masks the repo's .env to empty, so .env files cannot override
 # inside jailed rounds). opencode alert: neither the openai nor the
 # anthropic base-URL env vars reach it (source-verified 2026-09-26) — its
@@ -197,14 +205,14 @@ temporal:
 # wired lever, so the agent proceeds silently on its default (never an
 # error):
 #
-#   knob               claude    aider          opencode    pi            amp
-#   -----------------  --------  -------------  ----------  ------------  ---------
-#   context_tokens     env       staged file    ignored     staged file*  ignored
-#   max_output_tokens  env       staged file    ignored     staged file*  ignored
-#   thinking: false    env       argv           ignored     argv          ignored
-#   stream on/off      —         argv           ignored     ignored       ignored
-#   samplers (openai)  (n/a)     staged file    ignored     staged file*  (n/a)
-#   timeout_ms         env       (unprobed)     (unprobed)  staged file*  (unprobed)
+#   knob               claude    aider          opencode    pi            amp         codex
+#   -----------------  --------  -------------  ----------  ------------  ----------  ---------
+#   context_tokens     env       staged file    ignored     staged file*  ignored     ignored
+#   max_output_tokens  env       staged file    ignored     staged file*  ignored     ignored
+#   thinking: false    env       argv           ignored     argv          ignored     ignored
+#   stream on/off      —         argv           ignored     ignored       ignored     ignored
+#   samplers (openai)  (n/a)     staged file    ignored     staged file*  (n/a)       ignored
+#   timeout_ms         env       (unprobed)     (unprobed)  staged file*  (unprobed)  (unprobed)
 #
 # Lever detail: claude env = CLAUDE_CODE_MAX_CONTEXT_TOKENS (window) and
 # MAX_THINKING_TOKENS=0 (thinking) and CLAUDE_CODE_MAX_OUTPUT_TOKENS
@@ -225,7 +233,12 @@ temporal:
 # samplingParams as top-level OpenAI-completions request params with no
 # litellm layer in between, so top_k/min_p reach only backends that accept
 # non-standard OpenAI params.
-# amp is unprobed: no lever assumed until someone probes one.
+# amp is unprobed: no lever assumed until someone probes one. codex is
+# likewise unprobed for every knob row — no lever assumed — but note the
+# codex column says nothing about provider serving: the openai section's
+# url/key/model reach codex rounds regardless, bridged through codex's own
+# per-invocation "-c" config overrides (see the openai section below); only
+# these knob rows have no codex route.
 
 anthropic:
   # API base URL. Empty (the default) means "use whatever the worker's
@@ -254,7 +267,8 @@ anthropic:
   # exports as CLAUDE_CODE_MAX_CONTEXT_TOKENS (which jailed claude honors
   # for its compaction/budget math), replaces the input side of the
   # model metadata staged for aider rounds, and lands as contextWindow on
-  # the model entry staged for openai-served pi rounds; opencode and amp
+  # the model entry staged for openai-served pi rounds; opencode, amp, and
+  # codex
   # ignore it (opencode's only mechanism is a config-file pointer whose
   # precedence against a repo-committed opencode.json was never probed).
   # Zero/unset means each agent's own default.
@@ -266,7 +280,7 @@ anthropic:
   # CLAUDE_CODE_MAX_OUTPUT_TOKENS (the var claude 2.1.283's own error text
   # names for its request-level max_tokens override), and it lands as
   # maxTokens on the model entry staged for openai-served pi rounds.
-  # opencode/amp have
+  # opencode, amp, and codex have
   # no wired route. Zero/unset keeps aider's 8192 constant and every other
   # agent's API default.
   max_output_tokens: 0
@@ -292,7 +306,18 @@ openai:
   # default. The guard keys on the exported env vars, not on this section:
   # a foreground run inherits the invoking shell, so an ambient
   # OPENAI_API_KEY with no OPENAI_BASE_URL/OPENAI_MODEL fails pi rounds
-  # the same way — unset it or export a full section. Same rule as
+  # the same way — unset it or export a full section. A codex round
+  # consumes the section too, though codex reads no OPENAI_* var natively:
+  # the worker bridges it per invocation through codex's own "-c" config
+  # overrides (a staged model_providers entry carrying the base URL, the
+  # key's env-var NAME — the key value itself never lands in argv or on
+  # disk — and codex's responses wire, plus --model). Same failure posture
+  # as pi's: an openai section without url or without model fails a codex
+  # round before launch, and the guard keys on the exported env vars, so
+  # an ambient partial section fails codex rounds the same way. The
+  # section's timeout and sampler knobs have no codex route (a
+  # model_providers entry carries no request params) — the backend's own
+  # defaults stand. Same rule as
   # anthropic.url: empty = inherit the environment.
   url: ""
   key: ""
@@ -445,4 +470,32 @@ test_output:
   enabled: false
   dir: ""
   mirror: ""
+
+# Project-wise prompt overrides. Empty (the default): every round's prompt
+# renders byte-identically to the embedded templates in
+# internal/template/prompts. When set, this names a directory of
+# replacement prompts: one <prompt-name>.md file per replaced prompt, the
+# file stem naming the prompt — implement, implement_fix, continue, tests,
+# tests_failed, tests_review, review, rebuild, investigate,
+# investigate_fix, refactor, refactor_fix, bugfix, bugfix_fix, slim_plan,
+# slim_step, or slim_fix (daedalus template names, not flow names — there
+# is no dev-session). The path may be absolute, ~/…, or relative to this
+# config file's directory, so a deployment's replacements travel with its
+# config. Every .md file directly inside must name a prompt — a stray stem
+# (e.g. a hoped-for dev-session.md) fails the worker's start rather than
+# being ignored. The worker resolves and validates the whole directory at
+# startup: a missing directory, an unreadable file, a template that does
+# not parse, an empty file, a data field the prompt does not take (each
+# template renders a fixed struct — copy the field references from the
+# embedded file), a {{template}} action (an override runs alone), or a
+# review override missing the verdict protocol all fail the start, never a
+# mid-round render. Two machine contracts a replacement must keep: review
+# is validated at startup to still carry all four verdict words (APPROVED,
+# CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
+# protocol the loop parses), and slim_plan must keep instructing the
+# planner to emit the raw SlimSubtask JSON array the plan parser reads
+# (unvalidated — check it by hand). Overrides resolve once per worker
+# process at startup; rendered prompts are recorded in workflow history,
+# so replacement content is not secret and may live beside this config.
+# prompt: prompts/
 `

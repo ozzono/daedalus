@@ -1400,33 +1400,101 @@ func TestRunJailedClaudeActivityHomeUnresolved(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityResumeOtherAgents pins that opencode and amp
-// rounds ignore a set SessionID: neither CLI takes --resume here, so the
-// round must start fresh rather than pass an unknown flag.
+// TestRunJailedClaudeActivityResumeOtherAgents pins the per-CLI resume
+// compose: opencode and codex take their resume tokens after the run/exec
+// subcommand, so the activity hands over the whole post-`--` argv
+// (agentResumeArgs — subcommand and headless flags embedded, and codex's
+// provider staging still trails the headless set); amp has no
+// id-addressable resume and starts fresh rather than pass an unknown flag.
 func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
-	for _, agent := range []string{"opencode", "amp"} {
-		t.Run(agent, func(t *testing.T) {
-			log := newStubLog(t)
-			stubBin(t, "ai-jail", "echo OUTPUT; exit 0")
-			t.Setenv("DAEDALUS_AGENT", agent)
+	t.Run("opencode resumes via run -s", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		ocMount := opencodeTestEnv(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "echo OUTPUT; exit 0")
+		t.Setenv("DAEDALUS_AGENT", "opencode")
 
-			_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
-				WorktreePath: t.TempDir(),
-				Prompt:       "fix the bug",
-				SessionID:    "sess-7",
-			})
-			if err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
-			}
-			calls := readCalls(t, log)
-			if len(calls) != 1 {
-				t.Fatalf("ai-jail called %d times, want 1", len(calls))
-			}
-			if contains(calls[0].Args, "--resume") || contains(calls[0].Args, "sess-7") {
-				t.Errorf("%s round passed resume state: %v", agent, calls[0].Args)
-			}
+		res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+			SessionID:    "sess-7",
 		})
-	}
+		if err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		if res.Text != "OUTPUT\n" {
+			t.Errorf("result.Text = %q, want the raw plain-mode output", res.Text)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		assertArgs(t, calls[0].Args, append(slices.Concat(
+			[]string{"--worktree", "--network",
+				"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
+				"--mask", homeClaudeMask(t)},
+			ocMount,
+			[]string{"--", "opencode"},
+		), "run", "-s", "sess-7", "--auto"), "ai-jail")
+	})
+
+	t.Run("codex resumes via exec resume, staging trails", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		cxMount := codexTestEnv(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "echo OUTPUT; exit 0")
+		t.Setenv("DAEDALUS_AGENT", "codex")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+
+		res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+			SessionID:    "sess-7",
+		})
+		if err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		if res.Text != "OUTPUT\n" {
+			t.Errorf("result.Text = %q, want the raw plain-mode output", res.Text)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		assertArgs(t, calls[0].Args, append(slices.Concat(
+			[]string{"--worktree", "--network",
+				"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
+				"--mask", homeClaudeMask(t)},
+			cxMount,
+			[]string{"--", "codex", "exec", "resume", "sess-7", "-",
+				"--dangerously-bypass-approvals-and-sandbox"},
+		), stagedCodexArgs("https://selfhost.example/v1", true, "glm-selfhost")...), "ai-jail")
+	})
+
+	t.Run("amp ignores the session", func(t *testing.T) {
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "echo OUTPUT; exit 0")
+		t.Setenv("DAEDALUS_AGENT", "amp")
+		t.Setenv("AMP_API_KEY", "")
+
+		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+			SessionID:    "sess-7",
+		})
+		if err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if contains(calls[0].Args, "--resume") || contains(calls[0].Args, "sess-7") {
+			t.Errorf("amp round passed resume state: %v", calls[0].Args)
+		}
+	})
 }
 
 // TestAgentConcurrency pins the env parsing behind the concurrency cap:
@@ -1508,9 +1576,12 @@ func TestRunJailedSlotWaitBounded(t *testing.T) {
 
 // TestRunJailedClaudeActivityOpenCode pins the opencode path: DAEDALUS_AGENT
 // switches the jailed CLI, the headless flags replace claude's, no
-// stream-json is requested, and the plain output is taken as-is.
+// stream-json is requested, the state dir is bridged into the jail
+// (opencodeTestEnv — session db and auth), and the plain output is taken
+// as-is.
 func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 	scrubBugFilingEnv(t)
+	ocMount := opencodeTestEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "echo OPENCODE-OUTPUT; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "opencode")
@@ -1534,20 +1605,21 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"opencode",
-		"run",
-		"--auto",
-	}, "ai-jail")
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{"--worktree",
+			"--network",
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t)},
+		ocMount,
+		[]string{"--",
+			"opencode",
+			"run",
+			"--auto"},
+	), "ai-jail")
 	if calls[0].Stdin != "fix the bug" {
 		t.Errorf("ai-jail stdin = %q, want the prompt", calls[0].Stdin)
 	}
@@ -1556,9 +1628,11 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 // TestRunJailedClaudeActivityAgentOverride pins the -cli precedence: a run
 // whose Agent is set (run -cli/--cli) picks the jailed CLI over the worker's
 // DAEDALUS_AGENT — here the worker runs claude while the run asks for
-// opencode, and opencode's headless flag set is what reaches ai-jail.
+// opencode, and opencode's headless flag set (plus its state-dir bridge) is
+// what reaches ai-jail.
 func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 	scrubBugFilingEnv(t)
+	ocMount := opencodeTestEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "echo OPENCODE-OUTPUT; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "claude")
@@ -1575,20 +1649,21 @@ func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"opencode",
-		"run",
-		"--auto",
-	}, "ai-jail")
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{"--worktree",
+			"--network",
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t)},
+		ocMount,
+		[]string{"--",
+			"opencode",
+			"run",
+			"--auto"},
+	), "ai-jail")
 }
 
 // TestRunJailedClaudeActivityAmp pins the amp path: DAEDALUS_AGENT switches
@@ -1902,6 +1977,7 @@ exit 0`)
 // over the worker's DAEDALUS_AGENT.
 func TestRunJailedReviewerActivityAgentOverride(t *testing.T) {
 	scrubBugFilingEnv(t)
+	ocMount := opencodeTestEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
 exit 0`)
@@ -1920,20 +1996,21 @@ exit 0`)
 	if len(calls) != 3 {
 		t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
 	}
-	assertArgs(t, calls[2].Args, []string{
-		"--worktree",
-		"--network",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"opencode",
-		"run",
-		"--auto",
-	}, "review jail")
+	assertArgs(t, calls[2].Args, slices.Concat(
+		[]string{"--worktree",
+			"--network",
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t)},
+		ocMount,
+		[]string{"--",
+			"opencode",
+			"run",
+			"--auto"},
+	), "review jail")
 }
 
 // TestRunJailedReviewerActivityStderrNoise pins the stdout-only verdict rule:
@@ -2373,6 +2450,7 @@ func TestNativeTestsAIDiscovery(t *testing.T) {
 // detection would claim first), so the probed reply is real.
 func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 	scrubBugFilingEnv(t)
+	ocMount := opencodeTestEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail",
 		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test"}'; exit 0`)
@@ -2391,20 +2469,21 @@ func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("called %d times, want 2 (discovery + test run)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"opencode",
-		"run",
-		"--auto",
-	}, "discovery jail")
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{"--worktree",
+			"--network",
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t)},
+		ocMount,
+		[]string{"--",
+			"opencode",
+			"run",
+			"--auto"},
+	), "discovery jail")
 }
 
 // TestFirstCommandLine pins the reply hygiene: fences and backticks are
@@ -4154,7 +4233,7 @@ func TestParsePiUsage(t *testing.T) {
 
 // TestParseRoundOutput pins the per-CLI dispatch: pi reads its own event
 // schema, claude and amp share the claude schema, and the plain-text CLIs
-// (opencode, aider) yield nothing — the caller's cue to take the raw
+// (opencode, codex, aider) yield nothing — the caller's cue to take the raw
 // stdout.
 func TestParseRoundOutput(t *testing.T) {
 	piOut := `{"type":"session","id":"sess-p"}` + "\n" +
@@ -4171,7 +4250,7 @@ func TestParseRoundOutput(t *testing.T) {
 		t.Errorf("parseRoundOutput(claude) = %q, %q, %q, %+v; want claude's reply, session, and cost", thinking, text, session, usage)
 	}
 
-	for _, agent := range []string{"opencode", "aider"} {
+	for _, agent := range []string{"opencode", "codex", "aider"} {
 		thinking, text, session, usage = parseRoundOutput(agent, "plain markdown reply\n")
 		if thinking != "" || text != "" || session != "" || usage != (Usage{}) {
 			t.Errorf("parseRoundOutput(%s) = %q, %q, %q, %+v; want all empty (raw stdout is the text)", agent, thinking, text, session, usage)
@@ -4231,6 +4310,10 @@ func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 // stdout extracted as the discovered command, and the reply is trusted
 // once the probe verifies its runner exists.
 func TestNativeTestsAIDiscoveryPlainText(t *testing.T) {
+	scrubBugFilingEnv(t)
+	// The opencode data-dir bridge is exercised for its hermeticity side
+	// effect only; the jail argv itself is pinned by the override siblings.
+	opencodeTestEnv(t)
 	newStubLog(t)
 	stubBin(t, "ai-jail", "echo 'make test'; exit 0")
 	stubBin(t, "sh", "echo 'suite green'; exit 0")

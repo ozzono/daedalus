@@ -85,7 +85,29 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// the session tracking below work: the host sees
 		// ~/.pi/agent/sessions.
 		return "pi", []string{"-p"}, []string{"--mode", "json"}
+	case "codex":
+		// codex exec is the headless entry: it reads the prompt from piped
+		// stdin like claude -p (probe-verified banner, codex-cli 0.160.0:
+		// "Reading additional input from stdin..."), and
+		// --dangerously-bypass-approvals-and-sandbox is codex's own lever
+		// for "environments that are externally sandboxed" — which is
+		// exactly the jail; codex's own --worktree/-C stay unset, daedalus
+		// owns the worktree cwd. Output is plain text, so Thinking stays
+		// empty and the raw stdout is the round's text. codex speaks only
+		// OpenAI wire formats, so an anthropic-section round has no codex
+		// channel at all (pi's asymmetry class — see
+		// backlog/bugs/pi-anthropic-fallback-unserveable.md); the openai
+		// section is bridged per invocation by stageCodexProvider, and the
+		// state dir the jail must bridge for auth and session tracking is
+		// resolved by codexJailMounts.
+		return "codex", []string{"exec", "--dangerously-bypass-approvals-and-sandbox"}, nil
 	case "aider":
+		// DEPRECATED, amp-parity: it keeps working exactly as it does
+		// today, but it is no longer changed or maintained — no new flags,
+		// fixes, or probes. Its known gaps are accepted limitations, not
+		// work items: no id-addressable resume (below), openai-only model
+		// wiring (the litellm anthropic probe is still pending), and the
+		// uv-tools-only install layout.
 		// --yes-always approves every confirmation. (--yes is not a real
 		// flag: it only works via argparse prefix abbreviation and would
 		// break loudly if a second --yes* option ever appears.)
@@ -217,20 +239,133 @@ func aiderJailMounts() ([]string, error) {
 	return args, nil
 }
 
+// codexJailMounts resolves the codex state dir a jailed codex round needs
+// mapped into the jail and returns it as an ai-jail argument. ai-jail's
+// agent-state presets bridge ~/.claude and ~/.pi but not ~/.codex — where
+// codex keeps both its auth (auth.json) and the session rollouts the
+// tracking (codexTranscriptIDs) reads — so an unmounted round can neither
+// authenticate nor record a resumable session. The dir is CODEX_HOME when
+// the operator set it, ~/.codex otherwise, and it is mapped read-write at
+// its host path: codex resolves both from CODEX_HOME/its default, so the
+// jail must see the dir exactly where the host has it, and the rollouts
+// must land on the host for a retry to resume them. A missing dir is
+// created before spawn (a fresh host has none yet; an empty dir is what
+// codex's first session would create anyway) so the mount cannot fail on
+// it. ponytail: assembled but never probed against a real ai-jail — this
+// sandbox has no binary; that the extra --rw-map nests inside the
+// --worktree mount and composes with the bug-mirror/folder-grant maps is
+// the same verification class as those blocks. Probe on the first live
+// host, alongside them.
+func codexJailMounts() ([]string, error) {
+	dir := os.Getenv("CODEX_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("resolve codex state dir: %w", err)
+		}
+		dir = filepath.Join(home, ".codex")
+	}
+	// Same invariant FolderMounts and the bug-mirror block enforce for
+	// their --rw-map specs: a colon in the path splits the spec at the
+	// wrong boundary.
+	if strings.ContainsRune(dir, ':') {
+		return nil, fmt.Errorf("codex state dir %s must not contain %q — it composes into the jail's --rw-map <source>:<dest> mount spec", dir, ":")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("prepare codex state dir %s: %w", dir, err)
+	}
+	return []string{"--rw-map", dir + ":" + dir}, nil
+}
+
+// opencodeJailMounts resolves the opencode state dir a jailed opencode
+// round needs mapped into the jail and returns it as an ai-jail argument.
+// The generic jail passthrough blank-slates home (ai-jail's agent-state
+// presets bridge ~/.claude and ~/.pi only), and opencode keeps its session
+// database — and its auth.json — under <data home>/opencode, so an
+// unmounted round's sessions die with the sandbox and the host-side
+// tracking (opencodeSessionList) never sees them: the mount is what makes
+// opencode's resume path real under the jail. The data home is
+// XDG_DATA_HOME when the operator set it (opencode's documented data-dir
+// root), ~/.local/share otherwise; like codexJailMounts the dir is mapped
+// read-write at its host path so the child's own resolution lands on it,
+// which requires the child to see the same XDG_DATA_HOME — the caller
+// passes it through with --env (the amp pattern) when set. The accepted
+// trade is pi's and codex's: the bridged dir carries opencode's
+// auth.json, so host login state reaches jailed rounds read-write.
+// ponytail: assembled but never probed against a real ai-jail — this
+// sandbox has no binary; and that jailed opencode honors XDG_DATA_HOME is
+// probe-derived (its documented XDG layout), not exercised live.
+func opencodeJailMounts() ([]string, error) {
+	dataHome := os.Getenv("XDG_DATA_HOME")
+	if dataHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("resolve opencode state dir: %w", err)
+		}
+		dataHome = filepath.Join(home, ".local", "share")
+	}
+	dir := filepath.Join(dataHome, "opencode")
+	// Same invariant FolderMounts and the bug-mirror block enforce for
+	// their --rw-map specs: a colon in the path splits the spec at the
+	// wrong boundary.
+	if strings.ContainsRune(dir, ':') {
+		return nil, fmt.Errorf("opencode state dir %s must not contain %q — it composes into the jail's --rw-map <source>:<dest> mount spec", dir, ":")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("prepare opencode state dir %s: %w", dir, err)
+	}
+	return []string{"--rw-map", dir + ":" + dir}, nil
+}
+
 // agentResumeFlag returns the flag that resumes a previous conversation on
 // the named CLI — claude: --resume; pi: --session (it takes a session file
-// path or a partial UUID, so the full recorded UUID works). ok is false for
-// agents with no session-id mechanism (opencode, amp, aider — aider's chat
-// history persists to a markdown file, not anything id-addressable), whose
-// rounds ignore a set SessionID and always start fresh.
+// path or a partial UUID, so the full recorded UUID works); opencode: -s
+// (on its run subcommand). codex has no flag — its resume is a subcommand
+// nested under exec (`codex exec resume <id>`), composed whole by
+// agentResumeArgs, and "" marks that. ok is false for agents with no
+// id-addressable resume (amp, aider — aider's chat history persists to a
+// markdown file, not anything id-addressable), whose rounds ignore a set
+// SessionID and always start fresh.
 func agentResumeFlag(agent string) (flag string, ok bool) {
 	switch agent {
 	case "claude":
 		return "--resume", true
 	case "pi":
 		return "--session", true
+	case "opencode":
+		return "-s", true
+	case "codex":
+		return "", true
 	}
 	return "", false
+}
+
+// agentResumeArgs composes a resuming round's agent args. claude and pi
+// take their resume flag anywhere before the headless set, so the generic
+// [flag, id] prefix composes ahead of the fixed agentArgs (see
+// jailedAgentCLI) and the headless set still appends at the jail. opencode
+// and codex resume only after their subcommand (opencode: `run -s <id>`;
+// codex: `exec resume <id> -`, the `-` pointing the prompt at stdin after
+// the id), so those two compose the whole post-`--` argv — subcommand and
+// fixed headless flags embedded — and runJailedRoundFolders skips its own
+// headless append for them (a non-empty caller agent-arg list for exactly
+// those two CLIs is always such a precomposed round; their fixed list is
+// empty). Callers gate on agentResumeFlag first: this assumes ok was true.
+func agentResumeArgs(agent, id string, agentArgs []string) []string {
+	flag, _ := agentResumeFlag(agent)
+	switch agent {
+	case "opencode":
+		_, headless, _ := jailedAgentCLI(agent)
+		// -s belongs to the run subcommand: it composes right after the
+		// subcommand head, before the rest of the headless set.
+		return append([]string{headless[0], flag, id}, headless[1:]...)
+	case "codex":
+		_, headless, _ := jailedAgentCLI(agent)
+		// The resume subcommand nests under exec; the rest of the headless
+		// set trails.
+		return append([]string{headless[0], "resume", id, "-"}, headless[1:]...)
+	}
+	return append([]string{flag, id}, agentArgs...)
 }
 
 // agentConcurrency reads the worker-level cap on concurrent jailed-agent
@@ -429,10 +564,10 @@ func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArg
 // runJailedKind is runJailed for a round that belongs to a chained
 // conversation: role names it (RoleDev/RoleTest/RoleDevReview/
 // RoleTestReview), and the round's conversation id is recorded for retry
-// resume as soon as the CLI creates its transcript (see agentsession.go;
-// only claude and pi create transcripts daedalus can address). An empty
-// role — discovery, and every direct caller that does not chain — skips
-// the tracking.
+// resume as soon as the CLI creates its session state (see agentsession.go;
+// claude, pi, opencode, and codex keep session state daedalus can address).
+// An empty role — discovery, and every direct caller that does not chain —
+// skips the tracking.
 func runJailedKind(ctx context.Context, role SessionRole, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
 	return runJailedKindFolders(ctx, role, agent, worktreePath, prompt, nil, agentArgs...)
 }
@@ -502,6 +637,16 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// round env — pi's provider staging included.
 	env = reviewerEnv(env, role)
 	selected, headless, _ := jailedAgentCLI(agent)
+	// opencode and codex resumed rounds arrive with the whole post-`--`
+	// argv precomposed (agentResumeArgs — their resume tokens follow the
+	// run/exec subcommand, so the fixed headless set is already embedded);
+	// appending the fixed set behind it would repeat it. Their fixed list
+	// is empty, so a non-empty caller list for exactly those two CLIs is
+	// always such a precomposed round — a fresh or one-shot round (no
+	// caller args) takes the fixed set as usual.
+	if len(agentArgs) > 0 && (selected == "opencode" || selected == "codex") {
+		headless = nil
+	}
 	// pi-served implementing rounds carry a small-model edit-discipline
 	// guardrail (self-hosted models otherwise retry failing edits without
 	// re-reading; wa-termo 2026-09-29). Gated to pi and the edit-carrying
@@ -590,6 +735,38 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			return jailResult{}, err
 		}
 		args = append(args, mounts...)
+	}
+	// ai-jail has no codex preset: its agent-state dirs bridge ~/.claude
+	// and ~/.pi, not ~/.codex — map the state dir in read-write before
+	// launch (codexJailMounts), or the round can neither authenticate nor
+	// record the session a retry would resume. CODEX_HOME rides the amp
+	// pattern (--env copies the value from this process's environment)
+	// when the operator set it: the mount follows the var host-side, so
+	// the jailed codex must resolve the same dir — without it the child
+	// falls back to $HOME/.codex and misses the mounted state entirely.
+	if selected == "codex" {
+		mounts, err := codexJailMounts()
+		if err != nil {
+			return jailResult{}, err
+		}
+		args = append(args, mounts...)
+		if os.Getenv("CODEX_HOME") != "" {
+			args = append(args, "--env", "CODEX_HOME")
+		}
+	}
+	// Same for opencode: its session database (and auth.json) lives under
+	// the data home (opencodeJailMounts), and an operator-set
+	// XDG_DATA_HOME must reach the child or it resolves a different root
+	// than the one mounted.
+	if selected == "opencode" {
+		mounts, err := opencodeJailMounts()
+		if err != nil {
+			return jailResult{}, err
+		}
+		args = append(args, mounts...)
+		if os.Getenv("XDG_DATA_HOME") != "" {
+			args = append(args, "--env", "XDG_DATA_HOME")
+		}
 	}
 	// The bug-file mirror (bug_filing.mirror), mounted read-write into the
 	// round's sandbox at the worktree-relative bug dir when configured: the
@@ -752,6 +929,23 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 		}
 	}
 	args = append(args, headless...)
+	// codex reads no provider env var natively, so an openai-served codex
+	// round is bridged per invocation: stageCodexProvider returns the -c
+	// overrides selecting the staged provider and -m the model, layered
+	// over the host config the jail maps in (codexJailMounts) without
+	// rewriting it. Appended after the headless set — the overrides must
+	// follow the exec subcommand (their flags are defined there), in both
+	// this fresh shape and the precomposed resumed shape (headless nil).
+	// An anthropic-section round has no codex channel (see jailedAgentCLI)
+	// — the anthropic env simply stages nothing, and the round dials
+	// whatever the host's ~/.codex/config.toml says.
+	if selected == "codex" {
+		modelArgs, err := stageCodexProvider(env)
+		if err != nil {
+			return jailResult{}, err
+		}
+		args = append(args, modelArgs...)
+	}
 	// pi's thinking follows the config: an explicit thinking: false is
 	// exported as DAEDALUS_THINKING=off at worker startup. The builder
 	// translates that one signal to each agent's own off lever here —
@@ -820,21 +1014,28 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(prompt)
 
-	// Session tracking snapshot: the transcripts the CLI already holds for
-	// this worktree, taken before spawn so the round's own session is the
-	// new one (claude: its transcript dir; pi: its per-worktree session
-	// dir — the other CLIs create nothing the watcher would find, so the
-	// claude snapshot stays harmless for them). If the dir cannot be read,
+	// Session tracking snapshot: the session state the CLI already holds
+	// for this worktree, taken before spawn so the round's own session is
+	// the new one (claude: its transcript dir; pi: its per-worktree session
+	// dir; codex: its rollout tree, arbitrated per worktree by the
+	// recorded cwd; opencode: its session database, listed by shelling out
+	// — amp and aider create nothing the watcher would find, so the claude
+	// snapshot stays harmless for them). If the source cannot be read,
 	// tracking stays off for the round (known stays nil) rather than risk
-	// recording an old session. The capture itself is the transcript file
-	// on disk — not anything the round printed: pi's json output carries
+	// recording an old session. The capture itself is the session state on
+	// disk — not anything the round printed: pi's json output carries
 	// the session id from its first line, but nothing a jailed round
 	// prints may decide anything (see the ErrAgentKilled wrap note below).
 	var known map[string]bool
 	idsFn, recordFn, watchFn := transcriptIDs, recordNewTranscript, watchTranscripts
 	if role != "" {
-		if selected == "pi" {
+		switch selected {
+		case "pi":
 			idsFn, recordFn, watchFn = piTranscriptIDs, recordNewPiTranscript, watchPiTranscripts
+		case "opencode":
+			idsFn, recordFn, watchFn = opencodeTranscriptIDs, recordNewOpencodeTranscript, watchOpencodeTranscripts
+		case "codex":
+			idsFn, recordFn, watchFn = codexTranscriptIDs, recordNewCodexTranscript, watchCodexTranscripts
 		}
 		if ids, ok := idsFn(worktreePath); ok {
 			known = ids
@@ -923,12 +1124,12 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	if apiErr != "" {
 		return res, fmt.Errorf("%w: %s round died on an api error: %s", ErrAPIExhausted, selected, apiErr)
 	}
-	// Exit-0 plain-text faces (aider, opencode): their API failures surface
-	// only as litellm/connection error text in otherwise-successful output,
-	// so classify a marker hit as a failed round instead of a silent
-	// success. Both streams are read, symmetric with the failed path above
-	// — which CLI prints its failure face where is its business, not this
-	// check's. The structured faces never reach this branch
+	// Exit-0 plain-text faces (aider, opencode, codex): their API failures
+	// surface only as litellm/connection error text in otherwise-successful
+	// output, so classify a marker hit as a failed round instead of a silent
+	// success. All three streams are read, symmetric with the failed path
+	// above — which CLI prints its failure face where is its business, not
+	// this check's. The structured faces never reach this branch
 	// (agentAPIError handled them above), which is what keeps the
 	// forgeable match off claude and pi.
 	// ponytail: this match IS forgeable — chat text an agent printed can
@@ -936,7 +1137,7 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// are litellm-internal shapes an agent has no honest reason to print,
 	// and the cost is bounded (failover, heartbeat, park), never silent
 	// wrong work.
-	if selected == "aider" || selected == "opencode" {
+	if selected == "aider" || selected == "opencode" || selected == "codex" {
 		if out := res.Stdout + res.Stderr; matchesAny(out, apiErrorTextMarkers) {
 			return res, fmt.Errorf("%w: %s round reported an api error and exited clean: %s",
 				ErrAPIExhausted, selected, out)
@@ -1186,7 +1387,7 @@ var apiExhaustionMarkers = []string{
 
 // apiErrorTextMarkers are the plain-text faces of an API-level failure —
 // the litellm error classes and connection failures aider (and, in plain
-// text mode, opencode) print into their output when the provider fails,
+// text mode, opencode and codex) print into their output when the provider fails,
 // with no structured event and often a clean exit 0. They extend the
 // exhaustion match on a failed round's output and are the only
 // classification a clean-exiting plain-text round can get (see the

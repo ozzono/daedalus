@@ -91,10 +91,11 @@ FLAGS
                           branch_prefix (the issue part of the name stays as given).
                           Fresh runs only — rejected in append mode.
   -cli, --cli <agent>     Jailed agent for this run: claude, opencode, amp,
-                          pi, or aider. Overrides the config's agent; travels
-                          with the run's workflow input, so it applies on
-                          whichever worker serves the queue. Fresh runs only —
-                          rejected in append mode.
+                          pi, aider (deprecated), or codex. Overrides the
+                          config's agent; travels with the run's workflow
+                          input, so it applies on whichever worker serves
+                          the queue. Fresh runs only — rejected in append
+                          mode.
   -folder, --folder <path>
                           Grant this run read-write access to a host folder
                           (repeatable). Each is mounted into the jailed
@@ -240,9 +241,11 @@ while the worker or Temporal are down, and it is always scoped to the one
 workflow id given. A missing log prints the same not-started error either way.
 The transcript freshness and digest read claude's transcript dir and pi's
 session dir, newest file wins — a previous run's stale transcripts on one
-side never shadow the other agent's live session. Agents that keep no
-transcript daedalus can address (opencode, amp, aider) show "no
-transcripts yet" even while running; the task log itself is complete for
+side never shadow the other agent's live session. Agents the reader does
+not consult (opencode, codex, amp, aider) show "no transcripts yet" even
+while running — opencode and codex do keep addressable session state
+(their rounds chain conversations; the status view just does not read it
+yet), while amp and aider keep none; the task log itself is complete for
 every agent.
 
 With -cot, prints the run's chain-of-thought logs instead of the task
@@ -256,7 +259,7 @@ thinking channel (claude, amp, pi) show their captured thinking;
 openai-wire rounds whose reasoning arrived inline in the answer show the
 <think>-fenced part when the model fenced it (tagless inline CoT cannot
 be told apart from the answer, so it is not guessed at); rounds with no
-CoT at all (aider, opencode) say so per round. Needs the Temporal
+CoT at all (aider, opencode, codex) say so per round. Needs the Temporal
 service up: it dials the resolved config's host, or the default when no
 config is found. Reviewer rounds' native thinking is not in history (the
 reviewer activity discards it at capture), so review sections surface
@@ -273,9 +276,11 @@ follows regardless of the tail — it is newer than every completed round.
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
 host-side transcript as the agent writes it — claude's and pi's, the same
-newest-wins precedence as --status. Agents that keep no host transcript
-(aider, opencode, amp) get one line saying their CoT appears when the
-round completes. Between rounds there is no live section — the newest
+newest-wins precedence as --status. Agents whose host transcripts the
+live view does not follow (aider, opencode, codex, amp) get one line
+saying their CoT appears when the round completes — codex does keep a
+rollout transcript, the live view just does not read it yet. Between
+rounds there is no live section — the newest
 transcript then belongs to the just-finished round, already rendered
 above — and a round whose transcript holds no assistant output yet says
 so in one line. The live section never truncates, and it does not repeat
@@ -387,9 +392,9 @@ fresh "daedalus run <repo-path>" additionally prefers the target repo's
 .daedalus/config.yaml over all of the above — see "daedalus run --help".
 
 CONFIGURATION REFERENCE
-  agent                 Jailed agent CLI: claude, opencode, amp, pi, or
-                        aider (default claude; run -cli/--cli overrides per
-                        run)
+  agent                 Jailed agent CLI: claude, opencode, amp, pi, aider
+                        (deprecated), or codex (default claude; run
+                        -cli/--cli overrides per run)
   thinking              Thinking toggle: an explicit false sends each
                         agent its own off lever (pi --thinking off, aider
                         --thinking-tokens 0, claude MAX_THINKING_TOKENS=0);
@@ -493,12 +498,12 @@ CONFIGURATION REFERENCE
                         Jailed agent context window in tokens: exported as
                         CLAUDE_CODE_MAX_CONTEXT_TOKENS for claude, and the
                         input side of aider's staged model metadata;
-                        ignored by opencode/pi/amp (0 = agent default)
+                        ignored by opencode/pi/amp/codex (0 = agent default)
   anthropic.max_output_tokens
                         Jailed agent completion cap in tokens: re-exported
                         as CLAUDE_CODE_MAX_OUTPUT_TOKENS for claude, and
                         both sides of the 8192 constant in aider's staged
-                        model metadata; ignored by opencode/pi/amp (0 =
+                        model metadata; ignored by opencode/pi/amp/codex (0 =
                         aider constant / agent API default)
   openai.top_p/presence_penalty/top_k/min_p/repetition_penalty
                         Sampler knobs for rounds served by the openai
@@ -507,7 +512,9 @@ CONFIGURATION REFERENCE
                         until its passthrough is probed (0 = omitted from
                         the request entirely)
   openai.url/key/model  Optional OpenAI settings injected into the agent
-                        environment
+                        environment; aider and codex rounds consume the
+                        section directly (aider via --model openai/<model>,
+                        codex via per-invocation -c overrides)
   fallback.enabled/url/key/model/heartbeat_model
                         Independent secondary provider: when a jailed round
                         fails with the primary's quota exhausted, the worker
@@ -519,7 +526,8 @@ CONFIGURATION REFERENCE
                         wire is chosen by the agent (claude dials ANTHROPIC_*),
                         so openai serves only agents dialing OPENAI_BASE_URL;
                         pi and aider dial whichever provider their selected
-                        model uses
+                        model uses, and codex dials OpenAI wire formats only,
+                        so an openai fallback is exactly what serves it
 `,
 	"config": `daedalus config — print the active configuration.
 
@@ -562,9 +570,9 @@ jailed agent CLIs that report them) into per-session, per-day, per-worker,
 and total slices, and lists this host's workers with their live slot
 occupancy (busy/total) and rounds queued waiting for a slot.
 
-CLIs without a structured result (opencode, aider) report only the worker's
-measured wall time: their rounds count toward ROUNDS and TIME with zero
-cost and tokens. pi's --mode json events carry usage, so its rounds report
+CLIs without a structured result (opencode, codex, aider) report only the
+worker's measured wall time: their rounds count toward ROUNDS and TIME with
+zero cost and tokens. pi's --mode json events carry usage, so its rounds report
 cost and tokens like claude's and amp's. Rounds that ran before usage
 capture carry no Usage at all in history and are absent from the slices
 entirely, not zeroed.

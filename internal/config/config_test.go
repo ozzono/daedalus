@@ -71,7 +71,7 @@ func TestLoadDefaults(t *testing.T) {
 // TestLoadAgent pins the accepted agent values: every shipped agent loads,
 // anything else is rejected with the available choices named.
 func TestLoadAgent(t *testing.T) {
-	for _, agent := range []string{"claude", "opencode", "amp", "pi", "aider"} {
+	for _, agent := range []string{"claude", "opencode", "amp", "pi", "aider", "codex"} {
 		cfg, err := Load(writeConfig(t, "agent: "+agent+"\n"))
 		if err != nil {
 			t.Fatalf("Load(agent: %s): %v", agent, err)
@@ -910,6 +910,7 @@ fallback:
 reviewer:
   url: https://review.example
   key: sk-review
+prompt: overrides/
 `))
 	if err != nil {
 		t.Fatalf("LoadRaw: %v", err)
@@ -926,7 +927,7 @@ reviewer:
 		"agent:", "branch_prefix:", "authorship:", "worker_id:",
 		"tests_timeout:", "agent_run_timeout:", "review_timeout:", "cleanup_timeout:",
 		"max_concurrent_agent_runs:", "max_concurrent_tests:",
-		"temporal:", "anthropic:", "openai:", "fallback:", "reviewer:",
+		"temporal:", "anthropic:", "openai:", "fallback:", "reviewer:", "prompt:",
 	} {
 		i := strings.Index(out, key)
 		if i < 0 {
@@ -986,7 +987,7 @@ func TestRenderYAMLUnsetFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderYAML: %v", err)
 	}
-	for _, want := range []string{"tests_timeout: 0", "agent_run_timeout: 0", `agent: ""`, "authorship: false", "enabled: false"} {
+	for _, want := range []string{"tests_timeout: 0", "agent_run_timeout: 0", `agent: ""`, "authorship: false", "enabled: false", `prompt: ""`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderYAML(empty) output is missing %q:\n%s", want, out)
 		}

@@ -1,10 +1,12 @@
 package activities
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,10 +23,14 @@ import (
 // that gap: the round's conversation id is persisted to a small state file
 // while the round still runs, and a retry whose workflow-provided id is
 // empty resumes the recorded conversation (recordedAgentSession). The id's
-// source is the transcript file the CLI itself writes — claude's
+// source is the session state the CLI itself writes — claude's
 // `<uuid>.jsonl` under the worktree's project dir, pi's
-// `<timestamp>_<uuid>.jsonl` under the worktree's session dir, each created
-// the moment the session starts and independent of the process afterwards —
+// `<timestamp>_<uuid>.jsonl` under the worktree's session dir, codex's
+// `rollout-<timestamp>-<session-id>.jsonl` under its sessions tree (a
+// worktree's own files told apart by the recorded cwd), opencode's rows in
+// its session database, listed by shelling out to
+// `opencode session list --format json` — each created the moment the
+// session starts and independent of the process afterwards —
 // detected as "new since the snapshot taken at spawn" (transcript
 // tracking). Nothing the round
 // printed is trusted: claude's json output emits a single result object at
@@ -228,12 +234,19 @@ func recordedPiSession(ctx context.Context, worktree string, role SessionRole) (
 	return recordedSessionCheck(ctx, worktree, role, piTranscriptExists)
 }
 
-// recordedAgentSession dispatches recordedSession per agent: only claude
-// and pi have transcripts the tracking can address; every caller is gated
-// on agentResumeFlag, so anything else never reaches here.
+// recordedAgentSession dispatches recordedSession per agent: claude and pi
+// get their dedicated wrappers; opencode and codex share the body with
+// their own staleness check; amp and aider have no session state the
+// tracking can address. Every caller is gated on agentResumeFlag, so
+// anything else never reaches here.
 func recordedAgentSession(ctx context.Context, agent, worktree string, role SessionRole) (string, bool) {
-	if agent == "pi" {
+	switch agent {
+	case "pi":
 		return recordedPiSession(ctx, worktree, role)
+	case "opencode":
+		return recordedSessionCheck(ctx, worktree, role, opencodeTranscriptExists)
+	case "codex":
+		return recordedSessionCheck(ctx, worktree, role, codexTranscriptExists)
 	}
 	return recordedSession(ctx, worktree, role)
 }
@@ -425,6 +438,284 @@ func watchTranscriptsIn(ctx context.Context, known map[string]bool, worktree str
 			}
 		}
 	}
+}
+
+// sameDir reports whether two path strings name the same directory after
+// cleaning. The transcript filters compare paths the CLIs recorded against
+// the worktree path daedalus holds; a trailing separator or a non-clean
+// form on either side must not split them. An empty string never matches —
+// an unreadable codex rollout cannot attribute its session anywhere.
+func sameDir(a, b string) bool {
+	return a != "" && filepath.Clean(a) == filepath.Clean(b)
+}
+
+// opencodeSession is one entry of `opencode session list --format json`
+// (probe-verified shape, opencode 1.18.31: id, directory, created,
+// updated, projectId, title). Only the two fields the tracking needs are
+// modeled; the rest of each entry is ignored.
+type opencodeSession struct {
+	ID        string `json:"id"`
+	Directory string `json:"directory"`
+}
+
+// opencodeListTimeout bounds one `opencode session list` invocation — the
+// tracking shells out to it once per round (the spawn-time snapshot) and
+// then once per transcriptScanInterval tick, and a wedged opencode must
+// cost tracking, not the round.
+const opencodeListTimeout = 10 * time.Second
+
+// opencodeSessionList shells out to `opencode session list --format json`.
+// Since 1.18.x opencode keeps every session in one SQLite database
+// (~/.local/share/opencode/opencode.db) with no per-session files, and the
+// list command is its only read that needs no Go sqlite driver — one JSON
+// array answers what the transcript walk answers for the file-based CLIs.
+// The database is the round's only because the jail bridges that dir in
+// (opencodeJailMounts) — an unbridged jailed round's sessions die with its
+// sandbox and nothing here can ever see them.
+// ok is false when the command fails, times out, or prints anything
+// unparseable; tracking stays off for the round rather than mistake an old
+// session for this round's.
+func opencodeSessionList() ([]opencodeSession, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), opencodeListTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "opencode", "session", "list", "--format", "json").Output()
+	if err != nil {
+		return nil, false
+	}
+	var sessions []opencodeSession
+	if json.Unmarshal(out, &sessions) != nil {
+		return nil, false
+	}
+	return sessions, true
+}
+
+// opencodeTranscriptIDs lists the session ids opencode holds for this
+// worktree — the snapshot half of the diff.
+func opencodeTranscriptIDs(worktree string) (map[string]bool, bool) {
+	sessions, ok := opencodeSessionList()
+	if !ok {
+		return nil, false
+	}
+	ids := map[string]bool{}
+	for _, s := range sessions {
+		if sameDir(s.Directory, worktree) {
+			ids[s.ID] = true
+		}
+	}
+	return ids, true
+}
+
+// recordNewOpencodeTranscript records the conversation id of a session
+// opencode created for this worktree after the round's snapshot — the
+// round's own session — and reports whether one was found.
+func recordNewOpencodeTranscript(ctx context.Context, known map[string]bool, worktree string, role SessionRole) bool {
+	sessions, ok := opencodeSessionList()
+	if !ok {
+		return false
+	}
+	for _, s := range sessions {
+		if s.ID == "" || known[s.ID] || !sameDir(s.Directory, worktree) {
+			continue
+		}
+		recordSession(ctx, worktree, role, s.ID)
+		activityLogger(ctx).Info("Conversation transcript recorded for retry resume",
+			"Role", string(role), "SessionID", s.ID)
+		return true
+	}
+	return false
+}
+
+// watchOpencodeTranscripts polls opencode's session list until the round's
+// session appears, the round ends (stop closes), or the activity context
+// ends.
+func watchOpencodeTranscripts(ctx context.Context, known map[string]bool, worktree string, role SessionRole, stop <-chan struct{}) {
+	watchTranscriptsIn(ctx, known, worktree, role, stop, recordNewOpencodeTranscript)
+}
+
+// opencodeTranscriptExists reports whether opencode still lists session id
+// for this worktree — the staleness check for a recorded opencode session
+// (the database is never auto-pruned today, but the check keeps the
+// contract uniform with the file-based CLIs, whose transcripts claude
+// prunes).
+func opencodeTranscriptExists(worktree, id string) bool {
+	sessions, ok := opencodeSessionList()
+	if !ok {
+		return false
+	}
+	for _, s := range sessions {
+		if s.ID == id && sameDir(s.Directory, worktree) {
+			return true
+		}
+	}
+	return false
+}
+
+// codexSessionsRoot returns codex's session rollout root — ~/.codex/sessions
+// (under CODEX_HOME when the operator set it), a tree of YYYY/MM/DD dirs
+// holding rollout-<timestamp>-<session-id>.jsonl files, created at session
+// start and independent of the process (probe-verified against a live
+// 401-failing round: the rollout file lands before any API traffic). ok is
+// false only when even the home dir cannot be resolved.
+func codexSessionsRoot() (string, bool) {
+	dir := os.Getenv("CODEX_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", false
+		}
+		dir = filepath.Join(home, ".codex")
+	}
+	return filepath.Join(dir, "sessions"), true
+}
+
+// codexSessionID extracts codex's session id from a rollout file name —
+// rollout-<timestamp>-<session-id>.jsonl, where the timestamp itself
+// carries hyphens (2026-10-05T17-45-12) and the id is a UUID (four
+// hyphens), so the id is everything after the fifth hyphen from the right
+// (piSessionID's last-field rule, five fields deep).
+func codexSessionID(name string) (string, bool) {
+	if !strings.HasSuffix(name, ".jsonl") {
+		return "", false
+	}
+	base := strings.TrimSuffix(name, ".jsonl")
+	i := len(base)
+	for n := 0; n < 5; n++ {
+		j := strings.LastIndexByte(base[:i], '-')
+		if j < 0 {
+			return "", false
+		}
+		i = j
+	}
+	return base[i+1:], true
+}
+
+// codexTranscriptIDs lists the session ids codex holds rollout files for —
+// the whole sessions tree, walked because the YYYY/MM/DD nesting is
+// codex's own and a session whose file lands after a day boundary sits in
+// another dir than its siblings'. The snapshot is global across worktrees
+// (claude scopes by per-project dir; codex has no such layout) — the
+// record step arbitrates by the recorded cwd. ok is false when the tree
+// cannot be read for a reason other than not existing yet — codex creates
+// it with its first session, so a missing root is a valid empty snapshot.
+func codexTranscriptIDs(worktree string) (map[string]bool, bool) {
+	root, ok := codexSessionsRoot()
+	if !ok {
+		return nil, false
+	}
+	ids := map[string]bool{}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if path == root && errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if id, ok := codexSessionID(d.Name()); ok {
+			ids[id] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false
+	}
+	return ids, true
+}
+
+// codexRolloutCWD reads the rollout file's first line and returns the
+// cwd codex recorded for the session — the session_meta line's payload.cwd
+// (top-level fallback for schema drift). It is what attributes a file in
+// the shared sessions tree to this worktree's round: two concurrent rounds
+// in different worktrees each see both new files, and only the cwd says
+// which is whose. An unreadable, empty, or malformed first line reports ""
+// — the caller skips the file rather than record a session it cannot
+// attribute.
+func codexRolloutCWD(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	var line struct {
+		Payload struct {
+			CWD string `json:"cwd"`
+		} `json:"payload"`
+		CWD string `json:"cwd"`
+	}
+	sc := bufio.NewScanner(f)
+	if !sc.Scan() || json.Unmarshal(sc.Bytes(), &line) != nil {
+		return ""
+	}
+	if line.Payload.CWD != "" {
+		return line.Payload.CWD
+	}
+	return line.CWD
+}
+
+// recordNewCodexTranscript records the conversation id of a rollout file
+// created after the round's snapshot whose recorded cwd is this worktree —
+// the round's own session — and reports whether one was found.
+func recordNewCodexTranscript(ctx context.Context, known map[string]bool, worktree string, role SessionRole) bool {
+	root, ok := codexSessionsRoot()
+	if !ok {
+		return false
+	}
+	recorded := false
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		id, ok := codexSessionID(d.Name())
+		if !ok || known[id] || !sameDir(codexRolloutCWD(path), worktree) {
+			return nil
+		}
+		recordSession(ctx, worktree, role, id)
+		activityLogger(ctx).Info("Conversation transcript recorded for retry resume",
+			"Role", string(role), "SessionID", id)
+		recorded = true
+		return filepath.SkipAll
+	})
+	if err != nil {
+		return false
+	}
+	return recorded
+}
+
+// watchCodexTranscripts polls codex's rollout tree until the round's file
+// appears, the round ends (stop closes), or the activity context ends.
+func watchCodexTranscripts(ctx context.Context, known map[string]bool, worktree string, role SessionRole, stop <-chan struct{}) {
+	watchTranscriptsIn(ctx, known, worktree, role, stop, recordNewCodexTranscript)
+}
+
+// codexTranscriptExists reports whether codex holds a rollout file for id —
+// the staleness check for a recorded codex session. The id is a UUID, so
+// the file name alone identifies the session wherever its recorded cwd
+// points; the walk covers the day-boundary dirs.
+func codexTranscriptExists(worktree, id string) bool {
+	root, ok := codexSessionsRoot()
+	if !ok {
+		return false
+	}
+	found := false
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if own, ok := codexSessionID(d.Name()); ok && own == id {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // brokenResume reports whether err is consistent with the resumed

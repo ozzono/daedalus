@@ -41,7 +41,11 @@ func wantsPipelineWorker(workerType string) bool { return workerType != workerTy
 func wantsTestWorker(workerType string) bool { return workerType != workerTypeDev }
 
 // runWorker registers and runs the pollers the daemon's run type selects
-// (workerType: dev, test, or empty for both) and blocks running them.
+// (workerType: dev, test, or empty for both) and blocks running them. Any
+// prompt overrides were resolved and validated by the caller (the one
+// `worker foreground` dispatch, which knows the config file's directory)
+// before this runs, so a bad override fails the start before any poller
+// registers.
 func runWorker(cfg config.Config, workerType string) error {
 	// Export provider settings into the worker's environment — but only the
 	// ones actually set in the config. A missing key is not an error: the

@@ -1116,3 +1116,446 @@ exit 0`)
 		t.Errorf("fresh review args %v must start clean, not resume rev-past", jail.Args)
 	}
 }
+
+// fakeCodexHome points CODEX_HOME at a fresh temp dir and returns it — the
+// state dir both codexJailMounts and the rollout tracking resolve, so a
+// test must never let them touch the real ~/.codex of the host.
+func fakeCodexHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	return home
+}
+
+// Codex session ids are UUIDs, and the extraction rule (fifth hyphen from
+// the right) is defined over that shape — the rollout fixtures must carry
+// realistic ids for the round trip to hold.
+const (
+	codexUUIDA = "0f8a2b1c-3d4e-5f60-7a8b-9c0d1e2f3a4b"
+	codexUUIDB = "abcdef01-2222-3333-4444-555555555555"
+	codexUUIDC = "12345678-90ab-4cde-8f01-23456789abcd"
+)
+
+// plantCodexRollout fakes codex's own record of a session: the rollout file
+// under CODEX_HOME's sessions tree in its YYYY/MM/DD day dir, named
+// rollout-<timestamp>-<session-id>.jsonl with the session's recorded cwd in
+// the first line's session_meta payload — the field the tracking
+// arbitrates by. Returns the file's path.
+func plantCodexRollout(t *testing.T, codexHome, day, id, cwd string) string {
+	t.Helper()
+	dir := filepath.Join(codexHome, "sessions", filepath.FromSlash(day))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir rollout day dir: %v", err)
+	}
+	meta, err := json.Marshal(map[string]any{
+		"timestamp": "2026-10-05T17:45:12.000Z",
+		"type":      "session_meta",
+		"payload":   map[string]any{"cwd": cwd},
+	})
+	if err != nil {
+		t.Fatalf("marshal session meta: %v", err)
+	}
+	path := filepath.Join(dir, "rollout-2026-10-05T17-45-12-"+id+".jsonl")
+	if err := os.WriteFile(path, append(meta, '\n'), 0o644); err != nil {
+		t.Fatalf("write rollout: %v", err)
+	}
+	return path
+}
+
+// TestSameDir pins the path comparison the codex and opencode filters
+// arbitrate by: a trailing separator or a non-clean form on either side
+// must not split two paths naming one directory, and an empty string never
+// matches — an unreadable rollout cannot attribute its session anywhere.
+func TestSameDir(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{
+		{"/tmp/wt", "/tmp/wt", true},
+		{"/tmp/wt/", "/tmp/wt", true},
+		{"/tmp/wt", "/tmp/wt/", true},
+		{"/tmp/./wt", "/tmp/wt", true},
+		{"/tmp/wt", "/tmp/other", false},
+		{"/tmp/wt", "", false},
+		{"", "/tmp/wt", false},
+		{"", "", false},
+	} {
+		if got := sameDir(c.a, c.b); got != c.want {
+			t.Errorf("sameDir(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// TestCodexSessionID pins the id extraction from codex's rollout file
+// names: the id is everything after the fifth hyphen from the right — the
+// timestamp itself carries hyphens (2026-10-05T17-45-12) and the UUID id
+// four more — so a timestamped rollout's id survives whole; non-jsonl
+// entries and names too short to carry the shape hold no id.
+func TestCodexSessionID(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		want string
+		ok   bool
+	}{
+		{"rollout-2026-10-05T17-45-12-0f8a2b1c-3d4e-5f60-7a8b-9c0d1e2f3a4b.jsonl",
+			"0f8a2b1c-3d4e-5f60-7a8b-9c0d1e2f3a4b", true},
+		{"rollout-2026-10-06T00-01-02-abcdef01-2222-3333-4444-555555555555.jsonl",
+			"abcdef01-2222-3333-4444-555555555555", true},
+		{"rollout-1234.jsonl", "", false},
+		{"notes.txt", "", false},
+	} {
+		got, ok := codexSessionID(c.name)
+		if got != c.want || ok != c.ok {
+			t.Errorf("codexSessionID(%q) = %q, %v; want %q, %v", c.name, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// TestCodexTranscriptIDs pins the codex snapshot: rollout files are listed
+// by their extracted id across the whole day-dir tree (a session whose file
+// lands after a day boundary sits in another dir than its siblings),
+// non-rollout entries are ignored, a missing sessions tree is a valid empty
+// snapshot (codex creates it with its first session), and an unresolvable
+// state dir disables detection rather than risking an old session being
+// mistaken for this round's.
+func TestCodexTranscriptIDs(t *testing.T) {
+	cxHome := fakeCodexHome(t)
+	wt := t.TempDir()
+
+	ids, ok := codexTranscriptIDs(wt)
+	if !ok || len(ids) != 0 {
+		t.Errorf("codexTranscriptIDs without a sessions tree = %v, %v; want an empty snapshot", ids, ok)
+	}
+
+	plantCodexRollout(t, cxHome, "2026/10/05", codexUUIDA, wt)
+	plantCodexRollout(t, cxHome, "2026/10/06", codexUUIDB, wt)
+	sessions := filepath.Join(cxHome, "sessions")
+	if err := os.WriteFile(filepath.Join(sessions, "notes.txt"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessions, "rollout-1234.jsonl"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ids, ok = codexTranscriptIDs(wt)
+	if !ok || len(ids) != 2 || !ids[codexUUIDA] || !ids[codexUUIDB] {
+		t.Errorf("codexTranscriptIDs = %v, %v; want exactly both UUIDs across the day dirs", ids, ok)
+	}
+
+	// An operator-set CODEX_HOME moves the tree the tracking reads.
+	other := t.TempDir()
+	t.Setenv("CODEX_HOME", other)
+	plantCodexRollout(t, other, "2026/10/05", codexUUIDC, wt)
+	if ids, ok = codexTranscriptIDs(wt); !ok || len(ids) != 1 || !ids[codexUUIDC] {
+		t.Errorf("codexTranscriptIDs under CODEX_HOME = %v, %v; want the other tree's session only", ids, ok)
+	}
+
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("HOME", "")
+	if ids, ok = codexTranscriptIDs(t.TempDir()); ok || ids != nil {
+		t.Errorf("codexTranscriptIDs without a home = %v, %v; want detection off", ids, ok)
+	}
+}
+
+// TestCodexRolloutCWD pins the attribution read: the recorded cwd comes
+// from the first line's session_meta payload (with the top-level cwd as the
+// schema-drift fallback), and an unreadable, empty, or malformed first line
+// reports "" — the caller skips the file rather than record a session it
+// cannot attribute to a worktree.
+func TestCodexRolloutCWD(t *testing.T) {
+	t.Run("session_meta payload wins", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "rollout.jsonl")
+		if err := os.WriteFile(path, []byte(
+			`{"timestamp":"t","type":"session_meta","payload":{"cwd":"/tmp/wt"}}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := codexRolloutCWD(path); got != "/tmp/wt" {
+			t.Errorf("codexRolloutCWD = %q, want the payload cwd", got)
+		}
+	})
+
+	t.Run("top-level cwd fallback", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "rollout.jsonl")
+		if err := os.WriteFile(path, []byte(`{"type":"session_meta","cwd":"/tmp/other"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := codexRolloutCWD(path); got != "/tmp/other" {
+			t.Errorf("codexRolloutCWD = %q, want the top-level cwd", got)
+		}
+	})
+
+	for _, c := range []struct{ name, line string }{
+		{"malformed first line", "{not json"},
+		{"empty file", ""},
+		{"no cwd recorded", `{"type":"session_meta","payload":{}}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rollout.jsonl")
+			if err := os.WriteFile(path, []byte(c.line), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := codexRolloutCWD(path); got != "" {
+				t.Errorf("codexRolloutCWD = %q, want %q", got, "")
+			}
+		})
+	}
+
+	if got := codexRolloutCWD(filepath.Join(t.TempDir(), "missing.jsonl")); got != "" {
+		t.Errorf("codexRolloutCWD(missing) = %q, want %q", got, "")
+	}
+}
+
+// TestRecordNewCodexTranscript pins the recording rule: a rollout file the
+// round's snapshot does not already know — the round's own session — is
+// recorded only when its recorded cwd is this worktree, the shared tree's
+// arbitration between concurrent worktrees' rounds.
+func TestRecordNewCodexTranscript(t *testing.T) {
+	fakeHome(t)
+	cxHome := fakeCodexHome(t)
+	ctx := context.Background()
+	wt := t.TempDir()
+	other := t.TempDir()
+	plantCodexRollout(t, cxHome, "2026/10/05", codexUUIDA, wt)
+
+	known := map[string]bool{codexUUIDA: true}
+	if recordNewCodexTranscript(ctx, known, wt, RoleDev) {
+		t.Error("recordNewCodexTranscript recorded a known rollout")
+	}
+	if id, _ := recordedSession(ctx, wt, RoleDev); id != "" {
+		t.Errorf("record holds %q, want empty", id)
+	}
+
+	// Another worktree's fresh rollout is not this round's.
+	plantCodexRollout(t, cxHome, "2026/10/06", codexUUIDB, other)
+	if recordNewCodexTranscript(ctx, known, wt, RoleDev) {
+		t.Error("recordNewCodexTranscript recorded a rollout whose cwd is another worktree")
+	}
+	if id, _ := recordedSession(ctx, wt, RoleDev); id != "" {
+		t.Errorf("record holds %q, want empty", id)
+	}
+
+	plantCodexRollout(t, cxHome, "2026/10/06", codexUUIDC, wt)
+	if !recordNewCodexTranscript(ctx, known, wt, RoleDev) {
+		t.Error("recordNewCodexTranscript missed the round's new rollout")
+	}
+	if id, stale := recordedAgentSession(ctx, "codex", wt, RoleDev); id != codexUUIDC || stale {
+		t.Errorf("recorded session = %q (stale=%v), want the new UUID live", id, stale)
+	}
+}
+
+// TestCodexTranscriptExists pins the staleness check: the UUID-named file
+// identifies the session wherever its day dir sits, and a missing sessions
+// tree holds nothing.
+func TestCodexTranscriptExists(t *testing.T) {
+	cxHome := fakeCodexHome(t)
+	plantCodexRollout(t, cxHome, "2026/10/06", codexUUIDA, t.TempDir())
+
+	// The worktree argument plays no part: the UUID file name alone
+	// identifies the session wherever its recorded cwd points.
+	if !codexTranscriptExists("", codexUUIDA) {
+		t.Error("codexTranscriptExists = false, want the planted rollout found across the day dirs")
+	}
+	if codexTranscriptExists("", codexUUIDB) {
+		t.Error("codexTranscriptExists = true for an absent id, want false")
+	}
+
+	os.RemoveAll(cxHome)
+	if codexTranscriptExists("", codexUUIDA) {
+		t.Error("codexTranscriptExists after the tree is removed = true, want false")
+	}
+}
+
+// TestRecordedCodexSession pins the codex fallback: a recorded id reads
+// back live while codex holds its rollout, other roles get nothing, and a
+// gone rollout reports stale — the per-agent dispatch routes codex to the
+// rollout tree, not claude's transcripts.
+func TestRecordedCodexSession(t *testing.T) {
+	fakeHome(t)
+	cxHome := fakeCodexHome(t)
+	ctx := context.Background()
+	wt := t.TempDir()
+
+	recordSession(ctx, wt, RoleDev, codexUUIDA)
+	plantCodexRollout(t, cxHome, "2026/10/05", codexUUIDA, wt)
+
+	id, stale := recordedAgentSession(ctx, "codex", wt, RoleDev)
+	if id != codexUUIDA || stale {
+		t.Fatalf("recordedAgentSession(codex) = %q (stale=%v), want the recorded UUID live", id, stale)
+	}
+	if id, _ := recordedAgentSession(ctx, "codex", wt, RoleTest); id != "" {
+		t.Errorf("role %s resumed %q; one role's session must not serve another", RoleTest, id)
+	}
+
+	if err := os.Remove(filepath.Join(cxHome, "sessions", "2026", "10", "05",
+		"rollout-2026-10-05T17-45-12-"+codexUUIDA+".jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	if id, stale := recordedAgentSession(ctx, "codex", wt, RoleDev); id != "" || !stale {
+		t.Errorf("recordedAgentSession(codex) after removal = %q (stale=%v), want empty and stale", id, stale)
+	}
+}
+
+// fakeOpencodeList installs an `opencode` stub whose `session list --format
+// json` prints the given body — the read opencodeSessionList shells out to,
+// since opencode keeps every session in one SQLite database with no
+// per-session files to walk.
+func fakeOpencodeList(t *testing.T, body string) {
+	t.Helper()
+	stubBin(t, "opencode", "printf '%s' '"+body+"'; exit 0")
+}
+
+// opencodeListJSON renders the session entries a fake `opencode session
+// list` prints.
+func opencodeListJSON(entries ...string) string {
+	return "[" + strings.Join(entries, ",") + "]"
+}
+
+// TestOpencodeSessionList pins the read and its failure posture: the JSON
+// array parses into the modeled fields, and a missing binary, a nonzero
+// exit, or unparseable output all report not-ok — tracking stays off for
+// the round rather than mistake an old session for this round's.
+func TestOpencodeSessionList(t *testing.T) {
+	t.Run("list parses", func(t *testing.T) {
+		fakeOpencodeList(t, opencodeListJSON(
+			`{"id":"oc-1","directory":"/tmp/wt","title":"ignored","projectId":"p"}`,
+			`{"id":"oc-2","directory":"/tmp/other"}`,
+		))
+		sessions, ok := opencodeSessionList()
+		if !ok || len(sessions) != 2 || sessions[0].ID != "oc-1" || sessions[0].Directory != "/tmp/wt" {
+			t.Errorf("opencodeSessionList = %+v, %v; want both sessions parsed", sessions, ok)
+		}
+	})
+
+	t.Run("garbage output is not ok", func(t *testing.T) {
+		fakeOpencodeList(t, "not json at all")
+		if sessions, ok := opencodeSessionList(); ok || sessions != nil {
+			t.Errorf("opencodeSessionList = %+v, %v; want not-ok on unparseable output", sessions, ok)
+		}
+	})
+
+	t.Run("failing command is not ok", func(t *testing.T) {
+		stubBin(t, "opencode", "exit 1")
+		if sessions, ok := opencodeSessionList(); ok || sessions != nil {
+			t.Errorf("opencodeSessionList = %+v, %v; want not-ok on a nonzero exit", sessions, ok)
+		}
+	})
+
+	t.Run("missing binary is not ok", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if sessions, ok := opencodeSessionList(); ok || sessions != nil {
+			t.Errorf("opencodeSessionList = %+v, %v; want not-ok without opencode on PATH", sessions, ok)
+		}
+	})
+}
+
+// TestOpencodeTranscriptIDs pins the opencode snapshot: sessions are listed
+// by id, filtered to this worktree's recorded directory (a trailing
+// separator on either side must not split them), and a failed list disables
+// detection.
+func TestOpencodeTranscriptIDs(t *testing.T) {
+	wt := t.TempDir()
+	fakeOpencodeList(t, opencodeListJSON(
+		`{"id":"oc-mine","directory":"`+wt+`"}`,
+		`{"id":"oc-mine-slash","directory":"`+wt+`/"}`,
+		`{"id":"oc-foreign","directory":"/tmp/elsewhere"}`,
+	))
+	ids, ok := opencodeTranscriptIDs(wt)
+	if !ok || len(ids) != 2 || !ids["oc-mine"] || !ids["oc-mine-slash"] {
+		t.Errorf("opencodeTranscriptIDs = %v, %v; want this worktree's two sessions", ids, ok)
+	}
+
+	stubBin(t, "opencode", "exit 1")
+	if ids, ok = opencodeTranscriptIDs(wt); ok || ids != nil {
+		t.Errorf("opencodeTranscriptIDs on a failed list = %v, %v; want detection off", ids, ok)
+	}
+}
+
+// TestRecordNewOpencodeTranscript pins the recording rule: only a session
+// the round's snapshot does not already know — and only one whose recorded
+// directory is this worktree — gets recorded.
+func TestRecordNewOpencodeTranscript(t *testing.T) {
+	fakeHome(t)
+	ctx := context.Background()
+	wt := t.TempDir()
+	list := opencodeListJSON(
+		`{"id":"oc-old","directory":"`+wt+`"}`,
+		`{"id":"oc-foreign","directory":"/tmp/elsewhere"}`,
+	)
+	fakeOpencodeList(t, list)
+
+	known := map[string]bool{"oc-old": true}
+	if recordNewOpencodeTranscript(ctx, known, wt, RoleDev) {
+		t.Error("recordNewOpencodeTranscript recorded a known session")
+	}
+	if id, _ := recordedSession(ctx, wt, RoleDev); id != "" {
+		t.Errorf("record holds %q, want empty", id)
+	}
+
+	// A session with no id, and one from another worktree, record nothing.
+	fakeOpencodeList(t, opencodeListJSON(
+		`{"id":"","directory":"`+wt+`"}`,
+		`{"id":"oc-foreign","directory":"/tmp/elsewhere"}`,
+	))
+	if recordNewOpencodeTranscript(ctx, known, wt, RoleDev) {
+		t.Error("recordNewOpencodeTranscript recorded an empty-id or foreign session")
+	}
+
+	fakeOpencodeList(t, opencodeListJSON(`{"id":"oc-new","directory":"`+wt+`"}`))
+	if !recordNewOpencodeTranscript(ctx, known, wt, RoleDev) {
+		t.Error("recordNewOpencodeTranscript missed the round's new session")
+	}
+	if id, _ := recordedAgentSession(ctx, "opencode", wt, RoleDev); id != "oc-new" {
+		t.Errorf("recorded session = %q, want oc-new live", id)
+	}
+
+	// A failed list records nothing rather than guessing.
+	stubBin(t, "opencode", "exit 1")
+	if recordNewOpencodeTranscript(ctx, known, wt, RoleDev) {
+		t.Error("recordNewOpencodeTranscript recorded on a failed list")
+	}
+}
+
+// TestOpencodeTranscriptExists pins the staleness check: the id exists only
+// when the list still carries it for this worktree, and a failed list never
+// vouches for one.
+func TestOpencodeTranscriptExists(t *testing.T) {
+	wt := t.TempDir()
+	fakeOpencodeList(t, opencodeListJSON(`{"id":"oc-live","directory":"`+wt+`"}`))
+
+	if !opencodeTranscriptExists(wt, "oc-live") {
+		t.Error("opencodeTranscriptExists = false, want the listed session found")
+	}
+	if opencodeTranscriptExists(wt, "oc-gone") {
+		t.Error("opencodeTranscriptExists(oc-gone) = true, want false")
+	}
+	if opencodeTranscriptExists("/tmp/elsewhere", "oc-live") {
+		t.Error("opencodeTranscriptExists in another worktree = true, want false")
+	}
+
+	stubBin(t, "opencode", "exit 1")
+	if opencodeTranscriptExists(wt, "oc-live") {
+		t.Error("opencodeTranscriptExists on a failed list = true, want false")
+	}
+}
+
+// TestRecordedOpencodeSession pins the opencode fallback: a recorded id
+// reads back live while opencode still lists it for this worktree, and a
+// vanished one reports stale — the per-agent dispatch routes opencode to
+// the session list, not claude's transcripts.
+func TestRecordedOpencodeSession(t *testing.T) {
+	fakeHome(t)
+	ctx := context.Background()
+	wt := t.TempDir()
+	recordSession(ctx, wt, RoleDev, "oc-rec")
+	fakeOpencodeList(t, opencodeListJSON(`{"id":"oc-rec","directory":"`+wt+`"}`))
+
+	id, stale := recordedAgentSession(ctx, "opencode", wt, RoleDev)
+	if id != "oc-rec" || stale {
+		t.Fatalf("recordedAgentSession(opencode) = %q (stale=%v), want oc-rec live", id, stale)
+	}
+
+	// The session no longer in the database reads stale, never resumable.
+	fakeOpencodeList(t, opencodeListJSON())
+	if id, stale := recordedAgentSession(ctx, "opencode", wt, RoleDev); id != "" || !stale {
+		t.Errorf("recordedAgentSession(opencode) after the session vanished = %q (stale=%v), want empty and stale", id, stale)
+	}
+}

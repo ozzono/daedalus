@@ -34,10 +34,11 @@ type AgentRunInput struct {
 	// run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
 	Agent string
 	// SessionID, when set, resumes the agent's previous conversation for
-	// this worktree (claude -p --resume, pi --session) instead of starting
+	// this worktree (claude -p --resume, pi --session, opencode run -s,
+	// codex exec resume) instead of starting
 	// cold — the round inherits the prior context and its warm provider
-	// prompt cache. Empty starts a fresh session; agents without a
-	// session-id mechanism (opencode, amp, aider) ignore it.
+	// prompt cache. Empty starts a fresh session; agents without an
+	// id-addressable session (amp, aider) ignore it.
 	SessionID string
 	// Role scopes the recorded-session fallback to one of the run's four
 	// chained conversations (RoleDev, RoleTest, RoleDevReview,
@@ -99,11 +100,12 @@ type ReviewInput struct {
 	// this run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
 	Agent string
 	// SessionID, when set, resumes the reviewer's previous conversation
-	// (claude -p --resume, pi --session) so a re-review verifies its
+	// (claude -p --resume, pi --session, opencode run -s, codex exec
+	// resume) so a re-review verifies its
 	// earlier findings with the prior context and warm prompt cache
 	// instead of starting cold. Each reviewer role (code review, test
 	// review) chains its own session; empty starts a fresh one. Agents
-	// without a session-id mechanism (opencode, amp, aider) ignore it.
+	// without an id-addressable session (amp, aider) ignore it.
 	SessionID string
 	// Role scopes the recorded-session fallback to one of the run's four
 	// chained conversations (RoleDev, RoleTest, RoleDevReview,
@@ -168,14 +170,14 @@ type ReviewResult struct {
 }
 
 // RunJailedClaudeActivity runs the jailed agent (Claude Code, opencode,
-// amp, pi, or aider, per config) inside an ai-jail sandbox rooted at the
+// amp, pi, codex, or aider, per config) inside an ai-jail sandbox rooted at the
 // worktree. Claude runs with json output so its visible text comes back
 // structured and lands complete in the activity result (serialized into
 // Temporal history, visible in the UI per round); amp's --stream-json-thinking emits
 // Claude-Code-compatible events including thinking blocks, so the same
 // parser applies; pi's --mode json emits pi's own event schema, read by
 // its own parser branch (thinking, session id, and usage all captured);
-// opencode's and aider's plain output is taken as-is (no thinking,
+// opencode's, codex's, and aider's plain output is taken as-is (no thinking,
 // session, or usage). stream-json (which also carries the chain of
 // thought via --verbose) is blocked for claude for now: ai-jail's flag
 // guard rejects --verbose after the command by prefix match, even
@@ -192,16 +194,16 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 	agent, _, agentArgs := jailedAgentCLI(input.Agent)
 	// A session id from a previous round resumes that conversation instead
 	// of starting cold — the round inherits the prior context and the
-	// provider's warm prompt cache for it. Only claude (--resume) and pi
-	// (--session) support resume; opencode, amp, and aider ignore the
-	// field and start fresh.
+	// provider's warm prompt cache for it. claude (--resume), pi
+	// (--session), opencode (-s), and codex (exec resume) support resume;
+	// amp and aider have no id-addressable session and ignore the field.
 	//
 	// With no workflow-provided id — a first round, or the retry after a
 	// round cut off at its ceiling, which never produced a result carrying
 	// one — the round resumes the conversation recorded from the killed
 	// attempt's transcript, so the retry continues its progress instead of
 	// restarting from zero.
-	resumeFlag, canResume := agentResumeFlag(agent)
+	_, canResume := agentResumeFlag(agent)
 	resume := input.SessionID
 	if resume == "" && canResume {
 		logger := activityLogger(ctx)
@@ -236,7 +238,7 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 	}
 	runArgs := agentArgs
 	if resume != "" && canResume {
-		runArgs = append([]string{resumeFlag, resume}, agentArgs...)
+		runArgs = agentResumeArgs(agent, resume, agentArgs)
 	}
 	prompt := input.Prompt
 	// Granted host folders: a fresh conversation — any round that will not
@@ -360,14 +362,14 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	agent, _, agentArgs := jailedAgentCLI(input.Agent)
 	// A session id from a previous round of the same review role resumes
 	// that conversation — the re-review verifies its earlier findings with
-	// the prior context instead of re-deriving them cold. Only claude
-	// (--resume) and pi (--session) support resume; opencode, amp, and
-	// aider start fresh. As with the agent rounds, a retry with no
-	// workflow-provided id resumes the conversation recorded from a
-	// cut-off attempt's transcript — the exact incident this replaces: a
-	// long review killed at its ceiling used to restart from zero and
-	// never deliver a verdict.
-	resumeFlag, canResume := agentResumeFlag(agent)
+	// the prior context instead of re-deriving them cold. claude
+	// (--resume), pi (--session), opencode (-s), and codex (exec resume)
+	// support resume; amp and aider start fresh. As with the agent rounds,
+	// a retry with no workflow-provided id resumes the conversation
+	// recorded from a cut-off attempt's transcript — the exact incident
+	// this replaces: a long review killed at its ceiling used to restart
+	// from zero and never deliver a verdict.
+	_, canResume := agentResumeFlag(agent)
 	resume := input.SessionID
 	if resume == "" && canResume && !input.FreshReview {
 		logger := activityLogger(ctx)
@@ -393,7 +395,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	}
 	runArgs := agentArgs
 	if resume != "" && canResume {
-		runArgs = append([]string{resumeFlag, resume}, agentArgs...)
+		runArgs = agentResumeArgs(agent, resume, agentArgs)
 	}
 	start := time.Now()
 	res, err := runJailedKind(ctx, input.Role, input.Agent, input.WorktreePath, prompt, runArgs...)
@@ -418,7 +420,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	}
 	usage.Worker = os.Getenv("DAEDALUS_WORKER_NAME")
 	if text == "" {
-		// Plain-text CLI (opencode, aider) or a parse miss: the whole
+		// Plain-text CLI (opencode, codex, aider) or a parse miss: the whole
 		// stdout is the review.
 		text = res.Stdout
 	}

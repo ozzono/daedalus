@@ -12,7 +12,8 @@ repository, an issue ID, and a prompt, it spins up an isolated git worktree
 and runs two review-gated loops inside it: a jailed agent —
 [Claude Code](https://claude.com/claude-code) by default,
 [opencode](https://opencode.ai), [Amp](https://ampcode.com) (deprecated —
-see below), [pi](https://pi.dev), or [aider](https://aider.chat) —
+see below), [pi](https://pi.dev), [aider](https://aider.chat) (deprecated —
+see below), or [codex](https://developers.openai.com/codex/) —
 implements the change
 while a jailed reviewer approves the code; the agent then writes the test
 suite while the reviewer — and the repository's own test suite — approve the
@@ -92,7 +93,13 @@ up.
 - The `ai-jail` CLI on your `PATH`
 - One supported jailed-agent CLI:
   - `claude` (the default, invoked by the jail)
-  - `opencode` when `agent: opencode` is set in config.yaml
+  - `opencode` when `agent: opencode` is set in config.yaml — the jail
+    bridges opencode's state dir (`~/.local/share/opencode`, or
+    `$XDG_DATA_HOME/opencode` when that var is set, which is passed
+    through) read-write, so jailed rounds share the host's session
+    database and auth: rounds chain conversations for resume, and host
+    login state reaches jailed rounds (the same accepted trade pi and
+    codex make)
   - `amp` when `agent: amp` is — authenticates via `AMP_API_KEY` in the
     worker's environment, which daedalus passes into the jail when set;
     amp's own host login does not reach the jail. **Amp support is
@@ -112,7 +119,21 @@ up.
     paths are byte-for-byte untouched.
   - `aider` when `agent: aider` is — authenticates via the same provider
     env vars; the repo's `.env` is masked to empty inside the jail, so it
-    cannot override the exported env
+    cannot override the exported env. **Aider support is deprecated:** it
+    keeps working exactly as it does today, but it accepts no new flags,
+    fixes, or probes — its gaps are accepted limitations: no
+    id-addressable resume (rounds always start fresh), openai-only model
+    wiring (the anthropic half awaits a probe of the installed litellm's
+    anthropic provider), and a uv-tools-only install layout.
+  - `codex` when `agent: codex` is — authenticates via its host login
+    state (`~/.codex`, or `$CODEX_HOME` when that var is set — the jail
+    bridges the directory read-write and passes the var through) plus the
+    provider env vars daedalus exports. codex reads
+    no `OPENAI_*` var natively and speaks only OpenAI wire formats, so an
+    `openai:`-section round is bridged per invocation through codex's own
+    `-c` config overrides (a staged provider entry — the key value never
+    lands in argv or on disk; see `stageCodexProvider`), while an
+    `anthropic:`-section round has no codex channel at all
 - The repo's `.claude/settings.json` / `.claude/settings.local.json` are
   masked to empty inside the jail: a committed settings file's `env` block
   would otherwise apply over the exported env inside the jail (a stale
@@ -134,6 +155,8 @@ up.
     in opencode.json (`provider.<id>.models.<model>.limit`), which a jailed
     round honors from a repo-committed file
   - `pi`, `amp` — unprobed (neither binary was available to probe)
+  - `codex` — no wired lever (unprobed; a `model_providers` entry carries
+    no request params)
 
 ## Usage
 
@@ -239,7 +262,8 @@ up.
    ```
 
    `-cli/--cli <agent>` overrides the config's jailed agent (`claude`,
-   `opencode`, `amp`, `pi`, `aider`) for this run — the selection travels
+   `opencode`, `amp`, `pi`, `aider`, `codex`) for this run — the selection
+   travels
    with the run, so
    it applies on whichever worker serves the task queue:
 
@@ -303,7 +327,7 @@ invoked from inside it. `daedalus init` writes a fully commented
 
 | Field                 | Default            | Purpose                              |
 | --------------------- | ------------------ | ------------------------------------ |
-| `agent`               | `claude`           | Jailed agent CLI: `claude`, `opencode`, `amp` (deprecated, unmaintained), `pi`, or `aider` (`run -cli/--cli` overrides per run). Only claude and pi chain conversations (`--resume`/`--session`); the others start each round fresh |
+| `agent`               | `claude`           | Jailed agent CLI: `claude`, `opencode`, `amp` (deprecated, unmaintained), `pi`, `aider` (deprecated), or `codex` (`run -cli/--cli` overrides per run). claude, pi, opencode, and codex chain conversations (`--resume`/`--session`/`run -s`/`exec resume`); amp and aider start each round fresh |
 | `branch_prefix`       | `daedalus`         | Prefix for preserved branches (`<prefix>/issue-<id>-<ts>`); `run -p/--prefix` overrides per run |
 | `authorship`          | `false`            | When true, daedalus's own commits (the approved deliverable and the aborted-work snapshot) are authored "daedalus `<daedalus@local>`"; false leaves them to the worker's git config |
 | `temporal.host`       | `127.0.0.1:7233`   | Temporal frontend address            |
@@ -312,12 +336,13 @@ invoked from inside it. `daedalus init` writes a fully commented
 | `anthropic.url`       | `""` (inherit env) | Anthropic API base URL — set only to override |
 | `anthropic.key`       | `""` (optional)    | API key for the jailed agent; if unset, the agent authenticates via the worker's inherited environment or its own login |
 | `anthropic.model`     | `""` (agent default) | Model for the jailed agent         |
-| `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself — except pi, whose openai rounds are staged into `~/.pi/agent/models.json` per round (pi reads the key env var but no base-URL env var) |
+| `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself — except pi, whose openai rounds are staged into `~/.pi/agent/models.json` per round (pi reads the key env var but no base-URL env var), and codex, whose rounds consume the section via per-invocation `-c` overrides (codex reads no `OPENAI_*` var natively) |
 | `slim.enabled/parser_model` | `enabled: false` | Slim mode for small self-hosted models (aider/pi): one jailed-agent round at a time (no two provider requests in flight), aider's weak/editor models pinned to `AIDER_MODEL` under `DAEDALUS_SLIM`, and a defaulted `-w` rerouted to the slim flow. With `parser_model` also set, the worker starts a loopback tool-call relay (`internal/toolrelay`) that lifts text-encoded tool calls — fenced JSON in the message content, which pi executes only in its native `tool_calls` form — into a synthetic native stream, with the parser model normalizing the arguments via ollama structured output against the tool's own schema; prose is never converted and any relay failure degrades to the old inert-text behavior. Breaking reshape (2026-10-02): the former top-level `slim: true` boolean moved into this section — migrate by renaming it `slim.enabled` |
 | `fallback.enabled/url/key/model/heartbeat_model` | `enabled: false` | Independent secondary provider: when a jailed round fails with the primary's quota exhausted, the worker retries it on the fallback until the primary recovers |
 | `fallback.type`       | `anthropic`        | Fallback wire style: `anthropic` or `openai`; governs the `worker status` probe and which env failover values travel on. A round's wire is chosen by the agent (claude dials `ANTHROPIC_*`), so `openai` serves only agents that dial `OPENAI_BASE_URL` |
 | `reviewer.url/key`    | `""` (share primary) | Reviewer rounds' own provider endpoint: overrides `ANTHROPIC_*`/`OPENAI_*` URL and key for reviewer rounds only, while implementing and test rounds keep the primary's. Models are not overridable |
 | `bug_filing.enabled/dir/mirror` | `enabled: false` | Out-of-scope-bug filing. Off (the default), no bug files are written: out-of-scope bugs surface in round replies and review comments only. On, the round prompts instruct the agent to file every out-of-scope bug under `dir` — worktree-relative, resolved against the run's worktree root (`dir` empty keeps the historical `backlog/bugs` path). Without `mirror` the files are ordinary committed content of the branch. `mirror`, when set (absolute, or `~/…`; a relative path, the filesystem root, or a colon is rejected), is a host directory bind-mounted read-write into each jailed round's sandbox at `dir`, so the agent's writes land on the host directly and never ride the branch — a configured mirror is a read-write window the jailed agent holds onto a host path, so point it at a dedicated directory; on an ai-jail that rejects the mount the round fails loudly rather than running unmounted. `test_output.mirror` mirrors suite dumps worker-side the same way (copy, not mount) |
+| `prompt`             | `""` (embedded)     | Project-wise prompt overrides: a directory of replacement prompts, one `<prompt-name>.md` file per replaced prompt, the stem naming the prompt (`implement`, `implement_fix`, `continue`, `tests`, `tests_failed`, `tests_review`, `review`, `rebuild`, `investigate`, `investigate_fix`, `refactor`, `refactor_fix`, `bugfix`, `bugfix_fix`, `slim_plan`, `slim_step`, `slim_fix` — template names, not flow names). Absolute, `~/…`, or relative to the config file's directory. The worker resolves and validates the whole directory at startup — an unknown stem, missing directory, unparsable template, empty file, a data field the prompt does not take, a `{{template}}` action, or a `review` override missing the verdict protocol fails the start, never a mid-round render; unset, every prompt renders byte-identically to the embedded one. `review` is validated to keep all four verdict words (the reviewer's final-line machine contract); `slim_plan` must keep instructing the raw SlimSubtask JSON array (unvalidated caveat). Rendered prompts ride workflow history, so override content is not secret |
 
 Provider settings that are set are exported into the worker's environment
 at startup and injected into the jailed agent's process environment; unset
