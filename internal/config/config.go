@@ -548,6 +548,29 @@ type Config struct {
 	// TestOutput is the suite-output dump toggle; inactive unless Enabled
 	// (see TestOutputConfig).
 	TestOutput TestOutputConfig `yaml:"test_output"`
+	// Prompt points at a directory of prompt-template overrides: every .md
+	// file directly inside it whose file stem names a prompt (the
+	// internal/template Prompts — the embedded prompts/*.md stems:
+	// implement, implement_fix, continue, tests, tests_failed, tests_review,
+	// review, rebuild, investigate, investigate_fix, refactor,
+	// refactor_fix, bugfix, bugfix_fix, slim_plan, slim_step, slim_fix)
+	// replaces that embedded prompt for this deployment; a stem matching no
+	// prompt fails the start. The path may be absolute, ~/…, or relative to
+	// this config file's directory. Resolved and validated once at worker
+	// startup (missing directory, unreadable file, empty file, template
+	// that does not parse, a data field the prompt does not take, a
+	// {{template}} action, or a review override missing the verdict
+	// protocol all fail the start); rendered prompts
+	// are recorded in workflow history, so replacement content is not
+	// secret and may live on the same path as the config. Empty — the
+	// default — renders every prompt byte-identically to the embedded one.
+	// A string, not a name→path mapping, so Config stays ==-comparable; the
+	// one directory keeps a deployment's replacements together. Note the
+	// machine contracts a replacement must keep: review's verdict protocol
+	// is validated at startup, and slim_plan must keep instructing the
+	// planner to emit the raw SlimSubtask JSON array parseSlimPlan reads
+	// (caveat, not validated).
+	Prompt string `yaml:"prompt"`
 }
 
 // BugFilingDir returns the effective worktree-relative folder unscoped bug
@@ -614,6 +637,7 @@ type renderConfig struct {
 	Reviewer               ReviewerConfig   `yaml:"reviewer"`
 	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
 	TestOutput             TestOutputConfig `yaml:"test_output"`
+	Prompt                 string           `yaml:"prompt"`
 }
 
 // RenderYAML renders the config as YAML covering every field of the struct,
@@ -643,6 +667,7 @@ func (c Config) RenderYAML() (string, error) {
 		Reviewer:               c.Reviewer,
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
+		Prompt:                 c.Prompt,
 	})
 	return string(out), err
 }

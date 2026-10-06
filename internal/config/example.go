@@ -445,4 +445,32 @@ test_output:
   enabled: false
   dir: ""
   mirror: ""
+
+# Project-wise prompt overrides. Empty (the default): every round's prompt
+# renders byte-identically to the embedded templates in
+# internal/template/prompts. When set, this names a directory of
+# replacement prompts: one <prompt-name>.md file per replaced prompt, the
+# file stem naming the prompt — implement, implement_fix, continue, tests,
+# tests_failed, tests_review, review, rebuild, investigate,
+# investigate_fix, refactor, refactor_fix, bugfix, bugfix_fix, slim_plan,
+# slim_step, or slim_fix (daedalus template names, not flow names — there
+# is no dev-session). The path may be absolute, ~/…, or relative to this
+# config file's directory, so a deployment's replacements travel with its
+# config. Every .md file directly inside must name a prompt — a stray stem
+# (e.g. a hoped-for dev-session.md) fails the worker's start rather than
+# being ignored. The worker resolves and validates the whole directory at
+# startup: a missing directory, an unreadable file, a template that does
+# not parse, an empty file, a data field the prompt does not take (each
+# template renders a fixed struct — copy the field references from the
+# embedded file), a {{template}} action (an override runs alone), or a
+# review override missing the verdict protocol all fail the start, never a
+# mid-round render. Two machine contracts a replacement must keep: review
+# is validated at startup to still carry all four verdict words (APPROVED,
+# CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
+# protocol the loop parses), and slim_plan must keep instructing the
+# planner to emit the raw SlimSubtask JSON array the plan parser reads
+# (unvalidated — check it by hand). Overrides resolve once per worker
+# process at startup; rendered prompts are recorded in workflow history,
+# so replacement content is not secret and may live beside this config.
+# prompt: prompts/
 `
