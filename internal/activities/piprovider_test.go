@@ -70,6 +70,93 @@ func stagedPiProvider(t *testing.T, home string) piProviderConfig {
 	return entry
 }
 
+// stagedPiModelRaw returns the staged daedalus model entry as raw JSON —
+// the bytes pi would read — for assertions a typed decode cannot make (a
+// key an omitempty tag dropped is indistinguishable from a zero value once
+// decoded).
+func stagedPiModelRaw(t *testing.T, home string) map[string]json.RawMessage {
+	t.Helper()
+	top := readStagedPiModels(t, home)
+	var providers map[string]json.RawMessage
+	if err := json.Unmarshal(top["providers"], &providers); err != nil {
+		t.Fatalf("parse staged providers: %v", err)
+	}
+	var entry map[string]json.RawMessage
+	if err := json.Unmarshal(providers[piProviderID], &entry); err != nil {
+		t.Fatalf("parse staged %s entry: %v", piProviderID, err)
+	}
+	var models []map[string]json.RawMessage
+	if err := json.Unmarshal(entry["models"], &models); err != nil {
+		t.Fatalf("parse staged models: %v", err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("staged models = %d entries, want 1", len(models))
+	}
+	return models[0]
+}
+
+// TestStagePiProviderStagesStoreCompat pins the compat override: every
+// staged entry carries compat.supportsStore=false, in both bridge shapes —
+// pi's URL-inferred openai compat otherwise hardcodes store:false into
+// every chat-completions body, which strict OpenAI-compatible validators
+// reject with 422 extra_forbidden. The raw-JSON half is the load-bearing
+// assertion: SupportsStore is a *bool precisely so the false survives
+// omitempty — a plain bool would drop the key from the staged file while a
+// decode-back still reads false either way, so only the bytes pi reads can
+// catch that regression.
+func TestStagePiProviderStagesStoreCompat(t *testing.T) {
+	assertStoreOff := func(t *testing.T, home string) {
+		t.Helper()
+		model := stagedPiModelRaw(t, home)
+		compatRaw, ok := model["compat"]
+		if !ok {
+			t.Fatal("staged model carries no compat object, want supportsStore staged")
+		}
+		var compat map[string]json.RawMessage
+		if err := json.Unmarshal(compatRaw, &compat); err != nil {
+			t.Fatalf("parse staged compat: %v", err)
+		}
+		if len(compat) != 1 {
+			t.Errorf("compat = %s, want exactly the one staged override", compatRaw)
+		}
+		if string(compat["supportsStore"]) != "false" {
+			t.Errorf("compat.supportsStore = %s, want the literal false in the staged bytes", compat["supportsStore"])
+		}
+		decoded := stagedPiProvider(t, home).Models[0].Compat
+		if decoded == nil || decoded.SupportsStore == nil || *decoded.SupportsStore {
+			t.Errorf("decoded compat = %+v, want supportsStore=false", decoded)
+		}
+	}
+
+	t.Run("keyless backend", func(t *testing.T) {
+		home := piTestHome(t)
+		if _, err := stagePiProvider(piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1",
+			"OPENAI_MODEL=qwen2.5-coder:3b",
+		)); err != nil {
+			t.Fatalf("stagePiProvider: %v", err)
+		}
+		assertStoreOff(t, home)
+	})
+
+	// The keyed shape also carries metadata and sampler exports, pinning
+	// that compat stages alongside every other conditional branch of the
+	// entry, never instead of them.
+	t.Run("keyed backend with metadata and samplers", func(t *testing.T) {
+		home := piTestHome(t)
+		if _, err := stagePiProvider(piEnv(
+			"OPENAI_BASE_URL=https://llm.example/v1",
+			"OPENAI_API_KEY=sk-local",
+			"OPENAI_MODEL=glm",
+			config.ContextTokensEnv+"=131072",
+			config.TemperatureEnv+"=0.2",
+		)); err != nil {
+			t.Fatalf("stagePiProvider: %v", err)
+		}
+		assertStoreOff(t, home)
+	})
+}
+
 // TestStagePiProviderNoOpenaiVars pins the pass-through shape: a round env
 // with none of the openai exports stages nothing (no models.json is even
 // created) and adds no --model flag, leaving pi on its own config.

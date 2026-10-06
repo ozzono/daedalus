@@ -12,11 +12,15 @@ command = [
 rw_maps = [
     "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-mask-home-claude/backlog/bugs",
     "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-mask-home-claude/.daedalus-folders/daedalus",
-    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-mask-home-claude/backlog/bugs",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-pi-fix/backlog/bugs",
+    "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-pi-fix/.daedalus-folders/daedalus",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-pi-fix/backlog/bugs",
 ]
 mask = [
     ".claude/settings.json",
     ".claude/settings.local.json",
+    "~/.claude/settings.json",
+    "~/.claude/settings.json",
 ]
 network = true
 no_worktree = false
