@@ -291,6 +291,13 @@ func liveCotSection(workflowID string) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== in-flight round (stage=%s, live) ===\n", stage)
+	if name == "codex" {
+		// codex keeps a rollout transcript the live view does not follow
+		// yet — say so rather than reuse the "keeps no host transcript"
+		// note below, which is false for codex.
+		fmt.Fprintf(&b, "%s keeps a host transcript the live view does not read; CoT appears here when the round completes\n", name)
+		return b.String() + "\n"
+	}
 	if name != "claude" && name != "pi" {
 		// aider, opencode, and amp keep no host transcript; never silence,
 		// never a guess.

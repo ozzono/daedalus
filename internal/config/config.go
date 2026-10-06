@@ -219,7 +219,8 @@ type AnthropicConfig struct {
 	// arithmetic. It exports as ContextTokensEnv, which jailed claude
 	// honors for its compaction/budget math, and replaces the input side of
 	// the model metadata staged for aider rounds (aider's completion cap is
-	// unchanged — see MaxOutputTokens for that). opencode, pi, and amp have
+	// unchanged — see MaxOutputTokens for that). opencode, pi, amp, and
+	// codex have
 	// no wired lever and simply ignore it — opencode's only mechanism is a
 	// config file pointer (OPENCODE_CONFIG), whose precedence against a
 	// repo-committed opencode.json was never probed, so no staged-config
@@ -233,7 +234,7 @@ type AnthropicConfig struct {
 	// error text names for its request-level max_tokens override) and the
 	// aider staging replaces both sides of the 8192 constant (the staged
 	// metadata's max_output_tokens and extra_params.max_tokens). opencode,
-	// pi, and amp have no wired route. Zero (unset) keeps the aider
+	// pi, amp, and codex have no wired route. Zero (unset) keeps the aider
 	// constant and every other agent's API default.
 	MaxOutputTokens int `yaml:"max_output_tokens"`
 }
@@ -255,7 +256,9 @@ type FallbackConfig struct {
 	// jailed round's wire is chosen by the agent itself: an openai-style
 	// fallback serves only agents that dial OPENAI_BASE_URL — claude dials
 	// ANTHROPIC_* and cannot use it, while pi and aider dial whichever
-	// provider their selected model uses. Empty loads as the default.
+	// provider their selected model uses (codex dials OpenAI wire formats
+	// only, so an openai-style fallback is exactly what serves it — an
+	// anthropic-style one has no codex channel). Empty loads as the default.
 	Type  string `yaml:"type"`
 	URL   string `yaml:"url"`
 	Key   string `yaml:"key"`
@@ -311,6 +314,9 @@ func (f FallbackConfig) Active() bool {
 // the section directly: the worker selects aider's model with
 // `--model openai/<model>` when it is set (aider's litellm layer only dials
 // a custom endpoint for a provider-prefixed model name; see runJailedRound).
+// A codex round consumes it through per-invocation `-c` overrides (codex
+// reads no OPENAI_* var natively — see stageCodexProvider), so the section
+// is the only way an openai endpoint serves codex.
 type OpenAIConfig struct {
 	URL   string `yaml:"url"`
 	Key   string `yaml:"key"`
@@ -430,8 +436,8 @@ type SlimConfig struct {
 // from a YAML file (see config-example.yaml).
 type Config struct {
 	// Agent selects which jailed CLI runs the implementing and reviewer
-	// agents: "claude" (Claude Code), "opencode", "amp", "pi", or "aider"
-	// (see agents for the accepted values).
+	// agents: "claude" (Claude Code), "opencode", "amp", "pi", "aider"
+	// (deprecated), or "codex" (see agents for the accepted values).
 	Agent string `yaml:"agent"`
 	// BranchPrefix names the preserved branch carrying a run's approved
 	// work: <prefix>/issue-<id>-<unix timestamp>. It is deliberately
@@ -686,10 +692,19 @@ func (c Config) RenderYAML() (string, error) {
 // (stagePiProvider — an openai section missing url or model fails the round
 // before it can silently dial api.openai.com); and aider's dotenv load uses
 // override=True, but the jail masks the repo's .env to empty, so inside
-// jailed rounds the config-derived exports stand. Which wire a round dials
-// is chosen by the agent's selected model, not by daedalus — see
-// FallbackTypeOpenAI.
-var agents = []string{"claude", "opencode", "amp", "pi", "aider"}
+// jailed rounds the config-derived exports stand. codex authenticates like
+// pi — host login state (~/.codex, bridged read-write by the jail) plus the
+// provider env vars — but reads no OPENAI_* var natively and speaks only
+// OpenAI wire formats, so an openai-served codex round is bridged through
+// per-invocation `-c` config overrides instead (stageCodexProvider — the
+// same missing-url/missing-model failure posture as pi's staging), and an
+// anthropic-section round has no codex channel at all. aider is DEPRECATED
+// (amp-parity): it keeps working as-is, accepts no new flags or fixes, and
+// its gaps are accepted limitations — no id-addressable resume, openai-only
+// model wiring (the anthropic half awaits a litellm probe), uv-tools-only
+// install layout. Which wire a round dials is chosen by the agent's selected
+// model, not by daedalus — see FallbackTypeOpenAI.
+var agents = []string{"claude", "opencode", "amp", "pi", "aider", "codex"}
 
 // ValidateAgent rejects Agent values Load would refuse. The CLI's
 // -cli/--cli flag overrides the config's agent and must fail up front,

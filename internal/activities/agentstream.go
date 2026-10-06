@@ -13,7 +13,7 @@ import (
 // usage objects). Raw figures only —
 // deltas are computed at aggregation time — so per-round token attribution
 // and tokens/sec stay lossless if provider semantics change. CLIs without
-// a structured result (opencode's and aider's plain text) contribute
+// a structured result (opencode's, codex's, and aider's plain text) contribute
 // nothing.
 type Usage struct {
 	// Worker names the worker process that ran the round (config
@@ -113,8 +113,8 @@ func parseAgentStream(stdout string) (thinking, text, session string) {
 // parseAgentUsage extracts the raw provider metrics (Usage) from json or
 // stream-json output — the terminal result event's cost, token counts, and
 // duration_ms, captured raw per the maintainer decision so aggregation
-// computes deltas. A stream without a result event (opencode's and aider's
-// plain text) reports a zero Usage.
+// computes deltas. A stream without a result event (opencode's, codex's,
+// and aider's plain text) reports a zero Usage.
 func parseAgentUsage(stdout string) (usage Usage) {
 	for line := range strings.SplitSeq(stdout, "\n") {
 		var m streamMessage
@@ -238,7 +238,7 @@ func parsePiUsage(stdout string) (usage Usage) {
 // text, conversation session id, and raw usage metrics from its stdout,
 // dispatching on the CLI: claude and amp share the claude event schema
 // (parseAgentStream); pi emits its own JSON-lines schema (parsePiStream);
-// opencode and aider print plain text and yield empty fields — the
+// opencode, codex, and aider print plain text and yield empty fields — the
 // caller's cue to take the raw stdout as the text.
 func parseRoundOutput(agent, stdout string) (thinking, text, session string, usage Usage) {
 	if agent == "pi" {
@@ -264,8 +264,8 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // on the assumption its reused schema carries the same field — unverifiable
 // here (no binary) and the diff declares amp unmaintained, so it stays an
 // assumption: if the shape differs, amp's face degrades to "" (inert).
-// Agents without a structured stream (opencode, aider) report "" here;
-// their plain-text face is matched separately (apiErrorTextMarkers).
+// Agents without a structured stream (opencode, codex, aider) report ""
+// here; their plain-text face is matched separately (apiErrorTextMarkers).
 func agentAPIError(agent, stdout string) string {
 	switch agent {
 	case "pi":
