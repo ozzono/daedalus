@@ -599,7 +599,8 @@ type Config struct {
 	// internal/template Prompts — the embedded prompts/*.md stems:
 	// implement, implement_fix, continue, tests, tests_failed, tests_review,
 	// review, rebuild, investigate, investigate_fix, refactor,
-	// refactor_fix, bugfix, bugfix_fix, slim_plan, slim_step, slim_fix)
+	// refactor_fix, bugfix, bugfix_fix, slim_plan, slim_step, slim_parse,
+	// slim_parse_reask, slim_fix)
 	// replaces that embedded prompt for this deployment; a stem matching no
 	// prompt fails the start. The path may be absolute, ~/…, or relative to
 	// this config file's directory. Resolved and validated once at worker
@@ -614,9 +615,11 @@ type Config struct {
 	// A string, not a name→path mapping, so Config stays ==-comparable; the
 	// one directory keeps a deployment's replacements together. Note the
 	// machine contracts a replacement must keep: review's verdict protocol
-	// is validated at startup, and slim_plan must keep instructing the
-	// planner to emit the raw SlimSubtask JSON array parseSlimPlan reads
-	// (caveat, not validated).
+	// is validated at startup, and slim_parse must keep instructing the
+	// parse round to emit the raw SlimSubtask JSON array parseSlimPlan
+	// reads (caveat, not validated); slim_plan's replacement carries no
+	// such contract — it is pure generation, a prose plan with no JSON,
+	// which the slim_parse round transcribes.
 	Prompt string `yaml:"prompt"`
 }
 

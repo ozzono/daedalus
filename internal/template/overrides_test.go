@@ -38,8 +38,8 @@ func TestPrompts(t *testing.T) {
 	want := []string{
 		"bugfix", "bugfix_fix", "continue", "implement", "implement_fix",
 		"investigate", "investigate_fix", "rebuild", "refactor", "refactor_fix",
-		"review", "slim_fix", "slim_plan", "slim_step", "tests", "tests_failed",
-		"tests_review",
+		"review", "slim_fix", "slim_parse", "slim_parse_reask", "slim_plan",
+		"slim_step", "tests", "tests_failed", "tests_review",
 	}
 	got := Prompts()
 	if !slices.Equal(got, want) {
@@ -264,6 +264,42 @@ func TestLoadOverridesInstalls(t *testing.T) {
 	got, err = Continue("t", "fb")
 	if err != nil || !strings.Contains(got, "continuing a previous attempt") {
 		t.Errorf("Continue after unrelated overrides = %q, %v; want the embedded prompt", got, err)
+	}
+}
+
+// TestSlimParseOverrideFields pins the two new prompts' render contracts at
+// the override boundary: a slim_parse replacement reads the plan (.Plan),
+// and slim_parse_reask's data is the parse error alone (.Error) — a re-ask
+// override reaching for the plan is rejected at load, so the deployment's
+// mistake fails the worker's start instead of surfacing mid-round. (The
+// workflow composes the plan into the re-ask round itself: parsePrompt +
+// re-ask, so the model still sees its reply to correct.)
+func TestSlimParseOverrideFields(t *testing.T) {
+	resetInstalled(t)
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"slim_parse.md":       "TRANSCRIBE THE PLAN: {{.Plan}}",
+		"slim_parse_reask.md": "PARSE FAILED: {{.Error}} — try again.",
+	})
+	if err := LoadOverrides(dir, t.TempDir()); err != nil {
+		t.Fatalf("LoadOverrides: %v", err)
+	}
+	got, err := SlimParse("add the adder, then multiply")
+	if err != nil || !strings.Contains(got, "TRANSCRIBE THE PLAN: add the adder, then multiply") {
+		t.Errorf("SlimParse after override = %q, %v; want the replacement rendering the plan", got, err)
+	}
+	got, err = SlimParseReask("the JSON array is empty")
+	if err != nil || !strings.Contains(got, "PARSE FAILED: the JSON array is empty") {
+		t.Errorf("SlimParseReask after override = %q, %v; want the replacement rendering the error", got, err)
+	}
+
+	// The re-ask's data is the error alone: a plan reference in its
+	// replacement names a field the embedded prompt does not carry.
+	resetInstalled(t)
+	bad := t.TempDir()
+	writeFiles(t, bad, map[string]string{"slim_parse_reask.md": "the plan says {{.Plan}}"})
+	if err := LoadOverrides(bad, t.TempDir()); err == nil || !strings.Contains(err.Error(), `references data field(s) "Plan"`) {
+		t.Errorf("LoadOverrides(reask override with .Plan) = %v, want the unknown-field rejection", err)
 	}
 }
 

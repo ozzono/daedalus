@@ -156,8 +156,9 @@ const exampleSlimBlock = `# Slim mode for limited self-hosted models (small cont
 # preset mounts ~/.pi read-write.
 # slim also gates the run flow: with slim.enabled: true, a "daedalus run" without
 # an explicit -w/--workflow starts the slim flow — the micro-stepped
-# atomic loop for limited models (a planner round atomizes the task into
-# an ordered queue of 1–2-file sub-tasks, then each sub-task runs its own
+# atomic loop for limited models (a planner round writes the plan in
+# prose and a parse round transcribes it into an ordered queue of 1–2-file
+# sub-tasks, then each sub-task runs its own
 # implement ↔ review loop with a fresh reviewer session per round and the
 # native suite as ground truth) — instead of feature-dev. An explicit -w
 # always wins. The flow targets the pi agent (aider is deprecated for
@@ -510,25 +511,27 @@ const examplePromptBlock = `
 # file stem naming the prompt — implement, implement_fix, continue, tests,
 # tests_failed, tests_review, review, rebuild, investigate,
 # investigate_fix, refactor, refactor_fix, bugfix, bugfix_fix, slim_plan,
-# slim_step, or slim_fix (daedalus template names, not flow names — there
-# is no dev-session). The path may be absolute, ~/…, or relative to this
-# config file's directory, so a deployment's replacements travel with its
-# config. Every .md file directly inside must name a prompt — a stray stem
-# (e.g. a hoped-for dev-session.md) fails the worker's start rather than
-# being ignored. The worker resolves and validates the whole directory at
-# startup: a missing directory, an unreadable file, a template that does
-# not parse, an empty file, a data field the prompt does not take (each
-# template renders a fixed struct — copy the field references from the
-# embedded file), a {{template}} action (an override runs alone), a
-# {{define}}/{{block}} block (a define body can never render in an
-# override), or a review override missing the verdict protocol all fail
-# the start, never a mid-round render. Two machine contracts a
-# replacement must keep: review
+# slim_step, slim_parse, slim_parse_reask, or slim_fix (daedalus template
+# names, not flow names — there is no dev-session). The path may be
+# absolute, ~/…, or relative to this config file's directory, so a
+# deployment's replacements travel with its config. Every .md file
+# directly inside must name a prompt — a stray stem (e.g. a hoped-for
+# dev-session.md) fails the worker's start rather than being ignored. The
+# worker resolves and validates the whole directory at startup: a missing
+# directory, an unreadable file, a template that does not parse, an empty
+# file, a data field the prompt does not take (each template renders a
+# fixed struct — copy the field references from the embedded file), a
+# {{template}} action (an override runs alone), a {{define}}/{{block}}
+# block (a define body can never render in an override), or a review
+# override missing the verdict protocol all fail the start, never a
+# mid-round render. Two machine contracts a replacement must keep: review
 # is validated at startup to still carry all four verdict words (APPROVED,
 # CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
-# protocol the loop parses), and slim_plan must keep instructing the
-# planner to emit the raw SlimSubtask JSON array the plan parser reads
-# (unvalidated — check it by hand). Overrides resolve once per worker
+# protocol the loop parses), and slim_parse must keep instructing the
+# parse round to emit the raw SlimSubtask JSON array the plan parser reads
+# (unvalidated — check it by hand); slim_plan's replacement carries no
+# such contract — it is pure generation, a prose plan with no JSON, which
+# the slim_parse round transcribes. Overrides resolve once per worker
 # process at startup; rendered prompts are recorded in workflow history,
 # so replacement content is not secret and may live beside this config.
 # prompt: prompts/

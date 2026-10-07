@@ -502,10 +502,10 @@ func BugFixFix(testLogs, comments string) (string, error) {
 }
 
 // SlimSubtask is one atomized unit of the slim flow's plan — the JSON
-// schema the planner round is told to emit and SlimStep renders into the
-// worker prompt. The struct doubles as the parse target for the planner's
-// raw JSON array reply (workflows.parseSlimPlan), so the wire schema and
-// the prompt schema can never drift.
+// schema the parse round is told to emit and SlimStep renders into the
+// worker prompt. The struct doubles as the parse target for the parse
+// round's raw JSON array reply (workflows.parseSlimPlan), so the wire
+// schema and the prompt schema can never drift.
 type SlimSubtask struct {
 	ID                 int      `json:"id"`
 	Type               string   `json:"type"`
@@ -515,10 +515,26 @@ type SlimSubtask struct {
 }
 
 // SlimPlan builds the slim flow's planner opener: the task, deconstructed
-// into a strictly ordered queue of atomic sub-tasks emitted as a raw JSON
-// array of SlimSubtask objects.
+// in prose into a strictly ordered queue of atomic sub-tasks. Pure
+// generation — no JSON contract; transcription into the machine queue is
+// the parse round's job (SlimParse).
 func SlimPlan(task string) (string, error) {
 	return render("slim_plan", struct{ Task string }{task})
+}
+
+// SlimParse builds the slim flow's parse round: the planner's prose plan,
+// transcribed into the raw SlimSubtask JSON array the loop executes. The
+// round runs in the planner's conversation, so its reply joins the plan in
+// the worker's progressive context.
+func SlimParse(plan string) (string, error) {
+	return render("slim_parse", struct{ Plan string }{plan})
+}
+
+// SlimParseReask builds the parse round's one strict re-ask: the parse
+// failure, delivered into the parse round's own conversation — the model
+// sees its previous reply and corrects it.
+func SlimParseReask(parseErr string) (string, error) {
+	return render("slim_parse_reask", struct{ Error string }{parseErr})
 }
 
 // SlimStep builds the slim worker prompt for one sub-task (1-based index

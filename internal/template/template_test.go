@@ -629,19 +629,57 @@ func TestSlimReview(t *testing.T) {
 	}
 }
 
-// TestSlimPlanStepFix pins the slim worker prompts: the planner opener
-// carries the task and the raw-JSON-array output contract, the step prompt
-// frames the sub-task inside the run's progress (index of total), and the
-// fix prompt relays only the failure inputs it was given.
-func TestSlimPlanStepFix(t *testing.T) {
+// TestSlimPrompts pins the slim flow's prompt set: the planner opener is
+// pure generation — the task and a prose plan, with the JSON contract gone
+// from it — the parse round carries the planner's plan plus the raw
+// SlimSubtask JSON array contract, the parse re-ask relays only the parse
+// failure (never the plan — the workflow composes the parse prompt above
+// it), the step prompt frames the sub-task inside the run's progress (index
+// of total), and the fix prompt relays only the failure inputs it was
+// given.
+func TestSlimPrompts(t *testing.T) {
 	plan, err := SlimPlan("ship the widget")
 	if err != nil {
 		t.Fatalf("SlimPlan: %v", err)
 	}
-	for _, want := range []string{"ship the widget", "raw JSON array", `"acceptance_criteria"`} {
+	for _, want := range []string{"ship the widget", "prose only", "Do not emit JSON, arrays, or code fences"} {
 		if !strings.Contains(plan, want) {
 			t.Errorf("SlimPlan = %q, want it to contain %q", plan, want)
 		}
+	}
+	for _, notWant := range []string{`"acceptance_criteria"`, "raw JSON array"} {
+		if strings.Contains(plan, notWant) {
+			t.Errorf("SlimPlan = %q, the JSON contract moved to the parse round; want %q absent", plan, notWant)
+		}
+	}
+
+	parse, err := SlimParse("add the adder, then multiply")
+	if err != nil {
+		t.Fatalf("SlimParse: %v", err)
+	}
+	for _, want := range []string{
+		"add the adder, then multiply", "raw JSON array", `"acceptance_criteria"`,
+		"No prose, no markdown code fences",
+	} {
+		if !strings.Contains(parse, want) {
+			t.Errorf("SlimParse = %q, want it to contain %q", parse, want)
+		}
+	}
+
+	reask, err := SlimParseReask("the JSON array is empty")
+	if err != nil {
+		t.Fatalf("SlimParseReask: %v", err)
+	}
+	for _, want := range []string{
+		"could not be parsed as the required JSON array", "the JSON array is empty",
+		"ONLY the raw JSON array",
+	} {
+		if !strings.Contains(reask, want) {
+			t.Errorf("SlimParseReask = %q, want it to contain %q", reask, want)
+		}
+	}
+	if strings.Contains(reask, "add the adder, then multiply") {
+		t.Errorf("SlimParseReask = %q, want the plan absent (the parse prompt rides above the re-ask)", reask)
 	}
 
 	step, err := SlimStep(2, 3, SlimSubtask{
