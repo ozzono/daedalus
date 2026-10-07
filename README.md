@@ -99,7 +99,15 @@ up.
     through) read-write, so jailed rounds share the host's session
     database and auth: rounds chain conversations for resume, and host
     login state reaches jailed rounds (the same accepted trade pi and
-    codex make)
+    codex make). opencode reads no `OPENAI_*` var natively, so an
+    `openai:`-section round is bridged per invocation through a staged
+    round-scoped config file exposed via `OPENCODE_CONFIG` (a custom
+    provider entry — the key rides a `{env:OPENAI_API_KEY}` template and
+    never lands on disk; see `stageOpencodeProvider`), while an
+    `anthropic:`-section round has no opencode channel — daedalus stages
+    nothing and the round resolves its own config inside the jail: a
+    repo-committed opencode.json is honored, the host's global one is not
+    (the jail bridges only the state dir, no opencode config dir)
   - `amp` when `agent: amp` is — authenticates via `AMP_API_KEY` in the
     worker's environment, which daedalus passes into the jail when set;
     amp's own host login does not reach the jail. **Amp support is
@@ -151,9 +159,11 @@ up.
     `env` block would not reach jailed rounds — masked, above; the `[1m]`
     model-name suffix for the 1M window is expressible today via the
     configured `model`)
-  - `opencode` — no argv or env lever; its window is overridden per model
-    in opencode.json (`provider.<id>.models.<model>.limit`), which a jailed
-    round honors from a repo-committed file
+  - `opencode` — openai-served rounds stage `limit.context` on the staged
+    provider's model entry (selected with `-m`); without the openai
+    section, the window is overridden per model in opencode.json
+    (`provider.<id>.models.<model>.limit`), which a jailed round honors
+    from a repo-committed file (the host's global config is not mounted)
   - `pi`, `amp` — unprobed (neither binary was available to probe)
   - `codex` — no wired lever (unprobed; a `model_providers` entry carries
     no request params)
@@ -336,7 +346,7 @@ invoked from inside it. `daedalus init` writes a fully commented
 | `anthropic.url`       | `""` (inherit env) | Anthropic API base URL — set only to override |
 | `anthropic.key`       | `""` (optional)    | API key for the jailed agent; if unset, the agent authenticates via the worker's inherited environment or its own login |
 | `anthropic.model`     | `""` (agent default) | Model for the jailed agent         |
-| `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself — except pi, whose openai rounds are staged into `~/.pi/agent/models.json` per round (pi reads the key env var but no base-URL env var), and codex, whose rounds consume the section via per-invocation `-c` overrides (codex reads no `OPENAI_*` var natively) |
+| `openai.url/key/model`| `""` (inherit env) | Optional OpenAI settings, exported as `OPENAI_*` into the agent's environment for tooling it runs; not consumed by daedalus itself — except pi, whose openai rounds are staged into `~/.pi/agent/models.json` per round (pi reads the key env var but no base-URL env var), codex, whose rounds consume the section via per-invocation `-c` overrides (codex reads no `OPENAI_*` var natively), and opencode, whose rounds consume it via a staged round-scoped config file exposed through `OPENCODE_CONFIG` (opencode has no provider env channel at all) |
 | `slim.enabled/parser_model` | `enabled: false` | Slim mode for small self-hosted models (aider/pi): one jailed-agent round at a time (no two provider requests in flight), aider's weak/editor models pinned to `AIDER_MODEL` under `DAEDALUS_SLIM`, and a defaulted `-w` rerouted to the slim flow. With `parser_model` also set, the worker starts a loopback tool-call relay (`internal/toolrelay`) that lifts text-encoded tool calls — fenced JSON in the message content, which pi executes only in its native `tool_calls` form — into a synthetic native stream, with the parser model normalizing the arguments via ollama structured output against the tool's own schema; prose is never converted and any relay failure degrades to the old inert-text behavior. Breaking reshape (2026-10-02): the former top-level `slim: true` boolean moved into this section — migrate by renaming it `slim.enabled` |
 | `fallback.enabled/url/key/model/heartbeat_model` | `enabled: false` | Independent secondary provider: when a jailed round fails with the primary's quota exhausted, the worker retries it on the fallback until the primary recovers |
 | `fallback.type`       | `anthropic`        | Fallback wire style: `anthropic` or `openai`; governs the `worker status` probe and which env failover values travel on. A round's wire is chosen by the agent (claude dials `ANTHROPIC_*`), so `openai` serves only agents that dial `OPENAI_BASE_URL` |

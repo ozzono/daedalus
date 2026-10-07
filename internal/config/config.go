@@ -219,12 +219,14 @@ type AnthropicConfig struct {
 	// arithmetic. It exports as ContextTokensEnv, which jailed claude
 	// honors for its compaction/budget math, and replaces the input side of
 	// the model metadata staged for aider rounds (aider's completion cap is
-	// unchanged — see MaxOutputTokens for that). opencode, pi, amp, and
-	// codex have
-	// no wired lever and simply ignore it — opencode's only mechanism is a
-	// config file pointer (OPENCODE_CONFIG), whose precedence against a
-	// repo-committed opencode.json was never probed, so no staged-config
-	// route is wired for it. Zero (unset) leaves every agent on its own
+	// unchanged — see MaxOutputTokens for that). openai-served opencode
+	// rounds stage it as limit.context on the staged provider's model entry
+	// (stageOpencodeProvider, selected with -m); amp and codex have
+	// no wired lever and simply ignore it. The staged entry rides
+	// OPENCODE_CONFIG, whose precedence against a repo-committed
+	// opencode.json (project config, which upstream merge order puts
+	// above it) was never probed — see the stageOpencodeProvider ponytail
+	// note. Zero (unset) leaves every agent on its own
 	// default.
 	ContextTokens int `yaml:"context_tokens"`
 	// MaxOutputTokens, when set, caps the jailed agent's completion size in
@@ -233,9 +235,10 @@ type AnthropicConfig struct {
 	// gains CLAUDE_CODE_MAX_OUTPUT_TOKENS (the var claude 2.1.283's own
 	// error text names for its request-level max_tokens override) and the
 	// aider staging replaces both sides of the 8192 constant (the staged
-	// metadata's max_output_tokens and extra_params.max_tokens). opencode,
-	// pi, amp, and codex have no wired route. Zero (unset) keeps the aider
-	// constant and every other agent's API default.
+	// metadata's max_output_tokens and extra_params.max_tokens).
+	// Openai-served opencode rounds stage it as limit.output on the staged
+	// provider's model entry; amp and codex have no wired route. Zero
+	// (unset) keeps the aider constant and every other agent's API default.
 	MaxOutputTokens int `yaml:"max_output_tokens"`
 }
 

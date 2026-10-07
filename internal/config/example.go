@@ -32,10 +32,16 @@ const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; eve
 # below; the
 # jail masks the repo's .env to empty, so .env files cannot override
 # inside jailed rounds). opencode alert: neither the openai nor the
-# anthropic base-URL env vars reach it (source-verified 2026-09-26) — its
-# endpoints come from its own catalog/config files, which daedalus does
-# not bridge, so self-hosted endpoints need operator-side opencode.json
-# work (see backlog/bugs/pi-opencode-openai-section-unbridged.md).
+# anthropic base-URL env vars reach it (source-verified 2026-09-26), but
+# an openai-section round is bridged regardless: the worker stages a
+# round-scoped config file into the worktree (a "daedalus-openai"
+# provider entry — baseURL, the key as an env template so it never lands
+# on disk, the model's limits) and exposes it via OPENCODE_CONFIG,
+# selecting the staged model with -m — no operator-side opencode.json
+# work needed. The anthropic section stays unbridged (opencode has no
+# ANTHROPIC_* channel), and the jail mounts no opencode config dir, so
+# such a round resolves its own config inside the jail: a repo-committed
+# opencode.json is honored, the host's global one is not.
 agent: claude
 
 # Thinking toggle for the jailed agents, independent of slim: defaults to
@@ -266,21 +272,22 @@ anthropic:
   # Context window for the jailed agent's model, in tokens. When set, it
   # exports as CLAUDE_CODE_MAX_CONTEXT_TOKENS (which jailed claude honors
   # for its compaction/budget math), replaces the input side of the
-  # model metadata staged for aider rounds, and lands as contextWindow on
-  # the model entry staged for openai-served pi rounds; opencode, amp, and
-  # codex
-  # ignore it (opencode's only mechanism is a config-file pointer whose
-  # precedence against a repo-committed opencode.json was never probed).
-  # Zero/unset means each agent's own default.
+  # model metadata staged for aider rounds, lands as contextWindow on
+  # the model entry staged for openai-served pi rounds, and lands as
+  # limit.context on the entry staged for openai-served opencode rounds
+  # (that staged file rides OPENCODE_CONFIG, whose precedence against a
+  # repo-committed opencode.json was never probed); amp and codex
+  # ignore it. Zero/unset means each agent's own default.
   context_tokens: 0
   # Completion cap for the jailed agent's rounds, in tokens. When set, it
   # replaces both sides of the 8k constant in the model metadata staged
   # for aider rounds (the metadata's max_output_tokens and
   # extra_params.max_tokens), claude's round env gains
   # CLAUDE_CODE_MAX_OUTPUT_TOKENS (the var claude 2.1.283's own error text
-  # names for its request-level max_tokens override), and it lands as
-  # maxTokens on the model entry staged for openai-served pi rounds.
-  # opencode, amp, and codex have
+  # names for its request-level max_tokens override), lands as
+  # maxTokens on the model entry staged for openai-served pi rounds, and
+  # lands as limit.output on the entry staged for openai-served opencode
+  # rounds. amp and codex have
   # no wired route. Zero/unset keeps aider's 8192 constant and every other
   # agent's API default.
   max_output_tokens: 0

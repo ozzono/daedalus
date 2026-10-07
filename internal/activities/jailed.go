@@ -768,6 +768,30 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			args = append(args, "--env", "XDG_DATA_HOME")
 		}
 	}
+	// The config's openai section is dead config for an unbridged opencode
+	// round — no flag, no staging, the round dials whatever the host's own
+	// opencode.json holds (verified live 2026-10-06: an openai-section round
+	// dialed the host's hand-configured zai provider). stageOpencodeProvider
+	// stages the round-scoped config file into the worktree scratch dir and
+	// returns the path to expose through OPENCODE_CONFIG, which is not in
+	// ai-jail's default env allowlist: it rides the round env plus the --env
+	// passthrough (the CODEX_HOME pattern). The -m flag selecting the staged
+	// provider is held for the post-headless append below — it belongs to
+	// the run subcommand, like codex's overrides to exec. With no openai
+	// exports nothing is staged, no var is set, and the argv stays
+	// byte-identical to the unbridged shape.
+	var opencodeModelArgs []string
+	if selected == "opencode" {
+		cfgPath, modelArgs, err := stageOpencodeProvider(env, worktreePath)
+		if err != nil {
+			return jailResult{}, err
+		}
+		if cfgPath != "" {
+			env = setEnvVar(env, "OPENCODE_CONFIG", cfgPath)
+			args = append(args, "--env", "OPENCODE_CONFIG")
+			opencodeModelArgs = modelArgs
+		}
+	}
 	// The bug-file mirror (bug_filing.mirror), mounted read-write into the
 	// round's sandbox at the worktree-relative bug dir when configured: the
 	// agent writes through the familiar worktree-relative path and the
@@ -945,6 +969,14 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			return jailResult{}, err
 		}
 		args = append(args, modelArgs...)
+	}
+	// opencode's -m flag selecting the staged provider (stageOpencodeProvider
+	// above held it), appended after the headless set where the run
+	// subcommand defines it — the same slot codex's overrides take, in both
+	// the fresh shape and the precomposed resumed shape (headless nil, so
+	// -m follows the run -s tokens). Empty for an unbridged round.
+	if selected == "opencode" {
+		args = append(args, opencodeModelArgs...)
 	}
 	// pi's thinking follows the config: an explicit thinking: false is
 	// exported as DAEDALUS_THINKING=off at worker startup. The builder
@@ -1147,27 +1179,33 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 }
 
 // excludeAiderArtifacts creates aider's scratch dir (.daedalus-aider/,
-// holding the staged prompt and its chat/input history) and keeps it out of
-// git's sight by adding it to the worktree's info/exclude. info/exclude is
-// what add -A/-N -A and git diff honor without ever touching a tracked
-// file — the alternatives each pollute the deliverable: a .gitignore entry
-// becomes a tracked change, and leaving the files plain lands them in
-// every review diff and preserved branch. Idempotent: the pattern is
-// appended only once per worktree.
+// holding the staged prompt and its chat/input history) — see
+// excludeAgentArtifacts for how that stays out of git's sight.
 func excludeAiderArtifacts(worktreePath string) error {
-	if err := os.MkdirAll(filepath.Join(worktreePath, ".daedalus-aider"), 0o755); err != nil {
+	return excludeAgentArtifacts(worktreePath, ".daedalus-aider")
+}
+
+// excludeAgentArtifacts creates an agent's worktree scratch dir and keeps
+// it out of git's sight by adding it to the worktree's info/exclude.
+// info/exclude is what add -A/-N -A and git diff honor without ever
+// touching a tracked file — the alternatives each pollute the deliverable:
+// a .gitignore entry becomes a tracked change, and leaving the files plain
+// lands them in every review diff and preserved branch. Idempotent: the
+// pattern is appended only once per worktree.
+func excludeAgentArtifacts(worktreePath, name string) error {
+	if err := os.MkdirAll(filepath.Join(worktreePath, name), 0o755); err != nil {
 		return err
 	}
 	out, err := runGit(context.Background(), "-C", worktreePath, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return fmt.Errorf("resolve git dir: %w", err)
 	}
-	dir := strings.TrimSpace(string(out))
-	if dir == "." || !filepath.IsAbs(dir) {
-		dir = filepath.Join(worktreePath, dir)
+	gitDir := strings.TrimSpace(string(out))
+	if gitDir == "." || !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(worktreePath, gitDir)
 	}
-	const line = ".daedalus-aider/"
-	exclude := filepath.Join(dir, "info", "exclude")
+	line := name + "/"
+	exclude := filepath.Join(gitDir, "info", "exclude")
 	data, _ := os.ReadFile(exclude)
 	if strings.Contains(string(data), line) {
 		return nil
