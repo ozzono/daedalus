@@ -47,6 +47,40 @@ func Prompts() []string {
 	return names
 }
 
+// PromptSpec describes one overridable prompt: its name (the override
+// file's stem), its embedded source (the canonical sample), and the data
+// fields its template references — the exact field vocabulary an override
+// may use, since checkOverride rejects anything else at worker startup.
+type PromptSpec struct {
+	Name   string
+	Source string
+	Fields []string
+}
+
+// PromptSpecs returns every overridable prompt, sorted by name. Built for
+// `daedalus init prompt <dir>`: the scaffold emits each Source as
+// <Name>.md and lists Fields per prompt in its guide.
+func PromptSpecs() ([]PromptSpec, error) {
+	names := Prompts()
+	specs := make([]PromptSpec, 0, len(names))
+	for _, name := range names {
+		src, err := promptFiles.ReadFile("prompts/" + name + ".md")
+		if err != nil {
+			return nil, fmt.Errorf("prompt overrides: embedded source for %s: %w", name, err)
+		}
+		allowed, err := dataFields(parsed.Lookup(name + ".md").Tree.Root)
+		if err != nil {
+			return nil, fmt.Errorf("prompt overrides: embedded prompt %s: %w", name, err)
+		}
+		specs = append(specs, PromptSpec{
+			Name:   name,
+			Source: string(src),
+			Fields: slices.Sorted(maps.Keys(allowed)),
+		})
+	}
+	return specs, nil
+}
+
 // LoadOverrides installs the per-deployment prompt replacements: dir holds
 // one <prompt-name>.md file per replaced prompt, every stem naming a prompt
 // (see Prompts). The path is absolute, ~/…, or relative to baseDir (the
@@ -369,13 +403,62 @@ func TestsFix(testLogs, comments string) (string, error) {
 	return strings.Join(parts, "\n\n"), nil
 }
 
+// DiffHandoff routes an oversized review diff to a worktree file: the
+// prompt then carries the change digest, the per-file table of contents,
+// and reading instructions instead of the diff itself — nothing is
+// cropped, the reviewer reads the file in slices. Nil (the zero case)
+// embeds the diff inline, byte-identical to the original prompt shape.
+type DiffHandoff struct {
+	// Path is the diff file's worktree-relative path — the reviewer's
+	// round runs with the worktree as its directory, so this is the path
+	// its reads address.
+	Path  string
+	Lines int
+	// Stat is `git diff --compact-summary` over the same change.
+	Stat string
+	// Files is the table of contents, one precomputed entry per file's
+	// section: "lines a-b: path", the address a slice read (sed -n
+	// 'a,bp') takes. Precomputing the lines keeps element fields out of
+	// the prompt's template — the override field vocabulary stays exact
+	// (the range renders each entry as dot only).
+	Files []string
+}
+
+// ReviewExtra is one optional attachment to a reviewer prompt. The
+// interface is sealed by its unexported method to this package's two
+// concrete kinds: Jail (the jail carve-out) and *DiffHandoff (the
+// oversized-diff file handoff).
+type ReviewExtra interface{ reviewExtra() }
+
+func (Jail) reviewExtra() {}
+
+func (*DiffHandoff) reviewExtra() {}
+
+// reviewExtras splits a review builder's optional attachments into their
+// parts. At most one of each kind is meaningful; the last one wins.
+func reviewExtras(extra []ReviewExtra) (Jail, *DiffHandoff) {
+	var j Jail
+	var h *DiffHandoff
+	for _, e := range extra {
+		switch v := e.(type) {
+		case Jail:
+			j = v
+		case *DiffHandoff:
+			h = v
+		}
+	}
+	return j, h
+}
+
 // reviewData is the shared data of review.md. AcceptanceCriteria, when
 // non-empty, switches the template's framing to the slim flow's atomic
 // sub-task review (see SlimReview); the other framings leave it nil.
+// Handoff, when set, replaces the embedded diff with the file handoff.
 type reviewData struct {
 	Focus, Diff, TestLogs, AgentReply, BugDir, JailSpec string
 	TestsInScope, ReproInScope, TouchesJail             bool
 	AcceptanceCriteria                                  []string
+	Handoff                                             *DiffHandoff
 }
 
 // review renders the shared reviewer template for all framings.
@@ -398,9 +481,12 @@ func review(d reviewData) (string, error) {
 // framing — the diff's own repro test in the deliverable — see ReviewRepro.
 // jail, when set, marks a task whose own text names .ai-jail: the reviewer's
 // scope clause then audits .ai-jail changes (with the spec content relayed)
-// instead of blanket-ignoring them. It trails as variadic so existing
-// callers stay valid.
-func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string, jail ...Jail) (string, error) {
+// instead of blanket-ignoring them. Further extra attachments trail in the
+// same variadic — a *DiffHandoff swaps the embedded diff for the file
+// handoff (see DiffHandoff). They trail as variadic so existing callers
+// stay valid.
+func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string, extra ...ReviewExtra) (string, error) {
+	jail, handoff := reviewExtras(extra)
 	return review(reviewData{
 		Focus:        focus,
 		Diff:         diff,
@@ -408,16 +494,19 @@ func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir 
 		TestsInScope: testsInScope,
 		AgentReply:   agentReply,
 		BugDir:       bugDir,
-		TouchesJail:  len(jail) > 0 && jail[0].Touches,
-		JailSpec:     jailSpec(jail),
+		TouchesJail:  jail.Touches,
+		JailSpec:     jail.Spec,
+		Handoff:      handoff,
 	})
 }
 
 // ReviewRepro is Review's bug-fix framing: the diff's own tests are part of
 // its deliverable, and the reviewer must judge whether the repro actually
 // captures the reported bug — something the repro-first gate cannot. No
-// REBUILD verdict exists in this framing.
-func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, jail ...Jail) (string, error) {
+// REBUILD verdict exists in this framing. The trailing extras are Review's
+// (jail carve-out, diff file handoff).
+func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, extra ...ReviewExtra) (string, error) {
+	jail, handoff := reviewExtras(extra)
 	return review(reviewData{
 		Focus:        focus,
 		Diff:         diff,
@@ -425,8 +514,9 @@ func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, jail ...Jail)
 		ReproInScope: true,
 		AgentReply:   agentReply,
 		BugDir:       bugDir,
-		TouchesJail:  len(jail) > 0 && jail[0].Touches,
-		JailSpec:     jailSpec(jail),
+		TouchesJail:  jail.Touches,
+		JailSpec:     jail.Spec,
+		Handoff:      handoff,
 	})
 }
 
@@ -435,24 +525,20 @@ func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, jail ...Jail)
 // reviewer judges it against exactly the sub-task's acceptance criteria —
 // criteria belonging to later sub-tasks are not findings. No test-phase
 // framing exists (the slim loop runs the suite itself and relays it via
-// testLogs), and no REBUILD verdict.
-func SlimReview(focus, diff, testLogs, bugDir string, criteria []string) (string, error) {
+// testLogs), and no REBUILD verdict. The trailing extras are Review's
+// (jail carve-out, diff file handoff).
+func SlimReview(focus, diff, testLogs, bugDir string, criteria []string, extra ...ReviewExtra) (string, error) {
+	jail, handoff := reviewExtras(extra)
 	return review(reviewData{
 		Focus:              focus,
 		Diff:               diff,
 		TestLogs:           testLogs,
 		BugDir:             bugDir,
 		AcceptanceCriteria: criteria,
+		Handoff:            handoff,
+		TouchesJail:        jail.Touches,
+		JailSpec:           jail.Spec,
 	})
-}
-
-// jailSpec extracts the relayed spec content from the variadic jail of
-// Review/ReviewRepro.
-func jailSpec(jail []Jail) string {
-	if len(jail) > 0 {
-		return jail[0].Spec
-	}
-	return ""
 }
 
 // Rebuild feeds a test-review REBUILD finding back to the implementing

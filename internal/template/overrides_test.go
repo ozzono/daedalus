@@ -346,3 +346,56 @@ func TestLoadOverridesAtomicity(t *testing.T) {
 		t.Errorf("Rebuild after failed re-loads = %q, %v; want the previously installed set kept", got, err)
 	}
 }
+
+// TestPromptSpecs pins the scaffold's feed: one spec per overridable prompt
+// (same sorted names, sources byte-identical to the embedded prompts,
+// sorted non-empty field lists), and review's field list is the exact
+// vocabulary of the shared review data — a handoff element's fields
+// (First/Last/Path) must never reappear in it, because the range renders
+// dot-only and an override reaching for them would pass or fail on fiction.
+func TestPromptSpecs(t *testing.T) {
+	specs, err := PromptSpecs()
+	if err != nil {
+		t.Fatalf("PromptSpecs: %v", err)
+	}
+	names := make([]string, len(specs))
+	byName := make(map[string]PromptSpec, len(specs))
+	for i, s := range specs {
+		names[i] = s.Name
+		byName[s.Name] = s
+	}
+	if want := Prompts(); !slices.Equal(names, want) {
+		t.Errorf("PromptSpecs names = %v, want Prompts() %v", names, want)
+	}
+	for _, s := range specs {
+		src, err := promptFiles.ReadFile("prompts/" + s.Name + ".md")
+		if err != nil {
+			t.Fatalf("read embedded %s: %v", s.Name, err)
+		}
+		if s.Source != string(src) {
+			t.Errorf("spec %s source drifts from the embedded prompt (%d vs %d bytes)", s.Name, len(s.Source), len(src))
+		}
+		if len(s.Fields) == 0 {
+			t.Errorf("spec %s lists no data fields", s.Name)
+		}
+		if !slices.IsSorted(s.Fields) {
+			t.Errorf("spec %s fields are not sorted: %v", s.Name, s.Fields)
+		}
+	}
+	wantReview := []string{
+		"AcceptanceCriteria", "AgentReply", "BugDir", "Diff", "Focus", "Handoff",
+		"JailSpec", "ReproInScope", "TestLogs", "TestsInScope", "TouchesJail",
+	}
+	if !slices.Equal(byName["review"].Fields, wantReview) {
+		t.Errorf("review fields = %v, want the exact review-data vocabulary %v", byName["review"].Fields, wantReview)
+	}
+
+	// The vocabulary is what startup enforces: a review override reaching
+	// for a handoff element's field is rejected at load, not mid-round.
+	resetInstalled(t)
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"review.md": "{{range .Handoff.Files}}- {{.First}}{{end}}"})
+	if err := LoadOverrides(dir, t.TempDir()); err == nil || !strings.Contains(err.Error(), `"First"`) {
+		t.Errorf("LoadOverrides(review override with .First) = %v, want the unknown-field rejection", err)
+	}
+}

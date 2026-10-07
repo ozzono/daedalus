@@ -3072,3 +3072,65 @@ func TestParkedResultMarkers(t *testing.T) {
 		}
 	}
 }
+
+// errOverflowStub mirrors how a static prompt-overflow failure surfaces at
+// the activity boundary: message text only (claude's result JSON prints the
+// marker; the OpenAI-compatible wire its two siblings).
+var errOverflowStub = errors.New("run jailed: Prompt is too long: 250000 tokens > 200000 limit")
+
+// TestFeatureDevWorkflowReviewerPromptOverflowNotRetried pins the
+// overflow backstop: a reviewer round whose prompt cannot fit the serving
+// model's context is terminal — the run fails naming the static size, and
+// neither the fresh-session fallback nor the quota heartbeat is spent on a
+// prompt every retry re-sends at the same size (the stub would approve any
+// wrongful retry, so the single-call count is the pin).
+func TestFeatureDevWorkflowReviewerPromptOverflowNotRetried(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	rev := &reviewerRecorder{env: env, script: []reviewStep{{err: errOverflowStub}},
+		stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil || !strings.Contains(err.Error(), "cannot fit the serving model's context window") {
+		t.Fatalf("want the terminal prompt-overflow failure, got %v", err)
+	}
+	if len(rev.inputs) != 1 {
+		t.Fatalf("reviewer ran %d times, want 1 (the size is static, so no retry)", len(rev.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestIsPromptOverflow pins the classification: each provider's overflow
+// marker matches (wrapped or bare), while the recoverable failure shapes —
+// quota exhaustion, a killed round, an ordinary error, no error — do not.
+func TestIsPromptOverflow(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"claude result marker", errors.New(`run jailed: result: {"subtype":"error_during_execution"} Prompt is too long: 250000 tokens > 200000 limit`), true},
+		{"openai wire marker", errors.New(`error: {"error":{"code":"context_length_exceeded"}}`), true},
+		{"anthropic wire marker", errors.New("invalid_request_error: prompt exceeds the maximum context length"), true},
+		{"wrapped", fmt.Errorf("review %q: %w", "the implementation", errors.New("Prompt is too long")), true},
+		{"quota exhaustion", errQuotaStub, false},
+		{"killed round", errors.New("agent killed by SIGKILL"), false},
+		{"ordinary failure", errReviewStub, false},
+		{"no error", nil, false},
+	} {
+		if got := isPromptOverflow(c.err); got != c.want {
+			t.Errorf("isPromptOverflow(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

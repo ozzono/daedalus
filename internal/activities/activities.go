@@ -14,6 +14,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ozzono/daedalus/internal/config"
@@ -322,7 +324,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	// under the jail mount (see mirrorToHost's SameFile guard).
 	defer mirrorToHost(ctx, input.WorktreePath,
 		os.Getenv(config.BugDirEnv), os.Getenv(config.BugMirrorEnv))
-	diff, err := stagedDiff(ctx, input.WorktreePath)
+	diff, handoff, err := stagedDiff(ctx, input.WorktreePath)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -346,15 +348,21 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 				}
 			}
 		}
+		// The jail carve-out always rides along; the diff file handoff
+		// joins it only when the diff was too large to embed.
+		extras := []template.ReviewExtra{
+			template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec},
+		}
+		if handoff != nil {
+			extras = append(extras, handoff)
+		}
 		if input.ReproInScope {
-			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir,
-				template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
+			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir, extras...)
 		}
 		if len(input.AcceptanceCriteria) > 0 {
-			return template.SlimReview(input.Focus, diff, input.TestLogs, bugDir, input.AcceptanceCriteria)
+			return template.SlimReview(input.Focus, diff, input.TestLogs, bugDir, input.AcceptanceCriteria, extras...)
 		}
-		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir,
-			template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec})
+		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir, extras...)
 	}()
 	if err != nil {
 		return ReviewResult{}, err
@@ -509,17 +517,172 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	return out.Close()
 }
 
-// stagedDiff returns the full diff of the worktree against HEAD, including
-// new files, without leaving the tree staged: intent-to-add (-N) makes new
-// files visible to `git diff` while the index stays effectively untouched,
-// so the next agent round sees normal `git diff`/`git status` output.
-func stagedDiff(ctx context.Context, worktreePath string) (string, error) {
+// reviewDiffDir is the reviewer's worktree scratch dir, holding the diff
+// handoff file when a review diff is too large to embed (stagedDiff);
+// excludeAgentArtifacts keeps it out of git's sight.
+const reviewDiffDir = ".daedalus-review"
+
+// diffHandoffPath is the handoff file's worktree-relative path — the path
+// both the reviewer prompt and the stale-file removal address (jailed
+// rounds run with the worktree as their directory).
+const diffHandoffPath = reviewDiffDir + "/diff.patch"
+
+// reviewDiffBudget is the byte ceiling under which a review diff still
+// embeds inline in the reviewer prompt: half the serving model's context
+// window at a conservative 3 bytes per token, the other half reserved for
+// the rest of the prompt, the reviewer's tool traffic, and its verdict.
+// The window is the worker's anthropic.context_tokens (exported as
+// ContextTokensEnv for the jailed rounds); 200000 is the default window of
+// the serving models — the one whose overflow killed the run this handoff
+// replaces. An operator on a smaller model sets the knob and the budget
+// follows.
+func reviewDiffBudget() int {
+	tokens := 200000
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(config.ContextTokensEnv))); err == nil && v > 0 {
+		tokens = v
+	}
+	return tokens / 2 * 3
+}
+
+// stagedDiff returns the reviewer's view of the worktree's diff against
+// HEAD, including new files, without staging the work itself: intent-to-add
+// (-N) makes new files visible to `git diff` while modifications stay
+// unstaged, so the next agent round sees normal `git diff`/`git status`
+// output (one removal caveat — see the ALERT below). A diff at or under
+// reviewDiffBudget returns
+// inline — the prompt shape is byte-identical to the original. Above the
+// budget the same complete diff goes to <worktree>/.daedalus-review/
+// diff.patch — never cropped — and the return carries the prompt's file
+// handoff instead: the digest, the per-file table of contents, and the
+// line counts the prompt builds its reading instructions on. The file
+// lives in git's blind spot (info/exclude), so no later round's diff or
+// status, and no preserved branch, ever sees it.
+//
+// ALERT (recorded under backlog/bugs/): `add -N -A` has no intent-to-add
+// form for a removal — it stages deletions and renames fully, so they
+// leave the worktree-vs-index diff and the reviewer never sees them. The
+// handoff file carries the same `git diff`, so the gap predates and
+// outlives this mechanism; the fix (a `git diff HEAD` shape, or
+// unstaging after collection) changes the diff contract every review
+// prompt and pin rides on, so it stays its own round.
+func stagedDiff(ctx context.Context, worktreePath string) (string, *template.DiffHandoff, error) {
 	if _, err := runGit(ctx, "-C", worktreePath, "add", "-N", "-A"); err != nil {
-		return "", fmt.Errorf("stage intent-to-add: %w", err)
+		return "", nil, fmt.Errorf("stage intent-to-add: %w", err)
 	}
 	out, err := runGit(ctx, "-C", worktreePath, "diff")
 	if err != nil {
-		return "", fmt.Errorf("collect diff: %w", err)
+		return "", nil, fmt.Errorf("collect diff: %w", err)
 	}
-	return out, nil
+	if len(out) <= reviewDiffBudget() {
+		// A handoff file left by a previous oversized round is stale the
+		// moment this diff embeds inline: remove it (best-effort — the
+		// exclusion line keeps git blind either way) so no round reads a
+		// superseded diff, and drop the now-empty scratch dir with it
+		// (a failure means the dir holds something else — leave it).
+		if err := os.Remove(filepath.Join(worktreePath, diffHandoffPath)); err != nil && !os.IsNotExist(err) {
+			activityLogger(ctx).Warn("Stale review diff handoff could not be removed",
+				"Path", diffHandoffPath, "Error", err)
+		}
+		_ = os.Remove(filepath.Join(worktreePath, reviewDiffDir))
+		return out, nil, nil
+	}
+	h, err := writeDiffHandoff(ctx, worktreePath, out)
+	if err != nil {
+		return "", nil, err
+	}
+	return "", h, nil
+}
+
+// writeDiffHandoff routes an oversized review diff to the worktree: the
+// complete, uncropped diff is written to .daedalus-review/diff.patch (the
+// dir excluded from git via excludeAgentArtifacts) and the prompt's
+// handoff is gathered — the compact-summary digest, and the per-file table
+// of contents read off the very text being written.
+func writeDiffHandoff(ctx context.Context, worktreePath, diff string) (*template.DiffHandoff, error) {
+	if err := excludeAgentArtifacts(worktreePath, reviewDiffDir); err != nil {
+		return nil, fmt.Errorf("exclude review diff dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, diffHandoffPath), []byte(diff), 0o644); err != nil {
+		return nil, fmt.Errorf("write review diff handoff: %w", err)
+	}
+	stat, err := runGit(ctx, "-C", worktreePath, "diff", "--compact-summary")
+	if err != nil {
+		return nil, fmt.Errorf("diff digest: %w", err)
+	}
+	return &template.DiffHandoff{
+		Path:  diffHandoffPath,
+		Lines: diffLineCount(diff),
+		Stat:  stat,
+		Files: diffSections(diff),
+	}, nil
+}
+
+// diffLineCount counts the diff's lines the way a slice read addresses
+// them: one per newline, plus a final unterminated line when the diff
+// lacks the trailing newline.
+func diffLineCount(diff string) int {
+	n := strings.Count(diff, "\n")
+	if len(diff) > 0 && !strings.HasSuffix(diff, "\n") {
+		n++
+	}
+	return n
+}
+
+// diffSections maps every file's section of the diff text to one table-of-
+// contents entry, precomputed in the prompt's final form ("lines a-b:
+// path" — the 1-based range a slice read, sed -n 'a,bp', addresses): each
+// `diff --git` header opens a section that runs to the next header, or to
+// the last line. An entry's path prefers the section's `+++ b/` line — the
+// exact path git means even where the header is ambiguous (spaces, quoted
+// metachars) — falling back to the header's b-side tail, which still names
+// the sections that carry no +++ line (deletions, binary files); git
+// appends a tab after a space-carrying path on the +++ line, so it is
+// trimmed. The +++ line is honored only inside a section's header block
+// (before its first @@ hunk): a hunk body can carry a literal `+++ b/…`
+// line — a diff that adds the line `++ b/x` — and that must not retitle
+// the section.
+// ponytail: a header whose b-path itself embeds " b/", or that git had to
+// C-quote, yields a cosmetic path only — the load-bearing half of an entry
+// is its line range, which is always exact.
+func diffSections(diff string) []string {
+	var lines []string
+	path := ""
+	first := 0
+	header := false
+	n := 0
+	emit := func(last int) {
+		lines = append(lines, fmt.Sprintf("lines %d-%d: %s", first, last, path))
+	}
+	for line := range strings.SplitSeq(diff, "\n") {
+		n++
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			if first > 0 {
+				emit(n - 1)
+			}
+			first = n
+			header = true
+			path = diffHeaderPath(line)
+		case first > 0 && strings.HasPrefix(line, "@@ "):
+			header = false
+		case first > 0 && header && strings.HasPrefix(line, "+++ b/"):
+			path = strings.TrimRight(strings.TrimPrefix(line, "+++ b/"), "\t")
+		}
+	}
+	if first > 0 {
+		emit(diffLineCount(diff))
+	}
+	return lines
+}
+
+// diffHeaderPath extracts the b-side path from a `diff --git a/x b/y`
+// header line — the fallback for sections without a `+++ b/` line. A
+// header git had to quote, or whose path embeds " b/", yields a
+// best-effort string; see diffSections's ponytail note.
+func diffHeaderPath(line string) string {
+	tail := strings.TrimPrefix(line, "diff --git ")
+	if i := strings.LastIndex(tail, " b/"); i >= 0 {
+		return tail[i+3:]
+	}
+	return tail
 }

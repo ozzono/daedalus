@@ -479,7 +479,10 @@ test_output:
 # renders byte-identically to the embedded templates in
 # internal/template/prompts. When set, this names a directory of
 # replacement prompts: one <prompt-name>.md file per replaced prompt, the
-# file stem naming the prompt — implement, implement_fix, continue, tests,
+# file stem naming the prompt ("daedalus init prompt <dir>" scaffolds a
+# ready-to-edit copy of such a directory — every prompt's embedded source
+# plus a README guide). The stems are: implement, implement_fix, continue,
+# tests,
 # tests_failed, tests_review, review, rebuild, investigate,
 # investigate_fix, refactor, refactor_fix, bugfix, bugfix_fix, slim_plan,
 # slim_step, slim_parse, slim_parse_reask, or slim_fix (daedalus template

@@ -29,7 +29,8 @@ WORKER COMMANDS
 
 UTILITY COMMANDS
   init        Generate a fully commented config-example.yaml file
-              profiles: prompt slim
+              profiles: prompt slim; "init prompt <dir>" scaffolds a
+              prompt-override directory (samples + README)
   config      Print the active configuration (resolved path + every field)
               flags: none
   report      Summarize AI provider usage (cost, tokens, time) and worker slots
@@ -406,6 +407,7 @@ For a local Temporal dev server matching the defaults: temporal server start-dev
 
 USAGE
   daedalus init [prompt] [slim]
+  daedalus init prompt <dir>
 
 Bare init writes config-example.yaml in the current directory: the full
 example, every field with its default value, fully commented. Copy it to
@@ -424,6 +426,13 @@ earlier init wrote, so to hold two slices pass both profiles in one call
            block, the openai: block, and anthropic's context_tokens and
            max_output_tokens. The base always keeps agent, thinking, and
            max_concurrent_agent_runs, so the file stands alone.
+
+"daedalus init prompt <dir>" — a second word naming no profile — scaffolds
+the prompt-override directory <dir> instead: every prompt's current
+embedded source as a ready-to-edit sample, plus the README guide (activation,
+the startup-enforced writing rules, and each prompt's data fields). It then
+writes the prompt-profile example as above. Refuses a non-empty target dir;
+the scaffolded samples themselves override nothing until edited.
 
 Configuration is read from the first of ./config.yaml,
 ./.daedalus/config.yaml, and ~/.config/daedalus/config.yaml (-c/--config

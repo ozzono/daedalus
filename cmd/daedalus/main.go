@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -108,11 +109,16 @@ func main() {
 	case "init":
 		// Bare init writes the full example, refusing to overwrite;
 		// profile arguments regenerate it as the base plus the requested
-		// slices.
+		// slices. `init prompt <dir>` is the one three-word form: a second
+		// word naming no profile is a prompt-override directory to
+		// scaffold (samples plus README) ahead of the prompt-profile
+		// example.
 		if len(args) == 1 {
 			if err := writeExampleConfig("."); err != nil {
 				fail("init", err)
 			}
+		} else if len(args) == 3 && args[1] == "prompt" && !slices.Contains(initProfiles, args[2]) {
+			scaffoldPromptOverrides(args[2])
 		} else {
 			writeProfiledExample(args[1:])
 		}
