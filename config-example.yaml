@@ -24,10 +24,16 @@
 # below; the
 # jail masks the repo's .env to empty, so .env files cannot override
 # inside jailed rounds). opencode alert: neither the openai nor the
-# anthropic base-URL env vars reach it (source-verified 2026-09-26) — its
-# endpoints come from its own catalog/config files, which daedalus does
-# not bridge, so self-hosted endpoints need operator-side opencode.json
-# work (see backlog/bugs/pi-opencode-openai-section-unbridged.md).
+# anthropic base-URL env vars reach it (source-verified 2026-09-26), but
+# an openai-section round is bridged regardless: the worker stages a
+# round-scoped config file into the worktree (a "daedalus-openai"
+# provider entry — baseURL, the key as an env template so it never lands
+# on disk, the model's limits) and exposes it via OPENCODE_CONFIG,
+# selecting the staged model with -m — no operator-side opencode.json
+# work needed. The anthropic section stays unbridged (opencode has no
+# ANTHROPIC_* channel), and the jail mounts no opencode config dir, so
+# such a round resolves its own config inside the jail: a repo-committed
+# opencode.json is honored, the host's global one is not.
 agent: claude
 
 # Thinking toggle for the jailed agents, independent of slim: defaults to
@@ -156,7 +162,11 @@ slim:
   # inspects pi's chat-completions traffic, and an answer that is exactly
   # one JSON object naming one of the request's own tools is converted
   # into a native tool call, its arguments normalized by this model via
-  # ollama structured output against the tool's own schema. Prose is never
+  # ollama structured output against the tool's own schema. That schema
+  # conformance holds on ollama and other format-honoring parser
+  # upstreams; an OpenAI-compatible upstream that silently ignores
+  # ollama's format field leaves the arguments checked only as a JSON
+  # object. Prose is never
   # converted (reviewer verdicts are content), and any relay or parser
   # failure degrades to the old inert-text behavior — never a new run
   # failure. Resolved against the openai section's url; create the tag on
@@ -258,21 +268,22 @@ anthropic:
   # Context window for the jailed agent's model, in tokens. When set, it
   # exports as CLAUDE_CODE_MAX_CONTEXT_TOKENS (which jailed claude honors
   # for its compaction/budget math), replaces the input side of the
-  # model metadata staged for aider rounds, and lands as contextWindow on
-  # the model entry staged for openai-served pi rounds; opencode, amp, and
-  # codex
-  # ignore it (opencode's only mechanism is a config-file pointer whose
-  # precedence against a repo-committed opencode.json was never probed).
-  # Zero/unset means each agent's own default.
+  # model metadata staged for aider rounds, lands as contextWindow on
+  # the model entry staged for openai-served pi rounds, and lands as
+  # limit.context on the entry staged for openai-served opencode rounds
+  # (that staged file rides OPENCODE_CONFIG, whose precedence against a
+  # repo-committed opencode.json was never probed); amp and codex
+  # ignore it. Zero/unset means each agent's own default.
   context_tokens: 0
   # Completion cap for the jailed agent's rounds, in tokens. When set, it
   # replaces both sides of the 8k constant in the model metadata staged
   # for aider rounds (the metadata's max_output_tokens and
   # extra_params.max_tokens), claude's round env gains
   # CLAUDE_CODE_MAX_OUTPUT_TOKENS (the var claude 2.1.283's own error text
-  # names for its request-level max_tokens override), and it lands as
-  # maxTokens on the model entry staged for openai-served pi rounds.
-  # opencode, amp, and codex have
+  # names for its request-level max_tokens override), lands as
+  # maxTokens on the model entry staged for openai-served pi rounds, and
+  # lands as limit.output on the entry staged for openai-served opencode
+  # rounds. amp and codex have
   # no wired route. Zero/unset keeps aider's 8192 constant and every other
   # agent's API default.
   max_output_tokens: 0
@@ -479,9 +490,11 @@ test_output:
 # startup: a missing directory, an unreadable file, a template that does
 # not parse, an empty file, a data field the prompt does not take (each
 # template renders a fixed struct — copy the field references from the
-# embedded file), a {{template}} action (an override runs alone), or a
-# review override missing the verdict protocol all fail the start, never a
-# mid-round render. Two machine contracts a replacement must keep: review
+# embedded file), a {{template}} action (an override runs alone), a
+# {{define}}/{{block}} block (a define body can never render in an
+# override), or a review override missing the verdict protocol all fail
+# the start, never a mid-round render. Two machine contracts a
+# replacement must keep: review
 # is validated at startup to still carry all four verdict words (APPROVED,
 # CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
 # protocol the loop parses), and slim_plan must keep instructing the

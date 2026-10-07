@@ -33,6 +33,23 @@ type piModelConfig struct {
 	ContextWindow  int            `json:"contextWindow,omitempty"`
 	MaxTokens      int            `json:"maxTokens,omitempty"`
 	SamplingParams map[string]any `json:"samplingParams,omitempty"`
+	Compat         *piModelCompat `json:"compat,omitempty"`
+}
+
+// piModelCompat carries the per-model compat overrides pi merges over its
+// detected provider compat (getCompat(): model.compat.* ?? detected.*, task-
+// verified against the installed 0.87.1 release 2026-10-06). daedalus stages
+// exactly one: supportsStore=false. pi's openai-completions provider infers
+// compat from the base URL — any URL outside its known-provider list counts
+// as standard OpenAI and gets supportsStore, so buildParams hardcodes
+// `store: false` into every chat-completions body — which strict
+// OpenAI-compatible validators (Mistral) reject with 422
+// extra_forbidden. Staging the override makes pi omit the param, always
+// equivalent-or-better: store defaults to false on OpenAI itself. SupportsStore
+// is a *bool because omitempty on a plain bool would drop the very false the
+// override exists to send.
+type piModelCompat struct {
+	SupportsStore *bool `json:"supportsStore,omitempty"`
 }
 
 // piProviderConfig is the daedalus-owned provider entry. apiKey is staged as
@@ -115,6 +132,9 @@ func stagePiProvider(env []string) ([]string, error) {
 		entry.APIKey = "none"
 	}
 	modelEntry := piModelConfig{ID: model}
+	// Staged unconditionally (see piModelCompat): no backend wants the param.
+	storeOff := false
+	modelEntry.Compat = &piModelCompat{SupportsStore: &storeOff}
 	if n, err := strconv.Atoi(envLookup(env, config.ContextTokensEnv)); err == nil && n > 0 {
 		modelEntry.ContextWindow = n
 	}

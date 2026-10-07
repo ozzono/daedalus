@@ -2,14 +2,18 @@ package toolrelay
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // recordedRequest is one request a stub upstream received: path, headers,
@@ -212,6 +216,144 @@ type decodedSynthetic struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+}
+
+// TestCloseIsQuiet pins the designed shutdown's face: Close goes through
+// the server, so Serve exits on the http.ErrServerClosed path and logs
+// nothing — with the listener closed underneath it, Serve exits with the
+// raw accept error instead, and every worker shutdown logs a bogus
+// "toolrelay: serve:" line for the designed close. Serve's exit is not
+// observable from outside, so the quietness is bounded-checked: a wrong-path
+// exit logs within moments of the listener closing, and the check fails
+// fast on the line, passing only after a short clean window.
+func TestCloseIsQuiet(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer up.Close()
+	r, err := Start(up.URL+"/v1", "parser")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Serve must be up and answering before the close — otherwise the
+	// quietness would be vacuous (nothing was ever serving).
+	status, body := postCompletions(t, r.URL(), []byte(`{}`))
+	if status != http.StatusOK {
+		t.Fatalf("relay not serving before Close: status %d, body %s", status, body)
+	}
+
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The relay must actually be down: the designed shutdown stops the
+	// listener, so the next dial fails rather than hanging or answering.
+	if resp, err := http.Post(r.URL()+"/chat/completions", "application/json", strings.NewReader(`{}`)); err == nil {
+		resp.Body.Close()
+		t.Error("relay still answering after Close, want the listener down")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if msg := logBuf.String(); msg != "" {
+			t.Fatalf("designed shutdown logged %q, want a quiet close (Serve exited off the http.ErrServerClosed path)", msg)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestPinsAcceptEncodingIdentity pins the wire invariant both legs rely on:
+// the forwarded round trip and the parser call travel with
+// Accept-Encoding: identity — a transport asked to negotiate gzip would
+// re-add the header itself and transparently unwrap the reply, so the plain
+// bytes the JSON inspection reads would hold only for transports with that
+// auto-gzip behavior, not by the pin. The stub upstream negotiates for
+// real (gzip asked, gzip answered; identity asked, plain answered), and pi's
+// own request carries Accept-Encoding: gzip, so a drop instead of a set
+// would let the transport backfill gzip and show on the wire.
+func TestPinsAcceptEncodingIdentity(t *testing.T) {
+	const raw = `{"name":"read_file","arguments":{"path":"a.txt"}}`
+	forward := completionReply(strPtr(fenced(raw)), "")
+	parserOut := `{"path":"a.txt"}`
+	// negotiate replies gzip-encoded when the request asks for gzip and
+	// plain otherwise — an upstream honoring the wire's negotiation.
+	negotiate := func(w http.ResponseWriter, r *http.Request, body []byte) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(body)
+			return
+		}
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(body); err != nil {
+			panic(err) // unreachable: in-memory writer
+		}
+		if err := zw.Close(); err != nil {
+			panic(err) // unreachable: in-memory writer
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(buf.Bytes())
+	}
+	rec := &recorder{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		rec.add(r, body)
+		var top map[string]json.RawMessage
+		if json.Unmarshal(body, &top) == nil {
+			if _, ok := top["format"]; ok {
+				negotiate(w, r, completionReply(&parserOut, ""))
+				return
+			}
+		}
+		negotiate(w, r, forward)
+	}))
+	defer up.Close()
+	relay := startStubRelay(t, up, "parser-model")
+
+	// pi's dial negotiates gzip — the header the relay must overwrite, not
+	// merely drop, on both of its own dials.
+	req, err := http.NewRequest(http.MethodPost, relay.URL()+"/chat/completions",
+		bytes.NewReader(toolsRequestBody(t, false)))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST relay: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read relay response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body %s", resp.StatusCode, body)
+	}
+	// The inspected body was plain enough to lift: the answer became a
+	// native tool call, so the identity pin held end to end.
+	var got decodedSynthetic
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("parse relay reply %s: %v", body, err)
+	}
+	if len(got.Choices) != 1 || len(got.Choices[0].Message.ToolCalls) != 1 ||
+		got.Choices[0].Message.ToolCalls[0].Function.Name != "read_file" {
+		t.Errorf("relay reply %s, want the lifted read_file tool call (the inspection saw plain bytes)", body)
+	}
+
+	reqs := rec.all()
+	if len(reqs) != 2 {
+		t.Fatalf("upstream got %d requests, want 2 (forward + parser)", len(reqs))
+	}
+	for _, leg := range reqs {
+		if got := leg.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Errorf("leg %s Accept-Encoding = %q, want identity pinned on the wire", leg.Path, got)
+		}
+	}
 }
 
 // TestStartRejectsUnusableUpstream pins the boot guard: an upstream URL

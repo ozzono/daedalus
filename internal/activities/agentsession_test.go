@@ -1559,3 +1559,107 @@ func TestRecordedOpencodeSession(t *testing.T) {
 		t.Errorf("recordedAgentSession(opencode) after the session vanished = %q (stale=%v), want empty and stale", id, stale)
 	}
 }
+
+// TestOpencodeNewestUpdate pins the freshness scan behind the CLI's
+// task-status brief: the newest parseable updated stamp among this
+// worktree's sessions wins, other directories' sessions never count, and a
+// stamp that does not parse — a number where the string convention is
+// expected, or an exotic layout — drops its own session from the scan
+// rather than misdating the worktree. A failed list reports not-ok.
+func TestOpencodeNewestUpdate(t *testing.T) {
+	wt := t.TempDir()
+	old := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	new := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+
+	t.Run("newest stamp wins for this worktree", func(t *testing.T) {
+		fakeOpencodeList(t, opencodeListJSON(
+			`{"id":"oc-old","directory":"`+wt+`","updated":"`+old+`"}`,
+			`{"id":"oc-new","directory":"`+wt+`","updated":"`+new+`"}`,
+			`{"id":"oc-newest-elsewhere","directory":"/tmp/elsewhere","updated":"2030-01-01T00:00:00Z"}`,
+		))
+		got, ok := OpencodeNewestUpdate(wt)
+		if want, _ := time.Parse(time.RFC3339, new); !ok || !got.Equal(want) {
+			t.Errorf("OpencodeNewestUpdate = %v, %v; want the worktree's newest stamp %v", got, ok, want)
+		}
+	})
+
+	t.Run("unparseable stamps drop their session", func(t *testing.T) {
+		fakeOpencodeList(t, opencodeListJSON(
+			`{"id":"oc-numeric","directory":"`+wt+`","updated":1730000000}`,
+			`{"id":"oc-exotic","directory":"`+wt+`","updated":"10/07/2026 noon"}`,
+			`{"id":"oc-good","directory":"`+wt+`","updated":"`+old+`"}`,
+		))
+		got, ok := OpencodeNewestUpdate(wt)
+		if want, _ := time.Parse(time.RFC3339, old); !ok || !got.Equal(want) {
+			t.Errorf("OpencodeNewestUpdate = %v, %v; want the only parseable stamp %v", got, ok, want)
+		}
+	})
+
+	t.Run("no parseable stamp is not ok", func(t *testing.T) {
+		fakeOpencodeList(t, opencodeListJSON(`{"id":"oc-numeric","directory":"`+wt+`","updated":1730000000}`))
+		if got, ok := OpencodeNewestUpdate(wt); ok || !got.IsZero() {
+			t.Errorf("OpencodeNewestUpdate = %v, %v; want not-ok with no time", got, ok)
+		}
+	})
+
+	t.Run("failed list is not ok", func(t *testing.T) {
+		stubBin(t, "opencode", "exit 1")
+		if got, ok := OpencodeNewestUpdate(wt); ok || !got.IsZero() {
+			t.Errorf("OpencodeNewestUpdate on a failed list = %v, %v; want not-ok", got, ok)
+		}
+	})
+}
+
+// TestCodexNewestRollout pins the rollout freshness scan behind the CLI's
+// task-status brief: the whole sessions tree is walked (a rollout whose file
+// lands after a day boundary sits in another dir), the recorded cwd
+// attributes each file to the worktree, non-rollout entries are ignored, and
+// a tree with no rollout for this worktree reports not-ok.
+func TestCodexNewestRollout(t *testing.T) {
+	cxHome := fakeCodexHome(t)
+	wt := t.TempDir()
+	other := t.TempDir()
+
+	if _, _, ok := CodexNewestRollout(wt); ok {
+		t.Error("CodexNewestRollout without a sessions tree = ok, want not-ok")
+	}
+
+	old := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	new := time.Now().Add(-time.Hour).Truncate(time.Second)
+	older := plantCodexRollout(t, cxHome, "2026/10/05", codexUUIDA, wt)
+	foreign := plantCodexRollout(t, cxHome, "2026/10/05", codexUUIDB, other)
+	newer := plantCodexRollout(t, cxHome, "2026/10/06", codexUUIDC, wt)
+	for path, mtime := range map[string]time.Time{older: old, newer: new} {
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Non-rollout entries are never candidates, whatever their mtime.
+	notes := filepath.Join(cxHome, "sessions", "notes.txt")
+	if err := os.WriteFile(notes, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh := time.Now()
+	if err := os.Chtimes(notes, fresh, fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	path, mtime, ok := CodexNewestRollout(wt)
+	if !ok || path != newer || !mtime.Equal(new) {
+		t.Errorf("CodexNewestRollout = (%q, %v, %v); want %q at %v — the newer own-worktree rollout across the day dirs", path, mtime, ok, newer, new)
+	}
+
+	// The foreign-cwd rollout is not this worktree's even when it is newest.
+	if err := os.Chtimes(foreign, fresh, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if path, _, ok := CodexNewestRollout(wt); !ok || path != newer {
+		t.Errorf("CodexNewestRollout = (%q, %v) with a newer foreign-cwd rollout, want %q still", path, ok, newer)
+	}
+
+	// A missing tree under CODEX_HOME reports not-ok, not an error.
+	t.Setenv("CODEX_HOME", t.TempDir())
+	if _, _, ok := CodexNewestRollout(wt); ok {
+		t.Error("CodexNewestRollout under an empty CODEX_HOME = ok, want not-ok")
+	}
+}

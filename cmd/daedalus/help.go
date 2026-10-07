@@ -118,7 +118,13 @@ FLAGS
                           on run-b, which depends on run-a); a dependency that
                           is already approved at submit skips the wait
                           entirely. The id is verbatim from "daedalus list";
-                          the dependency must run on this config's task queue.
+                          the dependency must run on this config's task queue,
+                          and on the same repository this run targets — the
+                          chain checks the queue, not the repo, so a
+                          same-queue dependency from another repo waits out
+                          its gate and then fails at worktree creation with
+                          a raw git error (its preserved branch exists only
+                          in its own repo).
                           Fresh runs only — rejected in append mode.
   -f, --file <path>       Read the task description from a file. A glob pattern
                           (e.g. notes/*.md) expands to every matching file,
@@ -239,14 +245,15 @@ transcript's latest entry — the "looks stuck" check. It is computed from
 the task log and the agent transcripts on disk alone, so it works even
 while the worker or Temporal are down, and it is always scoped to the one
 workflow id given. A missing log prints the same not-started error either way.
-The transcript freshness and digest read claude's transcript dir and pi's
-session dir, newest file wins — a previous run's stale transcripts on one
-side never shadow the other agent's live session. Agents the reader does
-not consult (opencode, codex, amp, aider) show "no transcripts yet" even
-while running — opencode and codex do keep addressable session state
-(their rounds chain conversations; the status view just does not read it
-yet), while amp and aider keep none; the task log itself is complete for
-every agent.
+The transcript freshness and digest read claude's transcript dir, pi's
+session dir, and codex's rollout tree (the cwd recorded in each rollout
+file attributes it to this worktree), newest wins — a previous run's
+stale transcripts on one side never shadow the other agent's live
+session. opencode keeps no files: its freshness comes from one "opencode
+session list" call against its session database, printed as the newest
+updated stamp with no digest — the messages stay in the database. Amp and
+aider keep no addressable session state and show "no transcripts yet"
+even while running; the task log itself is complete for every agent.
 
 With -cot, prints the run's chain-of-thought logs instead of the task
 log: one complete section per jailed round (implementation and review),
@@ -275,8 +282,8 @@ follows regardless of the tail — it is newer than every completed round.
 
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
-host-side transcript as the agent writes it — claude's and pi's, the same
-newest-wins precedence as --status. Agents whose host transcripts the
+host-side transcript as the agent writes it — claude's and pi's, newest
+file wins. Agents whose host transcripts the
 live view does not follow (aider, opencode, codex, amp) get one line
 saying their CoT appears when the round completes — codex does keep a
 rollout transcript, the live view just does not read it yet. Between
@@ -381,15 +388,33 @@ For a local Temporal dev server matching the defaults: temporal server start-dev
 `,
 	"init": `daedalus init — generate a fully commented config-example.yaml.
 
-Writes config-example.yaml in the current directory: every field with its
-default value, fully commented. Copy it to config.yaml and edit. Refuses to
-overwrite an existing file.
+USAGE
+  daedalus init [prompt] [slim]
+
+Bare init writes config-example.yaml in the current directory: the full
+example, every field with its default value, fully commented. Copy it to
+config.yaml and edit. Refuses to overwrite an existing file.
+
+Profile arguments sample that example into a starting point for one
+feature: the base configuration — everything outside a profile's blocks —
+plus the requested slices, in file order. A profiled init regenerates the
+file, overwriting any existing one; there is no merging with what an
+earlier init wrote, so to hold two slices pass both profiles in one call
+("daedalus init prompt slim", which is the full example):
+
+  prompt   The prompt: block — project-wise prompt overrides, a directory
+           of replacement prompts resolved and validated at worker startup.
+  slim     The self-hosted-LLM slice for the aider/pi agents: the slim:
+           block, the openai: block, and anthropic's context_tokens and
+           max_output_tokens. The base always keeps agent, thinking, and
+           max_concurrent_agent_runs, so the file stands alone.
 
 Configuration is read from the first of ./config.yaml,
 ./.daedalus/config.yaml, and ~/.config/daedalus/config.yaml (-c/--config
-overrides the path); the latter makes the CLI work from any directory. A
+overrides the path); the last makes the CLI work from any directory. A
 fresh "daedalus run <repo-path>" additionally prefers the target repo's
-.daedalus/config.yaml over all of the above — see "daedalus run --help".
+.daedalus/config.yaml over all of the above — an explicit -c/--config
+still wins over it; see "daedalus run --help".
 
 CONFIGURATION REFERENCE
   agent                 Jailed agent CLI: claude, opencode, amp, pi, aider
@@ -656,9 +681,10 @@ is one eval in a shell rc (daedalus writes no files):
   eval "$(daedalus completion zsh)"      # in .zshrc
 
 On every tab press the script asks the hidden "daedalus __complete" probe
-what can come next — commands, worker actions, worker restart targets, and
-flags — and falls back to the shell's own file completion when the probe
-answers nothing (which serves -f/--file values and paths). The candidate
+what can come next — commands, worker actions, worker restart targets,
+init's profiles, completion's shells, and flags — and falls back to the
+shell's own file completion when the probe answers nothing (which serves
+-f/--file values and paths). The candidate
 logic lives in the binary the script calls, so an installed script
 self-updates with it: a command or flag added to daedalus is completed
 without reinstalling anything.

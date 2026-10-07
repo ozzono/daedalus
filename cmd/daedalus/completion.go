@@ -3,14 +3,20 @@
 // nothing else on the path — and `daedalus completion bash|zsh` prints the
 // small script that feeds the shell's tab press to that probe. The candidate
 // sources are the dispatch's own tables (commandHelp for commands,
-// workerActions for worker subcommands, flagTable for flags), so a command,
-// action, or flag added once is completed without touching this file.
+// workerActions for worker subcommands, initProfiles for init's profiles,
+// flagTable for flags) plus completion's own shells, so a command, action,
+// or flag added once is completed without touching this file.
 package main
 
 import (
+	"slices"
 	"sort"
 	"strings"
 )
+
+// completionShells are the shells `daedalus completion` writes an installer
+// for — also the probe's candidates at the position after "completion".
+var completionShells = []string{"bash", "zsh"}
 
 // complete returns the completion candidates for the word being completed.
 // words is the command line so far with the partial word last ("" when only
@@ -77,6 +83,26 @@ func complete(words []string) []string {
 				targets = append(targets, names...)
 			}
 			return prefixed(targets, toComplete)
+		}
+	}
+	switch typed[pos] {
+	case "init":
+		// The profile arguments. They compose, so a line already carrying
+		// one profile still offers the other.
+		rest := typed[pos+1:]
+		if len(rest) < len(initProfiles) {
+			var left []string
+			for _, p := range initProfiles {
+				if !slices.Contains(rest, p) {
+					left = append(left, p)
+				}
+			}
+			return prefixed(left, toComplete)
+		}
+	case "completion":
+		// Exactly one shell argument — a second is a usage failure.
+		if pos+1 == len(typed) {
+			return prefixed(completionShells, toComplete)
 		}
 	}
 	return nil

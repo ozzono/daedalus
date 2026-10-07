@@ -289,9 +289,12 @@ func TestDependentRunCapsFailingProbes(t *testing.T) {
 
 // TestDependentRunStampsPending pins the visibility contract of the wait:
 // the gate upserts DaedalusDependsOn (what `daedalus list` renders) and
-// stamps DaedalusStatus pending — the value that says a run is live but
-// owns no work — and a run broken at the gate dies still stamped pending,
-// since no round ever ran.
+// stamps DaedalusStatus pending while it waits — the value that says a run
+// is live but owns no work. The probe here observes only the gate's own
+// upserts, so pending is the last value it sees even on a broken chain:
+// production registers every flow through CompleteGreen, which stamps the
+// terminal status failed over this pending once the gate's error
+// propagates.
 func TestDependentRunStampsPending(t *testing.T) {
 	env := newTestEnv(t)
 	probe := &depProbeRecorder{env: env, script: []depProbeStep{
@@ -308,7 +311,7 @@ func TestDependentRunStampsPending(t *testing.T) {
 		t.Fatalf("workflow error = %v, want the broken-chain failure", err)
 	}
 	if final.Status != string(StatusPending) {
-		t.Errorf("final DaedalusStatus = %q, want %q — the gate's stamp is all a broken dependent ever had", final.Status, StatusPending)
+		t.Errorf("final DaedalusStatus = %q, want %q — the gate's during-wait stamp, which CompleteGreen's failed overrides once the error lands", final.Status, StatusPending)
 	}
 	if final.DependsOn != in.DependsOn {
 		t.Errorf("DaedalusDependsOn = %q, want %q", final.DependsOn, in.DependsOn)

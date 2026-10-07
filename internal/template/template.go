@@ -53,9 +53,10 @@ func Prompts() []string {
 // config file's directory, so a deployment's prompts travel with its
 // config). Every failure — an unknown stem, a missing directory, an
 // unreadable file, a template that does not parse, a data-field reference
-// the prompt's data does not carry, a {{template}} action, a review
-// override that dropped the verdict protocol — errors here, at worker
-// startup, instead of surfacing as a broken prompt mid-round. Overrides
+// the prompt's data does not carry, a {{template}} action, a
+// {{define}}/{{block}} block, a review override that dropped the verdict
+// protocol — errors here, at worker startup, instead of surfacing as a
+// broken prompt mid-round. Overrides
 // resolve once per process like the embedded set itself: rendered prompts
 // are recorded in workflow history, so a mid-run edit plus worker restart
 // is the same divergence class as upgrading the binary mid-run, which the
@@ -112,12 +113,16 @@ func LoadOverrides(dir, baseDir string) error {
 		// A {{define}} body is dead content in an override: the parser
 		// hoists it out of the root tree, where it would dodge the field
 		// validation below and render nothing, and the only action that
-		// could invoke it ({{template}}) is rejected. A define whose name
-		// equals the file's own template name is the one form that renders:
-		// the parser makes it the root tree, so the set stays size 1 and
-		// every check below sees the real content.
+		// could invoke it ({{template}}) is rejected. A root-level {{block}}
+		// desugars to the same shape (a defined template plus a
+		// {{template}} invocation), so the same check catches it — the
+		// diagnostic names both spellings, since the source may carry
+		// neither the word "define". A define whose name equals the file's
+		// own template name is the one form that renders: the parser makes
+		// it the root tree, so the set stays size 1 and every check below
+		// sees the real content.
 		if len(ov.Templates()) > 1 {
-			return fmt.Errorf("prompt overrides: %s contains a {{define}} block — a define body can never render in an override; put the content in the file body", path)
+			return fmt.Errorf("prompt overrides: %s contains a {{define}}/{{block}} block — a define body can never render in an override; put the content in the file body", path)
 		}
 		if err := checkOverride(name, emb, ov); err != nil {
 			return err

@@ -219,12 +219,14 @@ type AnthropicConfig struct {
 	// arithmetic. It exports as ContextTokensEnv, which jailed claude
 	// honors for its compaction/budget math, and replaces the input side of
 	// the model metadata staged for aider rounds (aider's completion cap is
-	// unchanged — see MaxOutputTokens for that). opencode, pi, amp, and
-	// codex have
-	// no wired lever and simply ignore it — opencode's only mechanism is a
-	// config file pointer (OPENCODE_CONFIG), whose precedence against a
-	// repo-committed opencode.json was never probed, so no staged-config
-	// route is wired for it. Zero (unset) leaves every agent on its own
+	// unchanged — see MaxOutputTokens for that). openai-served opencode
+	// rounds stage it as limit.context on the staged provider's model entry
+	// (stageOpencodeProvider, selected with -m); amp and codex have
+	// no wired lever and simply ignore it. The staged entry rides
+	// OPENCODE_CONFIG, whose precedence against a repo-committed
+	// opencode.json (project config, which upstream merge order puts
+	// above it) was never probed — see the stageOpencodeProvider ponytail
+	// note. Zero (unset) leaves every agent on its own
 	// default.
 	ContextTokens int `yaml:"context_tokens"`
 	// MaxOutputTokens, when set, caps the jailed agent's completion size in
@@ -233,9 +235,10 @@ type AnthropicConfig struct {
 	// gains CLAUDE_CODE_MAX_OUTPUT_TOKENS (the var claude 2.1.283's own
 	// error text names for its request-level max_tokens override) and the
 	// aider staging replaces both sides of the 8192 constant (the staged
-	// metadata's max_output_tokens and extra_params.max_tokens). opencode,
-	// pi, amp, and codex have no wired route. Zero (unset) keeps the aider
-	// constant and every other agent's API default.
+	// metadata's max_output_tokens and extra_params.max_tokens).
+	// Openai-served opencode rounds stage it as limit.output on the staged
+	// provider's model entry; amp and codex have no wired route. Zero
+	// (unset) keeps the aider constant and every other agent's API default.
 	MaxOutputTokens int `yaml:"max_output_tokens"`
 }
 
@@ -432,6 +435,43 @@ type SlimConfig struct {
 	ParserModel string `yaml:"parser_model"`
 }
 
+// UnmarshalYAML migrates the historical top-level `slim: true/false`
+// boolean the 2026-10-02 reshape renamed to slim.enabled: a scalar node
+// decodes into Enabled, so an upgrading operator's config loads instead
+// of failing the strict decode with a "cannot unmarshal !!bool into
+// config.SlimConfig" type error that names no migration. The section
+// shape decodes field by field, with the mapping's keys checked by hand —
+// KnownFields strictness does not reach through a custom unmarshaler, so
+// the hand check is what keeps a typo'd section key failing the load with
+// the yaml-style "field … not found" error.
+func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Tag == "!!null" {
+		return nil
+	}
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&s.Enabled)
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: cannot unmarshal %s into config.SlimConfig", value.Line, value.ShortTag())
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key, val := value.Content[i], value.Content[i+1]
+		switch key.Value {
+		case "enabled":
+			if err := val.Decode(&s.Enabled); err != nil {
+				return err
+			}
+		case "parser_model":
+			if err := val.Decode(&s.ParserModel); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("line %d: field %s not found in type config.SlimConfig", key.Line, key.Value)
+		}
+	}
+	return nil
+}
+
 // Config holds the runtime configuration for a Daedalus process, loaded
 // from a YAML file (see config-example.yaml).
 type Config struct {
@@ -565,8 +605,9 @@ type Config struct {
 	// this config file's directory. Resolved and validated once at worker
 	// startup (missing directory, unreadable file, empty file, template
 	// that does not parse, a data field the prompt does not take, a
-	// {{template}} action, or a review override missing the verdict
-	// protocol all fail the start); rendered prompts
+	// {{template}} action, a {{define}}/{{block}} block — a define body
+	// can never render in an override — or a review override missing the
+	// verdict protocol all fail the start); rendered prompts
 	// are recorded in workflow history, so replacement content is not
 	// secret and may live on the same path as the config. Empty — the
 	// default — renders every prompt byte-identically to the embedded one.

@@ -2,6 +2,7 @@ package activities
 
 import (
 	"fmt"
+	"strings"
 )
 
 // codexProviderID is the custom codex provider daedalus selects for jailed
@@ -28,8 +29,9 @@ const codexProviderID = "daedalus"
 // config untouched. With a key or model but no URL, or a URL but no model,
 // the round fails before launch: the section cannot be bridged
 // half-specified, and a silently-unbridged round would misdirect spend
-// (same posture as stagePiProvider, minus pi's silent-dial trap — an
-// ambient key with no URL is simply inert for codex).
+// (the same posture as stagePiProvider: an ambient key/model without a URL
+// fails the codex round before launch, exactly like pi — there is no inert
+// case).
 // ponytail: the -c override shapes are probe-derived from codex-cli
 // 0.160.0's documented config surface (2026-10-05) but never exercised
 // against a live round — this sandbox has no codex binary; wire_api is
@@ -57,11 +59,12 @@ func stageCodexProvider(env []string) ([]string, error) {
 	if model == "" {
 		return nil, fmt.Errorf("codex round: openai.url exported without openai.model — codex would pick its built-in default model against the bridged endpoint; set openai.model")
 	}
-	// Values are TOML — quoted strings, so a URL is never mistaken for
-	// anything else by codex's -c override parser.
+	// Values are TOML basic strings — tomlQuote escapes them, so a URL is
+	// never mistaken for anything else by codex's -c override parser, and
+	// never terminates the override early.
 	provider := "model_providers." + codexProviderID
 	args := []string{
-		"-c", provider + `.base_url="` + url + `"`,
+		"-c", provider + `.base_url=` + tomlQuote(url),
 		"-c", provider + `.wire_api="responses"`,
 	}
 	if key != "" {
@@ -70,4 +73,41 @@ func stageCodexProvider(env []string) ([]string, error) {
 	return append(args,
 		"-c", `model_provider="`+codexProviderID+`"`,
 		"-m", model), nil
+}
+
+// tomlQuote renders s as one TOML basic string: backslash and quote
+// escaped, the named control characters by their short forms, every other
+// control character as \uXXXX — TOML forbids raw control characters (and a
+// raw quote or backslash changes the string's shape) inside basic strings,
+// and both config load routes accept an openai.url carrying any of them.
+func tomlQuote(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\u%04X`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

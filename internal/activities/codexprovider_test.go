@@ -134,3 +134,39 @@ func TestStageCodexProviderAPIBaseFallback(t *testing.T) {
 		t.Errorf("args = %v, want %v", args, want)
 	}
 }
+
+// TestStageCodexProviderQuotesURL pins the TOML-basic-string escaping of
+// the bridged URL: both config load routes accept an openai.url carrying a
+// quote or a backslash, and raw interpolation into the -c override would
+// let the quote terminate the value early and the backslash start an
+// escape — so the URL must reach codex's override parser as one valid TOML
+// string, control characters included (TOML forbids them raw inside basic
+// strings).
+func TestStageCodexProviderQuotesURL(t *testing.T) {
+	for _, c := range []struct {
+		name, url, wantQuoted string
+	}{
+		{"quote and backslash", `https://llm.example/v1"a\b`, `"https://llm.example/v1\"a\\b"`},
+		{"control characters", "https://llm.example/v1?x=\n\a", `"https://llm.example/v1?x=\n\u0007"`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			args, err := stageCodexProvider(codexEnv(
+				"OPENAI_BASE_URL="+c.url,
+				"OPENAI_MODEL=glm",
+			))
+			if err != nil {
+				t.Fatalf("stageCodexProvider: %v", err)
+			}
+			provider := "model_providers." + codexProviderID
+			want := []string{
+				"-c", provider + ".base_url=" + c.wantQuoted,
+				"-c", provider + `.wire_api="responses"`,
+				"-c", `model_provider="` + codexProviderID + `"`,
+				"-m", "glm",
+			}
+			if !slices.Equal(args, want) {
+				t.Errorf("args = %v, want %v", args, want)
+			}
+		})
+	}
+}

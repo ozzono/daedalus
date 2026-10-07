@@ -1,12 +1,14 @@
 // Package config loads Daedalus runtime configuration from a YAML file.
 package config
 
-// ExampleYAML is the fully-commented example configuration, every field at
-// its default value. `daedalus init` writes it as config-example.yaml in the
-// working directory. It is kept in lockstep with the repository's own
-// config-example.yaml by TestExampleYAMLMatchesRepoFile, and TestExampleYAML
-// pins that loading it yields exactly the default configuration.
-const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; every field is
+import "strings"
+
+// The example in its composition pieces: the exampleBase* consts are the
+// base configuration — everything outside a profile's blocks — that every
+// `daedalus init` invocation writes; exampleSlimBlock/exampleSlimProviders
+// are the "slim" profile's slices and examplePromptBlock the "prompt"
+// profile's. Their concatenation in file order is ExampleYAML.
+const exampleBase1 = `# Daedalus configuration. Copy to config.yaml and edit; every field is
 # optional. Provider values that are unset are simply not exported — the
 # jailed agent then inherits whatever the worker's environment provides.
 
@@ -32,10 +34,16 @@ const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; eve
 # below; the
 # jail masks the repo's .env to empty, so .env files cannot override
 # inside jailed rounds). opencode alert: neither the openai nor the
-# anthropic base-URL env vars reach it (source-verified 2026-09-26) — its
-# endpoints come from its own catalog/config files, which daedalus does
-# not bridge, so self-hosted endpoints need operator-side opencode.json
-# work (see backlog/bugs/pi-opencode-openai-section-unbridged.md).
+# anthropic base-URL env vars reach it (source-verified 2026-09-26), but
+# an openai-section round is bridged regardless: the worker stages a
+# round-scoped config file into the worktree (a "daedalus-openai"
+# provider entry — baseURL, the key as an env template so it never lands
+# on disk, the model's limits) and exposes it via OPENCODE_CONFIG,
+# selecting the staged model with -m — no operator-side opencode.json
+# work needed. The anthropic section stays unbridged (opencode has no
+# ANTHROPIC_* channel), and the jail mounts no opencode config dir, so
+# such a round resolves its own config inside the jail: a repo-committed
+# opencode.json is honored, the host's global one is not.
 agent: claude
 
 # Thinking toggle for the jailed agents, independent of slim: defaults to
@@ -121,7 +129,11 @@ cleanup_timeout: 30m
 # or rate knob of its own (source-verified 2026-09-26), and the slot-wait
 # behavior is identical to aider/claude rounds.
 max_concurrent_agent_runs: 2
-# Slim mode for limited self-hosted models (small context window, low max
+`
+
+// exampleSlimBlock is the slim: section (the mode toggle and the tool-call
+// relay's parser model) — the "slim" profile's flow-side slice.
+const exampleSlimBlock = `# Slim mode for limited self-hosted models (small context window, low max
 # output tokens) on the aider and pi agents. When enabled: this worker runs a
 # single jailed-agent round at a time — max_concurrent_agent_runs above is
 # forced to 1, so no two LLM requests are ever in flight (native test
@@ -164,14 +176,22 @@ slim:
   # inspects pi's chat-completions traffic, and an answer that is exactly
   # one JSON object naming one of the request's own tools is converted
   # into a native tool call, its arguments normalized by this model via
-  # ollama structured output against the tool's own schema. Prose is never
+  # ollama structured output against the tool's own schema. That schema
+  # conformance holds on ollama and other format-honoring parser
+  # upstreams; an OpenAI-compatible upstream that silently ignores
+  # ollama's format field leaves the arguments checked only as a JSON
+  # object. Prose is never
   # converted (reviewer verdicts are content), and any relay or parser
   # failure degrades to the old inert-text behavior — never a new run
   # failure. Resolved against the openai section's url; create the tag on
   # the model host before setting it. Empty (the default) keeps the relay
   # off.
   parser_model: ""
-# How many native test-suite executions may run at once on the test worker
+`
+
+// exampleBase2 is the remaining general fields plus the anthropic section
+// through timeout_ms.
+const exampleBase2 = `# How many native test-suite executions may run at once on the test worker
 # (the deployment's suite task queue); further suites queue until a slot
 # frees (heartbeating while they wait). Suites are CPU-bound host work,
 # unlike the provider-bound agent rounds above, so this cap is separate.
@@ -263,24 +283,29 @@ anthropic:
   # the default is generous: 3000000 = 50 minutes. Zero/unset falls back to
   # this default; there is no inherit-the-environment escape hatch.
   timeout_ms: 3000000
-  # Context window for the jailed agent's model, in tokens. When set, it
+`
+
+// exampleSlimProviders is the "slim" profile's provider sizing: anthropic's
+// context_tokens/max_output_tokens and the whole openai: section.
+const exampleSlimProviders = `  # Context window for the jailed agent's model, in tokens. When set, it
   # exports as CLAUDE_CODE_MAX_CONTEXT_TOKENS (which jailed claude honors
   # for its compaction/budget math), replaces the input side of the
-  # model metadata staged for aider rounds, and lands as contextWindow on
-  # the model entry staged for openai-served pi rounds; opencode, amp, and
-  # codex
-  # ignore it (opencode's only mechanism is a config-file pointer whose
-  # precedence against a repo-committed opencode.json was never probed).
-  # Zero/unset means each agent's own default.
+  # model metadata staged for aider rounds, lands as contextWindow on
+  # the model entry staged for openai-served pi rounds, and lands as
+  # limit.context on the entry staged for openai-served opencode rounds
+  # (that staged file rides OPENCODE_CONFIG, whose precedence against a
+  # repo-committed opencode.json was never probed); amp and codex
+  # ignore it. Zero/unset means each agent's own default.
   context_tokens: 0
   # Completion cap for the jailed agent's rounds, in tokens. When set, it
   # replaces both sides of the 8k constant in the model metadata staged
   # for aider rounds (the metadata's max_output_tokens and
   # extra_params.max_tokens), claude's round env gains
   # CLAUDE_CODE_MAX_OUTPUT_TOKENS (the var claude 2.1.283's own error text
-  # names for its request-level max_tokens override), and it lands as
-  # maxTokens on the model entry staged for openai-served pi rounds.
-  # opencode, amp, and codex have
+  # names for its request-level max_tokens override), lands as
+  # maxTokens on the model entry staged for openai-served pi rounds, and
+  # lands as limit.output on the entry staged for openai-served opencode
+  # rounds. amp and codex have
   # no wired route. Zero/unset keeps aider's 8192 constant and every other
   # agent's API default.
   max_output_tokens: 0
@@ -365,7 +390,11 @@ openai:
   # probe-verified live against the tenor litellm proxy but lost before
   # landing).
   repetition_penalty: 0
+`
 
+// exampleBase3 is the base provider plumbing and toggles: the fallback,
+// reviewer, bug_filing, and test_output sections.
+const exampleBase3 = `
 # Secondary provider for automatic failover — fully independent of the
 # primary: the url/key/model may point at a different vendor's
 # anthropic-compatible endpoint, sharing nothing with the anthropic:
@@ -470,7 +499,10 @@ test_output:
   enabled: false
   dir: ""
   mirror: ""
+`
 
+// examplePromptBlock is the prompt: section — the "prompt" profile's slice.
+const examplePromptBlock = `
 # Project-wise prompt overrides. Empty (the default): every round's prompt
 # renders byte-identically to the embedded templates in
 # internal/template/prompts. When set, this names a directory of
@@ -487,9 +519,11 @@ test_output:
 # startup: a missing directory, an unreadable file, a template that does
 # not parse, an empty file, a data field the prompt does not take (each
 # template renders a fixed struct — copy the field references from the
-# embedded file), a {{template}} action (an override runs alone), or a
-# review override missing the verdict protocol all fail the start, never a
-# mid-round render. Two machine contracts a replacement must keep: review
+# embedded file), a {{template}} action (an override runs alone), a
+# {{define}}/{{block}} block (a define body can never render in an
+# override), or a review override missing the verdict protocol all fail
+# the start, never a mid-round render. Two machine contracts a
+# replacement must keep: review
 # is validated at startup to still carry all four verdict words (APPROVED,
 # CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
 # protocol the loop parses), and slim_plan must keep instructing the
@@ -499,3 +533,33 @@ test_output:
 # so replacement content is not secret and may live beside this config.
 # prompt: prompts/
 `
+
+// ExampleYAML is the fully-commented example configuration, every field at
+// its default value. Bare `daedalus init` writes it as config-example.yaml
+// in the working directory. It is kept in lockstep with the repository's own
+// config-example.yaml by TestExampleYAMLMatchesRepoFile, and TestExampleYAML
+// pins that loading it yields exactly the default configuration.
+const ExampleYAML = exampleBase1 + exampleSlimBlock + exampleBase2 +
+	exampleSlimProviders + exampleBase3 + examplePromptBlock
+
+// ExampleYAMLFor renders the example for a profiled `daedalus init`: the
+// base pieces always, the slim slices (the slim: section, the openai:
+// section, and anthropic's context_tokens/max_output_tokens) and the
+// prompt slice only when requested. Both requested reproduces ExampleYAML
+// exactly.
+func ExampleYAMLFor(slim, prompt bool) string {
+	var b strings.Builder
+	b.WriteString(exampleBase1)
+	if slim {
+		b.WriteString(exampleSlimBlock)
+	}
+	b.WriteString(exampleBase2)
+	if slim {
+		b.WriteString(exampleSlimProviders)
+	}
+	b.WriteString(exampleBase3)
+	if prompt {
+		b.WriteString(examplePromptBlock)
+	}
+	return b.String()
+}

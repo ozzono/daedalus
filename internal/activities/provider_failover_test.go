@@ -58,6 +58,11 @@ func TestMain(m *testing.M) {
 		"OPENAI_API_KEY",
 		"OPENAI_MODEL",
 		"OPENAI_API_BASE",
+		// OPENCODE_CONFIG (the opencode bridge stages the round-scoped
+		// config path into the round env) would leak an operator's own
+		// pointer into the pins that read the var back off the ai-jail
+		// call.
+		"OPENCODE_CONFIG",
 		// reviewerEnv reads these from the process env: a live worker host
 		// exporting them (runWorker sets them from config.yaml's reviewer
 		// section) would silently arm the reviewer override in every test.

@@ -112,14 +112,23 @@ func TestLoadOverridesRejects(t *testing.T) {
 			// tree, where it would render nothing.
 			name:  "define-only override",
 			files: map[string]string{"rebuild.md": `{{define "x"}}never shown{{end}}`},
-			want:  "contains a {{define}} block",
+			want:  "contains a {{define}}/{{block}} block",
 		},
 		{
 			// The define gate closes the dead-content route before field
 			// validation: an unknown field cannot hide in a define body.
 			name:  "unknown field hidden in a define body",
 			files: map[string]string{"rebuild.md": `ROOT TEXT {{define "x"}}{{.Nope}}{{end}}`},
-			want:  "contains a {{define}} block",
+			want:  "contains a {{define}}/{{block}} block",
+		},
+		{
+			// A root-level block desugars to the same dead shape (a defined
+			// template plus a template invocation), so the same gate catches
+			// it — the diagnostic names both spellings, since the source may
+			// carry neither the word "define".
+			name:  "root-level block override",
+			files: map[string]string{"rebuild.md": `{{block "x" .}}never shown{{end}}`},
+			want:  "contains a {{define}}/{{block}} block",
 		},
 		{
 			// The one legal define form — naming the file's own template —

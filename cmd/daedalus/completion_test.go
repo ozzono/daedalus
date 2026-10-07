@@ -139,6 +139,15 @@ func TestCompleteFlags(t *testing.T) {
 	}
 	sort.Strings(allFlags)
 
+	// The long spellings a line that already used -c must still offer,
+	// derived like allFlags so a flag added to flagTable needs no edit here.
+	longNoConfig := make([]string, 0, len(allFlags))
+	for _, s := range withoutNames(allFlags, "config") {
+		if strings.HasPrefix(s, "--") {
+			longNoConfig = append(longNoConfig, s)
+		}
+	}
+
 	for _, c := range []struct {
 		words []string
 		want  []string
@@ -150,7 +159,7 @@ func TestCompleteFlags(t *testing.T) {
 		{[]string{"wipe", "wf-1", "--yes", "-"}, withoutNames(allFlags, "yes")},
 		// -c already used: neither spelling is offered again, every other
 		// long spelling is.
-		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, []string{"--append", "--cli", "--cot", "--cot-n", "--depends", "--detach", "--file", "--folder", "--prefix", "--status", "--type", "--workflow", "--yes"}},
+		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, longNoConfig},
 		// The new dependency flag completes like any value-taking flag: by
 		// prefix, and its value position answers with nothing.
 		{[]string{"run", "--dep"}, []string{"--depends"}},
@@ -165,6 +174,51 @@ func TestCompleteFlags(t *testing.T) {
 		// -cot-n is value-taking too: its value position answers with
 		// nothing.
 		{[]string{"log", "wf-1", "-cot", "--cot-n", ""}, nil},
+	} {
+		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("complete(%q) = %q, want %q", c.words, got, c.want)
+		}
+	}
+}
+
+// TestCompleteInitProfiles pins the init profile position: both profiles on
+// an empty word, narrowed by the partial one, and — because the profiles
+// compose — a line already carrying one profile still offers the other,
+// while the saturated line answers nothing: a third profile argument is a
+// usage failure, so there is nothing left to complete. Global flags before
+// the command change nothing.
+func TestCompleteInitProfiles(t *testing.T) {
+	for _, c := range []struct {
+		words []string
+		want  []string
+	}{
+		{[]string{"init", ""}, []string{"prompt", "slim"}},
+		{[]string{"init", "s"}, []string{"slim"}},
+		{[]string{"-c", "cfg.yaml", "init", ""}, []string{"prompt", "slim"}},
+		{[]string{"init", "prompt", ""}, []string{"slim"}},
+		{[]string{"init", "slim", ""}, []string{"prompt"}},
+		{[]string{"init", "slim", "p"}, []string{"prompt"}},
+		{[]string{"init", "prompt", "slim", ""}, nil},
+	} {
+		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("complete(%q) = %q, want %q", c.words, got, c.want)
+		}
+	}
+}
+
+// TestCompleteCompletionShells pins the completion shell position: the two
+// shells completionScript installs, one argument deep — a second shell
+// argument is a usage failure, so the position past it answers nothing, and
+// neither does a shell the dispatch would reject.
+func TestCompleteCompletionShells(t *testing.T) {
+	for _, c := range []struct {
+		words []string
+		want  []string
+	}{
+		{[]string{"completion", ""}, []string{"bash", "zsh"}},
+		{[]string{"completion", "z"}, []string{"zsh"}},
+		{[]string{"completion", "tcsh"}, nil},
+		{[]string{"completion", "bash", ""}, nil},
 	} {
 		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("complete(%q) = %q, want %q", c.words, got, c.want)
@@ -259,6 +313,16 @@ func TestMainCompleteProbe(t *testing.T) {
 	stdout, _, code = runMainIn(t, dir, "__complete", "--config=cfg.yaml", "wo")
 	if code != 0 || stdout != "worker\n" {
 		t.Errorf("daedalus __complete --config=cfg.yaml wo = (exit %d) %q, want worker", code, stdout)
+	}
+
+	stdout, _, code = runMainIn(t, dir, "__complete", "init", "")
+	if code != 0 || stdout != "prompt\nslim\n" {
+		t.Errorf("daedalus __complete init = (exit %d) %q, want init's profiles one per line", code, stdout)
+	}
+
+	stdout, _, code = runMainIn(t, dir, "__complete", "completion", "z")
+	if code != 0 || stdout != "zsh\n" {
+		t.Errorf("daedalus __complete completion z = (exit %d) %q, want zsh", code, stdout)
 	}
 }
 
