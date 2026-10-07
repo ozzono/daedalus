@@ -29,9 +29,18 @@ var claudeProjectsDir = activities.ClaudeProjectDir
 // A package var so tests can point it at a fake tree.
 var piSessionsDir = activities.PiSessionsDir
 
+// codexNewestRollout returns the newest rollout file codex holds for a
+// worktree. A package var so tests can point it at a fake tree.
+var codexNewestRollout = activities.CodexNewestRollout
+
+// opencodeNewestUpdate returns the newest updated stamp opencode lists for
+// a worktree. A package var so tests can point it at a fake list.
+var opencodeNewestUpdate = activities.OpencodeNewestUpdate
+
 // runTaskLog implements `daedalus log <workflow-id>`: print the task's
 // captured log file, or — with --status — a short status brief instead.
-// File-derived only: no temporal connection, no config.
+// File- and session-state-derived only: no temporal connection, no config
+// (the one subprocess is opencode's session list, for opencode freshness).
 func runTaskLog(workflowID string, status bool) {
 	path, err := activities.TaskLogPath(workflowID)
 	if err != nil {
@@ -299,8 +308,9 @@ func liveCotSection(workflowID string) string {
 		return b.String() + "\n"
 	}
 	if name != "claude" && name != "pi" {
-		// aider, opencode, and amp keep no host transcript; never silence,
-		// never a guess.
+		// aider, opencode, and amp keep no host transcript the live view
+		// follows — opencode's session database exists, the live view just
+		// does not read it; never silence, never a guess.
 		fmt.Fprintf(&b, "%s keeps no host transcript; CoT appears here when the round completes\n", name)
 		return b.String() + "\n"
 	}
@@ -309,10 +319,11 @@ func liveCotSection(workflowID string) string {
 		b.WriteString("no transcript yet — no assistant output has landed\n")
 		return b.String() + "\n"
 	}
-	// ponytail: the transcript is picked by file freshness alone — the
-	// newest file is the live writer's except in the window before the
-	// in-flight round creates its own transcript, where the just-finished
-	// round's file can briefly read as live. Per-round session attribution
+	// ponytail: the transcript is picked by newest-wins freshness alone —
+	// the newest source is the live writer's except in the window before
+	// the in-flight round creates its own transcript, where the
+	// just-finished round's file (or another agent's just-finished
+	// session) can briefly read as live. Per-round session attribution
 	// is a maintainer decision, out of scope here.
 	cot, found := transcriptCoT(tpath, name)
 	if !found {
@@ -410,13 +421,20 @@ func taskStatusBrief(log string) {
 		}
 		return
 	}
-	path, _, mtime, ok, err := newestTranscript(worktree)
+	path, agent, mtime, ok, err := newestTranscript(worktree)
 	if err != nil {
 		fmt.Println("last update: unknown")
 		return
 	}
 	if !ok {
 		fmt.Println("last update: no transcripts yet")
+		return
+	}
+	if agent == "opencode" {
+		// opencode keeps no transcript files: freshness is its session
+		// database's updated stamp, and the brief has no body to digest.
+		fmt.Printf("last update: %s\n", mtime.UTC().Format(time.RFC3339))
+		fmt.Println("last update text: opencode session database — the brief reads no message bodies")
 		return
 	}
 	digest := "<unreadable transcript>"
@@ -497,14 +515,17 @@ func lastRoundState(log string) (name, stage, worktree string, running bool) {
 	return name, stage, worktree, running
 }
 
-// newestTranscript returns the newest transcript file written for a
-// worktree, naming the agent that wrote it: claude's project dir and pi's
-// session dir are consulted newest-wins — neither dir is ever cleaned, so
-// a previous run's stale transcripts on one side must not shadow the other
+// newestTranscript returns the newest transcript written for a worktree,
+// naming the agent that wrote it: claude's project dir, pi's session dir,
+// and codex's rollout tree (the cwd recorded in each rollout file
+// attributes it) are consulted newest-wins — no source is ever cleaned, so
+// a previous run's stale transcripts on one side must not shadow another
 // agent's live session (and the newest file is the live writer's either
-// way). ok is false when neither dir holds a transcript. err — returned
-// alone, without a path — means claude's dir could not even be located,
-// which --status degrades to its "last update: unknown" line.
+// way). opencode keeps no files: its session database's newest updated
+// stamp wins the same way, and the path comes back empty — there is no
+// body to digest. ok is false when no source holds a transcript. err —
+// returned alone, without a path — means claude's dir could not even be
+// located, which --status degrades to its "last update: unknown" line.
 func newestTranscript(worktree string) (path, agent string, mtime time.Time, ok bool, err error) {
 	cdir, err := claudeProjectsDir(worktree)
 	if err != nil {
@@ -516,6 +537,12 @@ func newestTranscript(worktree string) (path, agent string, mtime time.Time, ok 
 		if p, t, pok := newestTranscriptFile(pdir); pok && (path == "" || t.After(mtime)) {
 			path, agent, mtime, ok = p, "pi", t, true
 		}
+	}
+	if p, t, cok := codexNewestRollout(worktree); cok && (path == "" || t.After(mtime)) {
+		path, agent, mtime, ok = p, "codex", t, true
+	}
+	if t, ook := opencodeNewestUpdate(worktree); ook && (path == "" || t.After(mtime)) {
+		path, agent, mtime, ok = "", "opencode", t, true
 	}
 	return path, agent, mtime, ok, nil
 }
@@ -582,17 +609,47 @@ func digestLastEntry(data string) string {
 
 // digestEntry renders one transcript entry as a one-line digest: the entry
 // type plus the tool name for tool_use content (e.g. "assistant Bash"), or
-// the first ~80 chars of text content. A shape it does not recognize falls
-// back to the bare entry type.
+// the first ~80 chars of text content. codex's rollout lines carry
+// everything one level down in a payload envelope, and are digested by the
+// same rule there: role-attributed message text when there is any, the
+// tool name for a function call, else the bare item type. A shape it does
+// not recognize falls back to the bare entry type.
 func digestEntry(line string) (string, bool) {
 	var e struct {
 		Type    string `json:"type"`
 		Message struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
+		Payload struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Name    string `json:"name"`
+			Message string `json:"message"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"payload"`
 	}
 	if err := json.Unmarshal([]byte(line), &e); err != nil {
 		return "", false
+	}
+	// claude's and pi's entries have no payload; only codex rollout lines
+	// land in this branch.
+	if p := e.Payload; p.Type != "" {
+		switch {
+		case p.Message != "":
+			return briefSnippet(p.Type, p.Message), true
+		case p.Type == "message":
+			for _, it := range p.Content {
+				if it.Text != "" {
+					return briefSnippet(p.Role, it.Text), true
+				}
+			}
+		case p.Name != "":
+			return p.Type + " " + p.Name, true
+		}
+		return p.Type, true
 	}
 	if len(e.Message.Content) == 0 {
 		return e.Type, true

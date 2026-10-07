@@ -76,7 +76,7 @@ func piSessionFile(worktree, id string) (string, bool) {
 // id, and isError.
 type piSessionEntry struct {
 	Message struct {
-		Role    string `json:"role"`
+		Role    string   `json:"role"`
 		Content piBlocks `json:"content"`
 		// ToolCallID and ToolName ride toolResult messages; IsError marks
 		// the tool's failure.

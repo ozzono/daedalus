@@ -185,6 +185,34 @@ func TestDigestLastEntry(t *testing.T) {
 			want:       "system",
 		},
 		{
+			// codex's rollout lines carry everything one level down in a
+			// payload envelope; an event message digests by its payload type.
+			name:       "codex event message digests by payload type",
+			transcript: `{"timestamp":"t","type":"event_msg","payload":{"type":"agent_message","message":"checking the failing test"}}`,
+			want:       "agent_message checking the failing test",
+		},
+		{
+			// A response_item message is role-attributed: the role, not the
+			// payload type, names the speaker.
+			name:       "codex response_item message digests by role",
+			transcript: `{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"the prompt text"}]}}`,
+			want:       "user the prompt text",
+		},
+		{
+			// A function call digests like claude's tool_use: the item type
+			// plus the tool name.
+			name:       "codex function call names the tool",
+			transcript: `{"timestamp":"t","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"ls"}}`,
+			want:       "function_call shell",
+		},
+		{
+			// A payload shape with neither message, text, nor name falls
+			// back to the bare payload type.
+			name:       "codex unrecognized payload falls back to its type",
+			transcript: `{"timestamp":"t","type":"event_msg","payload":{"type":"token_count","info":{}}}`,
+			want:       "token_count",
+		},
+		{
 			name:       "array without tool_use takes the first item with text",
 			transcript: `{"type":"assistant","message":{"content":[{"type":"tool_result","text":"first"},{"type":"text","text":"second"}]}}`,
 			want:       "assistant first",
@@ -248,6 +276,10 @@ func TestLastTranscriptUpdate(t *testing.T) {
 // say. The claude projects dir and pi sessions dir are both faked, so the
 // brief is checked purely as a function of its file inputs.
 func TestTaskStatusBrief(t *testing.T) {
+	// The codex and opencode freshness sources are inert for every subtest;
+	// the opencode and codex-digest ones below override. Cleanups run LIFO,
+	// so the override unwinds before this registration.
+	fakeSessionSources(t, noCodexRollout, noOpencodeUpdate)
 	fakeProjectsDir := func(t *testing.T, dir string, err error) {
 		t.Helper()
 		reset := claudeProjectsDir
@@ -392,6 +424,47 @@ func TestTaskStatusBrief(t *testing.T) {
 			t.Errorf("brief = %q, want the claude transcript's line with the pi side ignored", out)
 		}
 	})
+
+	// opencode keeps no transcript files: the brief prints its session
+	// database's newest updated stamp and says so, instead of digesting a
+	// body it cannot read.
+	t.Run("opencode update prints the stamp with no digest", func(t *testing.T) {
+		fakeProjectsDir(t, t.TempDir(), nil)
+		fakePiSessionsDir(t, t.TempDir(), nil)
+		mtime := time.Now().Add(-time.Minute).Truncate(time.Second)
+		fakeSessionSources(t, noCodexRollout, func(string) (time.Time, bool) { return mtime, true })
+
+		out := captureStdout(t, func() { taskStatusBrief(briefLog) })
+		want := "current agent: dev\nlast update: " + mtime.UTC().Format(time.RFC3339) + "\n" +
+			"last update text: opencode session database — the brief reads no message bodies\n"
+		if out != want {
+			t.Errorf("brief = %q, want the opencode stamp line with no digest", out)
+		}
+	})
+
+	// codex's rollout is digested like any transcript file: the last
+	// entry's payload envelope unwraps to the same one-line shape the
+	// claude/pi digests render.
+	t.Run("codex rollout digest reads the payload envelope", func(t *testing.T) {
+		fakeProjectsDir(t, t.TempDir(), nil)
+		fakePiSessionsDir(t, t.TempDir(), nil)
+		mtime := time.Now().Add(-time.Minute).Truncate(time.Second)
+		rollout := filepath.Join(t.TempDir(), "rollout-2026-10-07T09-00-00-"+codexStatusUUID+".jsonl")
+		content := `{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"digging through the rollout"}]}}` + "\n"
+		if err := os.WriteFile(rollout, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(rollout, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		fakeSessionSources(t, func(string) (string, time.Time, bool) { return rollout, mtime, true }, noOpencodeUpdate)
+
+		out := captureStdout(t, func() { taskStatusBrief(briefLog) })
+		want := "current agent: dev\nlast update: " + mtime.UTC().Format(time.RFC3339) + "\nlast update text: assistant digging through the rollout\n"
+		if out != want {
+			t.Errorf("brief = %q, want the codex payload's digest line", out)
+		}
+	})
 }
 
 // TestRunTaskLogPrintsFile pins the raw mode in-process (its success path
@@ -431,13 +504,19 @@ func TestMainLogDispatch(t *testing.T) {
 
 	t.Run("--status prints the brief", func(t *testing.T) {
 		// No transcripts on disk: the brief's degraded line proves the
-		// dispatch reached the brief, not the raw printer.
+		// dispatch reached the brief, not the raw printer. The codex and
+		// opencode sources are not faked by package var here, so they are
+		// silenced for real: an empty CODEX_HOME, and an `opencode` stub
+		// that fails the list — no host session state can leak into the
+		// pinned line (the claude/pi sides ride the fakes above).
 		reset := claudeProjectsDir
 		t.Cleanup(func() { claudeProjectsDir = reset })
 		claudeProjectsDir = func(string) (string, error) { return t.TempDir(), nil }
 		resetPi := piSessionsDir
 		t.Cleanup(func() { piSessionsDir = resetPi })
 		piSessionsDir = func(string) (string, error) { return t.TempDir(), nil }
+		t.Setenv("CODEX_HOME", t.TempDir())
+		t.Setenv("PATH", stubOpencodeFailDir(t)+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 		args := os.Args
 		t.Cleanup(func() { os.Args = args })
@@ -768,12 +847,52 @@ func TestLastRoundState(t *testing.T) {
 	}
 }
 
+// codexStatusUUID gives this file's rollout fixtures a realistic codex
+// session id — the status reader treats the file as opaque bytes to digest,
+// but the name should stay indistinguishable from a real rollout's.
+const codexStatusUUID = "0f8a2b1c-3d4e-5f60-7a8b-9c0d1e2f3a4b"
+
+// noCodexRollout is the inert codex freshness source: no rollout anywhere.
+func noCodexRollout(string) (string, time.Time, bool) { return "", time.Time{}, false }
+
+// noOpencodeUpdate is the inert opencode freshness source: no session stamp.
+func noOpencodeUpdate(string) (time.Time, bool) { return time.Time{}, false }
+
+// fakeSessionSources points newestTranscript's codex and opencode consultees
+// at fakes, so no test reads the host's real ~/.codex tree or shells out to
+// the real opencode — the two sources the file-based dirs sit alongside. A
+// test wanting a live fake calls it again after its fakeDirs call; cleanups
+// run LIFO, so the override unwinds first.
+func fakeSessionSources(t *testing.T,
+	codex func(string) (string, time.Time, bool),
+	opencode func(string) (time.Time, bool)) {
+	t.Helper()
+	resetCodex := codexNewestRollout
+	t.Cleanup(func() { codexNewestRollout = resetCodex })
+	codexNewestRollout = codex
+	resetOc := opencodeNewestUpdate
+	t.Cleanup(func() { opencodeNewestUpdate = resetOc })
+	opencodeNewestUpdate = opencode
+}
+
+// stubOpencodeFailDir returns a directory holding an `opencode` that fails
+// its list — put on a child process's PATH so no host opencode answers a
+// subprocess test's session lookup.
+func stubOpencodeFailDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // TestNewestTranscript pins the newest-wins transcript lookup behind --status
-// and the live section: claude's project dir and pi's session dir are both
-// consulted and the newest file wins with its agent's name — a stale
-// transcript on one side must not shadow a live session on the other — and
-// an unresolvable claude dir is an error, while an unresolvable pi dir is
-// simply ignored.
+// and the live section: claude's project dir, pi's session dir, codex's
+// rollout tree, and opencode's session stamp are all consulted and the
+// newest wins with its agent's name — a stale transcript on one side must
+// not shadow a live session on another — and an unresolvable claude dir is
+// an error, while an unresolvable pi dir is simply ignored.
 func TestNewestTranscript(t *testing.T) {
 	fakeDirs := func(t *testing.T, claudeDir, piDir string, claudeErr, piErr error) {
 		t.Helper()
@@ -783,6 +902,7 @@ func TestNewestTranscript(t *testing.T) {
 		resetP := piSessionsDir
 		t.Cleanup(func() { piSessionsDir = resetP })
 		piSessionsDir = func(string) (string, error) { return piDir, piErr }
+		fakeSessionSources(t, noCodexRollout, noOpencodeUpdate)
 	}
 	seed := func(t *testing.T, dir, name string, mtime time.Time) string {
 		t.Helper()
@@ -848,6 +968,63 @@ func TestNewestTranscript(t *testing.T) {
 		path, agent, _, ok, err := newestTranscript("/wt")
 		if err != nil || !ok || path != want || agent != "claude" {
 			t.Errorf("newestTranscript = (%q, %q, _, %v, %v), want the claude file with pi ignored", path, agent, ok, err)
+		}
+	})
+
+	// codex keeps no per-project dir: its rollout path arrives from the
+	// shared tree walk, attributed by the recorded cwd — the caller only
+	// sees the newest file and its agent name.
+	t.Run("newest codex rollout wins with its path", func(t *testing.T) {
+		claudeDir := t.TempDir()
+		seed(t, claudeDir, "claude.jsonl", old)
+		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
+		rollout := filepath.Join(t.TempDir(), "rollout-2026-10-07T09-00-00-"+codexStatusUUID+".jsonl")
+		fakeSessionSources(t, func(string) (string, time.Time, bool) { return rollout, new, true }, noOpencodeUpdate)
+
+		path, agent, mtime, ok, err := newestTranscript("/wt")
+		if err != nil || !ok || path != rollout || agent != "codex" || !mtime.Equal(new) {
+			t.Errorf("newestTranscript = (%q, %q, %v, %v, %v), want the codex rollout over the stale claude file", path, agent, mtime, ok, err)
+		}
+	})
+
+	// opencode keeps no files at all: its stamp wins with an empty path —
+	// there is no body to digest — however new the file sources are stale.
+	t.Run("newest opencode stamp wins with an empty path", func(t *testing.T) {
+		claudeDir := t.TempDir()
+		seed(t, claudeDir, "claude.jsonl", old)
+		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
+		fakeSessionSources(t, noCodexRollout, func(string) (time.Time, bool) { return new, true })
+
+		path, agent, mtime, ok, err := newestTranscript("/wt")
+		if err != nil || !ok || path != "" || agent != "opencode" || !mtime.Equal(new) {
+			t.Errorf("newestTranscript = (%q, %q, %v, %v, %v), want the opencode stamp with no path", path, agent, mtime, ok, err)
+		}
+	})
+
+	t.Run("a newer file beats a stale opencode stamp", func(t *testing.T) {
+		claudeDir := t.TempDir()
+		want := seed(t, claudeDir, "claude.jsonl", new)
+		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
+		fakeSessionSources(t, noCodexRollout, func(string) (time.Time, bool) { return old, true })
+
+		path, agent, _, ok, err := newestTranscript("/wt")
+		if err != nil || !ok || path != want || agent != "claude" {
+			t.Errorf("newestTranscript = (%q, %q, _, %v, %v), want the claude file — a stale opencode stamp must not blank it", path, agent, ok, err)
+		}
+	})
+
+	t.Run("newest wins between codex and opencode", func(t *testing.T) {
+		claudeDir := t.TempDir()
+		seed(t, claudeDir, "claude.jsonl", old)
+		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
+		rollout := filepath.Join(t.TempDir(), "rollout-2026-10-07T09-00-00-"+codexStatusUUID+".jsonl")
+		fakeSessionSources(t,
+			func(string) (string, time.Time, bool) { return rollout, old, true },
+			func(string) (time.Time, bool) { return new, true })
+
+		path, agent, _, ok, err := newestTranscript("/wt")
+		if err != nil || !ok || path != "" || agent != "opencode" {
+			t.Errorf("newestTranscript = (%q, %q, _, %v, %v), want the newer opencode stamp with no path", path, agent, ok, err)
 		}
 	})
 }
@@ -932,6 +1109,10 @@ func TestTranscriptCoT(t *testing.T) {
 // and the empty-transcript states degrade to their one-liners — never a
 // guess and never a duplicate of a completed round.
 func TestLiveCotSection(t *testing.T) {
+	// The live section consults all four sources through newestTranscript;
+	// codex and opencode stay inert here — this test pins the file-based
+	// faces only.
+	fakeSessionSources(t, noCodexRollout, noOpencodeUpdate)
 	fakeDirs := func(t *testing.T, claudeDir, piDir string, claudeErr, piErr error) {
 		t.Helper()
 		resetC := claudeProjectsDir

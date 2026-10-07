@@ -46,6 +46,7 @@ type Relay struct {
 	parserModel string
 	transport   http.RoundTripper
 	proxy       *httputil.ReverseProxy
+	srv         *http.Server
 	listener    net.Listener
 }
 
@@ -78,18 +79,24 @@ func Start(upstreamURL, parserModel string) (*Relay, error) {
 			pr.Out.URL.RawPath = pr.In.URL.RawPath
 		}},
 	}
+	// The server lives on the Relay so Close goes through it — closing the
+	// listener alone would exit Serve with a raw accept error instead of
+	// http.ErrServerClosed, logging a bogus error for the designed
+	// shutdown.
+	r.srv = &http.Server{Handler: r, ReadHeaderTimeout: 30 * time.Second}
 	go func() {
-		srv := &http.Server{Handler: r, ReadHeaderTimeout: 30 * time.Second}
-		if err := srv.Serve(ln); err != http.ErrServerClosed {
+		if err := r.srv.Serve(ln); err != http.ErrServerClosed {
 			log.Printf("toolrelay: serve: %v", err)
 		}
 	}()
 	return r, nil
 }
 
-// Close stops the relay's listener; in-flight requests are not drained —
-// the worker daemon owns the lifecycle and exits whole.
-func (r *Relay) Close() error { return r.listener.Close() }
+// Close stops the relay's server (and with it the listener); in-flight
+// requests are not drained — the worker daemon owns the lifecycle and
+// exits whole. Closing through the server is what keeps Serve's exit on
+// the http.ErrServerClosed path, so the designed shutdown logs nothing.
+func (r *Relay) Close() error { return r.srv.Close() }
 
 // URL is the staged base URL pi dials: the relay's own loopback address
 // plus the upstream's path prefix. Request paths arriving on it are
@@ -266,10 +273,12 @@ func (r *Relay) serveCompletions(w http.ResponseWriter, req *http.Request) {
 // roundTrip forwards the buffered completions request to the upstream —
 // same method, same path (pi's staged base URL carries the upstream's
 // path prefix, so the incoming path is the upstream's own), same headers.
-// Accept-Encoding is dropped so the inspected response arrives
-// uncompressed: a hand-rolled RoundTrip does not unwrap a transport-
-// negotiated gzip layer, and an encoded body would defeat the JSON
-// inspection.
+// Accept-Encoding is pinned to identity so the inspected response arrives
+// uncompressed: the transport does not re-add the header when the request
+// carries one, so the invariant holds for any transport — dropping the
+// header alone would not, since a transport asked to negotiate gzip then
+// transparently unwraps the body itself (the plain bytes arriving here
+// today are that unwrap, not the drop).
 func (r *Relay) roundTrip(req *http.Request, body []byte) (*http.Response, error) {
 	up, err := http.NewRequestWithContext(req.Context(), req.Method,
 		r.upstream.Scheme+"://"+r.upstream.Host+req.URL.RequestURI(), bytes.NewReader(body))
@@ -277,7 +286,7 @@ func (r *Relay) roundTrip(req *http.Request, body []byte) (*http.Response, error
 		return nil, err
 	}
 	up.Header = req.Header.Clone()
-	up.Header.Del("Accept-Encoding")
+	up.Header.Set("Accept-Encoding", "identity")
 	return r.transport.RoundTrip(up)
 }
 
@@ -367,11 +376,11 @@ func (r *Relay) parserCall(req *http.Request, completionsPath string, tool toolS
 	// The parser dial is authenticated exactly like the forwarded leg:
 	// the request's own headers carry the key pi sent (a keyed upstream
 	// would 401 the parser call and silently disable every lift), and
-	// Accept-Encoding is dropped for the same unwrapped-body reason as
-	// roundTrip.
+	// Accept-Encoding is pinned to identity for the same
+	// any-transport-invariant reason as roundTrip.
 	up.Header = req.Header.Clone()
 	up.Header.Set("Content-Type", "application/json")
-	up.Header.Del("Accept-Encoding")
+	up.Header.Set("Accept-Encoding", "identity")
 	resp, err := r.transport.RoundTrip(up)
 	if err != nil {
 		return nil, err

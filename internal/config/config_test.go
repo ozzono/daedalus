@@ -188,9 +188,10 @@ func TestLoadMaxConcurrentAgentRuns(t *testing.T) {
 // suites dial no LLM). Validation precedes the clamp, so an invalid
 // negative max_concurrent_agent_runs still errors. The section also loads
 // the relay's parser_model, and the historical top-level `slim: true`
-// boolean is rejected by the strict decode — the 2026-10-02 reshape moved
-// it to slim.enabled, and a silently-dropped (all-defaults) misread must
-// not be possible.
+// boolean still loads (it decodes into enabled — the README-documented
+// migration for the 2026-10-02 reshape), so an upgrading operator's config
+// keeps working while the strict decode still rejects a typo'd section key
+// and a section-shaped value that is neither.
 func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
 	cfg, err := Load(writeConfig(t, "slim:\n  enabled: true\n  parser_model: qwen2.5-coder:3b-parser\nmax_concurrent_agent_runs: 4\nmax_concurrent_tests: 3\n"))
 	if err != nil {
@@ -219,11 +220,37 @@ func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
 		t.Fatalf("want max_concurrent_agent_runs error under slim, got %v", err)
 	}
 
-	// The legacy boolean spelling must fail loudly, not load as an
-	// all-defaults slim section.
-	_, err = Load(writeConfig(t, "slim: true\n"))
-	if err == nil {
-		t.Error("Load(slim: true) = nil error, want the legacy boolean rejected by the strict decode")
+	// The legacy top-level boolean spelling loads — it decodes into
+	// enabled, so an un-migrated config clamps exactly like the section
+	// shape instead of failing with a struct-name decode error.
+	cfg, err = Load(writeConfig(t, "slim: true\nmax_concurrent_agent_runs: 4\n"))
+	if err != nil {
+		t.Fatalf("Load(legacy slim: true): %v", err)
+	}
+	if !cfg.Slim.Enabled || cfg.MaxConcurrentAgentRuns != 1 {
+		t.Errorf("legacy slim: true = enabled %v, %d runs; want enabled with the clamp to 1", cfg.Slim.Enabled, cfg.MaxConcurrentAgentRuns)
+	}
+	cfg, err = Load(writeConfig(t, "slim: false\nmax_concurrent_agent_runs: 4\n"))
+	if err != nil {
+		t.Fatalf("Load(legacy slim: false): %v", err)
+	}
+	if cfg.Slim.Enabled || cfg.MaxConcurrentAgentRuns != 4 {
+		t.Errorf("legacy slim: false = enabled %v, %d runs; want disabled and untouched", cfg.Slim.Enabled, cfg.MaxConcurrentAgentRuns)
+	}
+
+	// KnownFields strictness does not reach through a custom unmarshaler,
+	// so a typo'd section key must still fail the load — the migration
+	// must not reopen the silent-typo hole.
+	_, err = Load(writeConfig(t, "slim:\n  enabld: true\n"))
+	if err == nil || !strings.Contains(err.Error(), "field enabld not found") {
+		t.Errorf("Load(typo'd slim key) error = %v, want the field-not-found rejection", err)
+	}
+
+	// A value that is neither the legacy scalar nor a mapping is still a
+	// decode error, not a zero-value section.
+	_, err = Load(writeConfig(t, "slim:\n  - true\n"))
+	if err == nil || !strings.Contains(err.Error(), "cannot unmarshal !!seq into config.SlimConfig") {
+		t.Errorf("Load(slim as a sequence) error = %v, want the shape rejection", err)
 	}
 }
 

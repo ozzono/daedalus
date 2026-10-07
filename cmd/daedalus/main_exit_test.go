@@ -2,15 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
+	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/version"
 )
 
@@ -49,36 +54,145 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// reexecTimeout bounds one re-exec'd child — a dispatch that exits takes
+// well under a second, so a child still running at this cap is a regression
+// that hung (a bypassed fail-fast dialing Temporal forever, chief among the
+// classes), and the test fails on it in seconds instead of stalling the
+// suite to the package timeout.
+const reexecTimeout = 30 * time.Second
+
 // runMainIn re-executes the test binary as the daedalus CLI with args (and
 // dir as the working directory, "" inheriting this process's) and returns its
 // stdout, stderr, and exit code. The child's arguments travel via reexecEnv,
-// never os.Setenv, so nothing leaks into this process.
+// never os.Setenv, so nothing leaks into this process. A child still running
+// at reexecTimeout fails the test — see runMainWithin.
 func runMainIn(t *testing.T, dir string, args ...string) (stdout, stderr string, exitCode int) {
+	out, errS, code, hung := runMainWithin(t, reexecTimeout, dir, args...)
+	if hung {
+		t.Fatalf("daedalus %v did not exit within %s — a regression hung the child (stdout so far %q, stderr so far %q)",
+			args, reexecTimeout, out, errS)
+	}
+	return out, errS, code
+}
+
+// runMainWithin is runMainIn with an explicit deadline: a child still
+// running after within is killed and hung comes back true (exitCode is then
+// meaningless), so a hang surfaces as this test's failure in seconds — not
+// as the package timeout panicking the binary around an orphaned
+// grandchild. The kill takes the child's whole process group: the
+// re-exec'd child leads it, so anything it spawned (a daemon re-exec, a
+// wedged CLI) dies with it instead of outliving the killed test binary.
+func runMainWithin(t *testing.T, within time.Duration, dir string, args ...string) (stdout, stderr string, exitCode int, hung bool) {
 	t.Helper()
 	// A zero-arg call would join to an empty payload, which TestMain's guard
 	// reads as absent — the child would re-run the whole test suite.
 	if len(args) == 0 {
-		t.Fatal("runMainIn needs at least one CLI argument")
+		t.Fatal("runMainWithin needs at least one CLI argument")
 	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("resolve test binary: %v", err)
 	}
-	cmd := exec.Command(exe)
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// A descendant that escaped the group would hold the output pipes open;
+	// Wait then returns anyway instead of blocking behind it.
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), reexecEnv+"="+strings.Join(args, "\x1f"))
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
 	runErr := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return out.String(), errBuf.String(), -1, true
+	}
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(runErr, &exitErr) {
 			t.Fatalf("run daedalus %v: %v", args, runErr)
 		}
-		return out.String(), errBuf.String(), exitErr.ExitCode()
+		return out.String(), errBuf.String(), exitErr.ExitCode(), false
 	}
-	return out.String(), errBuf.String(), 0
+	return out.String(), errBuf.String(), 0, false
+}
+
+// TestRunMainWithinDeadline pins the re-exec harness's deadline: a child
+// stuck past it is killed — process group whole — and the caller is told,
+// instead of the hang stalling the suite to the package timeout while the
+// killed test binary leaves a reparented grandchild running (the class a
+// bypassed fail-fast exposed: the child dialed Temporal forever). A
+// sleeping `opencode` stub is the deterministic stuck child: `log --status`
+// consults the session list, so the child blocks in that read while the
+// stub's sleep counts far past any cap.
+func TestRunMainWithinDeadline(t *testing.T) {
+	stubDir := t.TempDir()
+	pidFile := filepath.Join(t.TempDir(), "stub.pid")
+	script := "#!/bin/sh\necho $$ > " + pidFile + "\nexec sleep 60\n"
+	if err := os.WriteFile(filepath.Join(stubDir, "opencode"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", t.TempDir())       // claude's and pi's dirs off the host
+	t.Setenv("CODEX_HOME", t.TempDir()) // codex's rollout tree off the host
+
+	// The brief only runs once the task log exists; the child resolves the
+	// real daemon dir, so the probe's log lands there under an id no real
+	// run can hold, and is removed after.
+	id := fmt.Sprintf("daedalus-hangprobe-%d", time.Now().UnixNano())
+	if err := os.MkdirAll(activities.TaskLogDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(activities.TaskLogDir, id+".log")
+	started := "=== 2026-10-07T09:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===\n"
+	if err := os.WriteFile(logPath, []byte(started), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(logPath) })
+
+	begin := time.Now()
+	stdout, stderr, _, hung := runMainWithin(t, 750*time.Millisecond, "", "log", id, "--status")
+	elapsed := time.Since(begin)
+	if !hung {
+		t.Fatalf("child exited on its own within %v (stdout %q, stderr %q) — the deadline never fired for a child stuck on a 60s stub", elapsed, stdout, stderr)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("deadline fired after %v, want seconds — not the child's own timeout or the package's", elapsed)
+	}
+
+	// The kill took the group: the stub's sleep is gone (a zombie is fine —
+	// it holds nothing and dials nothing), not an orphan counting down its
+	// 60 seconds.
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read stub pid: %v", err)
+	}
+	pid := strings.TrimSpace(string(pidBytes))
+	t.Cleanup(func() {
+		if p, err := strconv.Atoi(pid); err == nil {
+			syscall.Kill(p, syscall.SIGKILL)
+		}
+	})
+	alive := func() bool {
+		b, err := os.ReadFile("/proc/" + pid + "/stat")
+		if err != nil {
+			return false // gone
+		}
+		fields := strings.Fields(string(b))
+		return len(fields) >= 3 && fields[2] != "Z"
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for alive() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if alive() {
+		t.Errorf("the stub process %s outlived the killed child — the deadline kill did not take the process group", pid)
+	}
 }
 
 // validConfig writes a minimal loadable config in a fresh temp dir and

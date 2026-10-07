@@ -139,6 +139,15 @@ func TestCompleteFlags(t *testing.T) {
 	}
 	sort.Strings(allFlags)
 
+	// The long spellings a line that already used -c must still offer,
+	// derived like allFlags so a flag added to flagTable needs no edit here.
+	longNoConfig := make([]string, 0, len(allFlags))
+	for _, s := range withoutNames(allFlags, "config") {
+		if strings.HasPrefix(s, "--") {
+			longNoConfig = append(longNoConfig, s)
+		}
+	}
+
 	for _, c := range []struct {
 		words []string
 		want  []string
@@ -150,7 +159,7 @@ func TestCompleteFlags(t *testing.T) {
 		{[]string{"wipe", "wf-1", "--yes", "-"}, withoutNames(allFlags, "yes")},
 		// -c already used: neither spelling is offered again, every other
 		// long spelling is.
-		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, []string{"--append", "--cli", "--cot", "--cot-n", "--depends", "--detach", "--file", "--folder", "--prefix", "--status", "--type", "--workflow", "--yes"}},
+		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, longNoConfig},
 		// The new dependency flag completes like any value-taking flag: by
 		// prefix, and its value position answers with nothing.
 		{[]string{"run", "--dep"}, []string{"--depends"}},

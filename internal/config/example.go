@@ -176,7 +176,11 @@ slim:
   # inspects pi's chat-completions traffic, and an answer that is exactly
   # one JSON object naming one of the request's own tools is converted
   # into a native tool call, its arguments normalized by this model via
-  # ollama structured output against the tool's own schema. Prose is never
+  # ollama structured output against the tool's own schema. That schema
+  # conformance holds on ollama and other format-honoring parser
+  # upstreams; an OpenAI-compatible upstream that silently ignores
+  # ollama's format field leaves the arguments checked only as a JSON
+  # object. Prose is never
   # converted (reviewer verdicts are content), and any relay or parser
   # failure degrades to the old inert-text behavior — never a new run
   # failure. Resolved against the openai section's url; create the tag on
@@ -515,9 +519,11 @@ const examplePromptBlock = `
 # startup: a missing directory, an unreadable file, a template that does
 # not parse, an empty file, a data field the prompt does not take (each
 # template renders a fixed struct — copy the field references from the
-# embedded file), a {{template}} action (an override runs alone), or a
-# review override missing the verdict protocol all fail the start, never a
-# mid-round render. Two machine contracts a replacement must keep: review
+# embedded file), a {{template}} action (an override runs alone), a
+# {{define}}/{{block}} block (a define body can never render in an
+# override), or a review override missing the verdict protocol all fail
+# the start, never a mid-round render. Two machine contracts a
+# replacement must keep: review
 # is validated at startup to still carry all four verdict words (APPROVED,
 # CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
 # protocol the loop parses), and slim_plan must keep instructing the

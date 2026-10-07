@@ -118,7 +118,13 @@ FLAGS
                           on run-b, which depends on run-a); a dependency that
                           is already approved at submit skips the wait
                           entirely. The id is verbatim from "daedalus list";
-                          the dependency must run on this config's task queue.
+                          the dependency must run on this config's task queue,
+                          and on the same repository this run targets — the
+                          chain checks the queue, not the repo, so a
+                          same-queue dependency from another repo waits out
+                          its gate and then fails at worktree creation with
+                          a raw git error (its preserved branch exists only
+                          in its own repo).
                           Fresh runs only — rejected in append mode.
   -f, --file <path>       Read the task description from a file. A glob pattern
                           (e.g. notes/*.md) expands to every matching file,
@@ -239,14 +245,15 @@ transcript's latest entry — the "looks stuck" check. It is computed from
 the task log and the agent transcripts on disk alone, so it works even
 while the worker or Temporal are down, and it is always scoped to the one
 workflow id given. A missing log prints the same not-started error either way.
-The transcript freshness and digest read claude's transcript dir and pi's
-session dir, newest file wins — a previous run's stale transcripts on one
-side never shadow the other agent's live session. Agents the reader does
-not consult (opencode, codex, amp, aider) show "no transcripts yet" even
-while running — opencode and codex do keep addressable session state
-(their rounds chain conversations; the status view just does not read it
-yet), while amp and aider keep none; the task log itself is complete for
-every agent.
+The transcript freshness and digest read claude's transcript dir, pi's
+session dir, and codex's rollout tree (the cwd recorded in each rollout
+file attributes it to this worktree), newest wins — a previous run's
+stale transcripts on one side never shadow the other agent's live
+session. opencode keeps no files: its freshness comes from one "opencode
+session list" call against its session database, printed as the newest
+updated stamp with no digest — the messages stay in the database. Amp and
+aider keep no addressable session state and show "no transcripts yet"
+even while running; the task log itself is complete for every agent.
 
 With -cot, prints the run's chain-of-thought logs instead of the task
 log: one complete section per jailed round (implementation and review),
@@ -275,8 +282,8 @@ follows regardless of the tail — it is newer than every completed round.
 
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
-host-side transcript as the agent writes it — claude's and pi's, the same
-newest-wins precedence as --status. Agents whose host transcripts the
+host-side transcript as the agent writes it — claude's and pi's, newest
+file wins. Agents whose host transcripts the
 live view does not follow (aider, opencode, codex, amp) get one line
 saying their CoT appears when the round completes — codex does keep a
 rollout transcript, the live view just does not read it yet. Between

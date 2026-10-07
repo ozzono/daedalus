@@ -435,6 +435,43 @@ type SlimConfig struct {
 	ParserModel string `yaml:"parser_model"`
 }
 
+// UnmarshalYAML migrates the historical top-level `slim: true/false`
+// boolean the 2026-10-02 reshape renamed to slim.enabled: a scalar node
+// decodes into Enabled, so an upgrading operator's config loads instead
+// of failing the strict decode with a "cannot unmarshal !!bool into
+// config.SlimConfig" type error that names no migration. The section
+// shape decodes field by field, with the mapping's keys checked by hand —
+// KnownFields strictness does not reach through a custom unmarshaler, so
+// the hand check is what keeps a typo'd section key failing the load with
+// the yaml-style "field … not found" error.
+func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Tag == "!!null" {
+		return nil
+	}
+	if value.Kind == yaml.ScalarNode {
+		return value.Decode(&s.Enabled)
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: cannot unmarshal %s into config.SlimConfig", value.Line, value.ShortTag())
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key, val := value.Content[i], value.Content[i+1]
+		switch key.Value {
+		case "enabled":
+			if err := val.Decode(&s.Enabled); err != nil {
+				return err
+			}
+		case "parser_model":
+			if err := val.Decode(&s.ParserModel); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("line %d: field %s not found in type config.SlimConfig", key.Line, key.Value)
+		}
+	}
+	return nil
+}
+
 // Config holds the runtime configuration for a Daedalus process, loaded
 // from a YAML file (see config-example.yaml).
 type Config struct {
@@ -568,8 +605,9 @@ type Config struct {
 	// this config file's directory. Resolved and validated once at worker
 	// startup (missing directory, unreadable file, empty file, template
 	// that does not parse, a data field the prompt does not take, a
-	// {{template}} action, or a review override missing the verdict
-	// protocol all fail the start); rendered prompts
+	// {{template}} action, a {{define}}/{{block}} block — a define body
+	// can never render in an override — or a review override missing the
+	// verdict protocol all fail the start); rendered prompts
 	// are recorded in workflow history, so replacement content is not
 	// secret and may live on the same path as the config. Empty — the
 	// default — renders every prompt byte-identically to the embedded one.

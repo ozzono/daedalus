@@ -451,11 +451,15 @@ func sameDir(a, b string) bool {
 
 // opencodeSession is one entry of `opencode session list --format json`
 // (probe-verified shape, opencode 1.18.31: id, directory, created,
-// updated, projectId, title). Only the two fields the tracking needs are
-// modeled; the rest of each entry is ignored.
+// updated, projectId, title). Only the fields the tracking and the CLI's
+// task-status brief need are modeled; the rest of each entry is ignored.
+// Updated stays a RawMessage: its value spelling is unprobed, and a typed
+// field would fail the whole list's parse — and with it opencode's session
+// tracking — if opencode emits a number instead of the string convention.
 type opencodeSession struct {
-	ID        string `json:"id"`
-	Directory string `json:"directory"`
+	ID        string          `json:"id"`
+	Directory string          `json:"directory"`
+	Updated   json.RawMessage `json:"updated"`
 }
 
 // opencodeListTimeout bounds one `opencode session list` invocation — the
@@ -548,6 +552,44 @@ func opencodeTranscriptExists(worktree, id string) bool {
 		}
 	}
 	return false
+}
+
+// OpencodeNewestUpdate returns the newest updated stamp among the sessions
+// opencode lists for this worktree. It backs the CLI's task-status brief
+// (`daedalus log <id> --status`): opencode keeps no transcript files, so
+// its session database's updated stamp is the only freshness signal the
+// host can read. ok is false when opencode lists no session for the
+// worktree, the command fails, or no listed stamp parses — an
+// unparseable stamp drops its session from the scan rather than misdating
+// it.
+func OpencodeNewestUpdate(worktree string) (time.Time, bool) {
+	sessions, ok := opencodeSessionList()
+	if !ok {
+		return time.Time{}, false
+	}
+	var newest time.Time
+	found := false
+	for _, s := range sessions {
+		if !sameDir(s.Directory, worktree) {
+			continue
+		}
+		// ponytail: the updated stamp's exact spelling is unprobed — this
+		// sandbox has no opencode binary — so only the string convention
+		// (RFC3339 is the JSON norm) feeds the freshness scan; a number or
+		// an exotic layout silently drops the session from it.
+		var stamp string
+		if json.Unmarshal(s.Updated, &stamp) != nil {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, stamp)
+		if err != nil {
+			continue
+		}
+		if !found || t.After(newest) {
+			newest, found = t, true
+		}
+	}
+	return newest, found
 }
 
 // codexSessionsRoot returns codex's session rollout root — ~/.codex/sessions
@@ -716,6 +758,45 @@ func codexTranscriptExists(worktree, id string) bool {
 		return nil
 	})
 	return found
+}
+
+// CodexNewestRollout returns the newest rollout file codex holds for this
+// worktree — the sessions tree walked whole (the YYYY/MM/DD nesting is
+// codex's own), the recorded cwd attributing each file to the worktree. It
+// backs the CLI's task-status brief (`daedalus log <id> --status`), which
+// digests the file the live round is writing. ok is false when the tree
+// holds no rollout for this worktree, or cannot be read — unreadable
+// individual files just do not count.
+func CodexNewestRollout(worktree string) (string, time.Time, bool) {
+	root, ok := codexSessionsRoot()
+	if !ok {
+		return "", time.Time{}, false
+	}
+	var best string
+	var bestT time.Time
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if _, ok := codexSessionID(d.Name()); !ok {
+			return nil
+		}
+		if !sameDir(codexRolloutCWD(path), worktree) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if best == "" || info.ModTime().After(bestT) {
+			best, bestT = path, info.ModTime()
+		}
+		return nil
+	})
+	if err != nil || best == "" {
+		return "", time.Time{}, false
+	}
+	return best, bestT, true
 }
 
 // brokenResume reports whether err is consistent with the resumed
