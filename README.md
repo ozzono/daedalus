@@ -170,6 +170,63 @@ up.
 
 ## Usage
 
+The full CLI surface is answerable from the binary itself: `daedalus -h`
+lists every command with a one-line flag hint, `daedalus <command>
+--help` prints that command's detail, and `daedalus worker <action>
+--help` prints a sub-action's flag rules (which flags it accepts, which
+it rejects). The tables below carry the same surface — this section and
+the help text are kept in agreement.
+
+| Command | Arguments | Flags | Purpose |
+|---|---|---|---|
+| `run` | `<repo-path> <issue-id> "<prompt>"` | `-w -d -p -cli -folder -dep -f -a` | Start an implementation pipeline for an issue |
+| `run -a <workflow-id>` | `<workflow-id> ["<prompt>"]` | `-f` | Append a prompt to an already-running pipeline (same as `guide`) |
+| `continue` | `<workflow-id> "<prompt>"` | `-d` | Resume a closed, failed, or parked session |
+| `guide` | `<workflow-id> "<message>"` | — | Send operator instructions to a running pipeline |
+| `attach` | `<workflow-id>` | — | Reconnect to an in-flight or completed pipeline |
+| `list` | `[max]` | — | Display past and current sessions on the task queue |
+| `log` | `<workflow-id>` | `--status -cot -cot-n` | Show a session's captured task log (raw, status brief, or chain-of-thought) |
+| `wipe` | `<workflow-id>` | `--yes` | Erase a session's disk work entirely (worktree, branches, logs) |
+| `worker start` | — | `-c -t` | Run the worker daemon detached (the default worker action) |
+| `worker stop` | — | `-c` | Drain the daemon gracefully (SIGTERM) |
+| `worker status` | — | — | List every worker on record (plus live strays) with live probes; the stuck-work recapture point |
+| `worker restart` | — | `-c -t` | Stop + start this config's worker with the config re-read from disk |
+| `worker restart <worker>` | `<worker>` | — | Restart one worker from its recorded config, from any directory |
+| `worker restart all` | — | `--all` | Restart every worker on record, each from its own record |
+| `worker foreground` | — | `-c -t` | Run the worker attached to this terminal |
+| `worker wakeup` | `<workflow-id>` | `-c` | Interrupt a RUNNING session's quota heartbeat so the round resumes |
+| `init` | `[prompt] [slim]` | — | Generate a fully commented `config-example.yaml` |
+| `config` | — | — | Print the active configuration (resolved path + every field) |
+| `report` | — | `-q --all --json --table` | Summarize AI provider usage (cost, tokens, time) and worker slots |
+| `version` | — | — | Print the version and exit |
+| `completion` | `bash\|zsh` | — | Print the tab-completion script (eval into your shell rc) |
+
+Global flags: `-c/--config <path>`, `-v/--version`, `-h/--help`. `-c` is
+accepted by every command except `log` and the record-driven worker
+commands (`worker status`, `worker restart <worker>`, `worker restart
+all`), which act from the recorded per-worker configs alone.
+
+Flag reference:
+
+| Flag | Accepted by | Meaning |
+|---|---|---|
+| `-w, --workflow <name>` | `run` (fresh runs) | Flow to run: `feature-dev` (default), `dev-only`, `slim`, `investigate`, `test-only`, `refactor`, `bug-fix`. Parsed but without effect on any other command — including `run -a`, where the pipeline keeps the flow it started with |
+| `-d, --detach` | `run`, `continue` | Start the pipeline and return immediately; `daedalus attach` reconnects |
+| `-p, --prefix <prefix>` | fresh `run` | Name the preserved branch `<prefix>/issue-<id>-<timestamp>`, overriding the config's `branch_prefix` |
+| `-cli, --cli <agent>` | fresh `run` | Jailed agent for this run: `claude`, `opencode`, `amp`, `pi`, `aider` (deprecated), `codex` |
+| `-folder, --folder <path>` | fresh `run` (repeatable) | Grant the run read-write access to a host folder, mounted at `.daedalus-folders/<basename>` |
+| `-dep, --depends <workflow-id>` | fresh `run` | Chain the run behind another; it starts from the dependency's preserved branch once that finishes approved |
+| `-f, --file <path>` | `run` (fresh and `-a`) | Read the task description from a file (glob-expandable); replaces the `"<prompt>"` argument |
+| `-a, --append <id>` | `run` | Append mode: fold the prompt into an already-running pipeline's next fix round |
+| `--status` | `log` | Print a maintainer-facing status brief instead of the raw log |
+| `-cot` | `log` | Print the run's chain-of-thought logs from Temporal history |
+| `-cot-n <N>` | `log -cot` | Tail the CoT view to the last N completed rounds (whole sections only) |
+| `-t, --type dev\|test` | `worker start`, bare `worker restart`, `worker foreground` | Which pollers the daemon starts (`dev` or `test`; omit for both). Rejected by `run`, `worker status`, and the record-driven restarts; parsed but without effect on any other command |
+| `--all` | `worker restart`, `report` | Restart every worker on record (same as the `all` argument) / scope the usage slices to every queue on record |
+| `--yes` | `wipe` | Skip the interactive confirmation (scripted use) |
+| `-q, --queue <queue>` | `report` | Scope the usage slices to one explicit queue instead of the resolved one |
+| `--json` / `--table` | `report` | JSON vs table output (table is the default; `--table` is accepted for explicitness) |
+
 1. **Install** the CLI:
 
    ```sh

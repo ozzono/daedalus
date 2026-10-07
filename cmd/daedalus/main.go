@@ -54,6 +54,24 @@ func main() {
 		}
 	}
 
+	// "daedalus worker <action> --help" (and -h/help): the sub-action's own
+	// screen — its arguments plus the flags it accepts and the ones it
+	// rejects. Also answered before config resolution: "worker start -h"
+	// used to die at the config lookup before its own dispatch, and an
+	// action's flag rules must not depend on a loadable config. A word
+	// naming no action fails right here with the usual unknown-action
+	// diagnostic — also without a config, and unreachable by any legitimate
+	// invocation, since every real action has a screen.
+	if len(args) == 3 && args[0] == "worker" &&
+		(args[2] == "-h" || args[2] == "--help" || args[2] == "help") {
+		h, ok := workerActionHelp[args[1]]
+		if !ok {
+			usageFail("unknown worker action %q (%s)", args[1], strings.Join(workerActions, ", "))
+		}
+		fmt.Print(h)
+		return
+	}
+
 	// Every subcommand except the no-config ones (help, version, init,
 	// report, completion, the record-driven worker commands — `worker
 	// restart all`, `worker restart <name>`, and `worker status`, which
