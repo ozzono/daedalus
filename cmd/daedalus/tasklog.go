@@ -38,9 +38,12 @@ var codexNewestRollout = activities.CodexNewestRollout
 var opencodeNewestUpdate = activities.OpencodeNewestUpdate
 
 // runTaskLog implements `daedalus log <workflow-id>`: print the task's
-// captured log file, or — with --status — a short status brief instead.
-// File- and session-state-derived only: no temporal connection, no config
-// (the one subprocess is opencode's session list, for opencode freshness).
+// captured log file — with a log-tail block appended naming when the last
+// log arrived and the run's state (see logTail) — or, with --status, a
+// short status brief instead (the brief already is the freshness summary,
+// so it carries no tail). File- and session-state-derived only: no
+// temporal connection, no config (the one subprocess is opencode's session
+// list, for opencode freshness).
 func runTaskLog(workflowID string, status bool) {
 	path, err := activities.TaskLogPath(workflowID)
 	if err != nil {
@@ -58,6 +61,22 @@ func runTaskLog(workflowID string, status bool) {
 		return
 	}
 	os.Stdout.Write(data)
+	fmt.Print(logTail(workflowID, plainTailState(string(data))))
+}
+
+// plainTailState renders the plain log's run-state clause for the tail
+// block, derived from the task log alone — the command never dials
+// Temporal, so a finished run and a crashed one are both "no round in
+// flight", and the clause says so rather than guessing an outcome.
+func plainTailState(log string) string {
+	_, stage, _, running := lastRoundState(log)
+	if !running {
+		return "run not running (no round in flight per task log): this dump is final as far as the file shows — completed vs crashed needs the temporal view (-cot)"
+	}
+	if stage == "" {
+		stage = "unknown"
+	}
+	return fmt.Sprintf("round in flight (stage=%s): run still going — this dump is not final", stage)
 }
 
 // runTaskLogCot implements `daedalus log <workflow-id> -cot`: print the
@@ -76,7 +95,10 @@ func runTaskLog(workflowID string, status bool) {
 // every other client command — else the default, so the command works
 // wherever the Temporal service is reachable. When a round is in flight
 // right now, a live section rendered from the agent's host-side transcript
-// follows the completed ones (see liveCotSection).
+// follows the completed ones (see liveCotSection). The dump ends with a
+// log-tail block naming when the last log arrived and the workflow's real
+// Temporal state, so a finished run's output never reads as live (see
+// logTail).
 func runTaskLogCot(workflowID string, cotN int) {
 	host := config.DefaultTemporalHost
 	if path, err := resolveConfigPath(defaultConfigPath); err == nil {
@@ -216,6 +238,59 @@ func runTaskLogCot(workflowID string, cotN int) {
 	if rounds == 0 && live == "" {
 		exitf("no jailed agent rounds in %s's Temporal history — the run has not started any rounds yet, or predates structured round capture", workflowID)
 	}
+	// The tail rides only on the dump path: the zero-round error above
+	// already names that state ("not started"), and an error line plus a
+	// tail would say it twice.
+	fmt.Print(logTail(workflowID, cotTailState(c, workflowID)))
+}
+
+// cotTailState renders -cot's run-state clause from the workflow's live
+// Temporal status — the same empty-run-id Describe the dependency gate and
+// wakeup use, which for a continued session means the latest execution,
+// exactly what "is it still going" asks. Terminal statuses end the clause
+// with "this dump is final", so a finished run's -cot output never reads
+// as live; a describe failure degrades the clause rather than failing a
+// dump that already succeeded.
+func cotTailState(c client.Client, workflowID string) string {
+	resp, err := c.DescribeWorkflowExecution(context.Background(), workflowID, "")
+	if err != nil {
+		return fmt.Sprintf("temporal state unknown (describe failed: %v)", err)
+	}
+	s := resp.GetWorkflowExecutionInfo().GetStatus()
+	switch s {
+	case enums.WORKFLOW_EXECUTION_STATUS_RUNNING, enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
+		return fmt.Sprintf("temporal state %s: run still going — this dump is not final", s)
+	case enums.WORKFLOW_EXECUTION_STATUS_PAUSED:
+		// Paused is not terminal — an unpause resumes the run and more
+		// rounds arrive — so it must never read final. daedalus itself
+		// never pauses a workflow; only a manual temporal-CLI pause lands
+		// here (see backlog/bugs/log-tail-paused-state-final-clause.md).
+		return fmt.Sprintf("temporal state %s: run paused — this dump is not final; the run can resume", s)
+	default:
+		return fmt.Sprintf("temporal state %s: run not running — this dump is final", s)
+	}
+}
+
+// logTail renders the tail block appended to every log dump (plain and
+// -cot): one more === === line in the task log's own header style, naming
+// when the last log material arrived and the run's state. The arrival
+// stamp is the task log file's mtime — the writer appends each block in a
+// single O_APPEND write, so mtime is the last arrival — and degrades to
+// "unknown" when the file is absent or unreadable: -cot works on hosts the
+// worker never touched, and a missing file must not fail a dump that
+// already rendered. A read/stat race with a concurrent block write shifts
+// the stamp by at most one block — this is an observability aid, not a
+// transaction. The line never enters the log file itself, so the file
+// parsers (lastRoundState and friends) never see it; even if one did, a
+// "log tail" event matches no state-bearing grammar.
+func logTail(workflowID, statePhrase string) string {
+	last := "unknown (task log not readable on this host)"
+	if path, err := activities.TaskLogPath(workflowID); err == nil {
+		if info, serr := os.Stat(path); serr == nil {
+			last = info.ModTime().UTC().Format(time.RFC3339)
+		}
+	}
+	return fmt.Sprintf("=== log tail: last log %s — workflow %s — %s ===\n", last, workflowID, statePhrase)
 }
 
 // listWorkflowRuns returns the run ids of every execution recorded for

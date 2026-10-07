@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/sdk/client"
 
 	"github.com/ozzono/daedalus/internal/activities"
 )
@@ -468,16 +475,246 @@ func TestTaskStatusBrief(t *testing.T) {
 }
 
 // TestRunTaskLogPrintsFile pins the raw mode in-process (its success path
-// never exits): the log file's bytes verbatim on stdout.
+// never exits): the log file's bytes verbatim on stdout, followed by the
+// log-tail block — whose arrival stamp is the file's mtime and whose state
+// clause follows the file's round state. The tail exists only in the dump:
+// the file's bytes are untouched, so the parsers never see the block.
 func TestRunTaskLogPrintsFile(t *testing.T) {
-	useTaskLogDir(t)
-	content := "=== 2026-09-20T10:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===\nround output\n"
-	writeTaskLogFile(t, "wf-raw", strings.TrimSuffix(content, "\n"))
+	const started = "=== 2026-09-20T10:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ==="
+	const exited = "=== 2026-09-20T10:05:00Z jailed claude round exited after 5m0s (run abcd1234) ==="
+	const runningTail = "=== log tail: last log %s — workflow wf-raw — round in flight (stage=dev): run still going — this dump is not final ===\n"
+	const notRunningTail = "=== log tail: last log %s — workflow wf-raw — run not running (no round in flight per task log): this dump is final as far as the file shows — completed vs crashed needs the temporal view (-cot) ===\n"
 
-	out := captureStdout(t, func() { runTaskLog("wf-raw", false) })
-	if out != content {
-		t.Errorf("daedalus log printed %q, want the file verbatim %q", out, content)
+	t.Run("a round in flight appends the still-going tail", func(t *testing.T) {
+		useTaskLogDir(t)
+		content := started + "\nround output\n"
+		writeTaskLogFile(t, "wf-raw", strings.TrimSuffix(content, "\n"))
+		mtime := stampTaskLog(t, "wf-raw")
+
+		out := captureStdout(t, func() { runTaskLog("wf-raw", false) })
+		want := content + fmt.Sprintf(runningTail, mtime.UTC().Format(time.RFC3339))
+		if out != want {
+			t.Errorf("daedalus log printed %q, want the file verbatim plus the tail block %q", out, want)
+		}
+	})
+
+	t.Run("a finished round appends the not-running tail", func(t *testing.T) {
+		useTaskLogDir(t)
+		content := started + "\nround output\n" + exited + "\n"
+		writeTaskLogFile(t, "wf-raw", strings.TrimSuffix(content, "\n"))
+		mtime := stampTaskLog(t, "wf-raw")
+
+		out := captureStdout(t, func() { runTaskLog("wf-raw", false) })
+		want := content + fmt.Sprintf(notRunningTail, mtime.UTC().Format(time.RFC3339))
+		if out != want {
+			t.Errorf("daedalus log printed %q, want the file verbatim plus the tail block %q", out, want)
+		}
+	})
+}
+
+// stampTaskLog pins the log file for id to a known mtime (truncate to the
+// second so the RFC3339 render is exact) and returns it. The task log dir
+// must already be redirected (useTaskLogDir).
+func stampTaskLog(t *testing.T, id string) time.Time {
+	t.Helper()
+	path, err := activities.TaskLogPath(id)
+	if err != nil {
+		t.Fatal(err)
 	}
+	mtime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	return mtime
+}
+
+// TestLogTailNeverEntersTheFile pins the tail's write scope: the dump
+// appends the block to stdout only — the task log's bytes are the same
+// before and after, so a re-read (lastRoundState and friends) can never
+// trip over the tail's own === === line.
+func TestLogTailNeverEntersTheFile(t *testing.T) {
+	useTaskLogDir(t)
+	writeTaskLogFile(t, "wf-keep",
+		"=== 2026-09-20T10:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===",
+		"round output")
+	path, err := activities.TaskLogPath("wf-keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captureStdout(t, func() { runTaskLog("wf-keep", false) })
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("task log after the dump = %q, want the untouched %q", after, before)
+	}
+}
+
+// TestPlainTailState pins the plain log's state clause: derived from the
+// task log alone, so a round in flight reads still going (an empty stage
+// reads unknown) and everything else — never started, finished, or a
+// dependent held by its dependency gate — reads not-running, naming
+// completed-vs-crashed as unknowable from the file rather than guessing an
+// outcome.
+func TestPlainTailState(t *testing.T) {
+	const started = "=== 2026-09-25T10:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ==="
+	const exited = "=== 2026-09-25T10:05:00Z jailed claude round exited after 5m0s (run abcd1234) ==="
+	const notRunning = "run not running (no round in flight per task log): this dump is final as far as the file shows — completed vs crashed needs the temporal view (-cot)"
+
+	cases := []struct{ name, log, want string }{
+		{
+			name: "an empty log has no round in flight",
+			want: notRunning,
+		},
+		{
+			name: "a round in flight reads still going",
+			log:  started,
+			want: "round in flight (stage=dev): run still going — this dump is not final",
+		},
+		{
+			name: "an empty stage reads unknown",
+			log:  "=== 2026-09-25T10:00:00Z jailed aider round started: stage= worktree=/wt pgid=1 (run abcd1234) ===",
+			want: "round in flight (stage=unknown): run still going — this dump is not final",
+		},
+		{
+			name: "an exited round is not running",
+			log:  started + "\n" + exited,
+			want: notRunning,
+		},
+		{
+			name: "a dependent held by its gate is not running",
+			log:  "waiting on dependency: wf-1\n",
+			want: notRunning,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := plainTailState(c.log); got != c.want {
+				t.Errorf("plainTailState(%q) = %q, want %q", c.log, got, c.want)
+			}
+		})
+	}
+}
+
+// fakeTailClient answers only DescribeWorkflowExecution — the one client
+// call cotTailState makes. The embedded nil interface keeps the rest of
+// client.Client unreachable: a panic there is the test failing loudly, not
+// a silent wrong clause.
+type fakeTailClient struct {
+	client.Client
+	resp       *workflowservice.DescribeWorkflowExecutionResponse
+	describeEr error
+	workflowID string
+	runID      string
+}
+
+func (f *fakeTailClient) DescribeWorkflowExecution(_ context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
+	f.workflowID, f.runID = workflowID, runID
+	return f.resp, f.describeEr
+}
+
+// TestCotTailState pins -cot's state clause, rendered from the workflow's
+// real Temporal status: the Describe rides the empty run id (the latest
+// execution is what "is it still going" asks about a continued session),
+// Running and ContinuedAsNew read still going, Paused reads resumable —
+// never final, an unpause brings more rounds — every terminal status reads
+// final, and a describe failure degrades the clause to unknown rather than
+// failing a dump that already rendered.
+func TestCotTailState(t *testing.T) {
+	t.Run("describe rides the empty run id", func(t *testing.T) {
+		c := &fakeTailClient{resp: preflightDescribe(enums.WORKFLOW_EXECUTION_STATUS_RUNNING, "")}
+		cotTailState(c, "wf-tail")
+		if c.workflowID != "wf-tail" || c.runID != "" {
+			t.Errorf("DescribeWorkflowExecution = (%q, %q), want (workflow, empty run id)", c.workflowID, c.runID)
+		}
+	})
+
+	for _, c := range []struct {
+		name, want string
+		status     enums.WorkflowExecutionStatus
+	}{
+		{
+			name:   "running reads still going",
+			status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			want:   "temporal state Running: run still going — this dump is not final",
+		},
+		{
+			name:   "ContinuedAsNew counts as still going",
+			status: enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+			want:   "temporal state ContinuedAsNew: run still going — this dump is not final",
+		},
+		{
+			name:   "paused reads resumable, never final",
+			status: enums.WORKFLOW_EXECUTION_STATUS_PAUSED,
+			want:   "temporal state Paused: run paused — this dump is not final; the run can resume",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := cotTailState(&fakeTailClient{resp: preflightDescribe(c.status, "")}, "wf-tail")
+			if got != c.want {
+				t.Errorf("cotTailState(%s) = %q, want %q", c.status, got, c.want)
+			}
+		})
+	}
+
+	// Every terminal status must read final — enumerated, because a
+	// misrouted status is exactly how Paused once claimed finality.
+	t.Run("terminal statuses read final", func(t *testing.T) {
+		for _, s := range []enums.WorkflowExecutionStatus{
+			enums.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+			enums.WORKFLOW_EXECUTION_STATUS_FAILED,
+			enums.WORKFLOW_EXECUTION_STATUS_CANCELED,
+			enums.WORKFLOW_EXECUTION_STATUS_TERMINATED,
+			enums.WORKFLOW_EXECUTION_STATUS_TIMED_OUT,
+		} {
+			want := "temporal state " + s.String() + ": run not running — this dump is final"
+			if got := cotTailState(&fakeTailClient{resp: preflightDescribe(s, "")}, "wf-tail"); got != want {
+				t.Errorf("cotTailState(%s) = %q, want %q", s, got, want)
+			}
+		}
+	})
+
+	t.Run("a describe failure degrades to unknown", func(t *testing.T) {
+		got := cotTailState(&fakeTailClient{describeEr: errors.New("dial failed")}, "wf-tail")
+		want := "temporal state unknown (describe failed: dial failed)"
+		if got != want {
+			t.Errorf("cotTailState(describe error) = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestLogTail pins the tail block's identity fields: the arrival stamp is
+// the task log file's mtime in UTC RFC3339, the block carries the workflow
+// id and the state phrase in the log's own === === header style — and on a
+// host the worker never touched the stamp degrades to unknown instead of
+// failing a dump that already rendered.
+func TestLogTail(t *testing.T) {
+	t.Run("the stamp is the log file's mtime", func(t *testing.T) {
+		useTaskLogDir(t)
+		writeTaskLogFile(t, "wf-tail", "=== 2026-09-25T10:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===")
+		mtime := stampTaskLog(t, "wf-tail")
+
+		want := "=== log tail: last log " + mtime.UTC().Format(time.RFC3339) +
+			" — workflow wf-tail — round in flight (stage=dev): run still going — this dump is not final ===\n"
+		if got := logTail("wf-tail", "round in flight (stage=dev): run still going — this dump is not final"); got != want {
+			t.Errorf("logTail = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("no task log degrades the stamp to unknown", func(t *testing.T) {
+		useTaskLogDir(t)
+		want := "=== log tail: last log unknown (task log not readable on this host)" +
+			" — workflow wf-absent — temporal state Completed: run not running — this dump is final ===\n"
+		if got := logTail("wf-absent", "temporal state Completed: run not running — this dump is final"); got != want {
+			t.Errorf("logTail = %q, want %q", got, want)
+		}
+	})
 }
 
 // TestMainLogDispatch pins the `daedalus log` dispatch wiring in-process:
@@ -524,6 +761,10 @@ func TestMainLogDispatch(t *testing.T) {
 		out := captureStdout(t, main)
 		if !strings.HasPrefix(out, "current agent: dev\nlast update: no transcripts yet\n") {
 			t.Errorf("daedalus log --status output %q, want the status brief", out)
+		}
+		// The brief already is the freshness summary: no tail block on it.
+		if strings.Contains(out, "log tail") {
+			t.Errorf("daedalus log --status output %q, want no log-tail block on the brief", out)
 		}
 	})
 }

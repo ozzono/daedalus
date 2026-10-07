@@ -254,6 +254,19 @@ header are prefixed with one space, so output is preserved except for that
 byte.) Each block header stamps the temporal run id
 (first 8 characters), so a continued session's runs are distinguishable in
 one file. Files untouched for 7 days are pruned along with the worker logs.
+The dump ends with a tail block (plain and -cot; --status needs none, it is
+itself the brief):
+
+  === log tail: last log 2026-10-07T18:04:05Z — workflow daedalus-42 — <state> ===
+
+naming when the last log material arrived (the task log file's last write)
+and the run's state. Plain log derives the state from the task log alone:
+a run with a round in flight reads "round in flight (stage=<role>): run
+still going — this dump is not final"; otherwise it reads "run not running
+(no round in flight per task log): this dump is final as far as the file
+shows — completed vs crashed needs the temporal view (-cot)". The file
+alone cannot tell a completed run from a crashed one, so the plain tail
+never claims an outcome.
 
 With --status, prints a short maintainer-facing brief instead: which agent
 round is running right now (dev, dev-review, test, test-review, or idle),
@@ -296,6 +309,21 @@ Round numbers keep their place in the run's full history, so a tailed
 view can open above round 1. 0 prints no completed sections; a negative
 value is a usage error. A live in-flight section, when one exists, always
 follows regardless of the tail — it is newer than every completed round.
+
+The -cot dump ends with the same tail block, but the state clause names
+the workflow's real Temporal execution status, since -cot is already
+connected: "temporal state Completed: run not running — this dump is
+final" (likewise Failed, Canceled, Terminated, TimedOut), or "temporal
+state Running: run still going — this dump is not final" while the
+workflow lives (ContinuedAsNew counts as still going). A run between
+rounds therefore reads as still going, and a finished run never reads as
+live. A paused execution — only a manual temporal-CLI pause can produce
+one; daedalus never pauses its own workflows — reads "temporal state
+Paused: run paused — this dump is not final; the run can resume", since
+unpausing brings more rounds. -cot works on hosts the worker never
+touched: there the arrival stamp reads "unknown (task log not readable
+on this host)" rather than failing a dump that already rendered, and a
+failed status lookup degrades to "temporal state unknown" the same way.
 
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
