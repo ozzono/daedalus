@@ -16,7 +16,9 @@ rw_maps = [
     "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-pi-fix/.daedalus-folders/daedalus",
     "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-opencode-provider/backlog/bugs",
     "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-opencode-provider/.daedalus-folders/daedalus",
-    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-opencode-provider/backlog/bugs",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-init-subcommands/backlog/bugs",
+    "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-init-subcommands/.daedalus-folders/daedalus",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-init-subcommands/backlog/bugs",
 ]
 mask = [
     ".claude/settings.json",

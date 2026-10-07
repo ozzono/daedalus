@@ -18,6 +18,12 @@ import (
 	"github.com/ozzono/daedalus/internal/version"
 )
 
+// initProfiles are the profile arguments `daedalus init` accepts: each
+// samples config-example.yaml down to the base configuration plus that
+// feature's blocks (config.ExampleYAMLFor) — also the probe's candidates at
+// the position after "init" (completion.go).
+var initProfiles = []string{"prompt", "slim"}
+
 func main() {
 	// The hidden completion probe is answered before anything else: its
 	// words are not real arguments (flags among them are candidates, not
@@ -82,8 +88,15 @@ func main() {
 	case "-v", "--version", "version":
 		fmt.Println(version.String())
 	case "init":
-		if err := writeExampleConfig("."); err != nil {
-			fail("init", err)
+		// Bare init writes the full example, refusing to overwrite;
+		// profile arguments regenerate it as the base plus the requested
+		// slices.
+		if len(args) == 1 {
+			if err := writeExampleConfig("."); err != nil {
+				fail("init", err)
+			}
+		} else {
+			writeProfiledExample(args[1:])
 		}
 	case "config":
 		// daedalus config — print the resolved config path plus every
@@ -328,6 +341,37 @@ func main() {
 	default:
 		usageFail("unknown subcommand %q", args[0])
 	}
+}
+
+// writeProfiledExample regenerates ./config-example.yaml as the base
+// configuration plus the requested profile slices — the one init form that
+// overwrites an existing file, because a profiled file is a sample of the
+// example, not an addition to whatever an earlier init left: there is no
+// merging across invocations. Unknown or repeated profiles are a usage
+// error.
+func writeProfiledExample(names []string) {
+	var slim, prompt bool
+	for _, n := range names {
+		switch n {
+		case "prompt":
+			if prompt {
+				usageFail("init got profile %q twice", n)
+			}
+			prompt = true
+		case "slim":
+			if slim {
+				usageFail("init got profile %q twice", n)
+			}
+			slim = true
+		default:
+			usageFail("unknown init profile %q (available: %s)", n, strings.Join(initProfiles, ", "))
+		}
+	}
+	path := filepath.Join(".", "config-example.yaml")
+	if err := os.WriteFile(path, []byte(config.ExampleYAMLFor(slim, prompt)), 0o644); err != nil {
+		fail("init", err)
+	}
+	fmt.Printf("wrote %s — copy to config.yaml and edit\n", path)
 }
 
 // exitf prints the formatted diagnostic to stderr and exits nonzero — the

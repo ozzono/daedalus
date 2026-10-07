@@ -778,6 +778,70 @@ func TestExampleYAML(t *testing.T) {
 	}
 }
 
+// TestExampleYAMLFor pins ExampleYAMLFor's composition: the base
+// configuration in every output (so a profiled file stands alone — Load
+// accepts each of them), the slim slices and the prompt slice only when
+// requested, the slim slices keeping the example's file order, and both
+// profiles reproducing ExampleYAML byte for byte.
+func TestExampleYAMLFor(t *testing.T) {
+	// Key-level markers, each unique to its piece of the example: the base
+	// ones ride exampleBase1/3, the slim and prompt ones a profile's slices.
+	markers := []struct {
+		label string
+		mark  string
+	}{
+		{"agent", "\nagent: claude\n"},
+		{"thinking", "\nthinking: true\n"},
+		{"slim section", "\nslim:\n"},
+		{"openai section", "\nopenai:\n"},
+		{"anthropic context_tokens", "\n  context_tokens: 0\n"},
+		{"prompt section", "# Project-wise prompt overrides"},
+	}
+	inBase := map[string]bool{"agent": true, "thinking": true}
+	inSlim := map[string]bool{"slim section": true, "openai section": true, "anthropic context_tokens": true}
+	inPrompt := map[string]bool{"prompt section": true}
+
+	for _, c := range []struct {
+		slim, prompt bool
+	}{
+		{false, false},
+		{true, false},
+		{false, true},
+		{true, true},
+	} {
+		out := ExampleYAMLFor(c.slim, c.prompt)
+		for _, m := range markers {
+			want := inBase[m.label] || (inSlim[m.label] && c.slim) || (inPrompt[m.label] && c.prompt)
+			if got := strings.Contains(out, m.mark); got != want {
+				t.Errorf("ExampleYAMLFor(slim=%t, prompt=%t) %s present = %v, want %v", c.slim, c.prompt, m.label, got, want)
+			}
+		}
+		// A profiled init's file is a configuration like any other: it must
+		// load.
+		path := filepath.Join(t.TempDir(), "config-example.yaml")
+		if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Errorf("Load(ExampleYAMLFor(slim=%t, prompt=%t)): %v", c.slim, c.prompt, err)
+		}
+	}
+
+	// Both requested is the whole example, nothing reordered.
+	if got := ExampleYAMLFor(true, true); got != ExampleYAML {
+		t.Error("ExampleYAMLFor(slim=true, prompt=true) should equal ExampleYAML byte for byte")
+	}
+
+	// The slim slices sit where the example puts them: the slim: block
+	// before the remaining general fields, the openai: section (and
+	// anthropic's sizing) after them and before the base provider plumbing.
+	slimOnly := ExampleYAMLFor(true, false)
+	first := func(mark string) int { return strings.Index(slimOnly, mark) }
+	if a, b, c, d := first("\nslim:\n"), first("max_concurrent_tests: 2"), first("\nopenai:\n"), first("\nfallback:\n"); !(a < b && b < c && c < d) {
+		t.Errorf("slim output out of file order: slim@%d max_concurrent_tests@%d openai@%d fallback@%d", a, b, c, d)
+	}
+}
+
 // TestExampleYAMLMatchesRepoFile keeps the shipped constant and the
 // repository's config-example.yaml in lockstep.
 func TestExampleYAMLMatchesRepoFile(t *testing.T) {

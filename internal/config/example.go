@@ -1,12 +1,14 @@
 // Package config loads Daedalus runtime configuration from a YAML file.
 package config
 
-// ExampleYAML is the fully-commented example configuration, every field at
-// its default value. `daedalus init` writes it as config-example.yaml in the
-// working directory. It is kept in lockstep with the repository's own
-// config-example.yaml by TestExampleYAMLMatchesRepoFile, and TestExampleYAML
-// pins that loading it yields exactly the default configuration.
-const ExampleYAML = `# Daedalus configuration. Copy to config.yaml and edit; every field is
+import "strings"
+
+// The example in its composition pieces: the exampleBase* consts are the
+// base configuration — everything outside a profile's blocks — that every
+// `daedalus init` invocation writes; exampleSlimBlock/exampleSlimProviders
+// are the "slim" profile's slices and examplePromptBlock the "prompt"
+// profile's. Their concatenation in file order is ExampleYAML.
+const exampleBase1 = `# Daedalus configuration. Copy to config.yaml and edit; every field is
 # optional. Provider values that are unset are simply not exported — the
 # jailed agent then inherits whatever the worker's environment provides.
 
@@ -127,7 +129,11 @@ cleanup_timeout: 30m
 # or rate knob of its own (source-verified 2026-09-26), and the slot-wait
 # behavior is identical to aider/claude rounds.
 max_concurrent_agent_runs: 2
-# Slim mode for limited self-hosted models (small context window, low max
+`
+
+// exampleSlimBlock is the slim: section (the mode toggle and the tool-call
+// relay's parser model) — the "slim" profile's flow-side slice.
+const exampleSlimBlock = `# Slim mode for limited self-hosted models (small context window, low max
 # output tokens) on the aider and pi agents. When enabled: this worker runs a
 # single jailed-agent round at a time — max_concurrent_agent_runs above is
 # forced to 1, so no two LLM requests are ever in flight (native test
@@ -177,7 +183,11 @@ slim:
   # the model host before setting it. Empty (the default) keeps the relay
   # off.
   parser_model: ""
-# How many native test-suite executions may run at once on the test worker
+`
+
+// exampleBase2 is the remaining general fields plus the anthropic section
+// through timeout_ms.
+const exampleBase2 = `# How many native test-suite executions may run at once on the test worker
 # (the deployment's suite task queue); further suites queue until a slot
 # frees (heartbeating while they wait). Suites are CPU-bound host work,
 # unlike the provider-bound agent rounds above, so this cap is separate.
@@ -269,7 +279,11 @@ anthropic:
   # the default is generous: 3000000 = 50 minutes. Zero/unset falls back to
   # this default; there is no inherit-the-environment escape hatch.
   timeout_ms: 3000000
-  # Context window for the jailed agent's model, in tokens. When set, it
+`
+
+// exampleSlimProviders is the "slim" profile's provider sizing: anthropic's
+// context_tokens/max_output_tokens and the whole openai: section.
+const exampleSlimProviders = `  # Context window for the jailed agent's model, in tokens. When set, it
   # exports as CLAUDE_CODE_MAX_CONTEXT_TOKENS (which jailed claude honors
   # for its compaction/budget math), replaces the input side of the
   # model metadata staged for aider rounds, lands as contextWindow on
@@ -372,7 +386,11 @@ openai:
   # probe-verified live against the tenor litellm proxy but lost before
   # landing).
   repetition_penalty: 0
+`
 
+// exampleBase3 is the base provider plumbing and toggles: the fallback,
+// reviewer, bug_filing, and test_output sections.
+const exampleBase3 = `
 # Secondary provider for automatic failover — fully independent of the
 # primary: the url/key/model may point at a different vendor's
 # anthropic-compatible endpoint, sharing nothing with the anthropic:
@@ -477,7 +495,10 @@ test_output:
   enabled: false
   dir: ""
   mirror: ""
+`
 
+// examplePromptBlock is the prompt: section — the "prompt" profile's slice.
+const examplePromptBlock = `
 # Project-wise prompt overrides. Empty (the default): every round's prompt
 # renders byte-identically to the embedded templates in
 # internal/template/prompts. When set, this names a directory of
@@ -506,3 +527,33 @@ test_output:
 # so replacement content is not secret and may live beside this config.
 # prompt: prompts/
 `
+
+// ExampleYAML is the fully-commented example configuration, every field at
+// its default value. Bare `daedalus init` writes it as config-example.yaml
+// in the working directory. It is kept in lockstep with the repository's own
+// config-example.yaml by TestExampleYAMLMatchesRepoFile, and TestExampleYAML
+// pins that loading it yields exactly the default configuration.
+const ExampleYAML = exampleBase1 + exampleSlimBlock + exampleBase2 +
+	exampleSlimProviders + exampleBase3 + examplePromptBlock
+
+// ExampleYAMLFor renders the example for a profiled `daedalus init`: the
+// base pieces always, the slim slices (the slim: section, the openai:
+// section, and anthropic's context_tokens/max_output_tokens) and the
+// prompt slice only when requested. Both requested reproduces ExampleYAML
+// exactly.
+func ExampleYAMLFor(slim, prompt bool) string {
+	var b strings.Builder
+	b.WriteString(exampleBase1)
+	if slim {
+		b.WriteString(exampleSlimBlock)
+	}
+	b.WriteString(exampleBase2)
+	if slim {
+		b.WriteString(exampleSlimProviders)
+	}
+	b.WriteString(exampleBase3)
+	if prompt {
+		b.WriteString(examplePromptBlock)
+	}
+	return b.String()
+}

@@ -172,6 +172,51 @@ func TestCompleteFlags(t *testing.T) {
 	}
 }
 
+// TestCompleteInitProfiles pins the init profile position: both profiles on
+// an empty word, narrowed by the partial one, and — because the profiles
+// compose — a line already carrying one profile still offers the other,
+// while the saturated line answers nothing: a third profile argument is a
+// usage failure, so there is nothing left to complete. Global flags before
+// the command change nothing.
+func TestCompleteInitProfiles(t *testing.T) {
+	for _, c := range []struct {
+		words []string
+		want  []string
+	}{
+		{[]string{"init", ""}, []string{"prompt", "slim"}},
+		{[]string{"init", "s"}, []string{"slim"}},
+		{[]string{"-c", "cfg.yaml", "init", ""}, []string{"prompt", "slim"}},
+		{[]string{"init", "prompt", ""}, []string{"slim"}},
+		{[]string{"init", "slim", ""}, []string{"prompt"}},
+		{[]string{"init", "slim", "p"}, []string{"prompt"}},
+		{[]string{"init", "prompt", "slim", ""}, nil},
+	} {
+		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("complete(%q) = %q, want %q", c.words, got, c.want)
+		}
+	}
+}
+
+// TestCompleteCompletionShells pins the completion shell position: the two
+// shells completionScript installs, one argument deep — a second shell
+// argument is a usage failure, so the position past it answers nothing, and
+// neither does a shell the dispatch would reject.
+func TestCompleteCompletionShells(t *testing.T) {
+	for _, c := range []struct {
+		words []string
+		want  []string
+	}{
+		{[]string{"completion", ""}, []string{"bash", "zsh"}},
+		{[]string{"completion", "z"}, []string{"zsh"}},
+		{[]string{"completion", "tcsh"}, nil},
+		{[]string{"completion", "bash", ""}, nil},
+	} {
+		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("complete(%q) = %q, want %q", c.words, got, c.want)
+		}
+	}
+}
+
 // TestCompleteRestartTargetFlags pins that the only flag offered in the
 // restart-target position is --all: the record-driven restart invocations
 // reject the global flags outright, so offering them would complete a line
@@ -259,6 +304,16 @@ func TestMainCompleteProbe(t *testing.T) {
 	stdout, _, code = runMainIn(t, dir, "__complete", "--config=cfg.yaml", "wo")
 	if code != 0 || stdout != "worker\n" {
 		t.Errorf("daedalus __complete --config=cfg.yaml wo = (exit %d) %q, want worker", code, stdout)
+	}
+
+	stdout, _, code = runMainIn(t, dir, "__complete", "init", "")
+	if code != 0 || stdout != "prompt\nslim\n" {
+		t.Errorf("daedalus __complete init = (exit %d) %q, want init's profiles one per line", code, stdout)
+	}
+
+	stdout, _, code = runMainIn(t, dir, "__complete", "completion", "z")
+	if code != 0 || stdout != "zsh\n" {
+		t.Errorf("daedalus __complete completion z = (exit %d) %q, want zsh", code, stdout)
 	}
 }
 

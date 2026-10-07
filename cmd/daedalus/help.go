@@ -381,15 +381,33 @@ For a local Temporal dev server matching the defaults: temporal server start-dev
 `,
 	"init": `daedalus init — generate a fully commented config-example.yaml.
 
-Writes config-example.yaml in the current directory: every field with its
-default value, fully commented. Copy it to config.yaml and edit. Refuses to
-overwrite an existing file.
+USAGE
+  daedalus init [prompt] [slim]
+
+Bare init writes config-example.yaml in the current directory: the full
+example, every field with its default value, fully commented. Copy it to
+config.yaml and edit. Refuses to overwrite an existing file.
+
+Profile arguments sample that example into a starting point for one
+feature: the base configuration — everything outside a profile's blocks —
+plus the requested slices, in file order. A profiled init regenerates the
+file, overwriting any existing one; there is no merging with what an
+earlier init wrote, so to hold two slices pass both profiles in one call
+("daedalus init prompt slim", which is the full example):
+
+  prompt   The prompt: block — project-wise prompt overrides, a directory
+           of replacement prompts resolved and validated at worker startup.
+  slim     The self-hosted-LLM slice for the aider/pi agents: the slim:
+           block, the openai: block, and anthropic's context_tokens and
+           max_output_tokens. The base always keeps agent, thinking, and
+           max_concurrent_agent_runs, so the file stands alone.
 
 Configuration is read from the first of ./config.yaml,
 ./.daedalus/config.yaml, and ~/.config/daedalus/config.yaml (-c/--config
-overrides the path); the latter makes the CLI work from any directory. A
+overrides the path); the last makes the CLI work from any directory. A
 fresh "daedalus run <repo-path>" additionally prefers the target repo's
-.daedalus/config.yaml over all of the above — see "daedalus run --help".
+.daedalus/config.yaml over all of the above — an explicit -c/--config
+still wins over it; see "daedalus run --help".
 
 CONFIGURATION REFERENCE
   agent                 Jailed agent CLI: claude, opencode, amp, pi, aider
@@ -656,9 +674,10 @@ is one eval in a shell rc (daedalus writes no files):
   eval "$(daedalus completion zsh)"      # in .zshrc
 
 On every tab press the script asks the hidden "daedalus __complete" probe
-what can come next — commands, worker actions, worker restart targets, and
-flags — and falls back to the shell's own file completion when the probe
-answers nothing (which serves -f/--file values and paths). The candidate
+what can come next — commands, worker actions, worker restart targets,
+init's profiles, completion's shells, and flags — and falls back to the
+shell's own file completion when the probe answers nothing (which serves
+-f/--file values and paths). The candidate
 logic lives in the binary the script calls, so an installed script
 self-updates with it: a command or flag added to daedalus is completed
 without reinstalling anything.
