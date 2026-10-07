@@ -537,6 +537,42 @@ func testFixPrompt(result activities.TestResult, verdict activities.ReviewResult
 	return prompt
 }
 
+// promptOverflowMarkers match the static failure of a prompt that cannot
+// fit the serving model's context window: claude's result JSON prints the
+// first shape, the OpenAI-compatible wire the other two. Crossing the
+// worker→workflow boundary an activity error survives only as message
+// text (see isAPIExhaustion), so a substring match over the wrapped
+// output is the classification. ponytail: the match IS forgeable — round
+// output an agent printed can fail a review that would have heartbeated;
+// accepted because the sizes are static (the same prompt is re-sent by
+// every retry), so the misclassification only skips retries that could
+// never succeed.
+var promptOverflowMarkers = []string{
+	"Prompt is too long",
+	"context_length_exceeded",
+	"maximum context length",
+}
+
+// isPromptOverflow reports whether a failed round died because its prompt
+// could not fit the serving model's context window. The size is static, so
+// the review loop treats the verdict as terminal instead of spending its
+// fresh-session fallback or its quota heartbeats on it. The diff-file
+// handoff keeps initial reviewer prompts under the window; this is the
+// mid-round backstop (a conversation grown past the window by its own tool
+// traffic, or test logs the budget does not cover).
+func isPromptOverflow(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, m := range promptOverflowMarkers {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // isAPIExhaustion reports whether err is the activities' ErrAPIExhausted.
 // Crossing the worker→workflow boundary an activity error survives only as
 // the application error's message text, and the activities wrap the

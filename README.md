@@ -170,6 +170,63 @@ up.
 
 ## Usage
 
+The full CLI surface is answerable from the binary itself: `daedalus -h`
+lists every command with a one-line flag hint, `daedalus <command>
+--help` prints that command's detail, and `daedalus worker <action>
+--help` prints a sub-action's flag rules (which flags it accepts, which
+it rejects). The tables below carry the same surface — this section and
+the help text are kept in agreement.
+
+| Command | Arguments | Flags | Purpose |
+|---|---|---|---|
+| `run` | `<repo-path> <issue-id> "<prompt>"` | `-w -d -p -cli -folder -dep -f -a` | Start an implementation pipeline for an issue |
+| `run -a <workflow-id>` | `<workflow-id> ["<prompt>"]` | `-f` | Append a prompt to an already-running pipeline (same as `guide`) |
+| `continue` | `<workflow-id> "<prompt>"` | `-d` | Resume a closed, failed, or parked session |
+| `guide` | `<workflow-id> "<message>"` | — | Send operator instructions to a running pipeline |
+| `attach` | `<workflow-id>` | — | Reconnect to an in-flight or completed pipeline |
+| `list` | `[max]` | — | Display past and current sessions on the task queue |
+| `log` | `<workflow-id>` | `--status -cot -cot-n` | Show a session's captured task log (raw, status brief, or chain-of-thought) |
+| `wipe` | `<workflow-id>` | `--yes` | Erase a session's disk work entirely (worktree, branches, logs) |
+| `worker start` | — | `-c -t` | Run the worker daemon detached (the default worker action) |
+| `worker stop` | — | `-c` | Drain the daemon gracefully (SIGTERM) |
+| `worker status` | — | — | List every worker on record (plus live strays) with live probes; the stuck-work recapture point |
+| `worker restart` | — | `-c -t` | Stop + start this config's worker with the config re-read from disk |
+| `worker restart <worker>` | `<worker>` | — | Restart one worker from its recorded config, from any directory |
+| `worker restart all` | — | `--all` | Restart every worker on record, each from its own record |
+| `worker foreground` | — | `-c -t` | Run the worker attached to this terminal |
+| `worker wakeup` | `<workflow-id>` | `-c` | Interrupt a RUNNING session's quota heartbeat so the round resumes |
+| `init` | `[prompt] [slim]` | — | Generate a fully commented `config-example.yaml` |
+| `config` | — | — | Print the active configuration (resolved path + every field) |
+| `report` | — | `-q --all --json --table` | Summarize AI provider usage (cost, tokens, time) and worker slots |
+| `version` | — | — | Print the version and exit |
+| `completion` | `bash\|zsh` | — | Print the tab-completion script (eval into your shell rc) |
+
+Global flags: `-c/--config <path>`, `-v/--version`, `-h/--help`. `-c` is
+accepted by every command except `log` and the record-driven worker
+commands (`worker status`, `worker restart <worker>`, `worker restart
+all`), which act from the recorded per-worker configs alone.
+
+Flag reference:
+
+| Flag | Accepted by | Meaning |
+|---|---|---|
+| `-w, --workflow <name>` | `run` (fresh runs) | Flow to run: `feature-dev` (default), `dev-only`, `slim`, `investigate`, `test-only`, `refactor`, `bug-fix`. Parsed but without effect on any other command — including `run -a`, where the pipeline keeps the flow it started with |
+| `-d, --detach` | `run`, `continue` | Start the pipeline and return immediately; `daedalus attach` reconnects |
+| `-p, --prefix <prefix>` | fresh `run` | Name the preserved branch `<prefix>/issue-<id>-<timestamp>`, overriding the config's `branch_prefix` |
+| `-cli, --cli <agent>` | fresh `run` | Jailed agent for this run: `claude`, `opencode`, `amp`, `pi`, `aider` (deprecated), `codex` |
+| `-folder, --folder <path>` | fresh `run` (repeatable) | Grant the run read-write access to a host folder, mounted at `.daedalus-folders/<basename>` |
+| `-dep, --depends <workflow-id>` | fresh `run` | Chain the run behind another; it starts from the dependency's preserved branch once that finishes approved |
+| `-f, --file <path>` | `run` (fresh and `-a`) | Read the task description from a file (glob-expandable); replaces the `"<prompt>"` argument |
+| `-a, --append <id>` | `run` | Append mode: fold the prompt into an already-running pipeline's next fix round |
+| `--status` | `log` | Print a maintainer-facing status brief instead of the raw log |
+| `-cot` | `log` | Print the run's chain-of-thought logs from Temporal history |
+| `-cot-n <N>` | `log -cot` | Tail the CoT view to the last N completed rounds (whole sections only) |
+| `-t, --type dev\|test` | `worker start`, bare `worker restart`, `worker foreground` | Which pollers the daemon starts (`dev` or `test`; omit for both). Rejected by `run`, `worker status`, and the record-driven restarts; parsed but without effect on any other command |
+| `--all` | `worker restart`, `report` | Restart every worker on record (same as the `all` argument) / scope the usage slices to every queue on record |
+| `--yes` | `wipe` | Skip the interactive confirmation (scripted use) |
+| `-q, --queue <queue>` | `report` | Scope the usage slices to one explicit queue instead of the resolved one |
+| `--json` / `--table` | `report` | JSON vs table output (table is the default; `--table` is accepted for explicitness) |
+
 1. **Install** the CLI:
 
    ```sh
@@ -352,7 +409,7 @@ invoked from inside it. `daedalus init` writes a fully commented
 | `fallback.type`       | `anthropic`        | Fallback wire style: `anthropic` or `openai`; governs the `worker status` probe and which env failover values travel on. A round's wire is chosen by the agent (claude dials `ANTHROPIC_*`), so `openai` serves only agents that dial `OPENAI_BASE_URL` |
 | `reviewer.url/key`    | `""` (share primary) | Reviewer rounds' own provider endpoint: overrides `ANTHROPIC_*`/`OPENAI_*` URL and key for reviewer rounds only, while implementing and test rounds keep the primary's. Models are not overridable |
 | `bug_filing.enabled/dir/mirror` | `enabled: false` | Out-of-scope-bug filing. Off (the default), no bug files are written: out-of-scope bugs surface in round replies and review comments only. On, the round prompts instruct the agent to file every out-of-scope bug under `dir` — worktree-relative, resolved against the run's worktree root (`dir` empty keeps the historical `backlog/bugs` path). Without `mirror` the files are ordinary committed content of the branch. `mirror`, when set (absolute, or `~/…`; a relative path, the filesystem root, or a colon is rejected), is a host directory bind-mounted read-write into each jailed round's sandbox at `dir`, so the agent's writes land on the host directly and never ride the branch — a configured mirror is a read-write window the jailed agent holds onto a host path, so point it at a dedicated directory; on an ai-jail that rejects the mount the round fails loudly rather than running unmounted. `test_output.mirror` mirrors suite dumps worker-side the same way (copy, not mount) |
-| `prompt`             | `""` (embedded)     | Project-wise prompt overrides: a directory of replacement prompts, one `<prompt-name>.md` file per replaced prompt, the stem naming the prompt (`implement`, `implement_fix`, `continue`, `tests`, `tests_failed`, `tests_review`, `review`, `rebuild`, `investigate`, `investigate_fix`, `refactor`, `refactor_fix`, `bugfix`, `bugfix_fix`, `slim_plan`, `slim_step`, `slim_fix` — template names, not flow names). Absolute, `~/…`, or relative to the config file's directory. The worker resolves and validates the whole directory at startup — an unknown stem, missing directory, unparsable template, empty file, a data field the prompt does not take, a `{{template}}` action, a `{{define}}`/`{{block}}` block (a define body can never render in an override), or a `review` override missing the verdict protocol fails the start, never a mid-round render; unset, every prompt renders byte-identically to the embedded one. `review` is validated to keep all four verdict words (the reviewer's final-line machine contract); `slim_plan` must keep instructing the raw SlimSubtask JSON array (unvalidated caveat). Rendered prompts ride workflow history, so override content is not secret |
+| `prompt`             | `""` (embedded)     | Project-wise prompt overrides: a directory of replacement prompts, one `<prompt-name>.md` file per replaced prompt, the stem naming the prompt (`implement`, `implement_fix`, `continue`, `tests`, `tests_failed`, `tests_review`, `review`, `rebuild`, `investigate`, `investigate_fix`, `refactor`, `refactor_fix`, `bugfix`, `bugfix_fix`, `slim_plan`, `slim_step`, `slim_parse`, `slim_parse_reask`, `slim_fix` — template names, not flow names). Absolute, `~/…`, or relative to the config file's directory. The worker resolves and validates the whole directory at startup — an unknown stem, missing directory, unparsable template, empty file, a data field the prompt does not take, a `{{template}}` action, a `{{define}}`/`{{block}}` block (a define body can never render in an override), or a `review` override missing the verdict protocol fails the start, never a mid-round render; unset, every prompt renders byte-identically to the embedded one. `review` is validated to keep all four verdict words (the reviewer's final-line machine contract); `slim_parse` must keep instructing the parse round to emit the raw SlimSubtask JSON array (unvalidated caveat), while a `slim_plan` replacement carries no such contract — it is pure generation, a prose plan with no JSON, which the `slim_parse` round transcribes. Rendered prompts ride workflow history, so override content is not secret |
 
 Provider settings that are set are exported into the worker's environment
 at startup and injected into the jailed agent's process environment; unset
@@ -437,8 +494,9 @@ issue never share live state). Re-running
   implementation ↔ code-review phase alone, landing without any test-phase
   execution (selection is CLI-only — no config key picks a flow);
   `slim` is the micro-stepped atomic loop for context-limited self-hosted
-  models (target agent: pi): a planner round atomizes the task into an
-  ordered queue of 1–2-file sub-tasks, then each sub-task runs its own
+  models (target agent: pi): a planner round writes the plan in prose and
+  a parse round transcribes it into the ordered queue of 1–2-file
+  sub-tasks, then each sub-task runs its own
   implement ↔ review loop — the worker conversation chains across the run
   (progressive context) while every review round is a completely fresh
   reviewer session (no WORKER context leaks into REVIEW), the native suite

@@ -27,11 +27,16 @@ const maxSlimStepRounds = 8
 // share, so every verdict, cap, park, and the finalize contract are
 // inherited unchanged:
 //
-//  1. Planner: one round atomizes the task into a strictly ordered queue
-//     of sub-tasks — each at most 1–2 target files, each verifiable
-//     against its own acceptance criteria — emitted as a raw JSON array
-//     (template.SlimSubtask). One strict re-ask absorbs a malformed
-//     reply; an unparseable second reply parks the run.
+//  1. Planner: two rounds on the run's dev conversation. A
+//     pure-generation round writes the plan in prose — no format
+//     pressure, so the planning model spends its budget on the plan
+//     rather than on the wire shape — and a parse round transcribes that
+//     plan into a strictly ordered queue of sub-tasks, each at most 1–2
+//     target files, each verifiable against its own acceptance criteria,
+//     emitted as a raw JSON array (template.SlimSubtask). One strict
+//     re-ask of the parse round absorbs a malformed reply (resumed in the
+//     parse round's own conversation, so the model sees and corrects its
+//     previous reply); an unparseable second reply parks the run.
 //
 //  2. Atomic loops: each sub-task in order runs implement ↔ review on
 //     the shared pipelineRun machinery, with the native suite executed
@@ -73,7 +78,8 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 
 	// Phase 1 — planner. The round opens the run's dev conversation, so
 	// the plan itself is the first block of the worker's progressive
-	// context.
+	// context. Pure generation: the plan is prose, and the wire format is
+	// nobody's job in this round.
 	planPrompt, err := template.SlimPlan(input.Prompt)
 	if err != nil {
 		return "", fmt.Errorf("build slim plan prompt: %w", err)
@@ -82,18 +88,38 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("planner round: %w", err)
 	}
-	subtasks, perr := parseSlimPlan(planReply.Text)
+
+	// Phase 1b — parse. The plan is transcribed into the machine queue in
+	// the same dev conversation: the model sees the plan it is
+	// transcribing, and the queue joins it in the worker's progressive
+	// context.
+	parsePrompt, err := template.SlimParse(planReply.Text)
+	if err != nil {
+		return "", fmt.Errorf("build slim parse prompt: %w", err)
+	}
+	parseReply, err := run.runAgent(parsePrompt, "slim-parse", activities.RoleDev, &run.devSession)
+	if err != nil {
+		return "", fmt.Errorf("parse round: %w", err)
+	}
+	subtasks, perr := parseSlimPlan(parseReply.Text)
 	if perr != nil {
-		// One strict re-ask, resumed in the planner's own conversation:
-		// the model sees its previous reply and corrects it.
-		run.logger.Warn("Planner reply was not a parseable subtask queue; re-asking", "Error", perr)
-		retry := planPrompt + "\n\nYour previous reply could not be parsed as the required JSON array (" + perr.Error() + "). Reply again with ONLY the raw JSON array — no prose, no markdown code fences."
-		planReply, err = run.runAgent(retry, "slim-plan", activities.RoleDev, &run.devSession)
+		// One strict re-ask, resumed in the parse round's own
+		// conversation: the model sees its previous reply and corrects it
+		// (never a re-run of the planner — the plan is not the thing that
+		// failed). The re-ask text is an overridable template; the parse
+		// prompt rides above it so the contract stays adjacent to the
+		// correction.
+		run.logger.Warn("Parse round reply was not a parseable subtask queue; re-asking", "Error", perr)
+		reask, err := template.SlimParseReask(perr.Error())
 		if err != nil {
-			return "", fmt.Errorf("planner retry round: %w", err)
+			return "", fmt.Errorf("build slim parse re-ask prompt: %w", err)
 		}
-		if subtasks, perr = parseSlimPlan(planReply.Text); perr != nil {
-			return "", run.park(fmt.Sprintf("planner could not produce a parseable subtask queue: %v", perr))
+		parseReply, err = run.runAgent(parsePrompt+"\n\n"+reask, "slim-parse", activities.RoleDev, &run.devSession)
+		if err != nil {
+			return "", fmt.Errorf("parse retry round: %w", err)
+		}
+		if subtasks, perr = parseSlimPlan(parseReply.Text); perr != nil {
+			return "", run.park(fmt.Sprintf("parse round could not produce a parseable subtask queue: %v", perr))
 		}
 	}
 	run.logger.Info("Plan atomized", "Subtasks", len(subtasks))
@@ -177,20 +203,25 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 	}
 }
 
-// parseSlimPlan extracts the planner's subtask queue from its reply: the
-// outermost JSON array of the text (a strict model emits only the array;
-// a chatty one may wrap it in prose), validated for the fields the loop
-// cannot run without. Pure string/JSON work — deterministic, so it is
-// safe to call from workflow code.
+// parseSlimPlan extracts the parse round's subtask queue from its reply.
+// The parse round's output contract is the raw JSON array and nothing
+// else, so the parse is strict: the whole reply — whitespace trimmed, one
+// wrapping markdown code fence tolerated — must unmarshal as the array.
+// There is no bracket slicing: the extractor this replaces took the text
+// from the first "[" through the last "]", so a stray bracketed phrase
+// anywhere in surrounding prose (a "[Draft]" note) widened the slice and
+// broke an otherwise valid queue; under the two-phase planner the parse
+// round owns the wire format outright, so a full-string unmarshal is both
+// available and stricter. Validated for the fields the loop cannot run
+// without. Pure string/JSON work — deterministic, so it is safe to call
+// from workflow code.
 func parseSlimPlan(text string) ([]template.SlimSubtask, error) {
-	start := strings.Index(text, "[")
-	end := strings.LastIndex(text, "]")
-	if start < 0 || end <= start {
-		return nil, fmt.Errorf("no JSON array found in a %d-character reply", len(text))
+	if s := stripCodeFence(strings.TrimSpace(text)); s != "" {
+		text = s
 	}
 	var out []template.SlimSubtask
-	if err := json.Unmarshal([]byte(text[start:end+1]), &out); err != nil {
-		return nil, err
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		return nil, fmt.Errorf("reply is not the required raw JSON array: %w", err)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("the JSON array is empty")
@@ -204,4 +235,27 @@ func parseSlimPlan(text string) ([]template.SlimSubtask, error) {
 		}
 	}
 	return out, nil
+}
+
+// stripCodeFence drops one wrapping markdown code fence from a reply: a
+// leading fence line (three or more backticks, optionally followed by an
+// info string such as "json") and a trailing fence line when present. The
+// parse round is told to reply with the bare array, but a fence is the one
+// formatting wrapper models emit anyway and it carries no information —
+// trimming it keeps the strict parse from spending the round's only
+// re-ask on decoration. Any other prose stays and fails the parse. A
+// fenced reply always spans lines, so a single-line reply is returned
+// unchanged — ponytail: a single-line fence-plus-array ("```json [...]"
+// with no newline) is the one shape this line-based strip cannot see, so
+// such a reply spends the parse round's re-ask on its fence.
+func stripCodeFence(s string) string {
+	first, rest, found := strings.Cut(s, "\n")
+	if !found || !strings.HasPrefix(strings.TrimLeft(first, " \t"), "```") {
+		return s
+	}
+	lines := strings.Split(strings.TrimRight(rest, "\n"), "\n")
+	if last := len(lines) - 1; strings.HasPrefix(strings.TrimLeft(lines[last], " \t"), "```") {
+		lines = lines[:last]
+	}
+	return strings.Join(lines, "\n")
 }

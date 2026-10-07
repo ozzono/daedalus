@@ -558,6 +558,13 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 		// reviewer must not park in the quota heartbeat over output
 		// text it printed before dying.
 		killed := isAgentKilled(err)
+		if !killed && isPromptOverflow(err) {
+			// A prompt that cannot fit the serving model's context is a
+			// static failure: the same prompt is re-sent by every retry,
+			// so neither the fresh-session fallback below nor the quota
+			// heartbeat can succeed — return instead of burning them.
+			return result, fmt.Errorf("reviewer prompt cannot fit the serving model's context window (focus %q); the prompt size is static, so no retry can succeed: %w", focus, err)
+		}
 		if !killed && isAPIExhaustion(err) {
 			if herr := r.heartbeat(err, "review"); herr != nil {
 				return result, herr

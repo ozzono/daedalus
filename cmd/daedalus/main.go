@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -54,6 +55,24 @@ func main() {
 		}
 	}
 
+	// "daedalus worker <action> --help" (and -h/help): the sub-action's own
+	// screen — its arguments plus the flags it accepts and the ones it
+	// rejects. Also answered before config resolution: "worker start -h"
+	// used to die at the config lookup before its own dispatch, and an
+	// action's flag rules must not depend on a loadable config. A word
+	// naming no action fails right here with the usual unknown-action
+	// diagnostic — also without a config, and unreachable by any legitimate
+	// invocation, since every real action has a screen.
+	if len(args) == 3 && args[0] == "worker" &&
+		(args[2] == "-h" || args[2] == "--help" || args[2] == "help") {
+		h, ok := workerActionHelp[args[1]]
+		if !ok {
+			usageFail("unknown worker action %q (%s)", args[1], strings.Join(workerActions, ", "))
+		}
+		fmt.Print(h)
+		return
+	}
+
 	// Every subcommand except the no-config ones (help, version, init,
 	// report, completion, the record-driven worker commands — `worker
 	// restart all`, `worker restart <name>`, and `worker status`, which
@@ -90,11 +109,16 @@ func main() {
 	case "init":
 		// Bare init writes the full example, refusing to overwrite;
 		// profile arguments regenerate it as the base plus the requested
-		// slices.
+		// slices. `init prompt <dir>` is the one three-word form: a second
+		// word naming no profile is a prompt-override directory to
+		// scaffold (samples plus README) ahead of the prompt-profile
+		// example.
 		if len(args) == 1 {
 			if err := writeExampleConfig("."); err != nil {
 				fail("init", err)
 			}
+		} else if len(args) == 3 && args[1] == "prompt" && !slices.Contains(initProfiles, args[2]) {
+			scaffoldPromptOverrides(args[2])
 		} else {
 			writeProfiledExample(args[1:])
 		}

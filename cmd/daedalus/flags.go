@@ -42,8 +42,9 @@ var workflowRegistry = map[string]workflows.Flow{
 	// no config key picks a flow.
 	"dev-only": {Fn: workflows.DevOnlyWorkflow},
 	// slim is the micro-stepped atomic loop for context-limited
-	// self-hosted models (target agent: pi): a planner round atomizes the
-	// task into an ordered queue of 1–2-file sub-tasks, then each
+	// self-hosted models (target agent: pi): a planner round writes the
+	// plan in prose and a parse round transcribes it into an ordered
+	// queue of 1–2-file sub-tasks, then each
 	// sub-task runs its own implement ↔ review loop — fresh reviewer
 	// session per round, native suite as terminal ground truth. Also
 	// config-gated: with slim: true, a run without an explicit -w starts

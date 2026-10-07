@@ -38,8 +38,8 @@ func TestPrompts(t *testing.T) {
 	want := []string{
 		"bugfix", "bugfix_fix", "continue", "implement", "implement_fix",
 		"investigate", "investigate_fix", "rebuild", "refactor", "refactor_fix",
-		"review", "slim_fix", "slim_plan", "slim_step", "tests", "tests_failed",
-		"tests_review",
+		"review", "slim_fix", "slim_parse", "slim_parse_reask", "slim_plan",
+		"slim_step", "tests", "tests_failed", "tests_review",
 	}
 	got := Prompts()
 	if !slices.Equal(got, want) {
@@ -267,6 +267,42 @@ func TestLoadOverridesInstalls(t *testing.T) {
 	}
 }
 
+// TestSlimParseOverrideFields pins the two new prompts' render contracts at
+// the override boundary: a slim_parse replacement reads the plan (.Plan),
+// and slim_parse_reask's data is the parse error alone (.Error) — a re-ask
+// override reaching for the plan is rejected at load, so the deployment's
+// mistake fails the worker's start instead of surfacing mid-round. (The
+// workflow composes the plan into the re-ask round itself: parsePrompt +
+// re-ask, so the model still sees its reply to correct.)
+func TestSlimParseOverrideFields(t *testing.T) {
+	resetInstalled(t)
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"slim_parse.md":       "TRANSCRIBE THE PLAN: {{.Plan}}",
+		"slim_parse_reask.md": "PARSE FAILED: {{.Error}} — try again.",
+	})
+	if err := LoadOverrides(dir, t.TempDir()); err != nil {
+		t.Fatalf("LoadOverrides: %v", err)
+	}
+	got, err := SlimParse("add the adder, then multiply")
+	if err != nil || !strings.Contains(got, "TRANSCRIBE THE PLAN: add the adder, then multiply") {
+		t.Errorf("SlimParse after override = %q, %v; want the replacement rendering the plan", got, err)
+	}
+	got, err = SlimParseReask("the JSON array is empty")
+	if err != nil || !strings.Contains(got, "PARSE FAILED: the JSON array is empty") {
+		t.Errorf("SlimParseReask after override = %q, %v; want the replacement rendering the error", got, err)
+	}
+
+	// The re-ask's data is the error alone: a plan reference in its
+	// replacement names a field the embedded prompt does not carry.
+	resetInstalled(t)
+	bad := t.TempDir()
+	writeFiles(t, bad, map[string]string{"slim_parse_reask.md": "the plan says {{.Plan}}"})
+	if err := LoadOverrides(bad, t.TempDir()); err == nil || !strings.Contains(err.Error(), `references data field(s) "Plan"`) {
+		t.Errorf("LoadOverrides(reask override with .Plan) = %v, want the unknown-field rejection", err)
+	}
+}
+
 // TestLoadOverridesAtomicity pins the install's all-or-nothing shape: a
 // directory where one file fails leaves the previously installed set (or the
 // embedded set) untouched, an empty directory is the unset case that wipes
@@ -308,5 +344,58 @@ func TestLoadOverridesAtomicity(t *testing.T) {
 	got, err = Rebuild("x")
 	if err != nil || !strings.Contains(got, "CUSTOM ONE x") {
 		t.Errorf("Rebuild after failed re-loads = %q, %v; want the previously installed set kept", got, err)
+	}
+}
+
+// TestPromptSpecs pins the scaffold's feed: one spec per overridable prompt
+// (same sorted names, sources byte-identical to the embedded prompts,
+// sorted non-empty field lists), and review's field list is the exact
+// vocabulary of the shared review data — a handoff element's fields
+// (First/Last/Path) must never reappear in it, because the range renders
+// dot-only and an override reaching for them would pass or fail on fiction.
+func TestPromptSpecs(t *testing.T) {
+	specs, err := PromptSpecs()
+	if err != nil {
+		t.Fatalf("PromptSpecs: %v", err)
+	}
+	names := make([]string, len(specs))
+	byName := make(map[string]PromptSpec, len(specs))
+	for i, s := range specs {
+		names[i] = s.Name
+		byName[s.Name] = s
+	}
+	if want := Prompts(); !slices.Equal(names, want) {
+		t.Errorf("PromptSpecs names = %v, want Prompts() %v", names, want)
+	}
+	for _, s := range specs {
+		src, err := promptFiles.ReadFile("prompts/" + s.Name + ".md")
+		if err != nil {
+			t.Fatalf("read embedded %s: %v", s.Name, err)
+		}
+		if s.Source != string(src) {
+			t.Errorf("spec %s source drifts from the embedded prompt (%d vs %d bytes)", s.Name, len(s.Source), len(src))
+		}
+		if len(s.Fields) == 0 {
+			t.Errorf("spec %s lists no data fields", s.Name)
+		}
+		if !slices.IsSorted(s.Fields) {
+			t.Errorf("spec %s fields are not sorted: %v", s.Name, s.Fields)
+		}
+	}
+	wantReview := []string{
+		"AcceptanceCriteria", "AgentReply", "BugDir", "Diff", "Focus", "Handoff",
+		"JailSpec", "ReproInScope", "TestLogs", "TestsInScope", "TouchesJail",
+	}
+	if !slices.Equal(byName["review"].Fields, wantReview) {
+		t.Errorf("review fields = %v, want the exact review-data vocabulary %v", byName["review"].Fields, wantReview)
+	}
+
+	// The vocabulary is what startup enforces: a review override reaching
+	// for a handoff element's field is rejected at load, not mid-round.
+	resetInstalled(t)
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"review.md": "{{range .Handoff.Files}}- {{.First}}{{end}}"})
+	if err := LoadOverrides(dir, t.TempDir()); err == nil || !strings.Contains(err.Error(), `"First"`) {
+		t.Errorf("LoadOverrides(review override with .First) = %v, want the unknown-field rejection", err)
 	}
 }

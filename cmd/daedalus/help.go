@@ -9,25 +9,40 @@ USAGE
 
 WORKFLOW COMMANDS
   run         Start an implementation pipeline for an issue
+              flags: -w -d -p -cli -folder -dep -f -a
   continue    Resume a closed, failed, or parked session
+              flags: -d
   guide       Send operator instructions to a running pipeline
+              flags: none
   attach      Reconnect to an in-flight or completed pipeline
+              flags: none
   list        Display past and current sessions on the task queue
+              flags: none
   log         Show a session's captured task log (/tmp/daedalus/<workflow-id>.log)
+              flags: --status -cot -cot-n
   wipe        Erase a session's disk work entirely (worktree, branches, logs)
+              flags: --yes
 
 WORKER COMMANDS
   worker      Manage the Temporal worker daemon (start, stop, status, restart, foreground, wakeup)
+              flags: -c -t --all per sub-action; "worker <action> --help" is exhaustive
 
 UTILITY COMMANDS
   init        Generate a fully commented config-example.yaml file
+              profiles: prompt slim; "init prompt <dir>" scaffolds a
+              prompt-override directory (samples + README)
   config      Print the active configuration (resolved path + every field)
+              flags: none
   report      Summarize AI provider usage (cost, tokens, time) and worker slots
+              flags: -q --all --json --table
   version     Print the version and exit
+              flags: none
   completion  Print the bash or zsh tab-completion script (eval into your rc)
+              arguments: bash|zsh
 
 GLOBAL FLAGS
-  -c, --config <path>   Path to config file (./config.yaml, ./.daedalus/config.yaml, or ~/.config/daedalus/config.yaml)
+  -c, --config <path>   Path to config file (./config.yaml, ./.daedalus/config.yaml, or ~/.config/daedalus/config.yaml);
+                        rejected by log and the record-driven worker commands (worker status, worker restart <worker>|all)
   -v, --version         Print version and exit
   -h, --help            Show this help message
 
@@ -38,12 +53,14 @@ EXAMPLES
   $ daedalus worker restart all
   $ daedalus log daedalus-42
 
-Use "daedalus <command> --help" for detailed information about a command.
+Use "daedalus <command> --help" for detailed information about a command,
+and "daedalus worker <action> --help" for a worker sub-action's flag rules.
 `
 
 // commandHelp holds the per-command help screens behind
 // "daedalus <command> --help": the argument, flag, and edge-case detail
-// the root screen deliberately omits (progressive disclosure). The init
+// behind the root screen's one-line flag hints (progressive disclosure).
+// The init
 // screen also carries the configuration reference table. Every dispatch
 // command carries an entry here, and the shell completion (completion.go)
 // reads the keys as its command list — a new command is help-screened and
@@ -237,6 +254,19 @@ header are prefixed with one space, so output is preserved except for that
 byte.) Each block header stamps the temporal run id
 (first 8 characters), so a continued session's runs are distinguishable in
 one file. Files untouched for 7 days are pruned along with the worker logs.
+The dump ends with a tail block (plain and -cot; --status needs none, it is
+itself the brief):
+
+  === log tail: last log 2026-10-07T18:04:05Z — workflow daedalus-42 — <state> ===
+
+naming when the last log material arrived (the task log file's last write)
+and the run's state. Plain log derives the state from the task log alone:
+a run with a round in flight reads "round in flight (stage=<role>): run
+still going — this dump is not final"; otherwise it reads "run not running
+(no round in flight per task log): this dump is final as far as the file
+shows — completed vs crashed needs the temporal view (-cot)". The file
+alone cannot tell a completed run from a crashed one, so the plain tail
+never claims an outcome.
 
 With --status, prints a short maintainer-facing brief instead: which agent
 round is running right now (dev, dev-review, test, test-review, or idle),
@@ -279,6 +309,21 @@ Round numbers keep their place in the run's full history, so a tailed
 view can open above round 1. 0 prints no completed sections; a negative
 value is a usage error. A live in-flight section, when one exists, always
 follows regardless of the tail — it is newer than every completed round.
+
+The -cot dump ends with the same tail block, but the state clause names
+the workflow's real Temporal execution status, since -cot is already
+connected: "temporal state Completed: run not running — this dump is
+final" (likewise Failed, Canceled, Terminated, TimedOut), or "temporal
+state Running: run still going — this dump is not final" while the
+workflow lives (ContinuedAsNew counts as still going). A run between
+rounds therefore reads as still going, and a finished run never reads as
+live. A paused execution — only a manual temporal-CLI pause can produce
+one; daedalus never pauses its own workflows — reads "temporal state
+Paused: run paused — this dump is not final; the run can resume", since
+unpausing brings more rounds. -cot works on hosts the worker never
+touched: there the arrival stamp reads "unknown (task log not readable
+on this host)" rather than failing a dump that already rendered, and a
+failed status lookup degrades to "temporal state unknown" the same way.
 
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
@@ -390,6 +435,7 @@ For a local Temporal dev server matching the defaults: temporal server start-dev
 
 USAGE
   daedalus init [prompt] [slim]
+  daedalus init prompt <dir>
 
 Bare init writes config-example.yaml in the current directory: the full
 example, every field with its default value, fully commented. Copy it to
@@ -408,6 +454,13 @@ earlier init wrote, so to hold two slices pass both profiles in one call
            block, the openai: block, and anthropic's context_tokens and
            max_output_tokens. The base always keeps agent, thinking, and
            max_concurrent_agent_runs, so the file stands alone.
+
+"daedalus init prompt <dir>" — a second word naming no profile — scaffolds
+the prompt-override directory <dir> instead: every prompt's current
+embedded source as a ready-to-edit sample, plus the README guide (activation,
+the startup-enforced writing rules, and each prompt's data fields). It then
+writes the prompt-profile example as above. Refuses a non-empty target dir;
+the scaffolded samples themselves override nothing until edited.
 
 Configuration is read from the first of ./config.yaml,
 ./.daedalus/config.yaml, and ~/.config/daedalus/config.yaml (-c/--config
@@ -688,5 +741,150 @@ shell's own file completion when the probe answers nothing (which serves
 logic lives in the binary the script calls, so an installed script
 self-updates with it: a command or flag added to daedalus is completed
 without reinstalling anything.
+`,
+}
+
+// workerActionHelp holds the per-subaction help screens behind
+// "daedalus worker <action> --help": each action's arguments plus the
+// flags it accepts and the ones it rejects — the per-action slice of the
+// FLAGS section in "daedalus worker --help". The dispatch (main.go) answers
+// before config resolution, like every help path; an action missing here
+// fails right there with the same "unknown worker action" diagnostic, so a
+// misspelled probe never dies at the config lookup either.
+var workerActionHelp = map[string]string{
+	"start": `daedalus worker start — run the worker as a detached daemon (the
+default worker action).
+
+USAGE
+  daedalus [-c config.yaml] worker start [-t dev|test]
+
+Logs append to /tmp/daedalus/worker-<name>.log (pruned to the past week),
+the pid lives in /tmp/daedalus/worker-<name>.pid — one daemon per worker
+name (the config's worker_id, else its task_queue). The daemon re-executes
+"worker foreground" with the resolved config path, so it keeps serving if
+the invoking directory goes away.
+
+FLAGS
+  -c, --config <path>   Path to the config file the daemon runs with; its
+                        absolute path is recorded, so a later
+                        "worker restart <name>" revives it from anywhere.
+  -t, --type <type>     Which pollers this daemon starts: dev (pipeline
+                        rounds and reviews only — no test-queue poller) or
+                        test (test suites and the repro gate only — no
+                        pipeline poller). Omit for both pollers, the
+                        default. The type is a run config, never recorded:
+                        a later bare "worker restart" comes back untyped
+                        unless -t is passed again.
+
+"daedalus worker --help" has the full worker reference (every action, the
+suite task queue, and the "worker status" recapture behavior).
+`,
+	"stop": `daedalus worker stop — drain the daemon gracefully (SIGTERM), then
+clear its pid file.
+
+USAGE
+  daedalus [-c config.yaml] worker stop
+
+The worker addressed is the invoking config's (worker_id, else its
+task_queue). An already-stopped worker prints "worker not running",
+clears a stale pid file, and exits 0.
+
+FLAGS
+  -c, --config <path>   Path to the config file naming the worker.
+
+-t/--type parses here but has no effect: it shapes only start, bare
+restart, and foreground — a stop drains whichever daemon is running.
+
+"daedalus worker --help" has the full worker reference.
+`,
+	"status": `daedalus worker status — list every worker on record, plus any live
+stray running without one, shown as "(no config record)".
+
+USAGE
+  daedalus worker status
+
+Prints, per worker: name, running pid, the binary version that worker is
+executing (so a daemon started before a CLI upgrade is visible as such),
+live API probe, config record, and log path. Also the recapture point: a
+running workflow whose outstanding activity attempt is held by a worker
+identity with no live poller (a worker that died mid-round) is recovered —
+the stuck attempt is failed so the workflow reschedules it, and a worker
+is restarted (or started, from the queue's most recent config record) only
+when the attempt's queue has no live poller left; each action prints a
+[DAEDALUS-ALERT] line here and to the worker log. With nothing stuck,
+status is a read-only no-op.
+
+FLAGS
+  none. status acts from the recorded per-worker configs alone, from any
+  directory: -c/--config and -t/--type are both rejected — they would have
+  no effect on a listing driven by the records.
+
+"daedalus worker --help" has the full worker reference.
+`,
+	"restart": `daedalus worker restart — stop + start a worker with the config
+re-read from disk, so values changed since the worker was started (a
+rotated API key, a new model) take effect.
+
+USAGE
+  daedalus [-c config.yaml] worker restart [-t dev|test]   (bare: this config's worker)
+  daedalus worker restart <worker>                         (from any directory)
+  daedalus worker restart all | --all                      (every worker on record)
+
+FLAGS
+  -c, --config <path>   Bare form only: the config the restart runs with
+                        (the start that follows rewrites the worker's
+                        record with it). Rejected by "restart <worker>"
+                        and "restart all" — those act from the recorded
+                        configs alone.
+  -t, --type <type>     Bare form only: dev, test, or omitted for both
+                        pollers. Rejected by the record-driven forms — a
+                        run config is never persisted, so they revive the
+                        daemon untyped; pass -t again on a bare restart to
+                        keep a typed daemon.
+  --all                 Restart-target spelling of the "all" argument.
+
+"daedalus worker --help" has the full worker reference.
+`,
+	"foreground": `daedalus worker foreground — run the worker attached to this
+terminal: the daemon child's mode, and the way to debug a worker that will
+not start.
+
+USAGE
+  daedalus [-c config.yaml] worker foreground [-t dev|test]
+
+Runs in the foreground until interrupted. Prompt overrides resolve and
+validate here, so a bad one fails the start before any poller registers.
+
+FLAGS
+  -c, --config <path>   Path to the config file.
+  -t, --type <type>     Which pollers to start: dev or test; omit for
+                        both pollers, the default.
+
+"daedalus worker --help" has the full worker reference.
+`,
+	"wakeup": `daedalus worker wakeup — interrupt a RUNNING session's quota
+heartbeat so the round resumes immediately.
+
+USAGE
+  daedalus [-c config.yaml] worker wakeup <workflow-id>
+
+For when the provider recovered (or its fallback does) but the run is
+still sleeping out its hourly retry — the operator's alternative to
+waiting up to maxQuotaHeartbeats hours. No prompt is taken (that is
+"guide"/"continue"); the run keeps its id and worktree. A session that is
+running but not sleeping buffers the wakeup, skipping only its next
+heartbeat. A closed (canceled/failed/parked) or unknown id is a usage
+error — closed sessions resume with "continue", and the id can be checked
+against "daedalus list". The workflow must belong to the active config's
+task queue: a mismatched -c fails without acting.
+
+FLAGS
+  -c, --config <path>   Path to the config file (names the owning task
+                        queue and the Temporal host).
+
+-t/--type parses here but has no effect: it shapes only start, bare
+restart, and foreground.
+
+"daedalus worker --help" has the full worker reference.
 `,
 }
