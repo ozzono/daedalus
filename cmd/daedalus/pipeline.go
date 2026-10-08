@@ -598,7 +598,7 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 	}
 	defer c.Close()
 
-	prev, lastReview, err := readPriorRun(c, workflowID)
+	prev, lastReview, gateGreen, err := readPriorRun(c, workflowID)
 	if err != nil {
 		return err
 	}
@@ -661,6 +661,14 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		SharedTestQueue: sharedTestQueueInput(cfg),
 		TestOutputDir:   cfg.TestOutputDir(),
 		BaseBranch:      base,
+		// The skip-key, threaded down the chain: this attempt's own green
+		// native-suite evidence (the preflight pass, or a green round
+		// after it), or the recorded flag of an earlier link — the skip
+		// records no suite of its own, so without the threading a second
+		// continue of a validated chain would re-gate and re-park on the
+		// preserved mid-flight worktree. A never-validated chain carries
+		// neither and re-runs the gate on every continue.
+		BaselineValidated: gateGreen || prev.BaselineValidated,
 		// No truncation anywhere in the app: the complete last review rides
 		// into the continued run's opening prompt.
 		PriorFeedback: lastReview.Comments,
@@ -680,9 +688,13 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 	return awaitPipeline(run)
 }
 
-// readPriorRun walks the workflow's history for the original pipeline input
-// and the last reviewer verdict.
-func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineInput, lastReview activities.ReviewResult, err error) {
+// readPriorRun walks the workflow's history for the original pipeline
+// input, the last reviewer verdict, and gateGreen — whether any
+// native-suite execution completed green (a failed or red suite
+// completes with Passed false, a crashed one never completes), the
+// recorded preflight pass `continue` threads into the new run's
+// BaselineValidated.
+func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineInput, lastReview activities.ReviewResult, gateGreen bool, err error) {
 	dc := converter.GetDefaultDataConverter()
 	scheduled := map[int64]string{}
 	iter := c.GetWorkflowHistory(context.Background(), workflowID, "",
@@ -690,14 +702,14 @@ func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineIn
 	for iter.HasNext() {
 		ev, err := iter.Next()
 		if err != nil {
-			return prev, lastReview, fmt.Errorf("read history of %s: %w", workflowID, err)
+			return prev, lastReview, gateGreen, fmt.Errorf("read history of %s: %w", workflowID, err)
 		}
 		switch {
 		case ev.GetWorkflowExecutionStartedEventAttributes() != nil:
 			ps := ev.GetWorkflowExecutionStartedEventAttributes().GetInput().GetPayloads()
 			if len(ps) > 0 {
 				if err := dc.FromPayload(ps[0], &prev); err != nil {
-					return prev, lastReview, fmt.Errorf("decode pipeline input: %w", err)
+					return prev, lastReview, gateGreen, fmt.Errorf("decode pipeline input: %w", err)
 				}
 			}
 		case ev.GetActivityTaskScheduledEventAttributes() != nil:
@@ -705,20 +717,29 @@ func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineIn
 			scheduled[ev.GetEventId()] = a.GetActivityType().GetName()
 		case ev.GetActivityTaskCompletedEventAttributes() != nil:
 			a := ev.GetActivityTaskCompletedEventAttributes()
-			if scheduled[a.GetScheduledEventId()] != "RunJailedReviewerActivity" {
-				continue
-			}
-			ps := a.GetResult().GetPayloads()
-			if len(ps) == 0 {
-				continue
-			}
-			var r activities.ReviewResult
-			if err := dc.FromPayload(ps[0], &r); err == nil {
-				lastReview = r
+			switch scheduled[a.GetScheduledEventId()] {
+			case "RunJailedReviewerActivity":
+				ps := a.GetResult().GetPayloads()
+				if len(ps) == 0 {
+					continue
+				}
+				var r activities.ReviewResult
+				if err := dc.FromPayload(ps[0], &r); err == nil {
+					lastReview = r
+				}
+			case "RunTestSuiteActivity":
+				ps := a.GetResult().GetPayloads()
+				if len(ps) == 0 {
+					continue
+				}
+				var r activities.TestResult
+				if err := dc.FromPayload(ps[0], &r); err == nil && r.Passed {
+					gateGreen = true
+				}
 			}
 		}
 	}
-	return prev, lastReview, nil
+	return prev, lastReview, gateGreen, nil
 }
 
 // verifyBranch fails unless ref resolves in the repository.

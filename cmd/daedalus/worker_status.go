@@ -119,7 +119,7 @@ func workerCodePath(confPath string) string {
 	var paths []string
 	seen := make(map[string]bool, len(resp.GetExecutions()))
 	for _, info := range resp.GetExecutions() {
-		prev, _, err := readPriorRun(c, info.GetExecution().GetWorkflowId())
+		prev, _, _, err := readPriorRun(c, info.GetExecution().GetWorkflowId())
 		if err != nil || prev.RepoPath == "" || seen[prev.RepoPath] {
 			continue
 		}
