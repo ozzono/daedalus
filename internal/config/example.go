@@ -525,9 +525,11 @@ const examplePromptBlock = `
 # file, a data field the prompt does not take (each template renders a
 # fixed struct — copy the field references from the embedded file), a
 # {{template}} action (an override runs alone), a {{define}}/{{block}}
-# block (a define body can never render in an override), or a review
-# override missing the verdict protocol all fail the start, never a
-# mid-round render. Two machine contracts a replacement must keep: review
+# block (a define or block body can never render in an override — the
+# sole exception is a define named exactly <prompt-name>.md; don't rely
+# on it), or a review override missing the verdict protocol all fail the
+# start, never a mid-round render. Two machine contracts a replacement
+# must keep: review
 # is validated at startup to still carry all four verdict words (APPROVED,
 # CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
 # protocol the loop parses), and slim_parse must keep instructing the

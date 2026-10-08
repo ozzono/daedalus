@@ -606,9 +606,11 @@ type Config struct {
 	// this config file's directory. Resolved and validated once at worker
 	// startup (missing directory, unreadable file, empty file, template
 	// that does not parse, a data field the prompt does not take, a
-	// {{template}} action, a {{define}}/{{block}} block — a define body
-	// can never render in an override — or a review override missing the
-	// verdict protocol all fail the start); rendered prompts
+	// {{template}} action, a {{define}}/{{block}} block (a define or
+	// block body can never render in an override — the sole exception is
+	// a define named exactly <prompt-name>.md; don't rely on it), or a
+	// review override missing the verdict protocol all fail the start);
+	// rendered prompts
 	// are recorded in workflow history, so replacement content is not
 	// secret and may live on the same path as the config. Empty — the
 	// default — renders every prompt byte-identically to the embedded one.
@@ -988,6 +990,25 @@ func parse(path string) (Config, error) {
 	if err != nil {
 		return c, fmt.Errorf("read config %s: %w", path, err)
 	}
+	// A repeated key in any section is tolerated — the last value wins,
+	// loudly — instead of failing the load the way yaml.v3's own
+	// duplicate-key check would (a check the slim section's custom
+	// unmarshaler bypassed anyway, so strictness there was never parity).
+	// The pre-scan prunes the losers from the node tree; only when it
+	// pruned something is the tree re-encoded for the strict decode — an
+	// ordinary config still decodes from the file's own bytes, error line
+	// numbers included. ponytail: a dup-carrying config decodes
+	// re-encoded, so a second error in it reports re-encoded line
+	// numbers; the alert lines keep the file's own.
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return c, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if dedupeKeys(&doc, path, "top level") {
+		if data, err = yaml.Marshal(&doc); err != nil {
+			return c, fmt.Errorf("parse config %s: %w", path, err)
+		}
+	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	// An empty document (touch config.yaml) is no config at all: it loads
@@ -997,6 +1018,49 @@ func parse(path string) (Config, error) {
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return c, nil
+}
+
+// dedupeKeys walks n's mapping nodes and deletes every repeated key's
+// earlier occurrences, keeping the last value and printing one alert line
+// per dropped occurrence to stderr (file, section, key, winning line).
+// section names the mapping the walk sits in — "top level" at the root,
+// else the key that introduced it. It reports whether anything was pruned.
+// Alias nodes are skipped: their target was walked where it was defined.
+func dedupeKeys(n *yaml.Node, path, section string) bool {
+	pruned := false
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, c := range n.Content {
+			pruned = dedupeKeys(c, path, section) || pruned
+		}
+	case yaml.MappingNode:
+		// Keys sit at even Content indices with their values at the odd
+		// ones that follow; the last occurrence of a key is the winner.
+		last := make(map[string]int, len(n.Content)/2)
+		for i := 0; i < len(n.Content); i += 2 {
+			last[n.Content[i].Value] = i
+		}
+		keep := make([]*yaml.Node, 0, len(n.Content))
+		for i := 0; i < len(n.Content); i += 2 {
+			key, val := n.Content[i], n.Content[i+1]
+			if j := last[key.Value]; j != i {
+				fmt.Fprintf(os.Stderr, "config alert: duplicate key %q in section %q (%s:%d) — the last value wins\n",
+					key.Value, section, path, n.Content[j].Line)
+				pruned = true
+				continue
+			}
+			keep = append(keep, key, val)
+		}
+		n.Content = keep
+		for i := 0; i+1 < len(keep); i += 2 {
+			pruned = dedupeKeys(keep[i+1], path, keep[i].Value) || pruned
+		}
+	case yaml.SequenceNode:
+		for _, c := range n.Content {
+			pruned = dedupeKeys(c, path, section) || pruned
+		}
+	}
+	return pruned
 }
 
 // validate rejects the configs Load refuses, with Load's diagnostics. Call

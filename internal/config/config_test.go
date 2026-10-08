@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -780,6 +782,115 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	if _, err := LoadRaw(writeConfig(t, "nosuchkey: 1\n")); err == nil || !strings.Contains(err.Error(), "nosuchkey") {
 		t.Fatalf("LoadRaw error = %v, want one naming the unknown key", err)
 	}
+}
+
+// loadCapturingAlerts loads content while capturing the stderr the
+// duplicate-key alerts print to, returning the loaded config, the config's
+// path (the alerts name it), the captured text, and Load's error. The swap is
+// safe here: nothing in the package's tests runs in parallel, and the alerts
+// are a few short lines — far under the pipe buffer, so the write never
+// blocks on this read.
+func loadCapturingAlerts(t *testing.T, content string) (Config, string, string, error) {
+	t.Helper()
+	path := writeConfig(t, content)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = w
+	cfg, loadErr := Load(path)
+	os.Stderr = saved
+	w.Close()
+	data, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg, path, string(data), loadErr
+}
+
+// TestLoadDuplicateKeys pins the tolerated-duplicate contract: a repeated
+// key in any section — the slim section's hand-walked unmarshaler included —
+// loads with the last value winning, one stderr alert per dropped occurrence
+// naming the file, section, key, and winning line. Nothing else loosens: a
+// typo'd key still fails the strict decode through the doc a prune leaves
+// behind, and an ordinary config still decodes from the file's own bytes, so
+// its decode errors keep the file's own line numbers (a re-encode drops the
+// blank lines between top-level sections, renumbering everything after the
+// first).
+func TestLoadDuplicateKeys(t *testing.T) {
+	t.Run("duplicate in the slim section keeps the last value, loudly", func(t *testing.T) {
+		cfg, path, alerts, err := loadCapturingAlerts(t, "slim:\n  enabled: true\n  enabled: false\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Slim.Enabled {
+			t.Error("Slim.Enabled = true, want false — the last value wins")
+		}
+		want := fmt.Sprintf("config alert: duplicate key %q in section %q (%s:3) — the last value wins\n", "enabled", "slim", path)
+		if alerts != want {
+			t.Errorf("alerts = %q, want exactly %q", alerts, want)
+		}
+	})
+
+	t.Run("duplicate at the top level — a load error before — keeps the last value", func(t *testing.T) {
+		cfg, path, alerts, err := loadCapturingAlerts(t, "agent: claude\nagent: pi\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Agent != "pi" {
+			t.Errorf("Agent = %q, want pi — the last value wins", cfg.Agent)
+		}
+		want := fmt.Sprintf("config alert: duplicate key %q in section %q (%s:2) — the last value wins\n", "agent", "top level", path)
+		if alerts != want {
+			t.Errorf("alerts = %q, want exactly %q", alerts, want)
+		}
+	})
+
+	t.Run("duplicate in a nested section names the section", func(t *testing.T) {
+		cfg, path, alerts, err := loadCapturingAlerts(t, "openai:\n  url: https://a.example/v1\n  url: https://b.example/v1\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.OpenAI.URL != "https://b.example/v1" {
+			t.Errorf("OpenAI.URL = %q, want the last value", cfg.OpenAI.URL)
+		}
+		want := fmt.Sprintf("config alert: duplicate key %q in section %q (%s:3) — the last value wins\n", "url", "openai", path)
+		if alerts != want {
+			t.Errorf("alerts = %q, want exactly %q", alerts, want)
+		}
+	})
+
+	t.Run("a typo still fails through the pruned doc", func(t *testing.T) {
+		_, _, alerts, err := loadCapturingAlerts(t, "agent: claude\nagent: pi\ntests_timeot: 5m\n")
+		if err == nil || !strings.Contains(err.Error(), "tests_timeot") {
+			t.Fatalf("Load error = %v, want the unknown-key rejection to survive the prune's re-encode", err)
+		}
+		if !strings.Contains(alerts, `duplicate key "agent"`) {
+			t.Errorf("alerts = %q, want the duplicate-key alert alongside the rejection", alerts)
+		}
+	})
+
+	t.Run("a dup-free config decodes the file's own bytes", func(t *testing.T) {
+		// The blank line between the sections is what a re-encode would
+		// drop, pulling thinking: up to line 3; the decode error must carry
+		// the file's own line 4.
+		_, err := Load(writeConfig(t, "agent: claude\n\nopenai:\n  thinking: false\n"))
+		if err == nil || !strings.Contains(err.Error(), "line 4") {
+			t.Fatalf("Load error = %v, want the misplaced-key rejection at the file's own line 4", err)
+		}
+	})
+
+	t.Run("no duplicate, no alert", func(t *testing.T) {
+		_, _, alerts, err := loadCapturingAlerts(t, "agent: claude\nslim:\n  enabled: true\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if alerts != "" {
+			t.Errorf("alerts = %q, want stderr untouched for an ordinary config", alerts)
+		}
+	})
 }
 
 // TestExampleYAML pins that loading the example yields exactly the default

@@ -793,8 +793,8 @@ clears a stale pid file, and exits 0.
 FLAGS
   -c, --config <path>   Path to the config file naming the worker.
 
--t/--type parses here but has no effect: it shapes only start, bare
-restart, and foreground — a stop drains whichever daemon is running.
+-t/--type is rejected here: it shapes only start, bare restart, and
+foreground — a stop drains whichever daemon is running.
 
 "daedalus worker --help" has the full worker reference.
 `,
@@ -806,7 +806,9 @@ USAGE
 
 Prints, per worker: name, running pid, the binary version that worker is
 executing (so a daemon started before a CLI upgrade is visible as such),
-live API probe, config record, and log path. Also the recapture point: a
+live API probe, config record, code path (the repo path of each run
+currently executing on the worker's queue, or an idle display value),
+and log path. Also the recapture point: a
 running workflow whose outstanding activity attempt is held by a worker
 identity with no live poller (a worker that died mid-round) is recovered —
 the stuck attempt is failed so the workflow reschedules it, and a worker
@@ -883,8 +885,8 @@ FLAGS
   -c, --config <path>   Path to the config file (names the owning task
                         queue and the Temporal host).
 
--t/--type parses here but has no effect: it shapes only start, bare
-restart, and foreground.
+-t/--type is rejected here: it shapes only start, bare restart, and
+foreground.
 
 "daedalus worker --help" has the full worker reference.
 `,

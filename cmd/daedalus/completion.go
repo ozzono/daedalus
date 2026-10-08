@@ -71,7 +71,11 @@ func complete(words []string) []string {
 		return prefixed(commandCandidates(), toComplete)
 	}
 	if typed[pos] == "worker" {
-		rest := typed[pos+1:]
+		// Global flags parse from anywhere, so only the positional tail
+		// reaches the action/target positions (same skip as init below):
+		// `worker -c cfg.yaml restart <tab>` is a valid restart, not a
+		// saturated one.
+		rest := positionalWords(typed[pos+1:])
 		switch {
 		case len(rest) == 0:
 			return prefixed(workerActions, toComplete)

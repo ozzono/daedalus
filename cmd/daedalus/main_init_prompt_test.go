@@ -79,6 +79,34 @@ func TestMainInitPromptScaffold(t *testing.T) {
 	}
 }
 
+// TestPromptScaffoldGuideSubstringCollision pins the fallback tail's
+// classification as exact membership: a prompt whose name is a substring of
+// a grouped name (a future short "parse" inside the grouped "slim_parse")
+// must land in the guide's "Other prompts" tail — the doc promises a prompt
+// no group names still lands there — not be classified grouped by a
+// substring match and silently render nowhere.
+func TestPromptScaffoldGuideSubstringCollision(t *testing.T) {
+	specs := []template.PromptSpec{
+		{Name: "slim_parse", Fields: []string{"Plan"}},
+		{Name: "parse", Fields: []string{"Plan"}},
+	}
+	guide := promptScaffoldGuide(specs)
+
+	_, tail, found := strings.Cut(guide, "Other prompts")
+	if !found {
+		t.Fatalf("guide has no Other prompts section — %q rendered nowhere:\n%s", "parse", guide)
+	}
+	if !strings.Contains(tail, "\n  parse") {
+		t.Errorf("the Other prompts section does not list parse at a line start:\n%s", tail)
+	}
+	if strings.Contains(tail, "slim_parse") {
+		t.Errorf("the Other prompts section lists slim_parse — a grouped prompt stays in its group:\n%s", tail)
+	}
+	if !strings.Contains(guide, "\n  slim_parse") {
+		t.Error("the guide lost the slim flow's slim_parse entry")
+	}
+}
+
 // TestMainInitPromptScaffoldRefusesNonEmpty pins the refuse-to-overwrite
 // shape: a non-empty target fails the init without writing anything — no
 // samples, no README, no config example — and the target's own content is

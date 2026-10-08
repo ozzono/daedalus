@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/ozzono/daedalus/internal/template"
@@ -195,7 +196,11 @@ exactly as it is.
 	for _, s := range specs {
 		grouped := false
 		for _, g := range promptScaffoldGroups {
-			grouped = grouped || strings.Contains(strings.Join(g.names, " "), s.Name)
+			// Exact membership, not substring matching: a future short
+			// name that happens to be a substring of a grouped name
+			// (e.g. "parse" inside "slim_parse") must still land in the
+			// fallback tail, not vanish from the guide.
+			grouped = grouped || slices.Contains(g.names, s.Name)
 		}
 		if !grouped {
 			rest = append(rest, s.Name)
