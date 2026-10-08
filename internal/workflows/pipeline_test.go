@@ -750,6 +750,95 @@ func TestFeatureDevWorkflowContinued(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowContinuedPreflightGate pins the two sides of the
+// gate's BaselineValidated skip on a continued run — the input `daedalus
+// continue` derives from the aborted attempt's history. The skip keeps the
+// suite discovery (the no-suite park and the resolved command stay
+// per-round) and drops only the baseline suite execution, which would
+// otherwise measure the preserved worktree's mid-flight work; a never-
+// validated continue — a gate-parked attempt, one that died at or before
+// the gate — re-runs the gate on that preserved worktree and still parks
+// red, before any session starts.
+func TestFeatureDevWorkflowContinuedPreflightGate(t *testing.T) {
+	t.Run("a validated continue skips the gate suite but keeps discovery", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+			Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+		rec := &agentRecorder{env: env}
+		rec.record()
+		rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+		rev.record()
+		disc, suiteRec := stubTestPhase(env)
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+		env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+			Return(nil).Once()
+
+		in := baseInput()
+		in.BaseBranch = "aborted/issue-42"
+		in.BaselineValidated = true
+		env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if len(disc.agents) != 2 {
+			t.Errorf("discovery ran %d times, want 2 (the gate's, phase 2's) — the skip keeps discovery", len(disc.agents))
+		}
+		if len(suiteRec.runs) != 1 {
+			t.Errorf("suite ran %d times, want 1 (phase 2 alone — no baseline execution on a validated continue)", len(suiteRec.runs))
+		}
+		if len(rec.inputs) == 0 {
+			t.Error("agent never ran — the skip must open the first session, not stall the run")
+		}
+		env.AssertExpectations(t)
+	})
+
+	t.Run("a never-validated continue re-runs the gate and parks on red", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+			Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+		var agentCalls, reviewCalls int
+		env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) { agentCalls++ }).
+			Return(activities.AgentRunResult{}, nil).Maybe()
+		env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+			Run(func(args mock.Arguments) { reviewCalls++ }).
+			Return(activities.ReviewResult{}, nil).Maybe()
+		_, suiteRec := stubTestPhase(env)
+		suiteRec.script = []suiteStep{
+			{result: activities.TestResult{Passed: false, Logs: "--- FAIL: TestBase"}},
+		}
+		env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+			Return(nil).Once()
+
+		in := baseInput()
+		in.BaseBranch = "aborted/issue-42"
+		env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+		err := env.GetWorkflowError()
+		if err == nil {
+			t.Fatal("want workflow error from a red gate on a never-validated continue")
+		}
+		for _, want := range []string{
+			ErrAwaitingMaintainer.Error(),
+			"preflight gate failed — the suite must be green before a session starts:",
+			"go test ./...",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if agentCalls != 0 || reviewCalls != 0 {
+			t.Errorf("agent ran %d times, reviewer %d — want 0 and 0 (a re-run gate parks before any session)", agentCalls, reviewCalls)
+		}
+		if len(suiteRec.runs) != 1 || suiteRec.runs[0].WorktreePath != "/wt/issue-42" {
+			t.Errorf("suite runs = %+v, want one gate execution in the preserved worktree", suiteRec.runs)
+		}
+		env.AssertExpectations(t)
+	})
+}
+
 // TestFeatureDevWorkflowAuthorshipWiring pins that the authorship flag
 // reaches every worktree activity that commits on daedalus's behalf: the
 // preserve (cleanup) and finalize commits only carry the forced

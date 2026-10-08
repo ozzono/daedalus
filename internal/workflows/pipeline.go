@@ -59,6 +59,16 @@ type PipelineInput struct {
 	// folded into the opening prompt.
 	BaseBranch    string
 	PriorFeedback string
+	// BaselineValidated, set by `daedalus continue` when the attempt
+	// chain's history shows a green native-suite execution — this link's
+	// own (the preflight gate's pass, or a green suite round after it) or
+	// an earlier link's flag threaded forward — is the only thing
+	// preFlightGate skips on. False — a fresh run, a run whose input
+	// predates the field, or the continue of a chain that has never
+	// recorded one (parked by the gate, died at or before it, started
+	// before the gate existed) — runs the gate: replay-safe in the loud
+	// direction, like every zero-value fallback here.
+	BaselineValidated bool
 	// Agent, set by `run -cli/--cli`, overrides the config's jailed agent
 	// for this run; empty — a run whose input predates the field, replayed
 	// by a newer worker — falls back to the worker's DAEDALUS_AGENT.
@@ -494,6 +504,30 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 // repository has no suite at all (activities.ErrNoSuite) passes vacuously:
 // nothing can be red when nothing exists — a greenfield repo is not a red
 // baseline — and the history records why no suite round ran.
+//
+// A continued run (`daedalus continue`) skips the suite execution but
+// keeps the discovery — and only when its input carries
+// BaselineValidated, which `continue` derives from the aborted attempt's
+// own history (the gate's pass, or a green suite round after it) or
+// threads forward from an earlier link's recorded flag — the skip
+// records no suite of its own, so the threading is what keeps a
+// validated chain validated across continues. Such a run's worktree
+// deliberately carries the attempt's
+// mid-flight work, so the old tests measure the in-progress change, not
+// the baseline — and an implementation round may legitimately break one
+// until the test phase updates it. The unchanged done path still
+// requires the full green suite before finalize. A never-validated
+// attempt — parked by this gate, died at or before it, or started before
+// the gate existed — continues into a re-run gate, the pre-change
+// behavior; on a dirty pre-gate-binary worktree that re-run reads
+// mid-flight work as the baseline and may re-park: fail-loud, and rarer
+// than the silent skip keying on the branch alone would have swallowed
+// (backlog/bugs/preflight-skip-continue-unvalidated-baseline.md).
+// ponytail: the skip is unversioned, so a continued run in flight across
+// a worker binary swap replays its recorded gate suite execution against
+// code that no longer issues it — nondeterminism wedge, same accepted
+// class as the unversioned loop caps
+// (backlog/bugs/preflight-skip-replay-nondeterminism.md).
 func (r *pipelineRun) preFlightGate() (string, error) {
 	command, err := r.resolveTestCommand()
 	if err != nil {
@@ -502,6 +536,10 @@ func (r *pipelineRun) preFlightGate() (string, error) {
 			return "", nil
 		}
 		return "", err
+	}
+	if r.input.BaselineValidated {
+		r.logger.Info("Continued run: baseline validated by a green suite round earlier in this chain; skipping the gate", "Command", command)
+		return command, nil
 	}
 	result, err := r.runSuite(command)
 	if err != nil {

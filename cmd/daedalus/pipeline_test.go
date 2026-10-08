@@ -7,8 +7,15 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
+	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/sdk/converter"
+
+	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/workflows"
 )
 
 // boolPtr is a literal for the config's pointer toggles.
@@ -390,4 +397,156 @@ func TestResolveFolderGrants(t *testing.T) {
 	if _, err := resolveFolderGrants(nil, filepath.Join(notes, "[x]/task.md")); err == nil || !strings.Contains(err.Error(), metaErr) {
 		t.Errorf("resolveFolderGrants(metachar task dir) err = %v, want it to name %q", err, metaErr)
 	}
+}
+
+// startedInputEvent builds the WorkflowExecutionStarted event carrying in as
+// the pipeline's input payload — the record `readPriorRun` decodes the
+// resumed run's frozen policy and skip-key flag from.
+func startedInputEvent(t *testing.T, in workflows.PipelineInput) *historypb.HistoryEvent {
+	t.Helper()
+	payload, err := converter.GetDefaultDataConverter().ToPayload(in)
+	if err != nil {
+		t.Fatalf("encode pipeline input: %v", err)
+	}
+	return &historypb.HistoryEvent{
+		EventId: 1,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{
+			WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{
+				WorkflowType: &commonpb.WorkflowType{Name: "FeatureDevWorkflow"},
+				Input:        &commonpb.Payloads{Payloads: []*commonpb.Payload{payload}},
+			},
+		},
+	}
+}
+
+// TestReadPriorRunBaselineValidation pins the two facts `continue` derives
+// from an aborted attempt's history and combines into the new run's
+// BaselineValidated — the gate-skip key (gateGreen ||
+// prev.BaselineValidated): gateGreen is readPriorRun's report of any
+// native-suite execution completing green, and prev is the started input's
+// recorded flag, threaded forward from an earlier continue link. A history
+// holding neither re-gates on the next continue; either alone skips it.
+func TestReadPriorRunBaselineValidation(t *testing.T) {
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	// A started input every subtest decodes: issue 42, never validated
+	// unless the subtest says otherwise.
+	prior := func() workflows.PipelineInput {
+		return workflows.PipelineInput{RepoPath: "/repo", IssueID: "42", Prompt: "implement the feature"}
+	}
+
+	t.Run("a gate-parked attempt stays unvalidated", func(t *testing.T) {
+		// The gate's red completion is exactly what parked this attempt:
+		// a suite execution that completed with Passed false validates
+		// nothing. A reviewer verdict still rides along for the opening
+		// prompt (the reviewer branch now sits in the same completion
+		// switch the suite branch joined).
+		c := &fakeHistoryClient{histories: map[string][]*historypb.HistoryEvent{
+			"wf": {
+				startedInputEvent(t, prior()),
+				scheduledEvent(2, at, "RunTestSuiteActivity"),
+				completedEvent(t, 2, at, activities.TestResult{Passed: false, Logs: "--- FAIL: TestBase"}),
+				scheduledEvent(4, at, "RunJailedReviewerActivity"),
+				completedEvent(t, 4, at, activities.ReviewResult{Comments: "the finding"}),
+			},
+		}}
+		prev, lastReview, gateGreen, err := readPriorRun(c, "wf")
+		if err != nil {
+			t.Fatalf("readPriorRun: %v", err)
+		}
+		if gateGreen || prev.BaselineValidated {
+			t.Errorf("gateGreen = %v, prev.BaselineValidated = %v — a gate-parked chain must re-gate on continue", gateGreen, prev.BaselineValidated)
+		}
+		if prev.IssueID != "42" {
+			t.Errorf("prev.IssueID = %q, want 42 (the input decodes)", prev.IssueID)
+		}
+		if lastReview.Comments != "the finding" {
+			t.Errorf("lastReview.Comments = %q, want the finding the reviewer verdict carried", lastReview.Comments)
+		}
+	})
+
+	t.Run("a green suite round validates despite a later red one", func(t *testing.T) {
+		// The gate passed and a phase-2 round went red afterwards: any
+		// completed green suite anywhere in the attempt's history is the
+		// validation, and a later red does not un-validate it — the
+		// baseline was measured green on this chain.
+		c := &fakeHistoryClient{histories: map[string][]*historypb.HistoryEvent{
+			"wf": {
+				startedInputEvent(t, prior()),
+				scheduledEvent(2, at, "RunTestSuiteActivity"),
+				completedEvent(t, 2, at, activities.TestResult{Passed: true, Logs: "ok"}),
+				scheduledEvent(4, at, "RunTestSuiteActivity"),
+				completedEvent(t, 4, at, activities.TestResult{Passed: false, Logs: "--- FAIL: TestLater"}),
+			},
+		}}
+		_, _, gateGreen, err := readPriorRun(c, "wf")
+		if err != nil {
+			t.Fatalf("readPriorRun: %v", err)
+		}
+		if !gateGreen {
+			t.Error("gateGreen = false, want true — the gate's own pass validates the chain's first continue")
+		}
+	})
+
+	t.Run("a chained continue's recorded flag survives the round trip", func(t *testing.T) {
+		// Continue #2 resumes an execution whose started input already
+		// carried the flag (its own predecessor threaded it in): the skip
+		// records no suite of its own, so the recorded flag is the only
+		// validation in the history — and it must decode back out of the
+		// payload for the threading to hold a chain together.
+		in := prior()
+		in.BaseBranch = "aborted/issue-42"
+		in.BaselineValidated = true
+		c := &fakeHistoryClient{histories: map[string][]*historypb.HistoryEvent{
+			"wf": {startedInputEvent(t, in)},
+		}}
+		prev, _, gateGreen, err := readPriorRun(c, "wf")
+		if err != nil {
+			t.Fatalf("readPriorRun: %v", err)
+		}
+		if !prev.BaselineValidated {
+			t.Error("prev.BaselineValidated = false, want true — the threaded flag must survive payload encode/decode")
+		}
+		if gateGreen {
+			t.Error("gateGreen = true, want false — a skipped gate records no suite completion")
+		}
+	})
+
+	t.Run("a suite that never completed validates nothing", func(t *testing.T) {
+		// The attempt died with the gate suite in flight — scheduled but
+		// never completed, so its outcome was never measured.
+		c := &fakeHistoryClient{histories: map[string][]*historypb.HistoryEvent{
+			"wf": {
+				startedInputEvent(t, prior()),
+				scheduledEvent(2, at, "RunTestSuiteActivity"),
+			},
+		}}
+		_, _, gateGreen, err := readPriorRun(c, "wf")
+		if err != nil {
+			t.Fatalf("readPriorRun: %v", err)
+		}
+		if gateGreen {
+			t.Error("gateGreen = true, want false — a suite that never completed measured nothing")
+		}
+	})
+
+	t.Run("an undecodable suite result fails toward re-gating", func(t *testing.T) {
+		// A suite completion whose payload no longer decodes (a pre-field
+		// worker's shape) is not read as green: the decode miss is
+		// swallowed, so the continue re-runs the gate instead of skipping
+		// it on a result nobody can vouch for.
+		c := &fakeHistoryClient{histories: map[string][]*historypb.HistoryEvent{
+			"wf": {
+				startedInputEvent(t, prior()),
+				scheduledEvent(2, at, "RunTestSuiteActivity"),
+				completedEvent(t, 2, at, "not a TestResult"),
+			},
+		}}
+		_, _, gateGreen, err := readPriorRun(c, "wf")
+		if err != nil {
+			t.Fatalf("readPriorRun: %v", err)
+		}
+		if gateGreen {
+			t.Error("gateGreen = true, want false — an undecodable result must not read as a green suite")
+		}
+	})
 }
