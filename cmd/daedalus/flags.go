@@ -283,6 +283,13 @@ parse:
 	if f.depends != "" && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
 		return f, nil, errors.New("-dep/--depends only applies to a fresh run")
 	}
+	// Likewise -w/--workflow: the flow is decided at start and travels in
+	// the run's workflow input, so only a fresh `run` can honor it —
+	// append mode steers a pipeline whose flow is already fixed, and a
+	// session `continue` resumes keeps the flow it started with.
+	if f.workflowSet && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
+		return f, nil, errors.New("-w/--workflow only applies to a fresh run")
+	}
 	// The record-driven worker commands (`worker restart all`, `worker
 	// restart <name>`, `worker status`) work from the recorded configs
 	// alone; an explicit -c there is silently ignored by every step —
@@ -315,6 +322,16 @@ parse:
 	// daemon stays an explicit `worker start`/`worker restart` concern.
 	if f.workerType != "" && len(rest) > 0 && rest[0] == "run" {
 		return f, nil, errors.New("-t/--type does not apply to daedalus run — the worker it starts comes untyped (both pollers); type one with `daedalus worker start -t <type>`")
+	}
+	// The sweep's last -t gap is everything else that still parses the
+	// flag: `worker stop` drains whatever daemon is running, `worker
+	// wakeup` interrupts one session's heartbeat, and no non-worker
+	// command reads a daemon's type — a -t there could only suggest a
+	// scoping that never happens. Reject it like the cases above instead
+	// of accepting a silent no-op (they stay ahead of this one so their
+	// wording can keep naming the record-driven commands and run).
+	if f.workerType != "" && len(rest) > 0 && !isTypedWorker(rest) {
+		return f, nil, errors.New("-t/--type only applies to worker start, bare worker restart, and worker foreground")
 	}
 	// --status switches `log` from the raw file to the status brief;
 	// anywhere else it would be an option the subcommand ignores — reject
@@ -350,6 +367,20 @@ parse:
 // record-free task-log read.
 func isTaskLog(rest []string) bool {
 	return len(rest) == 2 && rest[0] == "log"
+}
+
+// isTypedWorker reports whether rest is a worker invocation that brings
+// its daemon up from the invoking command line — the only paths -t/--type
+// reaches: bare `worker` and `worker start` (start is the default action),
+// the bare restart, and foreground. The record-driven restarts act from
+// their recorded configs, stop signals whatever daemon runs, and wakeup
+// interrupts one session — none of them reads a type.
+func isTypedWorker(rest []string) bool {
+	if len(rest) == 1 && rest[0] == "worker" {
+		return true
+	}
+	return len(rest) == 2 && rest[0] == "worker" &&
+		(rest[1] == "start" || rest[1] == "restart" || rest[1] == "foreground")
 }
 
 // resolveConfigPath locates the configuration when -c/--config is absent:
