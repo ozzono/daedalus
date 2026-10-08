@@ -412,11 +412,12 @@ FLAGS
                         and reviews only — no test-queue poller) or test (test
                         suites and the repro gate only — no pipeline poller).
                         Omit for both pollers, the default. Accepted by start,
-                        bare restart, and foreground. Rejected by status,
-                        restart <worker>, and restart all — those act from the
-                        recorded configs alone and revive the daemon untyped;
-                        a run config is never persisted, so pass -t again on
-                        a bare restart.
+                        bare restart, and foreground. Rejected everywhere else:
+                        status and the record-driven restarts act from the
+                        recorded configs alone and revive the daemon untyped,
+                        stop drains whatever daemon runs and wakeup interrupts
+                        one session, and a run config is never persisted, so
+                        pass -t again on a bare restart.
   --all                 Restart target: every worker on record (same as the
                         "all" argument).
 

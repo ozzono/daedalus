@@ -88,8 +88,12 @@ func complete(words []string) []string {
 	switch typed[pos] {
 	case "init":
 		// The profile arguments. They compose, so a line already carrying
-		// one profile still offers the other.
-		rest := typed[pos+1:]
+		// one profile still offers the other. Global flags parse from
+		// anywhere, so only the positional tail counts toward the
+		// saturation: a flag word (or the value a value-taking flag
+		// consumes) is never a profile argument — the same skip the
+		// command scan at the top does.
+		rest := positionalWords(typed[pos+1:])
 		if len(rest) < len(initProfiles) {
 			var left []string
 			for _, p := range initProfiles {
@@ -118,6 +122,27 @@ func commandCandidates() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// positionalWords filters a typed tail down to its positional words: flag
+// words drop out, a value-taking flag also drops the word it consumes, and
+// the "--name=value" form is one word. parseFlags strips the global flags
+// from anywhere, so none of them can be an argument of the command.
+func positionalWords(words []string) []string {
+	var out []string
+	for i := 0; i < len(words); i++ {
+		if s, ok := flagTable[words[i]]; ok {
+			if s.value {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(words[i], "-") && strings.Contains(words[i], "=") {
+			continue
+		}
+		out = append(out, words[i])
+	}
+	return out
 }
 
 // flagCandidates lists every flag spelling matching the prefix, each once:
