@@ -12,6 +12,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -161,14 +162,42 @@ func LoadOverrides(dir, baseDir string) error {
 		if err := checkOverride(name, emb, ov); err != nil {
 			return err
 		}
+		// Startup render against the prompt's representative data: a
+		// reference that parses and names a real first-level field can
+		// still fail at render time — a nested access (.Handoff.Path) or
+		// one a guard no longer shields (the override stripped the
+		// {{if}}) errors only here, never again mid-round. review renders
+		// three shapes: the zero value (the framing every non-handoff
+		// round actually renders), a non-nil Handoff (the guarded branch
+		// of the embedded shape — an override with a broken access behind
+		// a surviving {{if .Handoff}} fails here instead of on the first
+		// oversized diff), and the test-review framing the verdict check
+		// below reads.
+		if _, err := renderOverride(ov, representativeData[name]); err != nil {
+			return fmt.Errorf("prompt overrides: %s: %w", path, err)
+		}
 		if name == "review" {
-			// The wholesale-replacement guard: a review override that
-			// dropped any verdict word would silently break every review
-			// loop — the reviewer would stop ending with a parseable
-			// verdict and each round would burn a NoVerdict strike.
-			for _, v := range reviewVerdicts {
-				if !strings.Contains(string(src), v) {
-					return fmt.Errorf("prompt overrides: review.md is missing %q — the verdict protocol is the machine contract the review loop parses (the reviewer's final line must be exactly one of %s); keep all four verdict words in the text", v, strings.Join(reviewVerdicts, " / "))
+			if _, err := renderOverride(ov, reviewData{Handoff: &DiffHandoff{}}); err != nil {
+				return fmt.Errorf("prompt overrides: %s (with a diff handoff attached): %w", path, err)
+			}
+			// The wholesale-replacement guard runs against the test-review
+			// framing, the one shape that renders all four words: REBUILD
+			// exists only inside {{if .TestsInScope}}, so the zero value
+			// carries three of the four and a byte-verbatim copy of the
+			// embedded prompt — exactly what "daedalus init prompt"
+			// scaffolds — would fail a zero-value check
+			// (backlog/bugs/review-override-verdict-guard-rejects-verbatim-copy.md).
+			// A dropped word — or one carried only where it never renders —
+			// would silently break every review loop, and each round would
+			// burn a NoVerdict strike. Whole-word matching, so DISAPPROVED
+			// cannot vouch for APPROVED.
+			framed, err := renderOverride(ov, reviewData{TestsInScope: true})
+			if err != nil {
+				return fmt.Errorf("prompt overrides: %s (in the test-review framing): %w", path, err)
+			}
+			for i, v := range reviewVerdicts {
+				if !reviewVerdictRes[i].MatchString(framed) {
+					return fmt.Errorf("prompt overrides: review.md is missing %q — the verdict protocol is the machine contract the review loop parses (the reviewer's final line must be exactly one of %s); keep all four verdict words in the rendered text", v, strings.Join(reviewVerdicts, " / "))
 				}
 			}
 		}
@@ -186,12 +215,62 @@ func LoadOverrides(dir, baseDir string) error {
 // believes it will never run a test phase.
 var reviewVerdicts = []string{"APPROVED", "CHANGES_REQUESTED", "NEEDS_MAINTAINER", "REBUILD"}
 
-// checkOverride validates a parsed override against the embedded prompt it
-// replaces: its data-field references must stay within the embedded
-// template's (the render funcs pass fixed data, so a typo'd field would
-// otherwise fail only mid-round), and it must not use {{template}} — an
-// override parses alone, so a reference could only fail (or recurse into
-// itself) at render time.
+// reviewVerdictRes mirrors reviewVerdicts with whole-word matchers for the
+// rendered-text guard: \b treats the tail of DISAPPROVED as inside another
+// word, so a substring hit cannot vouch for a verdict the prompt never
+// states.
+var reviewVerdictRes = func() []*regexp.Regexp {
+	res := make([]*regexp.Regexp, len(reviewVerdicts))
+	for i, w := range reviewVerdicts {
+		res[i] = regexp.MustCompile(`\b` + w + `\b`)
+	}
+	return res
+}()
+
+// renderOverride executes an override against data — the startup
+// validation's render. It is render's execute-without-install twin: the
+// installed set is not written yet, and the output is checked, not kept.
+func renderOverride(ov *template.Template, data any) (string, error) {
+	var b strings.Builder
+	if err := ov.Execute(&b, data); err != nil {
+		return "", fmt.Errorf("does not render against the prompt's data: %w", err)
+	}
+	return b.String(), nil
+}
+
+// representativeData maps each prompt to the data its startup render runs
+// against — the zero value of the prompt's data struct, defined right next
+// to every struct so a new prompt cannot be added without being on the
+// list (a missing key renders against nil and misses field errors).
+var representativeData = map[string]any{
+	"bugfix":           bugfixData{},
+	"bugfix_fix":       bugfixFixData{},
+	"continue":         continueData{},
+	"implement":        implementData{},
+	"implement_fix":    implementFixData{},
+	"investigate":      investigateData{},
+	"investigate_fix":  investigateFixData{},
+	"rebuild":          rebuildData{},
+	"refactor":         refactorData{},
+	"refactor_fix":     refactorFixData{},
+	"review":           reviewData{},
+	"slim_fix":         slimFixData{},
+	"slim_parse":       slimParseData{},
+	"slim_parse_reask": slimParseReaskData{},
+	"slim_plan":        slimPlanData{},
+	"slim_step":        slimStepData{},
+	"tests":            testsData{},
+	"tests_failed":     testsFailedData{},
+	"tests_review":     testsReviewData{},
+}
+
+// checkOverride is the cheap structural pre-filter of a parsed override
+// against the embedded prompt it replaces: its data-field references must
+// stay within the embedded template's, and it must not use {{template}} —
+// an override parses alone, so a reference could only fail (or recurse
+// into itself) at render time. LoadOverrides' startup render is the real
+// gate; this check stays first because its error names the offending field
+// without needing any data.
 func checkOverride(name string, emb, ov *template.Template) error {
 	allowed, err := dataFields(emb.Tree.Root)
 	if err != nil {
@@ -224,8 +303,9 @@ func checkOverride(name string, emb, ov *template.Template) error {
 // ({{range .Xs}}{{.Typo}}{{end}}) is collected as a root field and checked
 // against the root's data — ponytail: that can reject a legitimate
 // override, and the error names the fix (write it as .Xs.Typo). Tracking
-// dot's real type through range/with needs the data structs' types, which
-// the render funcs keep anonymous.
+// dot's real type through range/with is a typechecker's job; LoadOverrides'
+// startup render exercises references at their real scope instead, so this
+// walk stays first-level-only on purpose.
 func dataFields(n parse.Node) (map[string]bool, error) {
 	fields := map[string]bool{}
 	var walk func(parse.Node) error
@@ -334,6 +414,16 @@ type Jail struct {
 	Spec    string
 }
 
+// implementData is implement.md's data. Every prompt's data is a named
+// type for one reason: LoadOverrides startup-renders each override against
+// the prompt's zero value, so a reference that only fails at render time
+// (a nested access, a guard an edit stripped) fails the worker's start
+// instead of the round.
+type implementData struct {
+	Task, BugDir string
+	TouchesJail  bool
+}
+
 // Implement builds the phase-1 opener: the issue task, framed so the
 // implementation phase excludes tests — the test suite gets its own reviewed
 // phase. bugDir is the configured out-of-scope-bug filing folder; empty
@@ -342,20 +432,26 @@ type Jail struct {
 // gets the carve-out branch: editing .ai-jail is in scope instead of
 // barred.
 func Implement(task, bugDir string) (string, error) {
-	return render("implement", struct {
-		Task, BugDir string
-		TouchesJail  bool
-	}{task, bugDir, TaskTouchesJail(task)})
+	return render("implement", implementData{task, bugDir, TaskTouchesJail(task)})
+}
+
+// continueData is continue.md's data.
+type continueData struct {
+	Task          string
+	PriorFeedback string
 }
 
 // Continue builds the phase-1 opener for a resumed run: the new task, the
 // framing that the worktree already contains an aborted attempt's work, and
 // that attempt's last review feedback when available.
 func Continue(task, priorFeedback string) (string, error) {
-	return render("continue", struct {
-		Task          string
-		PriorFeedback string
-	}{task, priorFeedback})
+	return render("continue", continueData{task, priorFeedback})
+}
+
+// implementFixData is implement_fix.md's data.
+type implementFixData struct {
+	Comments    string
+	TouchesJail bool
 }
 
 // ImplementFix feeds code-review comments back to the implementing agent
@@ -368,17 +464,17 @@ func ImplementFix(comments string, jail ...Jail) (string, error) {
 	if len(jail) > 0 {
 		j = jail[0]
 	}
-	return render("implement_fix", struct {
-		Comments    string
-		TouchesJail bool
-	}{comments, j.Touches})
+	return render("implement_fix", implementFixData{comments, j.Touches})
 }
+
+// testsData is tests.md's data.
+type testsData struct{ BugDir string }
 
 // Tests opens phase 2: the agent writes or improves the test suite covering
 // the change. bugDir is the configured out-of-scope-bug filing folder; empty
 // drops the file-filing instruction from the bug policy.
 func Tests(bugDir string) (string, error) {
-	return render("tests", struct{ BugDir string }{bugDir})
+	return render("tests", testsData{bugDir})
 }
 
 // TestsFix feeds phase-2 (tests ↔ test review) failures back to the agent:
@@ -387,14 +483,14 @@ func Tests(bugDir string) (string, error) {
 func TestsFix(testLogs, comments string) (string, error) {
 	var parts []string
 	if testLogs != "" {
-		p, err := render("tests_failed", struct{ Logs string }{testLogs})
+		p, err := render("tests_failed", testsFailedData{testLogs})
 		if err != nil {
 			return "", err
 		}
 		parts = append(parts, p)
 	}
 	if comments != "" {
-		p, err := render("tests_review", struct{ Comments string }{comments})
+		p, err := render("tests_review", testsReviewData{comments})
 		if err != nil {
 			return "", err
 		}
@@ -402,6 +498,12 @@ func TestsFix(testLogs, comments string) (string, error) {
 	}
 	return strings.Join(parts, "\n\n"), nil
 }
+
+// testsFailedData is tests_failed.md's data.
+type testsFailedData struct{ Logs string }
+
+// testsReviewData is tests_review.md's data.
+type testsReviewData struct{ Comments string }
 
 // DiffHandoff routes an oversized review diff to a worktree file: the
 // prompt then carries the change digest, the per-file table of contents,
@@ -541,50 +643,71 @@ func SlimReview(focus, diff, testLogs, bugDir string, criteria []string, extra .
 	})
 }
 
+// rebuildData is rebuild.md's data.
+type rebuildData struct{ Finding string }
+
 // Rebuild feeds a test-review REBUILD finding back to the implementing
 // agent: a tight, finding-only prompt — the change was already code- and
 // test-reviewed once, so the template fences the agent against reworking
 // anything the finding does not demand.
 func Rebuild(finding string) (string, error) {
-	return render("rebuild", struct{ Finding string }{finding})
+	return render("rebuild", rebuildData{finding})
 }
+
+// investigateData is investigate.md's data.
+type investigateData struct{ Task string }
 
 // Investigate opens a docs-only investigation run: analysis and written
 // deliverables, no code changes.
 func Investigate(task string) (string, error) {
-	return render("investigate", struct{ Task string }{task})
+	return render("investigate", investigateData{task})
 }
+
+// investigateFixData is investigate_fix.md's data.
+type investigateFixData struct{ Comments string }
 
 // InvestigateFix feeds docs-review comments back to the agent inside the
 // investigation loop.
 func InvestigateFix(comments string) (string, error) {
-	return render("investigate_fix", struct{ Comments string }{comments})
+	return render("investigate_fix", investigateFixData{comments})
 }
+
+// refactorData is refactor.md's data.
+type refactorData struct{ Task string }
 
 // Refactor opens a behavior-frozen refactoring run: structure only, the
 // existing suite green and untouched.
 func Refactor(task string) (string, error) {
-	return render("refactor", struct{ Task string }{task})
+	return render("refactor", refactorData{task})
 }
+
+// refactorFixData is refactor_fix.md's data.
+type refactorFixData struct{ Logs, Comments string }
 
 // RefactorFix feeds a refactoring round's failure back to the agent: the
 // frozen suite's red output, the review comments, or both. Empty arguments
 // are omitted.
 func RefactorFix(testLogs, comments string) (string, error) {
-	return render("refactor_fix", struct{ Logs, Comments string }{testLogs, comments})
+	return render("refactor_fix", refactorFixData{testLogs, comments})
 }
+
+// bugfixData is bugfix.md's data.
+type bugfixData struct{ Task string }
 
 // BugFix opens a test-first bug-fix run: the repro test and the minimal fix
 // in one deliverable.
 func BugFix(task string) (string, error) {
-	return render("bugfix", struct{ Task string }{task})
+	return render("bugfix", bugfixData{task})
 }
+
+// bugfixFixData is bugfix_fix.md's data.
+type bugfixFixData struct{ Logs, Comments string }
 
 // BugFixFix feeds a bug-fix round's failure back to the agent: the suite's
 // red output (or the repro-first gate's refusal), the review comments, or
 // both. Empty arguments are omitted.
 func BugFixFix(testLogs, comments string) (string, error) {
-	return render("bugfix_fix", struct{ Logs, Comments string }{testLogs, comments})
+	return render("bugfix_fix", bugfixFixData{testLogs, comments})
 }
 
 // SlimSubtask is one atomized unit of the slim flow's plan — the JSON
@@ -600,42 +723,59 @@ type SlimSubtask struct {
 	AcceptanceCriteria []string `json:"acceptance_criteria"`
 }
 
+// slimPlanData is slim_plan.md's data.
+type slimPlanData struct{ Task string }
+
 // SlimPlan builds the slim flow's planner opener: the task, deconstructed
 // in prose into a strictly ordered queue of atomic sub-tasks. Pure
 // generation — no JSON contract; transcription into the machine queue is
 // the parse round's job (SlimParse).
 func SlimPlan(task string) (string, error) {
-	return render("slim_plan", struct{ Task string }{task})
+	return render("slim_plan", slimPlanData{task})
 }
+
+// slimParseData is slim_parse.md's data.
+type slimParseData struct{ Plan string }
 
 // SlimParse builds the slim flow's parse round: the planner's prose plan,
 // transcribed into the raw SlimSubtask JSON array the loop executes. The
 // round runs in the planner's conversation, so its reply joins the plan in
 // the worker's progressive context.
 func SlimParse(plan string) (string, error) {
-	return render("slim_parse", struct{ Plan string }{plan})
+	return render("slim_parse", slimParseData{plan})
 }
+
+// slimParseReaskData is slim_parse_reask.md's data.
+type slimParseReaskData struct{ Error string }
 
 // SlimParseReask builds the parse round's one strict re-ask: the parse
 // failure, delivered into the parse round's own conversation — the model
 // sees its previous reply and corrects it.
 func SlimParseReask(parseErr string) (string, error) {
-	return render("slim_parse_reask", struct{ Error string }{parseErr})
+	return render("slim_parse_reask", slimParseReaskData{parseErr})
+}
+
+// slimStepData is slim_step.md's data.
+type slimStepData struct {
+	Index, Total int
+	Subtask      SlimSubtask
 }
 
 // SlimStep builds the slim worker prompt for one sub-task (1-based index
 // of total): implement only this sub-task, in the dev conversation that
 // already carries the plan and every completed sub-task before it.
 func SlimStep(index, total int, st SlimSubtask) (string, error) {
-	return render("slim_step", struct {
-		Index, Total int
-		Subtask      SlimSubtask
-	}{index, total, st})
+	return render("slim_step", slimStepData{index, total, st})
+}
+
+// slimFixData is slim_fix.md's data.
+type slimFixData struct {
+	Description, Logs, Comments string
 }
 
 // SlimFix feeds a slim sub-task round's failure back to the worker: the
 // suite's red output, the reviewer's comments, or both. Empty arguments
 // are omitted.
 func SlimFix(description, testLogs, comments string) (string, error) {
-	return render("slim_fix", struct{ Description, Logs, Comments string }{description, testLogs, comments})
+	return render("slim_fix", slimFixData{description, testLogs, comments})
 }

@@ -12,7 +12,9 @@ command = [
 rw_maps = [
     "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-bug-fix-round4/backlog/bugs",
     "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-bug-fix-round4/.daedalus-folders/daedalus",
-    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-bug-fix-round4/backlog/bugs",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-bug-fix-round4.2/backlog/bugs",
+    "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-bug-fix-round4.2/.daedalus-folders/daedalus",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-bug-fix-round4.2/backlog/bugs",
 ]
 mask = [
     ".claude/settings.json",

@@ -415,6 +415,68 @@ type TestOutputConfig struct {
 	Mirror string `yaml:"mirror"`
 }
 
+// DependencyConfig governs what a run does when its `depends_on`
+// dependency stops without approval. The default posture is still the
+// refusal the gate has always had — the run fails before anything was
+// started — because the skip flags all default false and an empty
+// fallback_branch gives a release nowhere to land. opting into
+// `fallback_branch` turns the gate from a wall into a switch: a dependency
+// that stopped in a skip-listed state releases the waiting run onto that
+// branch instead of failing it.
+type DependencyConfig struct {
+	// Enabled gates the whole section: false restores the unconditional
+	// refusal whatever the other fields say. Default true; tri-state
+	// (*bool) because applyDefaults cannot tell an explicit false from an
+	// unset field — the same idiom as SharedTestQueue.
+	Enabled *bool `yaml:"enabled"`
+	// FallbackBranch names the branch a released run starts its worktree
+	// from. Empty — the default — means the invocation branch, resolved
+	// once at submit against the run's repo (a detached HEAD refuses with
+	// the error naming this key as the fix). An explicitly set branch is
+	// verified to exist at submit, so a typo fails the run before the
+	// dependency gate instead of after it. The resolved name travels in
+	// the workflow input, so a config edit mid-run cannot retarget an
+	// in-flight chain.
+	FallbackBranch string `yaml:"fallback_branch"`
+	// SkipParked releases a run past a dependency that ended in a park
+	// (preserved on its aborted branch, resumable with `daedalus
+	// continue`). Default true — a parked dependency is the one stopped
+	// state whose work survives, so its dependent is routinely started
+	// rather than stranded; tri-state like Enabled for the same reason.
+	SkipParked *bool `yaml:"skip_parked"`
+	// SkipFailed releases past a dependency whose workflow failed. Default
+	// false: a failed dependency produced nothing to build on.
+	SkipFailed bool `yaml:"skip_failed"`
+	// SkipStuck releases past a dependency that ran past its Temporal
+	// timeouts and was killed (status "timed out"). Default false.
+	SkipStuck bool `yaml:"skip_stuck"`
+	// SkipCanceled releases past a dependency that was canceled or
+	// terminated. Default false.
+	SkipCanceled bool `yaml:"skip_canceled"`
+}
+
+// EnabledOrDefault reports the section's effective enabled: true unless an
+// explicit false was loaded (the default — nil — is on).
+func (d DependencyConfig) EnabledOrDefault() bool {
+	return d.Enabled == nil || *d.Enabled
+}
+
+// SkipParkedOrDefault reports the effective skip_parked: true unless an
+// explicit false was loaded (the default — nil — is on).
+func (d DependencyConfig) SkipParkedOrDefault() bool {
+	return d.SkipParked == nil || *d.SkipParked
+}
+
+// ReleasePosture reports whether the section can release a dependent run
+// past a dependency that stopped without approval: enabled, with a
+// fallback branch resolved. Both the submit preflight and the workflow
+// gate key on it; which stopped states actually release is the skip flags'
+// decision (workflows.dependencyReleases), and a paused or vanished
+// dependency is outside every skip set.
+func (d DependencyConfig) ReleasePosture() bool {
+	return d.EnabledOrDefault() && d.FallbackBranch != ""
+}
+
 // SlimConfig is the slim mode section. Intentionally breaking reshape
 // (2026-10-02): the historical top-level `slim: true/false` boolean became
 // this section — existing configs migrate by renaming the value to
@@ -594,6 +656,10 @@ type Config struct {
 	// TestOutput is the suite-output dump toggle; inactive unless Enabled
 	// (see TestOutputConfig).
 	TestOutput TestOutputConfig `yaml:"test_output"`
+	// Dependency governs the -dep gate's broken-chain answer: refuse (the
+	// historical default) or release onto a fallback branch (see
+	// DependencyConfig).
+	Dependency DependencyConfig `yaml:"dependency"`
 	// Prompt points at a directory of prompt-template overrides: every .md
 	// file directly inside it whose file stem names a prompt (the
 	// internal/template Prompts — the embedded prompts/*.md stems:
@@ -608,8 +674,14 @@ type Config struct {
 	// that does not parse, a data field the prompt does not take, a
 	// {{template}} action, a {{define}}/{{block}} block (a define or
 	// block body can never render in an override — the sole exception is
-	// a define named exactly <prompt-name>.md; don't rely on it), or a
-	// review override missing the verdict protocol all fail the start);
+	// a define named exactly <prompt-name>.md; don't rely on it), a render
+	// against the prompt's representative data that fails (a reference
+	// that only breaks at render time — a nested access, or one whose
+	// {{if}} guard an edit stripped; review renders further times with a
+	// diff handoff attached and in the test-review framing), or a review
+	// override missing the verdict
+	// protocol in its rendered text (checked in the test-review framing,
+	// the one shape where the fourth verdict renders) all fail the start);
 	// rendered prompts
 	// are recorded in workflow history, so replacement content is not
 	// secret and may live on the same path as the config. Empty — the
@@ -617,7 +689,8 @@ type Config struct {
 	// A string, not a name→path mapping, so Config stays ==-comparable; the
 	// one directory keeps a deployment's replacements together. Note the
 	// machine contracts a replacement must keep: review's verdict protocol
-	// is validated at startup, and slim_parse must keep instructing the
+	// is validated at startup (all four verdict words, whole words, in the
+	// rendered text), and slim_parse must keep instructing the
 	// parse round to emit the raw SlimSubtask JSON array parseSlimPlan
 	// reads (caveat, not validated); slim_plan's replacement carries no
 	// such contract — it is pure generation, a prose plan with no JSON,
@@ -689,6 +762,7 @@ type renderConfig struct {
 	Reviewer               ReviewerConfig   `yaml:"reviewer"`
 	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
 	TestOutput             TestOutputConfig `yaml:"test_output"`
+	Dependency             DependencyConfig `yaml:"dependency"`
 	Prompt                 string           `yaml:"prompt"`
 }
 
@@ -719,6 +793,7 @@ func (c Config) RenderYAML() (string, error) {
 		Reviewer:               c.Reviewer,
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
+		Dependency:             c.Dependency,
 		Prompt:                 c.Prompt,
 	})
 	return string(out), err

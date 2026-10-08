@@ -475,6 +475,37 @@ test_output:
   dir: ""
   mirror: ""
 
+# What a run chained behind another (-dep/--depends) does when its
+# dependency stops without approval. The default — every skip flag false,
+# no fallback branch — is the historical refusal: the waiting run fails
+# before any worktree, branch, or round existed, and re-submitting the
+# chain is your decision. Setting fallback_branch turns the gate into a
+# switch: a dependency that stops in a skip-listed state releases the
+# waiting run, which starts its worktree from that branch instead of
+# failing. fallback_branch empty (the default) means the branch you
+# submitted the run from, resolved once at submit (a detached HEAD refuses
+# and names this key as the fix); an explicitly set branch is verified to
+# exist at submit, so a typo fails the run before the dependency gate
+# instead of after it; the resolved name is frozen into the run,
+# so a config edit cannot retarget an in-flight chain. skip_parked defaults
+# true: a parked dependency is the one stopped state whose work survives on
+# its aborted branch (resumable with "daedalus continue"), so its
+# dependent routinely starts rather than strands. skip_failed, skip_stuck
+# (the dependency ran past its timeouts and was killed), and skip_canceled
+# (canceled or terminated) default false — a dependency that died those
+# ways produced nothing to build on, and releasing past one is an explicit
+# choice. A paused dependency is outside every skip set: it has not
+# stopped, so the gate waits and logs the unpause line
+# ("temporal workflow unpause"). enabled: false restores the unconditional
+# refusal whatever the other fields say.
+dependency:
+  enabled: true
+  fallback_branch: ""
+  skip_parked: true
+  skip_failed: false
+  skip_stuck: false
+  skip_canceled: false
+
 # Project-wise prompt overrides. Empty (the default): every round's prompt
 # renders byte-identically to the embedded templates in
 # internal/template/prompts. When set, this names a directory of
@@ -499,11 +530,21 @@ test_output:
 # block (a define or block body can never render in an override — the
 # sole exception is a define named exactly <prompt-name>.md; don't rely
 # on it), or a review override missing the verdict protocol all fail the
-# start, never a mid-round render. Two machine contracts a replacement
+# start, never a mid-round render. Every override is also render-tested at
+# startup against the prompt's representative data (its zero value; review
+# renders further times with a diff handoff attached and in the
+# test-review framing, exercising its guarded branches), so a reference
+# that parses but only fails at render —
+# a nested access, or one whose {{if}} guard an edit stripped — fails the
+# start too. Two machine contracts a replacement
 # must keep: review
-# is validated at startup to still carry all four verdict words (APPROVED,
+# is validated at startup to keep all four verdict words (APPROVED,
 # CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD — the reviewer's final line
-# protocol the loop parses), and slim_parse must keep instructing the
+# protocol the loop parses) in its rendered text — checked in the
+# test-review framing, the one shape where the fourth verdict renders —
+# as whole words —
+# DISAPPROVED cannot vouch for APPROVED — and slim_parse must keep
+# instructing the
 # parse round to emit the raw SlimSubtask JSON array the plan parser reads
 # (unvalidated — check it by hand); slim_plan's replacement carries no
 # such contract — it is pure generation, a prose plan with no JSON, which

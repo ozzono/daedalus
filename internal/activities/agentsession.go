@@ -449,17 +449,17 @@ func sameDir(a, b string) bool {
 	return a != "" && filepath.Clean(a) == filepath.Clean(b)
 }
 
-// opencodeSession is one entry of `opencode session list --format json`
-// (probe-verified shape, opencode 1.18.31: id, directory, created,
-// updated, projectId, title). Only the fields the tracking and the CLI's
-// task-status brief need are modeled; the rest of each entry is ignored.
-// Updated stays a RawMessage: its value spelling is unprobed, and a typed
-// field would fail the whole list's parse — and with it opencode's session
-// tracking — if opencode emits a number instead of the string convention.
+// opencodeSession is one entry of `opencode session list --format json`.
+// Only the fields the tracking and the CLI's task-status brief need are
+// modeled; the rest of each entry is ignored. Updated is epoch
+// milliseconds (probe-verified against a brew-installed opencode v2.0.25:
+// a live session listed as `"updated": 1791468020161`, a JSON number —
+// the RFC3339 string this field once assumed would have failed the whole
+// list's parse on v2, blinding both tracking and the status brief).
 type opencodeSession struct {
-	ID        string          `json:"id"`
-	Directory string          `json:"directory"`
-	Updated   json.RawMessage `json:"updated"`
+	ID        string `json:"id"`
+	Directory string `json:"directory"`
+	Updated   int64  `json:"updated"`
 }
 
 // opencodeListTimeout bounds one `opencode session list` invocation — the
@@ -559,9 +559,11 @@ func opencodeTranscriptExists(worktree, id string) bool {
 // (`daedalus log <id> --status`): opencode keeps no transcript files, so
 // its session database's updated stamp is the only freshness signal the
 // host can read. ok is false when opencode lists no session for the
-// worktree, the command fails, or no listed stamp parses — an
-// unparseable stamp drops its session from the scan rather than misdating
-// it.
+// worktree, the command fails, or every listed stamp is missing or zero —
+// a stampless entry drops its session from the scan rather than misdating
+// it (a non-numeric stamp fails the whole array's decode instead, and the
+// scan stays off for the round — the same tracking-off posture
+// opencodeSessionList already takes on an unparseable list).
 func OpencodeNewestUpdate(worktree string) (time.Time, bool) {
 	sessions, ok := opencodeSessionList()
 	if !ok {
@@ -573,18 +575,12 @@ func OpencodeNewestUpdate(worktree string) (time.Time, bool) {
 		if !sameDir(s.Directory, worktree) {
 			continue
 		}
-		// ponytail: the updated stamp's exact spelling is unprobed — this
-		// sandbox has no opencode binary — so only the string convention
-		// (RFC3339 is the JSON norm) feeds the freshness scan; a number or
-		// an exotic layout silently drops the session from it.
-		var stamp string
-		if json.Unmarshal(s.Updated, &stamp) != nil {
+		if s.Updated <= 0 {
+			// A session with no stamp (the field absent decodes to 0)
+			// cannot date anything.
 			continue
 		}
-		t, err := time.Parse(time.RFC3339, stamp)
-		if err != nil {
-			continue
-		}
+		t := time.UnixMilli(s.Updated)
 		if !found || t.After(newest) {
 			newest, found = t, true
 		}

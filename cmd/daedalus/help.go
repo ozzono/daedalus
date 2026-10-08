@@ -131,7 +131,16 @@ FLAGS
                           stays a fresh task, not a continuation). A dependency
                           that stops without approval (failed, parked,
                           canceled, timed out, wiped) fails the run before
-                          anything was started. Chains compose (run-c depends
+                          anything was started — unless the config's
+                          dependency section releases it: a fallback_branch
+                          (default: the branch you submitted from; an
+                          explicitly named branch is verified to exist at
+                          submit) plus the
+                          skip flags (skip_parked on by default) turn that
+                          refusal into a release onto the fallback branch; a
+                          paused dependency is never skipped — the gate waits
+                          ("temporal workflow unpause" resumes it). Chains
+                          compose (run-c depends
                           on run-b, which depends on run-a); a dependency that
                           is already approved at submit skips the wait
                           entirely. The id is verbatim from "daedalus list";

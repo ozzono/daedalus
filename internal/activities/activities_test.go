@@ -1899,7 +1899,8 @@ func TestParseReviewVerdict(t *testing.T) {
 
 func TestRunJailedReviewerActivityApproved(t *testing.T) {
 	log := newStubLog(t)
-	// git -C <wt> add -N -A, then git -C <wt> diff prints the diff.
+	// git -C <wt> add -N -A, then git -C <wt> diff HEAD prints the diff, then
+	// git -C <wt> reset -q restores the index.
 	// argv: -C <wt> <subcmd> ... — the subcommand is $3.
 	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
 exit 0`)
@@ -1921,15 +1922,16 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 3 {
-		t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+	if len(calls) != 4 {
+		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
 	}
 	assertArgs(t, calls[0].Args, []string{"-C", worktree, "add", "-N", "-A"}, "git add")
-	assertArgs(t, calls[1].Args, []string{"-C", worktree, "diff"}, "git diff")
+	assertArgs(t, calls[1].Args, []string{"-C", worktree, "diff", "HEAD"}, "git diff")
+	assertArgs(t, calls[2].Args, []string{"-C", worktree, "reset", "-q"}, "git reset")
 
 	// The reviewer prompt must carry the focus, the diff, and the verdict
 	// instructions — via stdin, like every prompt.
-	jailed := calls[2]
+	jailed := calls[3]
 	for _, want := range []string{"the implementation", "M foo.go", "APPROVED", "CHANGES_REQUESTED"} {
 		if !strings.Contains(jailed.Stdin, want) {
 			t.Errorf("reviewer prompt should mention %q", want)
@@ -1962,12 +1964,12 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 3 {
-		t.Fatalf("%d subprocess calls, want 3", len(calls))
+	if len(calls) != 4 {
+		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
 	}
 	// Test logs given to the reviewer must reach its prompt.
 	for _, want := range []string{"Latest test run output", "--- FAIL: TestBoom"} {
-		if !strings.Contains(calls[2].Stdin, want) {
+		if !strings.Contains(calls[3].Stdin, want) {
 			t.Errorf("reviewer prompt should mention %q", want)
 		}
 	}
@@ -1994,10 +1996,10 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 3 {
-		t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+	if len(calls) != 4 {
+		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
 	}
-	assertArgs(t, calls[2].Args, slices.Concat(
+	assertArgs(t, calls[3].Args, slices.Concat(
 		[]string{"--worktree",
 			"--network",
 			"--mask",
@@ -2068,10 +2070,10 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 3 {
-		t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+	if len(calls) != 4 {
+		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
 	}
-	assertArgs(t, calls[2].Args, []string{
+	assertArgs(t, calls[3].Args, []string{
 		"--worktree",
 		"--network",
 		"--mask",
@@ -4373,14 +4375,14 @@ exit 0`)
 				t.Error("Approved = false, want true")
 			}
 			calls := readCalls(t, log)
-			if len(calls) != 3 {
-				t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+			if len(calls) != 4 {
+				t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
 			}
-			if tc.want != "" && !strings.Contains(calls[2].Stdin, tc.want) {
-				t.Errorf("reviewer prompt should carry the bug dir %q, got %q", tc.want, calls[2].Stdin)
+			if tc.want != "" && !strings.Contains(calls[3].Stdin, tc.want) {
+				t.Errorf("reviewer prompt should carry the bug dir %q, got %q", tc.want, calls[3].Stdin)
 			}
-			if tc.notWant != "" && strings.Contains(calls[2].Stdin, tc.notWant) {
-				t.Errorf("reviewer prompt should not carry a file-filing instruction, got %q", calls[2].Stdin)
+			if tc.notWant != "" && strings.Contains(calls[3].Stdin, tc.notWant) {
+				t.Errorf("reviewer prompt should not carry a file-filing instruction, got %q", calls[3].Stdin)
 			}
 		})
 	}

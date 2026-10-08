@@ -13,6 +13,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/template"
 )
 
@@ -134,6 +135,18 @@ type PipelineInput struct {
 	// started. Empty — no chain, or a run whose input predates the field —
 	// skips the gate entirely, replay-safe like every other input field.
 	DependsOn string
+	// Dependency carries the config dependency section, resolved at start
+	// (cmd.startPipelineFolders fills FallbackBranch with the invocation
+	// branch when the section is enabled and the key unset). The gate reads
+	// it to release a run past a dependency that stopped without approval
+	// (dependencyReleases); the fallback lands in WorktreeInput.BaseBranch,
+	// same as an approving dependency's preserved branch. The zero value —
+	// a run whose input predates the field, a run with no -dep, a section
+	// left disabled, or a release that never resolved a branch — keeps the
+	// historical refusal on every broken chain: Enabled nil reads true, but
+	// the empty FallbackBranch refuses, replay-safe in the loud direction
+	// like every zero-value fallback here.
+	Dependency config.DependencyConfig
 }
 
 // maxConsecutiveTimeouts caps how many timed-out rounds in a row the
@@ -584,7 +597,10 @@ func testFixPrompt(result activities.TestResult, verdict activities.ReviewResult
 // output an agent printed can fail a review that would have heartbeated;
 // accepted because the sizes are static (the same prompt is re-sent by
 // every retry), so the misclassification only skips retries that could
-// never succeed.
+// never succeed. The one refinement over a bare text match is kill
+// precedence, refused in isPromptOverflow itself so no call site can
+// forget it: a wall-clock kill whose earlier stdout happened to echo a
+// marker is a retryable death, not a static failure.
 var promptOverflowMarkers = []string{
 	"Prompt is too long",
 	"context_length_exceeded",
@@ -598,8 +614,19 @@ var promptOverflowMarkers = []string{
 // handoff keeps initial reviewer prompts under the window; this is the
 // mid-round backstop (a conversation grown past the window by its own tool
 // traffic, or test logs the budget does not cover).
+//
+// A killed round is refused before the text match: the kill wraps carry no
+// output by design, but the refusal keeps a marker echoed into an earlier
+// round's stdout from classifying a later wall-clock death terminal. (An
+// envelope-only match — markers checked against only the structured
+// "round died on an api error" report — was tried here and reverted: the
+// plain exhaustion wraps carry no envelope, so real aider/opencode/codex
+// overflows and text-faced claude/pi overflows fell through to the quota
+// heartbeat and burned its five hourly retries before parking, on a prompt
+// whose size is static and unfixable by retry. See
+// backlog/bugs/prompt-overflow-envelope-only-misclassifies-text-overflows.md.)
 func isPromptOverflow(err error) bool {
-	if err == nil {
+	if err == nil || isAgentKilled(err) {
 		return false
 	}
 	msg := err.Error()

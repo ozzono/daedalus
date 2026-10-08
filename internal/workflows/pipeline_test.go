@@ -3215,6 +3215,10 @@ func TestIsPromptOverflow(t *testing.T) {
 		{"wrapped", fmt.Errorf("review %q: %w", "the implementation", errors.New("Prompt is too long")), true},
 		{"quota exhaustion", errQuotaStub, false},
 		{"killed round", errors.New("agent killed by SIGKILL"), false},
+		// Kill precedence: a wall-clock kill whose earlier stdout happened to
+		// echo a marker is a retryable death, not a static failure — the kill
+		// is refused before the text match runs.
+		{"killed round whose output echoed an overflow marker", errors.New(activities.ErrAgentKilled.Error() + ": Prompt is too long: 250000 tokens > 200000 limit"), false},
 		{"ordinary failure", errReviewStub, false},
 		{"no error", nil, false},
 	} {

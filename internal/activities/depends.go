@@ -58,6 +58,14 @@ func NewCheckDependencyActivity(c client.Client) func(context.Context, string) (
 		switch s := resp.GetWorkflowExecutionInfo().GetStatus(); s {
 		case enums.WORKFLOW_EXECUTION_STATUS_RUNNING, enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
 			return DependencyProbe{Status: "running"}, nil
+		case enums.WORKFLOW_EXECUTION_STATUS_PAUSED:
+			// Paused is resumable (`temporal workflow unpause`), not
+			// terminal — the old default case reported it Terminal, so a
+			// maintainer pausing a dependency failed every run chained
+			// behind it with "the chain is broken". The gate keeps polling;
+			// the status names the hold so the gate can log the unpause
+			// line.
+			return DependencyProbe{Status: "paused"}, nil
 		case enums.WORKFLOW_EXECUTION_STATUS_COMPLETED:
 			var result string
 			if err := c.GetWorkflow(ctx, workflowID, "").Get(ctx, &result); err != nil {
