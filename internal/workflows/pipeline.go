@@ -13,6 +13,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/template"
 )
 
@@ -59,6 +60,16 @@ type PipelineInput struct {
 	// folded into the opening prompt.
 	BaseBranch    string
 	PriorFeedback string
+	// BaselineValidated, set by `daedalus continue` when the attempt
+	// chain's history shows a green native-suite execution — this link's
+	// own (the preflight gate's pass, or a green suite round after it) or
+	// an earlier link's flag threaded forward — is the only thing
+	// preFlightGate skips on. False — a fresh run, a run whose input
+	// predates the field, or the continue of a chain that has never
+	// recorded one (parked by the gate, died at or before it, started
+	// before the gate existed) — runs the gate: replay-safe in the loud
+	// direction, like every zero-value fallback here.
+	BaselineValidated bool
 	// Agent, set by `run -cli/--cli`, overrides the config's jailed agent
 	// for this run; empty — a run whose input predates the field, replayed
 	// by a newer worker — falls back to the worker's DAEDALUS_AGENT.
@@ -124,6 +135,18 @@ type PipelineInput struct {
 	// started. Empty — no chain, or a run whose input predates the field —
 	// skips the gate entirely, replay-safe like every other input field.
 	DependsOn string
+	// Dependency carries the config dependency section, resolved at start
+	// (cmd.startPipelineFolders fills FallbackBranch with the invocation
+	// branch when the section is enabled and the key unset). The gate reads
+	// it to release a run past a dependency that stopped without approval
+	// (dependencyReleases); the fallback lands in WorktreeInput.BaseBranch,
+	// same as an approving dependency's preserved branch. The zero value —
+	// a run whose input predates the field, a run with no -dep, a section
+	// left disabled, or a release that never resolved a branch — keeps the
+	// historical refusal on every broken chain: Enabled nil reads true, but
+	// the empty FallbackBranch refuses, replay-safe in the loud direction
+	// like every zero-value fallback here.
+	Dependency config.DependencyConfig
 }
 
 // maxConsecutiveTimeouts caps how many timed-out rounds in a row the
@@ -494,6 +517,30 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 // repository has no suite at all (activities.ErrNoSuite) passes vacuously:
 // nothing can be red when nothing exists — a greenfield repo is not a red
 // baseline — and the history records why no suite round ran.
+//
+// A continued run (`daedalus continue`) skips the suite execution but
+// keeps the discovery — and only when its input carries
+// BaselineValidated, which `continue` derives from the aborted attempt's
+// own history (the gate's pass, or a green suite round after it) or
+// threads forward from an earlier link's recorded flag — the skip
+// records no suite of its own, so the threading is what keeps a
+// validated chain validated across continues. Such a run's worktree
+// deliberately carries the attempt's
+// mid-flight work, so the old tests measure the in-progress change, not
+// the baseline — and an implementation round may legitimately break one
+// until the test phase updates it. The unchanged done path still
+// requires the full green suite before finalize. A never-validated
+// attempt — parked by this gate, died at or before it, or started before
+// the gate existed — continues into a re-run gate, the pre-change
+// behavior; on a dirty pre-gate-binary worktree that re-run reads
+// mid-flight work as the baseline and may re-park: fail-loud, and rarer
+// than the silent skip keying on the branch alone would have swallowed
+// (backlog/bugs/preflight-skip-continue-unvalidated-baseline.md).
+// ponytail: the skip is unversioned, so a continued run in flight across
+// a worker binary swap replays its recorded gate suite execution against
+// code that no longer issues it — nondeterminism wedge, same accepted
+// class as the unversioned loop caps
+// (backlog/bugs/preflight-skip-replay-nondeterminism.md).
 func (r *pipelineRun) preFlightGate() (string, error) {
 	command, err := r.resolveTestCommand()
 	if err != nil {
@@ -502,6 +549,10 @@ func (r *pipelineRun) preFlightGate() (string, error) {
 			return "", nil
 		}
 		return "", err
+	}
+	if r.input.BaselineValidated {
+		r.logger.Info("Continued run: baseline validated by a green suite round earlier in this chain; skipping the gate", "Command", command)
+		return command, nil
 	}
 	result, err := r.runSuite(command)
 	if err != nil {
@@ -546,7 +597,10 @@ func testFixPrompt(result activities.TestResult, verdict activities.ReviewResult
 // output an agent printed can fail a review that would have heartbeated;
 // accepted because the sizes are static (the same prompt is re-sent by
 // every retry), so the misclassification only skips retries that could
-// never succeed.
+// never succeed. The one refinement over a bare text match is kill
+// precedence, refused in isPromptOverflow itself so no call site can
+// forget it: a wall-clock kill whose earlier stdout happened to echo a
+// marker is a retryable death, not a static failure.
 var promptOverflowMarkers = []string{
 	"Prompt is too long",
 	"context_length_exceeded",
@@ -560,8 +614,19 @@ var promptOverflowMarkers = []string{
 // handoff keeps initial reviewer prompts under the window; this is the
 // mid-round backstop (a conversation grown past the window by its own tool
 // traffic, or test logs the budget does not cover).
+//
+// A killed round is refused before the text match: the kill wraps carry no
+// output by design, but the refusal keeps a marker echoed into an earlier
+// round's stdout from classifying a later wall-clock death terminal. (An
+// envelope-only match — markers checked against only the structured
+// "round died on an api error" report — was tried here and reverted: the
+// plain exhaustion wraps carry no envelope, so real aider/opencode/codex
+// overflows and text-faced claude/pi overflows fell through to the quota
+// heartbeat and burned its five hourly retries before parking, on a prompt
+// whose size is static and unfixable by retry. See
+// backlog/bugs/prompt-overflow-envelope-only-misclassifies-text-overflows.md.)
 func isPromptOverflow(err error) bool {
-	if err == nil {
+	if err == nil || isAgentKilled(err) {
 		return false
 	}
 	msg := err.Error()

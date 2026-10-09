@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -597,11 +598,11 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 3 {
-		t.Fatalf("%d subprocess calls, want 3 (git add, git diff, ai-jail)", len(calls))
+	if len(calls) != 4 {
+		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
 	}
-	if !contains(calls[2].Args, "--resume") || !contains(calls[2].Args, "rev-cut") {
-		t.Errorf("review args %v should resume the recorded reviewer session rev-cut", calls[2].Args)
+	if !contains(calls[3].Args, "--resume") || !contains(calls[3].Args, "rev-cut") {
+		t.Errorf("review args %v should resume the recorded reviewer session rev-cut", calls[3].Args)
 	}
 }
 
@@ -1109,8 +1110,8 @@ exit 0`)
 	if jail == nil {
 		t.Fatal("no ai-jail call recorded")
 	}
-	if len(calls) != 3 {
-		t.Errorf("%d subprocess calls, want 3 (git add, git diff, one fresh ai-jail) — no resume retry may fire", len(calls))
+	if len(calls) != 4 {
+		t.Errorf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, one fresh ai-jail) — no resume retry may fire", len(calls))
 	}
 	if contains(jail.Args, "--resume") || contains(jail.Args, "rev-past") {
 		t.Errorf("fresh review args %v must start clean, not resume rev-past", jail.Args)
@@ -1561,42 +1562,50 @@ func TestRecordedOpencodeSession(t *testing.T) {
 }
 
 // TestOpencodeNewestUpdate pins the freshness scan behind the CLI's
-// task-status brief: the newest parseable updated stamp among this
-// worktree's sessions wins, other directories' sessions never count, and a
-// stamp that does not parse — a number where the string convention is
-// expected, or an exotic layout — drops its own session from the scan
-// rather than misdating the worktree. A failed list reports not-ok.
+// task-status brief: the newest updated stamp among this worktree's
+// sessions wins, other directories' sessions never count, and the stamp is
+// epoch milliseconds — the live v2 shape a typed int64 decodes (the
+// RFC3339 string this scan once assumed fails the whole list's decode on
+// v2, blinding the scan). A non-numeric stamp fails the list's decode the
+// same way, so the scan stays off for the round rather than misdate the
+// worktree, and an entry with no stamp at all drops out of the scan. A
+// failed list reports not-ok.
 func TestOpencodeNewestUpdate(t *testing.T) {
 	wt := t.TempDir()
-	old := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
-	new := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	old := time.Now().Add(-2 * time.Hour).UTC().UnixMilli()
+	new := time.Now().Add(-time.Hour).UTC().UnixMilli()
 
 	t.Run("newest stamp wins for this worktree", func(t *testing.T) {
 		fakeOpencodeList(t, opencodeListJSON(
-			`{"id":"oc-old","directory":"`+wt+`","updated":"`+old+`"}`,
-			`{"id":"oc-new","directory":"`+wt+`","updated":"`+new+`"}`,
-			`{"id":"oc-newest-elsewhere","directory":"/tmp/elsewhere","updated":"2030-01-01T00:00:00Z"}`,
+			`{"id":"oc-old","directory":"`+wt+`","updated":`+strconv.FormatInt(old, 10)+`}`,
+			`{"id":"oc-new","directory":"`+wt+`","updated":`+strconv.FormatInt(new, 10)+`}`,
+			`{"id":"oc-newest-elsewhere","directory":"/tmp/elsewhere","updated":`+strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10)+`}`,
 		))
 		got, ok := OpencodeNewestUpdate(wt)
-		if want, _ := time.Parse(time.RFC3339, new); !ok || !got.Equal(want) {
+		if want := time.UnixMilli(new); !ok || !got.Equal(want) {
 			t.Errorf("OpencodeNewestUpdate = %v, %v; want the worktree's newest stamp %v", got, ok, want)
 		}
 	})
 
-	t.Run("unparseable stamps drop their session", func(t *testing.T) {
+	t.Run("a non-numeric stamp blinds the scan", func(t *testing.T) {
+		// The RFC3339 string this field once assumed: a typed int64 cannot
+		// decode it, so the whole list's decode fails and the scan reports
+		// not-ok — the same tracking-off posture opencodeSessionList takes
+		// on garbage output — rather than guess a worktree freshness.
 		fakeOpencodeList(t, opencodeListJSON(
-			`{"id":"oc-numeric","directory":"`+wt+`","updated":1730000000}`,
-			`{"id":"oc-exotic","directory":"`+wt+`","updated":"10/07/2026 noon"}`,
-			`{"id":"oc-good","directory":"`+wt+`","updated":"`+old+`"}`,
+			`{"id":"oc-iso","directory":"`+wt+`","updated":"2026-10-08T12:00:00Z"}`,
+			`{"id":"oc-good","directory":"`+wt+`","updated":`+strconv.FormatInt(old, 10)+`}`,
 		))
-		got, ok := OpencodeNewestUpdate(wt)
-		if want, _ := time.Parse(time.RFC3339, old); !ok || !got.Equal(want) {
-			t.Errorf("OpencodeNewestUpdate = %v, %v; want the only parseable stamp %v", got, ok, want)
+		if got, ok := OpencodeNewestUpdate(wt); ok || !got.IsZero() {
+			t.Errorf("OpencodeNewestUpdate with an undecodable list = %v, %v; want not-ok with no time", got, ok)
 		}
 	})
 
-	t.Run("no parseable stamp is not ok", func(t *testing.T) {
-		fakeOpencodeList(t, opencodeListJSON(`{"id":"oc-numeric","directory":"`+wt+`","updated":1730000000}`))
+	t.Run("stampless entries drop their session", func(t *testing.T) {
+		fakeOpencodeList(t, opencodeListJSON(
+			`{"id":"oc-nostamp","directory":"`+wt+`"}`,
+			`{"id":"oc-zero","directory":"`+wt+`","updated":0}`,
+		))
 		if got, ok := OpencodeNewestUpdate(wt); ok || !got.IsZero() {
 			t.Errorf("OpencodeNewestUpdate = %v, %v; want not-ok with no time", got, ok)
 		}

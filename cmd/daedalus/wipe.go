@@ -74,7 +74,7 @@ func wipePipeline(cfg config.Config, workflowID string, yes bool) error {
 	// The run's own recorded input names everything on disk: the target
 	// repo, the issue id, the flow (scoping the worktree path and branch
 	// names), and the branch prefix the preserved branches carry.
-	prev, _, err := readPriorRun(c, workflowID)
+	prev, _, _, err := readPriorRun(c, workflowID)
 	if err != nil {
 		return err
 	}

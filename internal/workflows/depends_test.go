@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
 )
 
 // depProbeStep is one scripted dependency-probe outcome.
@@ -339,6 +340,126 @@ func TestNonDependentRunNeverProbes(t *testing.T) {
 	}
 	if created.BaseBranch != "" {
 		t.Errorf("worktree BaseBranch = %q, want empty — a fresh run starts from HEAD", created.BaseBranch)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestDependencyReleases pins the release table the gate reads: only a
+// section in release posture (enabled, a fallback branch resolved at
+// start) can release, and only past a stopped state its skip flags select.
+// Paused is outside every skip set — it has not stopped — and a vanished
+// id ("not found") is a broken submit, never a state to release past.
+func TestDependencyReleases(t *testing.T) {
+	allSkips := config.DependencyConfig{
+		FallbackBranch: "release-base",
+		SkipFailed:     true,
+		SkipStuck:      true,
+		SkipCanceled:   true,
+	}
+	disabled := false
+	disabledWithBranch := allSkips
+	disabledWithBranch.Enabled = &disabled
+	noParked := config.DependencyConfig{FallbackBranch: "release-base", SkipFailed: true, SkipStuck: true, SkipCanceled: true}
+	noParked.SkipParked = &disabled
+
+	for _, c := range []struct {
+		name  string
+		cfg   config.DependencyConfig
+		state string
+		want  bool
+	}{
+		{"zero value refuses every state", config.DependencyConfig{}, "parked", false},
+		{"zero value refuses failed", config.DependencyConfig{}, "failed", false},
+		{"fallback only releases parked (the default)", config.DependencyConfig{FallbackBranch: "b"}, "parked", true},
+		{"fallback only refuses failed", config.DependencyConfig{FallbackBranch: "b"}, "failed", false},
+		{"fallback only refuses timed out", config.DependencyConfig{FallbackBranch: "b"}, "timed out", false},
+		{"fallback only refuses canceled", config.DependencyConfig{FallbackBranch: "b"}, "canceled", false},
+		{"fallback only refuses terminated", config.DependencyConfig{FallbackBranch: "b"}, "terminated", false},
+		{"explicit skip_parked false refuses parked", noParked, "parked", false},
+		{"all skips release failed", allSkips, "failed", true},
+		{"all skips release timed out", allSkips, "timed out", true},
+		{"all skips release canceled", allSkips, "canceled", true},
+		{"all skips release terminated", allSkips, "terminated", true},
+		{"paused is outside every skip set", allSkips, "paused", false},
+		{"a vanished id is outside every skip set", allSkips, "not found", false},
+		{"an unknown status refuses", allSkips, "completed", false},
+		{"a disabled section refuses parked", disabledWithBranch, "parked", false},
+		{"a disabled section refuses failed", disabledWithBranch, "failed", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := dependencyReleases(c.cfg, c.state); got != c.want {
+				t.Errorf("dependencyReleases(%+v, %q) = %v, want %v", c.cfg, c.state, got, c.want)
+			}
+		})
+	}
+}
+
+// TestDependentRunReleasesPastParkedDependency pins the release path end to
+// end: a dependency that stopped in a skip-listed state does not fail the
+// run — the gate starts it anyway from the resolved fallback branch
+// (injected as the worktree's BaseBranch, exactly like an approving
+// dependency's preserved branch), and the dependent starts its work rather
+// than failing.
+func TestDependentRunReleasesPastParkedDependency(t *testing.T) {
+	env := newTestEnv(t)
+	probe := &depProbeRecorder{env: env, script: []depProbeStep{
+		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: ParkedResult("needs the maintainer"), Status: "completed"}},
+	}}
+	probe.record()
+	created, rec := stubDependentHappyPath(t, env)
+
+	in := baseInput()
+	in.DependsOn = "tf-issue-41"
+	in.Dependency = config.DependencyConfig{FallbackBranch: "release-base"}
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v — a skip-listed park must release, not fail", err)
+	}
+	if len(probe.ids) != 1 {
+		t.Errorf("probe calls = %v, want exactly one", probe.ids)
+	}
+	if created.BaseBranch != "release-base" {
+		t.Errorf("worktree BaseBranch = %q, want the resolved fallback branch", created.BaseBranch)
+	}
+	if len(rec.inputs) == 0 {
+		t.Fatal("no agent round ran — a released run starts its work")
+	}
+	env.AssertExpectations(t)
+}
+
+// TestDependentRunWaitsOutPausedDependency pins that paused is not a stop:
+// the gate keeps polling a paused dependency — even with every skip flag
+// set, since paused is outside every skip set — until it resumes and
+// approves, and the run then starts from the dependency's preserved branch.
+func TestDependentRunWaitsOutPausedDependency(t *testing.T) {
+	env := newTestEnv(t)
+	probe := &depProbeRecorder{env: env, script: []depProbeStep{
+		{probe: activities.DependencyProbe{Status: "paused"}},
+		{probe: activities.DependencyProbe{Status: "running"}},
+		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}},
+	}}
+	probe.record()
+	created, _ := stubDependentHappyPath(t, env)
+
+	in := baseInput()
+	in.DependsOn = "tf-issue-41"
+	in.Dependency = config.DependencyConfig{
+		FallbackBranch: "release-base",
+		SkipFailed:     true,
+		SkipStuck:      true,
+		SkipCanceled:   true,
+	}
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v — a paused dependency must be waited out, not released past or failed", err)
+	}
+	if len(probe.ids) != 3 {
+		t.Errorf("probe calls = %d (%v), want paused polled, then running, then the approval", len(probe.ids), probe.ids)
+	}
+	if created.BaseBranch != "daedalus/issue-41-1" {
+		t.Errorf("worktree BaseBranch = %q, want the dependency's preserved branch once it approved", created.BaseBranch)
 	}
 	env.AssertExpectations(t)
 }

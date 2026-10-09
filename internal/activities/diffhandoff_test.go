@@ -3,6 +3,7 @@ package activities
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -12,31 +13,47 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 )
 
-// TestStagedDiffInlineBelowBudget pins the small-diff contract: at or under
-// the byte budget the diff embeds inline byte-identical to `git diff`, no
-// handoff is returned, and no review scratch dir is left in the worktree.
+// TestStagedDiffInlineBelowBudget pins the small-diff contract on an unborn
+// HEAD — a fresh `git init` with no commit, the shape a zero-commit repo's
+// worktree lands in: `git diff HEAD` has no revision to name, so the plain
+// index diff is the whole change. At or under the byte budget the diff
+// embeds inline carrying the intent-to-add file's content, no handoff is
+// returned, the index is restored afterwards (nothing staged, the new file
+// back to plain untracked), and no review scratch dir is left behind.
 func TestStagedDiffInlineBelowBudget(t *testing.T) {
 	t.Setenv(config.ContextTokensEnv, "100000")
+	ctx := context.Background()
 	dir := gitRepo(t)
 	if err := os.WriteFile(filepath.Join(dir, "foo.go"), []byte("package foo\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	diff, handoff, err := stagedDiff(context.Background(), dir)
+	diff, handoff, err := stagedDiff(ctx, dir)
 	if err != nil {
 		t.Fatalf("stagedDiff: %v", err)
 	}
 	if handoff != nil {
 		t.Fatalf("a small diff produced a handoff: %+v", handoff)
 	}
-	want, err := runGit(context.Background(), "-C", dir, "diff")
+	if !strings.Contains(diff, "new file mode") || !strings.Contains(diff, "package foo") {
+		t.Errorf("inline diff = %q, want the intent-to-add file's new-file diff", diff)
+	}
+	// The index is restored after collection: the intent-to-add entries are
+	// dropped, so the new file is plain untracked again — the shape the next
+	// agent round's own `git diff`/`git status` must see (while the entries
+	// stood, plain `git diff` printed the new file and status showed ` A`).
+	remaining, err := runGit(ctx, "-C", dir, "diff")
 	if err != nil {
-		t.Fatalf("git diff: %v", err)
+		t.Fatalf("git diff after stagedDiff: %v", err)
 	}
-	if diff != want {
-		t.Errorf("inline diff = %q, want the plain `git diff` output %q", diff, want)
+	if remaining != "" {
+		t.Errorf("post-collection `git diff` = %q, want empty — the intent-to-add entries must be reset", remaining)
 	}
-	if !strings.Contains(diff, "package foo") {
-		t.Errorf("inline diff = %q, want the intent-to-add file's content", diff)
+	status, err := runGit(ctx, "-C", dir, "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if strings.Contains(status, "foo.go") && !strings.Contains(status, "?? foo.go") {
+		t.Errorf("git status = %q, want foo.go plain untracked (??), not intent-to-add", status)
 	}
 	if _, err := os.Stat(filepath.Join(dir, reviewDiffDir)); !os.IsNotExist(err) {
 		t.Errorf("an inline round left %s behind (stat err %v)", reviewDiffDir, err)
@@ -95,17 +112,28 @@ func TestStagedDiffBudgetBoundary(t *testing.T) {
 
 // TestStagedDiffHandsOffOversizedDiff pins the oversized-diff contract end
 // to end on a real repository: the complete uncropped diff is written to
-// the handoff file (identical to what `git diff` prints for the same
-// change), the prompt's handoff carries the digest and a per-file table of
-// contents whose ranges tile the file 1..Lines with every section opening
-// at its `diff --git` header — the address a slice read takes — and the
-// scratch dir is invisible to git (status and diff), while the work itself
-// stays visible.
+// the handoff file — the worktree+index-vs-HEAD diff, so a tracked-file
+// deletion and a rename ride along beside the modification and the
+// intent-to-add addition (an index-only diff stages deletions and renames
+// away, and the reviewer once never heard of a whole-module removal) — the
+// prompt's handoff carries the digest gathered before the index reset (a
+// post-reset digest loses every new file, which only the intent-to-add
+// entries make visible) and a per-file table of contents whose ranges tile
+// the file 1..Lines with every section opening at its `diff --git` header —
+// the address a slice read takes — and the scratch dir is invisible to git
+// (status and diff), while the work itself stays visible and the index is
+// handed back unstaged.
 func TestStagedDiffHandsOffOversizedDiff(t *testing.T) {
 	t.Setenv(config.ContextTokensEnv, "200")
 	ctx := context.Background()
 	dir := gitRepo(t)
 	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gone.txt"), []byte("goodbye\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "old.txt"), []byte("stays the same\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{
@@ -124,6 +152,28 @@ func TestStagedDiffHandsOffOversizedDiff(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "b.go"), []byte(strings.Repeat("line of the new file\n", 30)), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Remove(filepath.Join(dir, "gone.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", dir, "mv", "old.txt", "moved.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git mv old.txt moved.txt: %v: %s", err, out)
+	}
+	// The diff the reviewer reads is collected over the intent-to-add index;
+	// stagedDiff resets that index before returning, so the reference cannot
+	// be re-derived afterwards — capture the same window first.
+	if _, err := runGit(ctx, "-C", dir, "add", "-N", "-A"); err != nil {
+		t.Fatalf("stage intent-to-add: %v", err)
+	}
+	wantDiff, err := runGit(ctx, "-C", dir, "diff", "HEAD")
+	if err != nil {
+		t.Fatalf("git diff HEAD: %v", err)
+	}
+	if !strings.Contains(wantDiff, "deleted file mode") || !strings.Contains(wantDiff, "-goodbye") {
+		t.Fatalf("git diff HEAD = %q, want the tracked-file deletion covered", wantDiff)
+	}
+	if !strings.Contains(wantDiff, "rename from old.txt") || !strings.Contains(wantDiff, "rename to moved.txt") {
+		t.Fatalf("git diff HEAD = %q, want the rename covered", wantDiff)
+	}
 
 	diff, handoff, err := stagedDiff(ctx, dir)
 	if err != nil {
@@ -140,22 +190,20 @@ func TestStagedDiffHandsOffOversizedDiff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read handoff file: %v", err)
 	}
-	wantDiff, err := runGit(ctx, "-C", dir, "diff")
-	if err != nil {
-		t.Fatalf("git diff: %v", err)
-	}
 	if string(file) != wantDiff {
-		t.Errorf("handoff file = %d bytes, want the complete uncropped `git diff` (%d bytes)", len(file), len(wantDiff))
+		t.Errorf("handoff file = %d bytes, want the complete uncropped `git diff HEAD` (%d bytes)", len(file), len(wantDiff))
 	}
 	if handoff.Lines != strings.Count(string(file), "\n") {
 		t.Errorf("handoff Lines = %d, want the diff file's %d lines", handoff.Lines, strings.Count(string(file), "\n"))
 	}
-	wantStat, err := runGit(ctx, "-C", dir, "diff", "--compact-summary")
-	if err != nil {
-		t.Fatalf("git diff --compact-summary: %v", err)
-	}
-	if handoff.Stat != wantStat || !strings.Contains(wantStat, "a.go") || !strings.Contains(wantStat, "b.go") {
-		t.Errorf("handoff Stat = %q, want the compact summary %q", handoff.Stat, wantStat)
+	// The digest is gathered before the index reset: it must still see the
+	// new file (b.go (new)) and the rename — after the reset the new file is
+	// plain untracked and no re-runnable digest names either — beside the
+	// modification and the deletion.
+	for _, want := range []string{"a.go", "b.go (new)", "gone.txt (gone)", "old.txt => moved.txt", "4 files changed"} {
+		if !strings.Contains(handoff.Stat, want) {
+			t.Errorf("handoff Stat = %q, want it to carry %q", handoff.Stat, want)
+		}
 	}
 
 	// The table of contents is load-bearing: its ranges must tile the file
@@ -191,13 +239,17 @@ func TestStagedDiffHandsOffOversizedDiff(t *testing.T) {
 	if prevEnd != handoff.Lines {
 		t.Errorf("TOC ranges end at line %d, want the diff file's last line %d", prevEnd, handoff.Lines)
 	}
-	// The modification and the intent-to-add addition each carry a section
-	// named after their file.
-	if !paths["a.go"] || !paths["b.go"] {
-		t.Errorf("TOC paths = %v, want a.go and b.go", paths)
+	// The modification, the intent-to-add addition, the deletion, and the
+	// rename's new side each carry a section named after their file.
+	for _, want := range []string{"a.go", "b.go", "gone.txt", "moved.txt"} {
+		if !paths[want] {
+			t.Errorf("TOC paths = %v, want %q among them", paths, want)
+		}
 	}
 
-	// The scratch dir is in git's blind spot; the work is not.
+	// The scratch dir is in git's blind spot; the work is not — the deletion
+	// and rename included, which the reset leaves unstaged — and the index
+	// is handed back with nothing staged in it.
 	status, err := runGit(ctx, "-C", dir, "status", "--porcelain")
 	if err != nil {
 		t.Fatalf("git status: %v", err)
@@ -205,8 +257,17 @@ func TestStagedDiffHandsOffOversizedDiff(t *testing.T) {
 	if strings.Contains(status, ".daedalus-review") {
 		t.Errorf("git status sees the handoff scratch dir: %q", status)
 	}
-	if !strings.Contains(status, "a.go") || !strings.Contains(status, "b.go") {
-		t.Errorf("git status lost the work under the scratch-dir exclusion: %q", status)
+	for _, want := range []string{"a.go", "b.go", "gone.txt", "moved.txt", "old.txt"} {
+		if !strings.Contains(status, want) {
+			t.Errorf("git status lost %q under the scratch-dir exclusion: %q", want, status)
+		}
+	}
+	staged, err := runGit(ctx, "-C", dir, "diff", "--cached")
+	if err != nil {
+		t.Fatalf("git diff --cached: %v", err)
+	}
+	if staged != "" {
+		t.Errorf("the index kept staged entries after stagedDiff: %q — the reset must restore it", staged)
 	}
 	exclude, err := os.ReadFile(filepath.Join(dir, ".git", "info", "exclude"))
 	if err != nil {

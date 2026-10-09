@@ -98,6 +98,21 @@ func TestCheckDependencyActivity(t *testing.T) {
 		}
 	})
 
+	t.Run("paused is its own non-terminal state, not running", func(t *testing.T) {
+		// Paused is resumable (`temporal workflow unpause`), not stopped: the
+		// old default case reported it Terminal, failing every run chained
+		// behind a paused dependency, and the gate tells a paused hold from a
+		// plain running wait only by this status string.
+		c := &fakeDepClient{resp: describeWith(enums.WORKFLOW_EXECUTION_STATUS_PAUSED)}
+		probe, err := NewCheckDependencyActivity(c)(context.Background(), "tf-1")
+		if err != nil {
+			t.Fatalf("probe(paused): %v", err)
+		}
+		if probe.Terminal || probe.Completed || probe.Status != "paused" {
+			t.Errorf("probe(paused) = %+v, want non-terminal with status \"paused\"", probe)
+		}
+	})
+
 	t.Run("terminal states classify without reading a result", func(t *testing.T) {
 		for _, c := range []struct {
 			status enums.WorkflowExecutionStatus

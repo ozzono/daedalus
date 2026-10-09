@@ -741,20 +741,51 @@ func (r *pipelineRun) finalize() (string, error) {
 	return preservedBranch, nil
 }
 
+// dependencyReleases reports whether a dependency that stopped in state —
+// the gate's probe status, "parked" for a completed workflow carrying the
+// park marker — releases the waiting run onto the fallback branch instead
+// of failing it. The section must be in release posture (enabled, a
+// fallback branch resolved at start — the zero value keeps the historical
+// refusal, replay-safe) and the state in the skip set the section's flags
+// select. A paused dependency is outside every skip set: it has not
+// stopped, so the gate keeps waiting; a vanished id ("not found") is a
+// broken submit, never a state to release past.
+func dependencyReleases(d config.DependencyConfig, state string) bool {
+	if !d.ReleasePosture() {
+		return false
+	}
+	switch state {
+	case "parked":
+		return d.SkipParkedOrDefault()
+	case "failed":
+		return d.SkipFailed
+	case "timed out":
+		return d.SkipStuck
+	case "canceled", "terminated":
+		return d.SkipCanceled
+	}
+	return false
+}
+
 // awaitDependency is the dependency gate every flow inherits through
 // startRun: the run — nothing scheduled yet, no worktree, no branch, no
 // round — polls its dependency until the probe reports an approving
 // terminal state, then injects the dependency's preserved branch as the
 // worktree base (WorktreeInput.BaseBranch only — the input's own BaseBranch
 // would flip the opening prompt to a continuation). A dependency that stops
-// without approval (failed, parked, canceled, timed out, wiped — a vanished
-// id reads the same) fails the run before anything was started: an aborted
+// without approval fails the run before anything was started — an aborted
 // chain has nothing to preserve, so the interrupt is a failure, not a park,
-// and re-submitting the chain is a human decision. Transient probe errors
-// back off and retry, capped like the round timeouts: a permanently failing
-// check (a worker too old to know the activity) must fail loudly instead of
-// pending forever. The first probe races nothing — a dependency already
-// approved at submit resolves here without a single sleep.
+// and re-submitting the chain is a human decision — unless the dependency
+// section releases that state (dependencyReleases), in which case the run
+// starts anyway from the resolved fallback branch, logged loudly so the
+// degraded chain is visible in history. A paused dependency is not a stop:
+// the probe reports it non-terminal and the gate keeps waiting, with the
+// unpause line logged once so a maintainer reading the log knows the run
+// is held, not hung. Transient probe errors back off and retry, capped
+// like the round timeouts: a permanently failing check (a worker too old
+// to know the activity) must fail loudly instead of pending forever. The
+// first probe races nothing — a dependency already approved at submit
+// resolves here without a single sleep.
 func (r *pipelineRun) awaitDependency() error {
 	dep := r.input.DependsOn
 	if r.vis {
@@ -763,6 +794,7 @@ func (r *pipelineRun) awaitDependency() error {
 	r.setStatus(StatusPending)
 	r.logger.Info("Waiting on dependency", "Dependency", dep)
 	failures := 0
+	pausedSeen := false
 	for {
 		var probe activities.DependencyProbe
 		err := workflow.ExecuteActivity(r.ctx, activities.CheckDependencyActivityName, dep).Get(r.ctx, &probe)
@@ -780,8 +812,22 @@ func (r *pipelineRun) awaitDependency() error {
 				if probe.Completed {
 					state = "parked"
 				}
+				if dependencyReleases(r.input.Dependency, state) {
+					r.setStatus(StatusRunning)
+					r.logger.Info("Dependency stopped without approval; releasing onto the fallback branch",
+						"Dependency", dep, "State", state, "FallbackBranch", r.input.Dependency.FallbackBranch)
+					r.worktreeInput.BaseBranch = r.input.Dependency.FallbackBranch
+					return nil
+				}
 				return fmt.Errorf("dependency %s %s — the chain is broken; this run failed before any worktree, branch, or round existed. Resolve the dependency (check the id against \"daedalus list\"; closed sessions resume with `daedalus continue`), then re-submit",
 					dep, state)
+			case probe.Status == "paused" && !pausedSeen:
+				// Logged once, not per poll: the probe repeats every
+				// depPollInterval and history does not need the same line
+				// for hours.
+				pausedSeen = true
+				r.logger.Info("dependency paused: the gate waits; unpause with `temporal workflow unpause`",
+					"Dependency", dep)
 			}
 		} else {
 			failures++

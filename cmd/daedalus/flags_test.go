@@ -71,6 +71,37 @@ func TestParseFlagsWorkflowRegistry(t *testing.T) {
 	}
 }
 
+// TestParseFlagsWorkflowFreshRunOnly pins -w/--workflow's rejection sweep:
+// the flow is decided at start and travels in the run's workflow input, so
+// only a fresh `run` can honor it — append mode steers a pipeline whose flow
+// is already fixed, a session continue resumes keeps the flow it started
+// with, and no other command reads one. Each of those parses the flag,
+// validates the name against the registry, and would silently drop it; all
+// of them are rejected at parse time instead.
+func TestParseFlagsWorkflowFreshRunOnly(t *testing.T) {
+	// The honoring site the sweep must keep working: a fresh run, the flag
+	// before the command included.
+	f, _, err := parseFlags([]string{"-w", "bug-fix", "run", "/repo", "42", "do it"})
+	if err != nil || f.workflow != "bug-fix" || !f.workflowSet {
+		t.Errorf("parseFlags(-w bug-fix run …) = (%q, %v, %v), want (bug-fix, true, nil)", f.workflow, f.workflowSet, err)
+	}
+
+	const rejection = "-w/--workflow only applies to a fresh run"
+	for _, args := range [][]string{
+		{"run", "-a", "wf-1", "-w", "slim", "steer it"},
+		{"-w", "slim", "run", "-a", "wf-1", "steer it"},
+		{"continue", "-w", "bug-fix", "wf-1", "resume it"},
+		{"-w", "bug-fix", "continue", "wf-1", "resume it"},
+		{"guide", "-w", "slim", "wf-1", "hello"},
+		{"-w", "slim", "list"},
+		{"wipe", "-w", "slim", "wf-1"},
+	} {
+		if _, _, err := parseFlags(args); err == nil || err.Error() != rejection {
+			t.Errorf("parseFlags(%v) err = %v, want %q", args, err, rejection)
+		}
+	}
+}
+
 // TestWorkflowRegistryFlowPolicies pins the flow registry as the CLI's
 // dispatch surface: every entry carries a workflow function, and the
 // per-flow write-scope policies are exactly what the workflows verify
@@ -119,6 +150,8 @@ func TestParseFlagsWorkerType(t *testing.T) {
 			{[]string{"worker", "start", "--type=dev"}, workerTypeDev},
 			{[]string{"worker", "restart", "-t", "test"}, workerTypeTest},
 			{[]string{"worker", "foreground", "-t", "dev"}, workerTypeDev},
+			// Bare `worker` is start's spelling: a typed-worker line too.
+			{[]string{"worker", "-t", "dev"}, workerTypeDev},
 			{[]string{"-t", "dev", "worker", "start"}, workerTypeDev},
 		} {
 			f, _, err := parseFlags(c.args)
@@ -175,6 +208,28 @@ func TestParseFlagsWorkerType(t *testing.T) {
 		} {
 			if _, _, err := parseFlags(args); err == nil || err.Error() != runRejection {
 				t.Errorf("parseFlags(%v) err = %v, want %q", args, err, runRejection)
+			}
+		}
+	})
+
+	// The sweep's tail: stop drains whatever daemon is running, wakeup
+	// interrupts one session's heartbeat, and no non-worker command reads a
+	// daemon's type — a -t there is rejected like every other misplaced
+	// spelling instead of parsing into a value nothing reads.
+	const tailRejection = "-t/--type only applies to worker start, bare worker restart, and worker foreground"
+	t.Run("rejected on stop, wakeup, and every non-worker command", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"worker", "stop", "-t", "dev"},
+			{"-t", "dev", "worker", "stop"},
+			{"worker", "stop", "--type=test"},
+			{"worker", "wakeup", "-t", "dev", "wf-1"},
+			{"worker", "wakeup", "wf-1", "--type=test"},
+			{"list", "-t", "dev"},
+			{"wipe", "-t", "dev", "wf-1"},
+			{"log", "-t", "dev", "wf-1"},
+		} {
+			if _, _, err := parseFlags(args); err == nil || err.Error() != tailRejection {
+				t.Errorf("parseFlags(%v) err = %v, want %q", args, err, tailRejection)
 			}
 		}
 	})

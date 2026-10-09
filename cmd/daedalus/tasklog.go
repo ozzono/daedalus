@@ -95,7 +95,7 @@ func plainTailState(log string) string {
 // every other client command — else the default, so the command works
 // wherever the Temporal service is reachable. When a round is in flight
 // right now, a live section rendered from the agent's host-side transcript
-// follows the completed ones (see liveCotSection). The dump ends with a
+// follows the completed ones (see liveCotSectionWith). The dump ends with a
 // log-tail block naming when the last log arrived and the workflow's real
 // Temporal state, so a finished run's output never reads as live (see
 // logTail).
@@ -230,7 +230,7 @@ func runTaskLogCot(workflowID string, cotN int) {
 	// message: a round running with zero completed rounds is exactly the
 	// case the live view exists for. It rides outside the tail: the round
 	// it renders is newer than every completed one.
-	live := liveCotSection(workflowID)
+	live := liveCotSectionWith(workflowID, c)
 	if live != "" {
 		fmt.Print("=====================================\n")
 		fmt.Print(live)
@@ -348,7 +348,7 @@ func inlineCoT(text string) string {
 	return strings.TrimSpace(rest)
 }
 
-// liveCotSection renders the round in flight as a live section for the
+// liveCotSectionWith renders the round in flight as a live section for the
 // -cot view: the agent's reasoning and assistant text, read from its
 // host-side transcript as the agent writes it. The section's inputs are
 // file-derived — the task log for the round state, the transcript for the
@@ -357,7 +357,21 @@ func inlineCoT(text string) string {
 // when no round is in flight: between rounds the newest transcript is the
 // just-finished round's, and rendering it live would duplicate that
 // round's completed section and mislabel it.
-func liveCotSection(workflowID string) string {
+//
+// The header carries the section's own freshness stamp, so a mid-round
+// dump no longer reads as stale: `last write` is the transcript's mtime
+// — the liveness signal, what the agent last produced — and `activity`
+// the run's LastActivityAt search attribute off the live describe, the
+// same decode the runs table uses. touch() fires at round boundaries
+// only, so mid-round the activity value reads as round-start: it answers
+// "when did the workflow last change state", not "is anything moving
+// right now" — the two labels keep the halves apart. A describe failure,
+// an old run that never backfilled the attribute, or a nil client
+// degrades the activity half to "unknown", never a fabricated stamp and
+// never a failed dump. The early returns before a transcript is in hand
+// (codex's note, the no-host-transcript note, no transcript yet) have no
+// mtime to show and keep the bare header.
+func liveCotSectionWith(workflowID string, c client.Client) string {
 	path, err := activities.TaskLogPath(workflowID)
 	if err != nil {
 		return ""
@@ -374,11 +388,12 @@ func liveCotSection(workflowID string) string {
 		stage = "unknown"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "=== in-flight round (stage=%s, live) ===\n", stage)
+	bare := fmt.Sprintf("=== in-flight round (stage=%s, live) ===\n", stage)
 	if name == "codex" {
 		// codex keeps a rollout transcript the live view does not follow
 		// yet — say so rather than reuse the "keeps no host transcript"
 		// note below, which is false for codex.
+		b.WriteString(bare)
 		fmt.Fprintf(&b, "%s keeps a host transcript the live view does not read; CoT appears here when the round completes\n", name)
 		return b.String() + "\n"
 	}
@@ -386,14 +401,28 @@ func liveCotSection(workflowID string) string {
 		// aider, opencode, and amp keep no host transcript the live view
 		// follows — opencode's session database exists, the live view just
 		// does not read it; never silence, never a guess.
+		b.WriteString(bare)
 		fmt.Fprintf(&b, "%s keeps no host transcript; CoT appears here when the round completes\n", name)
 		return b.String() + "\n"
 	}
-	tpath, _, _, ok, err := newestTranscript(worktree)
+	tpath, _, tmod, ok, err := newestTranscript(worktree)
 	if err != nil || !ok {
+		b.WriteString(bare)
 		b.WriteString("no transcript yet — no assistant output has landed\n")
 		return b.String() + "\n"
 	}
+	activity := "unknown"
+	if c != nil {
+		if resp, derr := c.DescribeWorkflowExecution(context.Background(), workflowID, ""); derr == nil {
+			// Same decode the runs table uses; the describe is the
+			// empty-run-id latest-execution one cotTailState already makes.
+			if vis := decodeRunVisibility(resp.GetWorkflowExecutionInfo().GetSearchAttributes(), converter.GetDefaultDataConverter()); !vis.LastAt.IsZero() {
+				activity = vis.LastAt.UTC().Format(time.RFC3339)
+			}
+		}
+	}
+	fmt.Fprintf(&b, "=== in-flight round (stage=%s, live, last write %s|activity %s) ===\n",
+		stage, tmod.UTC().Format(time.RFC3339), activity)
 	// ponytail: the transcript is picked by newest-wins freshness alone —
 	// the newest source is the live writer's except in the window before
 	// the in-flight round creates its own transcript, where the

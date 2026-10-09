@@ -92,6 +92,33 @@ func TestWorkerActionHelpCoversActions(t *testing.T) {
 	}
 }
 
+// TestWorkerActionHelpFlagClaims pins the sub-action screens' claims against
+// the behavior pinned elsewhere (TestParseFlagsWorkerType), the way
+// TestRootHelpDispatch pins the root usage's claims: the stop and wakeup
+// screens must say -t/--type is rejected there — parseFlags rejects it — and
+// never regress to the stale "parses here but has no effect" inertness
+// wording that misdocumented the flag for exactly those actions; and the
+// status screen's output enumeration must name every column the listing
+// prints, the CODE PATH column included.
+func TestWorkerActionHelpFlagClaims(t *testing.T) {
+	for _, action := range []string{"stop", "wakeup"} {
+		screen := workerActionHelp[action]
+		if !strings.Contains(screen, "-t/--type is rejected here") {
+			t.Errorf("worker %s --help should say -t/--type is rejected there (parseFlags rejects it), got:\n%s", action, screen)
+		}
+		if strings.Contains(screen, "no effect") {
+			t.Errorf("worker %s --help still carries the stale inertness wording:\n%s", action, screen)
+		}
+	}
+
+	status := workerActionHelp["status"]
+	for _, column := range []string{"name", "pid", "version", "API", "config", "code path", "log"} {
+		if !strings.Contains(status, column) {
+			t.Errorf("worker status --help output enumeration omits the %q column the listing prints:\n%s", column, status)
+		}
+	}
+}
+
 // TestRootHelpDispatch pins the root screen's dispatch — -h/--help/help
 // print exactly the usage text on stdout, exit 0, configless — plus the
 // changed surface's own promises: the GLOBAL FLAGS -c entry names the

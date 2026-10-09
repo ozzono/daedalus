@@ -545,69 +545,106 @@ func reviewDiffBudget() int {
 }
 
 // stagedDiff returns the reviewer's view of the worktree's diff against
-// HEAD, including new files, without staging the work itself: intent-to-add
-// (-N) makes new files visible to `git diff` while modifications stay
-// unstaged, so the next agent round sees normal `git diff`/`git status`
-// output (one removal caveat — see the ALERT below). A diff at or under
-// reviewDiffBudget returns
-// inline — the prompt shape is byte-identical to the original. Above the
-// budget the same complete diff goes to <worktree>/.daedalus-review/
-// diff.patch — never cropped — and the return carries the prompt's file
-// handoff instead: the digest, the per-file table of contents, and the
-// line counts the prompt builds its reading instructions on. The file
-// lives in git's blind spot (info/exclude), so no later round's diff or
-// status, and no preserved branch, ever sees it.
-//
-// ALERT (recorded under backlog/bugs/): `add -N -A` has no intent-to-add
-// form for a removal — it stages deletions and renames fully, so they
-// leave the worktree-vs-index diff and the reviewer never sees them. The
-// handoff file carries the same `git diff`, so the gap predates and
-// outlives this mechanism; the fix (a `git diff HEAD` shape, or
-// unstaging after collection) changes the diff contract every review
-// prompt and pin rides on, so it stays its own round.
+// HEAD, including new files. `add -N -A` (intent-to-add) makes new files
+// visible to the diff, and the diff itself is collected against HEAD —
+// not the index — so deletions and renames are covered too: an
+// intent-to-add entry has no removal form (add -A stages a deletion
+// fully), which once let a whole-module deletion drop out of the
+// reviewer's diff unheard (backlog/bugs/bugs.md, first entry). An unborn
+// HEAD — a zero-commit repo's `worktree add -b` infers --orphan — has no
+// revision to diff against and would kill `diff HEAD` with exit 128; the
+// plain index diff is the whole change there (nothing precedes it), the
+// shape this function collected before the HEAD form existed. Above the
+// budget the digest is gathered before `git reset -q` restores the index
+// to HEAD — the reset drops the intent-to-add entries, and a brand-new
+// file is invisible to every plain `git diff` after it, so a digest
+// collected post-reset would contradict the diff file it summarizes
+// (backlog/bugs/stagediff-digest-after-reset-drops-new-files.md). The
+// reset drops the intent-to-add entries and any staged removals, so the
+// next agent round sees an unstaged worktree: modifications unstaged, new
+// files plain untracked, deletions unstaged. Nothing the work carried is
+// touched (a mixed reset moves the index only), and agent git writes are
+// forbidden anyway, so the index never held anything but this round's own
+// entries. A diff at or under reviewDiffBudget returns inline — the
+// prompt shape is byte-identical to the original. Above the budget the
+// same complete diff goes to <worktree>/.daedalus-review/diff.patch —
+// never cropped — and the return carries the prompt's file handoff
+// instead: the digest, the per-file table of contents, and the line
+// counts the prompt builds its reading instructions on. The file lives in
+// git's blind spot (info/exclude), so no later round's diff or status,
+// and no preserved branch, ever sees it.
 func stagedDiff(ctx context.Context, worktreePath string) (string, *template.DiffHandoff, error) {
 	if _, err := runGit(ctx, "-C", worktreePath, "add", "-N", "-A"); err != nil {
 		return "", nil, fmt.Errorf("stage intent-to-add: %w", err)
 	}
-	out, err := runGit(ctx, "-C", worktreePath, "diff")
+	out, err := gitDiffAgainstHead(ctx, worktreePath)
 	if err != nil {
 		return "", nil, fmt.Errorf("collect diff: %w", err)
 	}
-	if len(out) <= reviewDiffBudget() {
-		// A handoff file left by a previous oversized round is stale the
-		// moment this diff embeds inline: remove it (best-effort — the
-		// exclusion line keeps git blind either way) so no round reads a
-		// superseded diff, and drop the now-empty scratch dir with it
-		// (a failure means the dir holds something else — leave it).
-		if err := os.Remove(filepath.Join(worktreePath, diffHandoffPath)); err != nil && !os.IsNotExist(err) {
-			activityLogger(ctx).Warn("Stale review diff handoff could not be removed",
-				"Path", diffHandoffPath, "Error", err)
+	var handoff *template.DiffHandoff
+	if len(out) > reviewDiffBudget() {
+		// The digest rides with the diff text: both were collected against
+		// the same still-intent-to-add index, so the coverage contract the
+		// reviewer reads off the stat is the change the file holds.
+		stat, err := gitDiffAgainstHead(ctx, worktreePath, "--compact-summary")
+		if err != nil {
+			return "", nil, fmt.Errorf("diff digest: %w", err)
 		}
-		_ = os.Remove(filepath.Join(worktreePath, reviewDiffDir))
-		return out, nil, nil
+		if handoff, err = writeDiffHandoff(ctx, worktreePath, out, stat); err != nil {
+			return "", nil, err
+		}
 	}
-	h, err := writeDiffHandoff(ctx, worktreePath, out)
-	if err != nil {
-		return "", nil, err
+	// Collection done — restore the index before anything else reads it.
+	if _, err := runGit(ctx, "-C", worktreePath, "reset", "-q"); err != nil {
+		return "", nil, fmt.Errorf("restore index: %w", err)
 	}
-	return "", h, nil
+	if handoff != nil {
+		return "", handoff, nil
+	}
+	// A handoff file left by a previous oversized round is stale the
+	// moment this diff embeds inline: remove it (best-effort — the
+	// exclusion line keeps git blind either way) so no round reads a
+	// superseded diff, and drop the now-empty scratch dir with it
+	// (a failure means the dir holds something else — leave it).
+	if err := os.Remove(filepath.Join(worktreePath, diffHandoffPath)); err != nil && !os.IsNotExist(err) {
+		activityLogger(ctx).Warn("Stale review diff handoff could not be removed",
+			"Path", diffHandoffPath, "Error", err)
+	}
+	_ = os.Remove(filepath.Join(worktreePath, reviewDiffDir))
+	return out, nil, nil
+}
+
+// gitDiffAgainstHead runs `git diff HEAD` (plus any format flags) — the
+// reviewer's diff shape: worktree+index against HEAD, covering deletions
+// and renames the index-only diff stages away. On an unborn HEAD — a
+// zero-commit repo's `worktree add -b` infers --orphan, and a
+// fresh `git init` worktree has nothing to diff against — there is no
+// revision to name and git exits 128; `rev-parse --verify` failing too is
+// the unborn proof, and the plain index diff is the whole change there.
+func gitDiffAgainstHead(ctx context.Context, worktreePath string, format ...string) (string, error) {
+	args := append([]string{"-C", worktreePath, "diff", "HEAD"}, format...)
+	out, err := runGit(ctx, args...)
+	if err == nil {
+		return out, nil
+	}
+	if _, headErr := runGit(ctx, "-C", worktreePath, "rev-parse", "--verify", "-q", "HEAD"); headErr != nil {
+		return runGit(ctx, append([]string{"-C", worktreePath, "diff"}, format...)...)
+	}
+	return "", err
 }
 
 // writeDiffHandoff routes an oversized review diff to the worktree: the
 // complete, uncropped diff is written to .daedalus-review/diff.patch (the
 // dir excluded from git via excludeAgentArtifacts) and the prompt's
-// handoff is gathered — the compact-summary digest, and the per-file table
+// handoff is assembled — the stat digested by the caller from the same
+// index state the diff text was collected against, and the per-file table
 // of contents read off the very text being written.
-func writeDiffHandoff(ctx context.Context, worktreePath, diff string) (*template.DiffHandoff, error) {
+func writeDiffHandoff(ctx context.Context, worktreePath, diff, stat string) (*template.DiffHandoff, error) {
 	if err := excludeAgentArtifacts(worktreePath, reviewDiffDir); err != nil {
 		return nil, fmt.Errorf("exclude review diff dir: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(worktreePath, diffHandoffPath), []byte(diff), 0o644); err != nil {
 		return nil, fmt.Errorf("write review diff handoff: %w", err)
-	}
-	stat, err := runGit(ctx, "-C", worktreePath, "diff", "--compact-summary")
-	if err != nil {
-		return nil, fmt.Errorf("diff digest: %w", err)
 	}
 	return &template.DiffHandoff{
 		Path:  diffHandoffPath,

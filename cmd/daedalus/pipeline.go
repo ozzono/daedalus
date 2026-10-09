@@ -292,6 +292,26 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 		workflowID = fmt.Sprintf("%s-%s-%s", cfg.Temporal.TaskQueue, workflowName, issueID)
 	}
 	if depends != "" {
+		// Resolve the release-with-fallback default once, at submit: an
+		// enabled section without an explicit fallback_branch releases onto
+		// the invocation branch, and the resolved name travels in the
+		// workflow input — a config edit mid-run cannot retarget an
+		// in-flight chain, and replay re-executes the gate against the
+		// exact branch the live run saw. cfg is a value copy, so the
+		// mutation here never writes back to the caller's config. An
+		// explicitly set branch is verified to exist here — bad input
+		// failing at submit, not after the dependency has been waited out.
+		if cfg.Dependency.EnabledOrDefault() {
+			if cfg.Dependency.FallbackBranch == "" {
+				b, err := invocationBranch(repoPath)
+				if err != nil {
+					return err
+				}
+				cfg.Dependency.FallbackBranch = b
+			} else if err := verifyBranchExists(repoPath, cfg.Dependency.FallbackBranch); err != nil {
+				return err
+			}
+		}
 		if err := preflightDependency(c, cfg, workflowID, depends); err != nil {
 			return err
 		}
@@ -327,6 +347,7 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 		TestOutputDir:   cfg.TestOutputDir(),
 		Folders:         folders,
 		DependsOn:       depends,
+		Dependency:      cfg.Dependency,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -352,6 +373,45 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 	return awaitPipeline(run)
 }
 
+// invocationBranch names the branch the run is submitted from — the
+// default dependency.fallback_branch: a dependent run released past a dead
+// dependency continues from where the operator stood when submitting the
+// chain. Same env hygiene as resolveRepoPath. A detached HEAD names no
+// branch and is refused: "--abbrev-ref" prints the literal "HEAD" there,
+// and falling back to a raw commit reference the operator did not name
+// would start work from a moving target's idea of a branch — setting
+// fallback_branch explicitly is the fix the error names.
+func invocationBranch(repoPath string) (string, error) {
+	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Env = envWithoutGitRepoOverrides(os.Environ())
+	out, err := cmd.CombinedOutput()
+	branch := strings.TrimSpace(string(out))
+	if err != nil {
+		return "", fmt.Errorf("resolve the invocation branch of %s: %v: %s", repoPath, err, branch)
+	}
+	if branch == "HEAD" || branch == "" {
+		return "", fmt.Errorf("resolve the invocation branch of %s: detached HEAD names no branch — set dependency.fallback_branch in the config to release past a stopped dependency", repoPath)
+	}
+	return branch, nil
+}
+
+// verifyBranchExists refuses a named branch that does not exist as a
+// branch in the run's repo — dependency.fallback_branch is verified at
+// submit so a typo fails the run before the dependency gate instead of
+// after it, with git's raw "invalid reference" at release time. The
+// full refname (refs/heads/<branch>) pins the check to branches: a tag or
+// a SHA would resolve --verify alone and is not a worktree base this
+// feature promises. Same env hygiene as resolveRepoPath.
+func verifyBranchExists(repoPath, branch string) error {
+	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	cmd.Env = envWithoutGitRepoOverrides(os.Environ())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("dependency.fallback_branch %q: no such branch in %s (git: %s) — create it or fix the config before chaining behind a dependency",
+			branch, repoPath, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // preflightDependency is the submit-time half of the dependency gate: the
 // dependency is named by workflow id verbatim (the same convention as
 // continue/attach/wipe) and must exist on this config's task queue, so a
@@ -359,10 +419,16 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 // forever. A dependency already terminal without approval (failed,
 // canceled, wiped — or completed with a park marker) means the chain is
 // already broken: the run would fail at its first probe anyway, so the
-// refusal happens here. Terminal-approved passes straight through — the
-// workflow's first probe sees the approved completion and skips the wait
-// (idempotent re-submits). Anything still in flight dispatches and lets
-// the workflow gate block.
+// refusal happens here — unless the config's dependency section is in
+// release posture (cfg.Dependency, with the fallback branch already
+// resolved by startPipelineFolders), in which case the dispatch goes ahead
+// and the workflow gate applies the skip flags with the same resolved
+// section. A paused dependency passes through unconditionally: it is
+// resumable (`temporal workflow unpause`), not broken, and the gate waits
+// for it. Terminal-approved passes straight through — the workflow's first
+// probe sees the approved completion and skips the wait (idempotent
+// re-submits). Anything still in flight dispatches and lets the workflow
+// gate block.
 func preflightDependency(c client.Client, cfg config.Config, workflowID, depID string) error {
 	if depID == workflowID {
 		return fmt.Errorf("dependency %s is this run's own id — a run cannot depend on itself", depID)
@@ -387,19 +453,23 @@ func preflightDependency(c client.Client, cfg config.Config, workflowID, depID s
 			depID, q, cfg.Temporal.TaskQueue)
 	}
 	switch s := info.GetStatus(); s {
-	case enums.WORKFLOW_EXECUTION_STATUS_RUNNING, enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
+	case enums.WORKFLOW_EXECUTION_STATUS_RUNNING, enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
+		enums.WORKFLOW_EXECUTION_STATUS_PAUSED:
 		return nil
 	case enums.WORKFLOW_EXECUTION_STATUS_COMPLETED:
 		var result string
 		if err := c.GetWorkflow(context.Background(), depID, "").Get(context.Background(), &result); err != nil {
 			return fmt.Errorf("read result of dependency %s: %w", depID, err)
 		}
-		if workflows.IsParkedResult(result) {
+		if workflows.IsParkedResult(result) && !cfg.Dependency.ReleasePosture() {
 			return fmt.Errorf("dependency %s completed parked — the chain is already broken; resume it with `daedalus continue %s \"<prompt>\"` first",
 				depID, depID)
 		}
 		return nil
 	default:
+		if cfg.Dependency.ReleasePosture() {
+			return nil
+		}
 		return fmt.Errorf("dependency %s is %s — the chain is already broken; resolve it first (closed sessions resume with: daedalus continue %s \"<prompt>\")",
 			depID, s, depID)
 	}
@@ -598,7 +668,7 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 	}
 	defer c.Close()
 
-	prev, lastReview, err := readPriorRun(c, workflowID)
+	prev, lastReview, gateGreen, err := readPriorRun(c, workflowID)
 	if err != nil {
 		return err
 	}
@@ -661,6 +731,14 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		SharedTestQueue: sharedTestQueueInput(cfg),
 		TestOutputDir:   cfg.TestOutputDir(),
 		BaseBranch:      base,
+		// The skip-key, threaded down the chain: this attempt's own green
+		// native-suite evidence (the preflight pass, or a green round
+		// after it), or the recorded flag of an earlier link — the skip
+		// records no suite of its own, so without the threading a second
+		// continue of a validated chain would re-gate and re-park on the
+		// preserved mid-flight worktree. A never-validated chain carries
+		// neither and re-runs the gate on every continue.
+		BaselineValidated: gateGreen || prev.BaselineValidated,
 		// No truncation anywhere in the app: the complete last review rides
 		// into the continued run's opening prompt.
 		PriorFeedback: lastReview.Comments,
@@ -680,9 +758,13 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 	return awaitPipeline(run)
 }
 
-// readPriorRun walks the workflow's history for the original pipeline input
-// and the last reviewer verdict.
-func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineInput, lastReview activities.ReviewResult, err error) {
+// readPriorRun walks the workflow's history for the original pipeline
+// input, the last reviewer verdict, and gateGreen — whether any
+// native-suite execution completed green (a failed or red suite
+// completes with Passed false, a crashed one never completes), the
+// recorded preflight pass `continue` threads into the new run's
+// BaselineValidated.
+func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineInput, lastReview activities.ReviewResult, gateGreen bool, err error) {
 	dc := converter.GetDefaultDataConverter()
 	scheduled := map[int64]string{}
 	iter := c.GetWorkflowHistory(context.Background(), workflowID, "",
@@ -690,14 +772,14 @@ func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineIn
 	for iter.HasNext() {
 		ev, err := iter.Next()
 		if err != nil {
-			return prev, lastReview, fmt.Errorf("read history of %s: %w", workflowID, err)
+			return prev, lastReview, gateGreen, fmt.Errorf("read history of %s: %w", workflowID, err)
 		}
 		switch {
 		case ev.GetWorkflowExecutionStartedEventAttributes() != nil:
 			ps := ev.GetWorkflowExecutionStartedEventAttributes().GetInput().GetPayloads()
 			if len(ps) > 0 {
 				if err := dc.FromPayload(ps[0], &prev); err != nil {
-					return prev, lastReview, fmt.Errorf("decode pipeline input: %w", err)
+					return prev, lastReview, gateGreen, fmt.Errorf("decode pipeline input: %w", err)
 				}
 			}
 		case ev.GetActivityTaskScheduledEventAttributes() != nil:
@@ -705,20 +787,29 @@ func readPriorRun(c client.Client, workflowID string) (prev workflows.PipelineIn
 			scheduled[ev.GetEventId()] = a.GetActivityType().GetName()
 		case ev.GetActivityTaskCompletedEventAttributes() != nil:
 			a := ev.GetActivityTaskCompletedEventAttributes()
-			if scheduled[a.GetScheduledEventId()] != "RunJailedReviewerActivity" {
-				continue
-			}
-			ps := a.GetResult().GetPayloads()
-			if len(ps) == 0 {
-				continue
-			}
-			var r activities.ReviewResult
-			if err := dc.FromPayload(ps[0], &r); err == nil {
-				lastReview = r
+			switch scheduled[a.GetScheduledEventId()] {
+			case "RunJailedReviewerActivity":
+				ps := a.GetResult().GetPayloads()
+				if len(ps) == 0 {
+					continue
+				}
+				var r activities.ReviewResult
+				if err := dc.FromPayload(ps[0], &r); err == nil {
+					lastReview = r
+				}
+			case "RunTestSuiteActivity":
+				ps := a.GetResult().GetPayloads()
+				if len(ps) == 0 {
+					continue
+				}
+				var r activities.TestResult
+				if err := dc.FromPayload(ps[0], &r); err == nil && r.Passed {
+					gateGreen = true
+				}
 			}
 		}
 	}
-	return prev, lastReview, nil
+	return prev, lastReview, gateGreen, nil
 }
 
 // verifyBranch fails unless ref resolves in the repository.

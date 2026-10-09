@@ -138,6 +138,49 @@ func TestLoadOverridesRejects(t *testing.T) {
 			want:  `references data field(s) "Nope"`,
 		},
 		{
+			// A first-level field carrying a second-level read the data type
+			// does not have: checkOverride's first-level walk passes it, and
+			// only the startup render can catch it.
+			name:  "nested access fails the startup render",
+			files: map[string]string{"tests.md": "{{.BugDir}} {{.BugDir.Nope}}"},
+			want:  "does not render against the prompt's data",
+		},
+		{
+			// The same shape with the guard stripped: the embedded review
+			// reads Handoff only under {{if .Handoff}}, so a replacement that
+			// keeps the reference but drops the guard would have failed on
+			// every round's render, not just the oversized-diff ones.
+			name:  "stripped handoff guard fails the startup render",
+			files: map[string]string{"review.md": "verdicts: APPROVED CHANGES_REQUESTED NEEDS_MAINTAINER REBUILD {{.Handoff.Nope}}"},
+			want:  "does not render against the prompt's data",
+		},
+		{
+			// A broken access behind a surviving guard: the zero-value render
+			// skips it, so the handoff-attached render is what catches it —
+			// failing the start instead of the first oversized diff.
+			name: "broken access behind the handoff guard",
+			files: map[string]string{"review.md": "{{if .Handoff}}{{.Handoff.Nope}}{{end}} " +
+				"APPROVED CHANGES_REQUESTED NEEDS_MAINTAINER REBUILD"},
+			want: "(with a diff handoff attached)",
+		},
+		{
+			// Whole-word matching: DISAPPROVED contains APPROVED as a
+			// substring, and the source-level contains-check this guard once
+			// used took it as vouching for the verdict.
+			name:  "DISAPPROVED cannot vouch for APPROVED",
+			files: map[string]string{"review.md": "say DISAPPROVED CHANGES_REQUESTED NEEDS_MAINTAINER REBUILD"},
+			want:  `missing "APPROVED"`,
+		},
+		{
+			// A word present in the source but rendered nowhere: REBUILD
+			// hidden behind a condition that never fires fails the rendered-
+			// text check the same way a deletion would — the rendered text is
+			// the contract the review loop parses.
+			name:  "verdict word carried only where it never renders",
+			files: map[string]string{"review.md": `APPROVED CHANGES_REQUESTED NEEDS_MAINTAINER {{if eq .Focus "never"}}REBUILD{{end}}`},
+			want:  `missing "REBUILD"`,
+		},
+		{
 			name:  "review override dropped a verdict word",
 			files: map[string]string{"review.md": "End with exactly APPROVED, always."},
 			want:  `missing "CHANGES_REQUESTED"`,
@@ -264,6 +307,85 @@ func TestLoadOverridesInstalls(t *testing.T) {
 	got, err = Continue("t", "fb")
 	if err != nil || !strings.Contains(got, "continuing a previous attempt") {
 		t.Errorf("Continue after unrelated overrides = %q, %v; want the embedded prompt", got, err)
+	}
+}
+
+// TestLoadOverridesVerbatimReviewCopy pins the scaffold round trip: a
+// byte-verbatim copy of the embedded review prompt — exactly what
+// "daedalus init prompt review" scaffolds — loads and renders identically
+// to the embedded one. The rendered-text verdict check must read the
+// test-review framing, the one shape where REBUILD renders (it lives inside
+// {{if .TestsInScope}}), or this innocent copy fails the worker's start.
+func TestLoadOverridesVerbatimReviewCopy(t *testing.T) {
+	resetInstalled(t)
+	src, err := promptFiles.ReadFile("prompts/review.md")
+	if err != nil {
+		t.Fatalf("read embedded review.md: %v", err)
+	}
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"review.md": string(src)})
+
+	// The embedded render, captured before the override is installed.
+	want, err := Review("the change", "M x.go", "", true, "reply", "docs/bugs")
+	if err != nil {
+		t.Fatalf("embedded Review: %v", err)
+	}
+	if err := LoadOverrides(dir, t.TempDir()); err != nil {
+		t.Fatalf("LoadOverrides(verbatim review.md): %v — a byte-verbatim copy of the embedded prompt must load", err)
+	}
+	got, err := Review("the change", "M x.go", "", true, "reply", "docs/bugs")
+	if err != nil {
+		t.Fatalf("Review after override: %v", err)
+	}
+	if got != want {
+		t.Errorf("verbatim override render differs from the embedded render (%d vs %d bytes)", len(got), len(want))
+	}
+
+	// The guard's positive catch on the same faithful shape: every REBUILD
+	// occurrence stripped from the verbatim copy — an edit an override
+	// author could actually make — fails the load naming the word.
+	resetInstalled(t)
+	stripped := strings.ReplaceAll(string(src), "REBUILD", "")
+	if stripped == string(src) {
+		t.Fatal("the embedded review.md carries no REBUILD — the strip fixture is vacuous")
+	}
+	writeFiles(t, dir, map[string]string{"review.md": stripped})
+	err = LoadOverrides(dir, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), `missing "REBUILD"`) {
+		t.Errorf("LoadOverrides(REBUILD-stripped verbatim copy) = %v, want the missing-REBUILD refusal", err)
+	}
+	// The rejection swaps in nothing: the verbatim set the earlier load
+	// installed stays standing (the atomicity TestLoadOverridesAtomicity
+	// pins, here over the failed re-load).
+	if len(installed) != 1 {
+		t.Errorf("installed set after the failed load = %d override(s), want the previous verbatim set kept", len(installed))
+	}
+}
+
+// TestRepresentativeDataCoversPrompts pins the startup-render data map
+// against the prompt vocabulary: every prompt has an entry (a missing key
+// would render an override against nil and miss field errors), no entry is
+// left over from a renamed prompt, and every embedded prompt actually
+// renders against its entry — a mistyped zero value fails here instead of
+// on the first deployment that overrides the prompt.
+func TestRepresentativeDataCoversPrompts(t *testing.T) {
+	names := Prompts()
+	if len(representativeData) != len(names) {
+		t.Errorf("representativeData holds %d entries, want one per prompt (%d)", len(representativeData), len(names))
+	}
+	for _, name := range names {
+		data, ok := representativeData[name]
+		if !ok {
+			t.Errorf("representativeData has no entry for prompt %q", name)
+			continue
+		}
+		emb := parsed.Lookup(name + ".md")
+		if emb == nil {
+			t.Fatalf("no embedded template named %s.md", name)
+		}
+		if _, err := renderOverride(emb, data); err != nil {
+			t.Errorf("prompt %s does not render against its representative data: %v", name, err)
+		}
 	}
 }
 

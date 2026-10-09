@@ -245,6 +245,47 @@ func TestCompleteRestartTargetFlags(t *testing.T) {
 	}
 }
 
+// TestCompletePositionalWordsSkipFlags pins the positional-tail filter both
+// argument positions apply: a global flag (either spelling, the "=" form
+// included) between the command and its arguments never counts toward the
+// init profile saturation or the worker action/target positions — parseFlags
+// strips the global flags from anywhere, so `init -c cfg.yaml prompt` is a
+// legal one-profile line and `worker -c cfg.yaml restart` is a restart line,
+// not a saturated one the probe would answer with nothing.
+func TestCompletePositionalWordsSkipFlags(t *testing.T) {
+	// The worker restart-target cases read the recorded workers from
+	// daemonDir, seeded like TestCompleteRestartTargets's.
+	reset := daemonDir
+	t.Cleanup(func() { daemonDir = reset })
+	daemonDir = t.TempDir()
+	for _, name := range []string{"arete", "forge"} {
+		if err := os.WriteFile(filepath.Join(daemonDir, "worker-"+name+".conf"), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targets := []string{"all", "arete", "forge"}
+
+	for _, c := range []struct {
+		words []string
+		want  []string
+	}{
+		{[]string{"init", "-c", "cfg.yaml", ""}, []string{"prompt", "slim"}},
+		{[]string{"init", "--config=cfg.yaml", ""}, []string{"prompt", "slim"}},
+		{[]string{"init", "prompt", "-c", "cfg.yaml", ""}, []string{"slim"}},
+		{[]string{"init", "-c", "cfg.yaml", "prompt", "slim", ""}, nil},
+		{[]string{"worker", "-c", "cfg.yaml", ""}, sortedWorkerActions()},
+		// The "=" form must be stripped too: unstripped, it saturates the
+		// action position and the probe answers nothing.
+		{[]string{"worker", "--config=cfg.yaml", ""}, sortedWorkerActions()},
+		{[]string{"worker", "-c", "cfg.yaml", "restart", ""}, targets},
+		{[]string{"worker", "restart", "-c", "cfg.yaml", ""}, targets},
+	} {
+		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("complete(%q) = %q, want %q", c.words, got, c.want)
+		}
+	}
+}
+
 // withoutNames returns spellings whose semantic flag name is not in names.
 func withoutNames(spellings []string, names ...string) []string {
 	drop := map[string]bool{}

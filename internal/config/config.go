@@ -415,6 +415,68 @@ type TestOutputConfig struct {
 	Mirror string `yaml:"mirror"`
 }
 
+// DependencyConfig governs what a run does when its `depends_on`
+// dependency stops without approval. The default posture is still the
+// refusal the gate has always had — the run fails before anything was
+// started — because the skip flags all default false and an empty
+// fallback_branch gives a release nowhere to land. opting into
+// `fallback_branch` turns the gate from a wall into a switch: a dependency
+// that stopped in a skip-listed state releases the waiting run onto that
+// branch instead of failing it.
+type DependencyConfig struct {
+	// Enabled gates the whole section: false restores the unconditional
+	// refusal whatever the other fields say. Default true; tri-state
+	// (*bool) because applyDefaults cannot tell an explicit false from an
+	// unset field — the same idiom as SharedTestQueue.
+	Enabled *bool `yaml:"enabled"`
+	// FallbackBranch names the branch a released run starts its worktree
+	// from. Empty — the default — means the invocation branch, resolved
+	// once at submit against the run's repo (a detached HEAD refuses with
+	// the error naming this key as the fix). An explicitly set branch is
+	// verified to exist at submit, so a typo fails the run before the
+	// dependency gate instead of after it. The resolved name travels in
+	// the workflow input, so a config edit mid-run cannot retarget an
+	// in-flight chain.
+	FallbackBranch string `yaml:"fallback_branch"`
+	// SkipParked releases a run past a dependency that ended in a park
+	// (preserved on its aborted branch, resumable with `daedalus
+	// continue`). Default true — a parked dependency is the one stopped
+	// state whose work survives, so its dependent is routinely started
+	// rather than stranded; tri-state like Enabled for the same reason.
+	SkipParked *bool `yaml:"skip_parked"`
+	// SkipFailed releases past a dependency whose workflow failed. Default
+	// false: a failed dependency produced nothing to build on.
+	SkipFailed bool `yaml:"skip_failed"`
+	// SkipStuck releases past a dependency that ran past its Temporal
+	// timeouts and was killed (status "timed out"). Default false.
+	SkipStuck bool `yaml:"skip_stuck"`
+	// SkipCanceled releases past a dependency that was canceled or
+	// terminated. Default false.
+	SkipCanceled bool `yaml:"skip_canceled"`
+}
+
+// EnabledOrDefault reports the section's effective enabled: true unless an
+// explicit false was loaded (the default — nil — is on).
+func (d DependencyConfig) EnabledOrDefault() bool {
+	return d.Enabled == nil || *d.Enabled
+}
+
+// SkipParkedOrDefault reports the effective skip_parked: true unless an
+// explicit false was loaded (the default — nil — is on).
+func (d DependencyConfig) SkipParkedOrDefault() bool {
+	return d.SkipParked == nil || *d.SkipParked
+}
+
+// ReleasePosture reports whether the section can release a dependent run
+// past a dependency that stopped without approval: enabled, with a
+// fallback branch resolved. Both the submit preflight and the workflow
+// gate key on it; which stopped states actually release is the skip flags'
+// decision (workflows.dependencyReleases), and a paused or vanished
+// dependency is outside every skip set.
+func (d DependencyConfig) ReleasePosture() bool {
+	return d.EnabledOrDefault() && d.FallbackBranch != ""
+}
+
 // SlimConfig is the slim mode section. Intentionally breaking reshape
 // (2026-10-02): the historical top-level `slim: true/false` boolean became
 // this section — existing configs migrate by renaming the value to
@@ -594,6 +656,10 @@ type Config struct {
 	// TestOutput is the suite-output dump toggle; inactive unless Enabled
 	// (see TestOutputConfig).
 	TestOutput TestOutputConfig `yaml:"test_output"`
+	// Dependency governs the -dep gate's broken-chain answer: refuse (the
+	// historical default) or release onto a fallback branch (see
+	// DependencyConfig).
+	Dependency DependencyConfig `yaml:"dependency"`
 	// Prompt points at a directory of prompt-template overrides: every .md
 	// file directly inside it whose file stem names a prompt (the
 	// internal/template Prompts — the embedded prompts/*.md stems:
@@ -606,16 +672,25 @@ type Config struct {
 	// this config file's directory. Resolved and validated once at worker
 	// startup (missing directory, unreadable file, empty file, template
 	// that does not parse, a data field the prompt does not take, a
-	// {{template}} action, a {{define}}/{{block}} block — a define body
-	// can never render in an override — or a review override missing the
-	// verdict protocol all fail the start); rendered prompts
+	// {{template}} action, a {{define}}/{{block}} block (a define or
+	// block body can never render in an override — the sole exception is
+	// a define named exactly <prompt-name>.md; don't rely on it), a render
+	// against the prompt's representative data that fails (a reference
+	// that only breaks at render time — a nested access, or one whose
+	// {{if}} guard an edit stripped; review renders further times with a
+	// diff handoff attached and in the test-review framing), or a review
+	// override missing the verdict
+	// protocol in its rendered text (checked in the test-review framing,
+	// the one shape where the fourth verdict renders) all fail the start);
+	// rendered prompts
 	// are recorded in workflow history, so replacement content is not
 	// secret and may live on the same path as the config. Empty — the
 	// default — renders every prompt byte-identically to the embedded one.
 	// A string, not a name→path mapping, so Config stays ==-comparable; the
 	// one directory keeps a deployment's replacements together. Note the
 	// machine contracts a replacement must keep: review's verdict protocol
-	// is validated at startup, and slim_parse must keep instructing the
+	// is validated at startup (all four verdict words, whole words, in the
+	// rendered text), and slim_parse must keep instructing the
 	// parse round to emit the raw SlimSubtask JSON array parseSlimPlan
 	// reads (caveat, not validated); slim_plan's replacement carries no
 	// such contract — it is pure generation, a prose plan with no JSON,
@@ -687,6 +762,7 @@ type renderConfig struct {
 	Reviewer               ReviewerConfig   `yaml:"reviewer"`
 	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
 	TestOutput             TestOutputConfig `yaml:"test_output"`
+	Dependency             DependencyConfig `yaml:"dependency"`
 	Prompt                 string           `yaml:"prompt"`
 }
 
@@ -717,6 +793,7 @@ func (c Config) RenderYAML() (string, error) {
 		Reviewer:               c.Reviewer,
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
+		Dependency:             c.Dependency,
 		Prompt:                 c.Prompt,
 	})
 	return string(out), err
@@ -988,6 +1065,25 @@ func parse(path string) (Config, error) {
 	if err != nil {
 		return c, fmt.Errorf("read config %s: %w", path, err)
 	}
+	// A repeated key in any section is tolerated — the last value wins,
+	// loudly — instead of failing the load the way yaml.v3's own
+	// duplicate-key check would (a check the slim section's custom
+	// unmarshaler bypassed anyway, so strictness there was never parity).
+	// The pre-scan prunes the losers from the node tree; only when it
+	// pruned something is the tree re-encoded for the strict decode — an
+	// ordinary config still decodes from the file's own bytes, error line
+	// numbers included. ponytail: a dup-carrying config decodes
+	// re-encoded, so a second error in it reports re-encoded line
+	// numbers; the alert lines keep the file's own.
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return c, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if dedupeKeys(&doc, path, "top level") {
+		if data, err = yaml.Marshal(&doc); err != nil {
+			return c, fmt.Errorf("parse config %s: %w", path, err)
+		}
+	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	// An empty document (touch config.yaml) is no config at all: it loads
@@ -997,6 +1093,49 @@ func parse(path string) (Config, error) {
 		return c, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return c, nil
+}
+
+// dedupeKeys walks n's mapping nodes and deletes every repeated key's
+// earlier occurrences, keeping the last value and printing one alert line
+// per dropped occurrence to stderr (file, section, key, winning line).
+// section names the mapping the walk sits in — "top level" at the root,
+// else the key that introduced it. It reports whether anything was pruned.
+// Alias nodes are skipped: their target was walked where it was defined.
+func dedupeKeys(n *yaml.Node, path, section string) bool {
+	pruned := false
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, c := range n.Content {
+			pruned = dedupeKeys(c, path, section) || pruned
+		}
+	case yaml.MappingNode:
+		// Keys sit at even Content indices with their values at the odd
+		// ones that follow; the last occurrence of a key is the winner.
+		last := make(map[string]int, len(n.Content)/2)
+		for i := 0; i < len(n.Content); i += 2 {
+			last[n.Content[i].Value] = i
+		}
+		keep := make([]*yaml.Node, 0, len(n.Content))
+		for i := 0; i < len(n.Content); i += 2 {
+			key, val := n.Content[i], n.Content[i+1]
+			if j := last[key.Value]; j != i {
+				fmt.Fprintf(os.Stderr, "config alert: duplicate key %q in section %q (%s:%d) — the last value wins\n",
+					key.Value, section, path, n.Content[j].Line)
+				pruned = true
+				continue
+			}
+			keep = append(keep, key, val)
+		}
+		n.Content = keep
+		for i := 0; i+1 < len(keep); i += 2 {
+			pruned = dedupeKeys(keep[i+1], path, keep[i].Value) || pruned
+		}
+	case yaml.SequenceNode:
+		for _, c := range n.Content {
+			pruned = dedupeKeys(c, path, section) || pruned
+		}
+	}
+	return pruned
 }
 
 // validate rejects the configs Load refuses, with Load's diagnostics. Call

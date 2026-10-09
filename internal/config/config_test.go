@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -8,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 func writeConfig(t *testing.T, content string) string {
@@ -782,6 +782,115 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+// loadCapturingAlerts loads content while capturing the stderr the
+// duplicate-key alerts print to, returning the loaded config, the config's
+// path (the alerts name it), the captured text, and Load's error. The swap is
+// safe here: nothing in the package's tests runs in parallel, and the alerts
+// are a few short lines — far under the pipe buffer, so the write never
+// blocks on this read.
+func loadCapturingAlerts(t *testing.T, content string) (Config, string, string, error) {
+	t.Helper()
+	path := writeConfig(t, content)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = w
+	cfg, loadErr := Load(path)
+	os.Stderr = saved
+	w.Close()
+	data, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg, path, string(data), loadErr
+}
+
+// TestLoadDuplicateKeys pins the tolerated-duplicate contract: a repeated
+// key in any section — the slim section's hand-walked unmarshaler included —
+// loads with the last value winning, one stderr alert per dropped occurrence
+// naming the file, section, key, and winning line. Nothing else loosens: a
+// typo'd key still fails the strict decode through the doc a prune leaves
+// behind, and an ordinary config still decodes from the file's own bytes, so
+// its decode errors keep the file's own line numbers (a re-encode drops the
+// blank lines between top-level sections, renumbering everything after the
+// first).
+func TestLoadDuplicateKeys(t *testing.T) {
+	t.Run("duplicate in the slim section keeps the last value, loudly", func(t *testing.T) {
+		cfg, path, alerts, err := loadCapturingAlerts(t, "slim:\n  enabled: true\n  enabled: false\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Slim.Enabled {
+			t.Error("Slim.Enabled = true, want false — the last value wins")
+		}
+		want := fmt.Sprintf("config alert: duplicate key %q in section %q (%s:3) — the last value wins\n", "enabled", "slim", path)
+		if alerts != want {
+			t.Errorf("alerts = %q, want exactly %q", alerts, want)
+		}
+	})
+
+	t.Run("duplicate at the top level — a load error before — keeps the last value", func(t *testing.T) {
+		cfg, path, alerts, err := loadCapturingAlerts(t, "agent: claude\nagent: pi\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Agent != "pi" {
+			t.Errorf("Agent = %q, want pi — the last value wins", cfg.Agent)
+		}
+		want := fmt.Sprintf("config alert: duplicate key %q in section %q (%s:2) — the last value wins\n", "agent", "top level", path)
+		if alerts != want {
+			t.Errorf("alerts = %q, want exactly %q", alerts, want)
+		}
+	})
+
+	t.Run("duplicate in a nested section names the section", func(t *testing.T) {
+		cfg, path, alerts, err := loadCapturingAlerts(t, "openai:\n  url: https://a.example/v1\n  url: https://b.example/v1\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.OpenAI.URL != "https://b.example/v1" {
+			t.Errorf("OpenAI.URL = %q, want the last value", cfg.OpenAI.URL)
+		}
+		want := fmt.Sprintf("config alert: duplicate key %q in section %q (%s:3) — the last value wins\n", "url", "openai", path)
+		if alerts != want {
+			t.Errorf("alerts = %q, want exactly %q", alerts, want)
+		}
+	})
+
+	t.Run("a typo still fails through the pruned doc", func(t *testing.T) {
+		_, _, alerts, err := loadCapturingAlerts(t, "agent: claude\nagent: pi\ntests_timeot: 5m\n")
+		if err == nil || !strings.Contains(err.Error(), "tests_timeot") {
+			t.Fatalf("Load error = %v, want the unknown-key rejection to survive the prune's re-encode", err)
+		}
+		if !strings.Contains(alerts, `duplicate key "agent"`) {
+			t.Errorf("alerts = %q, want the duplicate-key alert alongside the rejection", alerts)
+		}
+	})
+
+	t.Run("a dup-free config decodes the file's own bytes", func(t *testing.T) {
+		// The blank line between the sections is what a re-encode would
+		// drop, pulling thinking: up to line 3; the decode error must carry
+		// the file's own line 4.
+		_, err := Load(writeConfig(t, "agent: claude\n\nopenai:\n  thinking: false\n"))
+		if err == nil || !strings.Contains(err.Error(), "line 4") {
+			t.Fatalf("Load error = %v, want the misplaced-key rejection at the file's own line 4", err)
+		}
+	})
+
+	t.Run("no duplicate, no alert", func(t *testing.T) {
+		_, _, alerts, err := loadCapturingAlerts(t, "agent: claude\nslim:\n  enabled: true\n")
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if alerts != "" {
+			t.Errorf("alerts = %q, want stderr untouched for an ordinary config", alerts)
+		}
+	})
+}
+
 // TestExampleYAML pins that loading the example yields exactly the default
 // configuration — every field at its default, nothing more.
 func TestExampleYAML(t *testing.T) {
@@ -1001,6 +1110,13 @@ fallback:
 reviewer:
   url: https://review.example
   key: sk-review
+dependency:
+  enabled: false
+  fallback_branch: dep-fallback
+  skip_parked: false
+  skip_failed: true
+  skip_stuck: true
+  skip_canceled: true
 prompt: overrides/
 `))
 	if err != nil {
@@ -1018,7 +1134,7 @@ prompt: overrides/
 		"agent:", "branch_prefix:", "authorship:", "worker_id:",
 		"tests_timeout:", "agent_run_timeout:", "review_timeout:", "cleanup_timeout:",
 		"max_concurrent_agent_runs:", "max_concurrent_tests:",
-		"temporal:", "anthropic:", "openai:", "fallback:", "reviewer:", "prompt:",
+		"temporal:", "anthropic:", "openai:", "fallback:", "reviewer:", "dependency:", "prompt:",
 	} {
 		i := strings.Index(out, key)
 		if i < 0 {
@@ -1055,13 +1171,31 @@ prompt: overrides/
 		}
 	}
 
-	// The render is lossless: parsing it back yields the same config.
-	var back Config
-	if err := yaml.Unmarshal([]byte(out), &back); err != nil {
+	// The render is lossless: parsing it back — strictly, so the render
+	// must emit only keys the decoder accepts — yields the same config.
+	// Config's tri-state dependency pointers make == compare by address
+	// (the known Config-equality wart), so the whole-config pin is the
+	// re-render: every field prints, so equal output means equal values.
+	back, err := LoadRaw(writeConfig(t, out))
+	if err != nil {
 		t.Fatalf("parse RenderYAML output: %v\n%s", err, out)
 	}
-	if back != raw {
-		t.Errorf("RenderYAML round-trip = %+v, want %+v", back, raw)
+	roundTrip, err := back.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML round-trip: %v", err)
+	}
+	if roundTrip != out {
+		t.Errorf("RenderYAML round-trip =\n%s\nwant\n%s", roundTrip, out)
+	}
+	// The explicit non-defaults survive un-defaulted: the tri-state flags
+	// keep their explicit false (nil would default to true), and the plain
+	// flags and branch name arrive verbatim.
+	if back.Dependency.EnabledOrDefault() || back.Dependency.SkipParkedOrDefault() {
+		t.Errorf("RenderYAML round-trip defaulted the explicit tri-state dependency flags: %+v", back.Dependency)
+	}
+	if back.Dependency.FallbackBranch != "dep-fallback" || !back.Dependency.SkipFailed ||
+		!back.Dependency.SkipStuck || !back.Dependency.SkipCanceled {
+		t.Errorf("RenderYAML round-trip lost the explicit dependency values: %+v", back.Dependency)
 	}
 }
 
@@ -1339,6 +1473,103 @@ func TestLoadSharedTestQueue(t *testing.T) {
 				t.Errorf("SharesTestQueue() = %v (SharedTestQueue = %v), want %v", got, cfg.SharedTestQueue, c.want)
 			}
 		})
+	}
+}
+
+// TestLoadDependency pins the dependency section's decode and tri-state
+// defaults: an absent section is the historical refusal posture (enabled,
+// but with no fallback branch there is nowhere to release to), only an
+// explicit false disables, and skip_parked is the one skip flag defaulted
+// on — the stopped state whose work survives on its aborted branch.
+func TestLoadDependency(t *testing.T) {
+	t.Run("absent section is enabled with no fallback", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, ""))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.Dependency.EnabledOrDefault() {
+			t.Error("EnabledOrDefault() = false on an absent section, want true")
+		}
+		if !cfg.Dependency.SkipParkedOrDefault() {
+			t.Error("SkipParkedOrDefault() = false on an absent section, want true")
+		}
+		if cfg.Dependency.ReleasePosture() {
+			t.Error("ReleasePosture() = true with no fallback_branch, want false — a release with nowhere to land is the refusal")
+		}
+	})
+
+	t.Run("explicit flags decode", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, ""+
+			"dependency:\n"+
+			"  enabled: true\n"+
+			"  fallback_branch: release-base\n"+
+			"  skip_parked: false\n"+
+			"  skip_failed: true\n"+
+			"  skip_stuck: true\n"+
+			"  skip_canceled: true\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Dependency.FallbackBranch != "release-base" {
+			t.Errorf("FallbackBranch = %q, want release-base", cfg.Dependency.FallbackBranch)
+		}
+		if cfg.Dependency.Enabled == nil || !*cfg.Dependency.Enabled {
+			t.Errorf("Enabled = %v, want the explicit true decoded into the pointer", cfg.Dependency.Enabled)
+		}
+		if cfg.Dependency.SkipParked == nil || *cfg.Dependency.SkipParked {
+			t.Errorf("SkipParked = %v, want the explicit false decoded into the pointer", cfg.Dependency.SkipParked)
+		}
+		if cfg.Dependency.SkipParkedOrDefault() {
+			t.Error("SkipParkedOrDefault() = true, want the explicit false")
+		}
+		if !cfg.Dependency.SkipFailed || !cfg.Dependency.SkipStuck || !cfg.Dependency.SkipCanceled {
+			t.Errorf("skip flags = %v/%v/%v, want all true", cfg.Dependency.SkipFailed, cfg.Dependency.SkipStuck, cfg.Dependency.SkipCanceled)
+		}
+		if !cfg.Dependency.ReleasePosture() {
+			t.Error("ReleasePosture() = false, want true (enabled with a fallback branch)")
+		}
+	})
+
+	t.Run("explicit enabled false disables the section", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "dependency:\n  enabled: false\n  fallback_branch: release-base\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Dependency.EnabledOrDefault() {
+			t.Error("EnabledOrDefault() = true on an explicit false, want false")
+		}
+		if cfg.Dependency.ReleasePosture() {
+			t.Error("ReleasePosture() = true while disabled, want false — enabled: false restores the unconditional refusal whatever the other fields say")
+		}
+	})
+
+	t.Run("unknown key under dependency is rejected", func(t *testing.T) {
+		_, err := Load(writeConfig(t, "dependency:\n  fallback_branchn: typo\n"))
+		if err == nil || !strings.Contains(err.Error(), "fallback_branchn") {
+			t.Errorf("Load(unknown dependency key) err = %v, want the strict-decode rejection naming the key", err)
+		}
+	})
+}
+
+// TestReleasePosture pins the posture gate both the submit preflight and the
+// workflow key on: enabled with a resolved fallback branch, and nothing
+// else — the zero value (a run whose input predates the field) refuses,
+// replay-safe in the loud direction.
+func TestReleasePosture(t *testing.T) {
+	if (DependencyConfig{}).ReleasePosture() {
+		t.Error("zero DependencyConfig is in release posture, want refusal")
+	}
+	enabledNoBranch := DependencyConfig{SkipParked: new(bool)}
+	if enabledNoBranch.ReleasePosture() {
+		t.Error("enabled with no fallback branch is in release posture, want refusal")
+	}
+	disabled := false
+	disabledWithBranch := DependencyConfig{FallbackBranch: "b", Enabled: &disabled}
+	if disabledWithBranch.ReleasePosture() {
+		t.Error("disabled section with a fallback branch is in release posture, want refusal")
+	}
+	if !(DependencyConfig{FallbackBranch: "b"}).ReleasePosture() {
+		t.Error("enabled section with a fallback branch refuses, want release posture")
 	}
 }
 

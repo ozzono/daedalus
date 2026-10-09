@@ -10,9 +10,12 @@ import (
 	"testing"
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/enums/v1"
+	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 
 	"github.com/ozzono/daedalus/internal/activities"
 )
@@ -1348,7 +1351,16 @@ func TestTranscriptCoT(t *testing.T) {
 // only exists while a round is in flight, non-transcript agents get the
 // one-line appears-when-complete note, claude and pi get their live CoT,
 // and the empty-transcript states degrade to their one-liners — never a
-// guess and never a duplicate of a completed round.
+// guess and never a duplicate of a completed round. Once a transcript is
+// in hand the header carries the freshness stamp — `last write` is the
+// transcript's mtime in UTC, `activity` the run's LastActivityAt off the
+// live describe — and the early returns before a transcript (codex's note,
+// the no-host-transcript note, no transcript yet) keep the bare header;
+// these subtests exercise the nil shape by passing a nil client to
+// liveCotSectionWith directly — a nil client, like a describe failure or
+// a run that never backfilled the attribute, degrades the activity half
+// to unknown — and the client-backed subtests pin what a live describe
+// adds.
 func TestLiveCotSection(t *testing.T) {
 	// The live section consults all four sources through newestTranscript;
 	// codex and opencode stay inert here — this test pins the file-based
@@ -1391,8 +1403,8 @@ func TestLiveCotSection(t *testing.T) {
 
 	t.Run("no task log is no section", func(t *testing.T) {
 		useTaskLogDir(t)
-		if got := liveCotSection("wf-live-none"); got != "" {
-			t.Errorf("liveCotSection = %q, want empty with no log file", got)
+		if got := liveCotSectionWith("wf-live-none", nil); got != "" {
+			t.Errorf("liveCotSectionWith = %q, want empty with no log file", got)
 		}
 	})
 
@@ -1400,8 +1412,8 @@ func TestLiveCotSection(t *testing.T) {
 		useTaskLogDir(t)
 		writeTaskLogFile(t, "wf-live-idle", startedLine("claude", "dev"),
 			"=== 2026-09-25T10:05:00Z jailed claude round exited after 5m0s (run abcd1234) ===")
-		if got := liveCotSection("wf-live-idle"); got != "" {
-			t.Errorf("liveCotSection = %q, want empty for a finished round", got)
+		if got := liveCotSectionWith("wf-live-idle", nil); got != "" {
+			t.Errorf("liveCotSectionWith = %q, want empty for a finished round", got)
 		}
 	})
 
@@ -1412,8 +1424,8 @@ func TestLiveCotSection(t *testing.T) {
 
 		want := "=== in-flight round (stage=dev, live) ===\n" +
 			"aider keeps no host transcript; CoT appears here when the round completes\n\n"
-		if got := liveCotSection("wf-live-aider"); got != want {
-			t.Errorf("liveCotSection = %q, want %q", got, want)
+		if got := liveCotSectionWith("wf-live-aider", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
@@ -1427,8 +1439,8 @@ func TestLiveCotSection(t *testing.T) {
 		// live view does not read it.
 		want := "=== in-flight round (stage=dev, live) ===\n" +
 			"codex keeps a host transcript the live view does not read; CoT appears here when the round completes\n\n"
-		if got := liveCotSection("wf-live-codex"); got != want {
-			t.Errorf("liveCotSection = %q, want %q", got, want)
+		if got := liveCotSectionWith("wf-live-codex", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
@@ -1437,9 +1449,9 @@ func TestLiveCotSection(t *testing.T) {
 		writeTaskLogFile(t, "wf-live-unknown", startedLine("aider", ""))
 		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
 
-		out := liveCotSection("wf-live-unknown")
+		out := liveCotSectionWith("wf-live-unknown", nil)
 		if !strings.HasPrefix(out, "=== in-flight round (stage=unknown, live) ===\n") {
-			t.Errorf("liveCotSection = %q, want the unknown-stage header", out)
+			t.Errorf("liveCotSectionWith = %q, want the unknown-stage header", out)
 		}
 	})
 
@@ -1448,11 +1460,17 @@ func TestLiveCotSection(t *testing.T) {
 		writeTaskLogFile(t, "wf-live-claude", startedLine("claude", "dev"))
 		claudeDir := t.TempDir()
 		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
-		seedTranscript(t, claudeDir, "claude", "the reasoning", "the answer", time.Now())
+		// The mtime feeds the header's `last write` half, so a fixed
+		// non-UTC stamp pins both the sourcing and the UTC rendering —
+		// and a nil client stubs no connection, so `activity unknown`
+		// here is the nil-shape degradation, never a fabricated stamp.
+		mtime := time.Date(2026, 10, 8, 11, 22, 33, 0, time.FixedZone("CET", 2*3600))
+		seedTranscript(t, claudeDir, "claude", "the reasoning", "the answer", mtime)
 
-		want := "=== in-flight round (stage=dev, live) ===\nthe reasoning\n\nthe answer\n\n"
-		if got := liveCotSection("wf-live-claude"); got != want {
-			t.Errorf("liveCotSection = %q, want %q", got, want)
+		want := "=== in-flight round (stage=dev, live, last write 2026-10-08T09:22:33Z|activity unknown) ===\n" +
+			"the reasoning\n\nthe answer\n\n"
+		if got := liveCotSectionWith("wf-live-claude", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
@@ -1466,10 +1484,12 @@ func TestLiveCotSection(t *testing.T) {
 		seedTranscript(t, piDir, "pi", "live pi reasoning", "live pi answer", new)
 		fakeDirs(t, t.TempDir(), piDir, nil, nil)
 
-		want := "=== in-flight round (stage=test-review, live) ===\n" +
+		// The winner's own mtime feeds `last write` — the header follows
+		// the freshest source, never the shadowed one.
+		want := "=== in-flight round (stage=test-review, live, last write " + new.UTC().Format(time.RFC3339) + "|activity unknown) ===\n" +
 			"live pi reasoning\n\nlive pi answer\n\n"
-		if got := liveCotSection("wf-live-pi"); got != want {
-			t.Errorf("liveCotSection = %q, want %q", got, want)
+		if got := liveCotSectionWith("wf-live-pi", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
@@ -1479,8 +1499,8 @@ func TestLiveCotSection(t *testing.T) {
 		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
 
 		want := "=== in-flight round (stage=dev, live) ===\nno transcript yet — no assistant output has landed\n\n"
-		if got := liveCotSection("wf-live-notyet"); got != want {
-			t.Errorf("liveCotSection = %q, want %q", got, want)
+		if got := liveCotSectionWith("wf-live-notyet", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
@@ -1492,11 +1512,92 @@ func TestLiveCotSection(t *testing.T) {
 		if err := os.WriteFile(path, []byte(`{"type":"user","message":{"content":"the prompt"}}`+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		// A transcript on disk with no assistant output yet is still in
+		// hand — the stamped header renders with its mtime, only the
+		// body degrades.
+		mtime := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
 		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
 
-		want := "=== in-flight round (stage=dev, live) ===\nno assistant output in the transcript yet\n\n"
-		if got := liveCotSection("wf-live-empty"); got != want {
-			t.Errorf("liveCotSection = %q, want %q", got, want)
+		want := "=== in-flight round (stage=dev, live, last write 2026-10-08T09:00:00Z|activity unknown) ===\n" +
+			"no assistant output in the transcript yet\n\n"
+		if got := liveCotSectionWith("wf-live-empty", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
+		}
+	})
+
+	// The activity half comes off the live describe — the same
+	// empty-run-id call cotTailState makes — so these run through
+	// liveCotSectionWith with the fake client. A failed describe or a
+	// run that never backfilled LastActivityAt degrades that half alone:
+	// the section still renders, on the last-write half's own stamp.
+	t.Run("a live describe stamps the activity half", func(t *testing.T) {
+		useTaskLogDir(t)
+		writeTaskLogFile(t, "wf-live-act", startedLine("claude", "dev"))
+		claudeDir := t.TempDir()
+		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
+		mtime := time.Date(2026, 10, 8, 11, 22, 33, 0, time.FixedZone("CET", 2*3600))
+		seedTranscript(t, claudeDir, "claude", "the reasoning", "the answer", mtime)
+
+		// Encoded in a non-UTC zone on purpose: the header renders the
+		// same UTC shape the last-write half is held to.
+		last := time.Date(2026, 10, 8, 12, 30, 5, 0, time.FixedZone("CET", 2*3600))
+		lastPayload, err := converter.GetDefaultDataConverter().ToPayload(last)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := &fakeTailClient{resp: &workflowservice.DescribeWorkflowExecutionResponse{
+			WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+				Status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+				SearchAttributes: &commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
+					"LastActivityAt": lastPayload,
+				}},
+			},
+		}}
+
+		want := "=== in-flight round (stage=dev, live, last write 2026-10-08T09:22:33Z|activity 2026-10-08T10:30:05Z) ===\n" +
+			"the reasoning\n\nthe answer\n\n"
+		if got := liveCotSectionWith("wf-live-act", c); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
+		}
+		if c.workflowID != "wf-live-act" || c.runID != "" {
+			t.Errorf("DescribeWorkflowExecution = (%q, %q), want (workflow, empty run id)", c.workflowID, c.runID)
+		}
+	})
+
+	t.Run("a describe failure leaves the stamp's activity half unknown", func(t *testing.T) {
+		useTaskLogDir(t)
+		writeTaskLogFile(t, "wf-live-acterr", startedLine("claude", "dev"))
+		claudeDir := t.TempDir()
+		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
+		mtime := time.Date(2026, 10, 8, 11, 22, 33, 0, time.FixedZone("CET", 2*3600))
+		seedTranscript(t, claudeDir, "claude", "the reasoning", "the answer", mtime)
+
+		c := &fakeTailClient{describeEr: errors.New("dial failed")}
+		want := "=== in-flight round (stage=dev, live, last write 2026-10-08T09:22:33Z|activity unknown) ===\n" +
+			"the reasoning\n\nthe answer\n\n"
+		if got := liveCotSectionWith("wf-live-acterr", c); got != want {
+			t.Errorf("liveCotSectionWith(describe error) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a describe without the attribute degrades alone", func(t *testing.T) {
+		useTaskLogDir(t)
+		writeTaskLogFile(t, "wf-live-actold", startedLine("claude", "dev"))
+		claudeDir := t.TempDir()
+		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
+		mtime := time.Date(2026, 10, 8, 11, 22, 33, 0, time.FixedZone("CET", 2*3600))
+		seedTranscript(t, claudeDir, "claude", "the reasoning", "the answer", mtime)
+
+		// preflightDescribe carries no search attributes — the old-run
+		// shape that never backfilled LastActivityAt.
+		c := &fakeTailClient{resp: preflightDescribe(enums.WORKFLOW_EXECUTION_STATUS_RUNNING, "")}
+		want := "=== in-flight round (stage=dev, live, last write 2026-10-08T09:22:33Z|activity unknown) ===\n" +
+			"the reasoning\n\nthe answer\n\n"
+		if got := liveCotSectionWith("wf-live-actold", c); got != want {
+			t.Errorf("liveCotSectionWith(no LastActivityAt) = %q, want %q", got, want)
 		}
 	})
 }

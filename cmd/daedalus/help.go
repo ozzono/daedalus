@@ -131,7 +131,16 @@ FLAGS
                           stays a fresh task, not a continuation). A dependency
                           that stops without approval (failed, parked,
                           canceled, timed out, wiped) fails the run before
-                          anything was started. Chains compose (run-c depends
+                          anything was started — unless the config's
+                          dependency section releases it: a fallback_branch
+                          (default: the branch you submitted from; an
+                          explicitly named branch is verified to exist at
+                          submit) plus the
+                          skip flags (skip_parked on by default) turn that
+                          refusal into a release onto the fallback branch; a
+                          paused dependency is never skipped — the gate waits
+                          ("temporal workflow unpause" resumes it). Chains
+                          compose (run-c depends
                           on run-b, which depends on run-a); a dependency that
                           is already approved at submit skips the wait
                           entirely. The id is verbatim from "daedalus list";
@@ -412,11 +421,12 @@ FLAGS
                         and reviews only — no test-queue poller) or test (test
                         suites and the repro gate only — no pipeline poller).
                         Omit for both pollers, the default. Accepted by start,
-                        bare restart, and foreground. Rejected by status,
-                        restart <worker>, and restart all — those act from the
-                        recorded configs alone and revive the daemon untyped;
-                        a run config is never persisted, so pass -t again on
-                        a bare restart.
+                        bare restart, and foreground. Rejected everywhere else:
+                        status and the record-driven restarts act from the
+                        recorded configs alone and revive the daemon untyped,
+                        stop drains whatever daemon runs and wakeup interrupts
+                        one session, and a run config is never persisted, so
+                        pass -t again on a bare restart.
   --all                 Restart target: every worker on record (same as the
                         "all" argument).
 
@@ -792,8 +802,8 @@ clears a stale pid file, and exits 0.
 FLAGS
   -c, --config <path>   Path to the config file naming the worker.
 
--t/--type parses here but has no effect: it shapes only start, bare
-restart, and foreground — a stop drains whichever daemon is running.
+-t/--type is rejected here: it shapes only start, bare restart, and
+foreground — a stop drains whichever daemon is running.
 
 "daedalus worker --help" has the full worker reference.
 `,
@@ -805,7 +815,9 @@ USAGE
 
 Prints, per worker: name, running pid, the binary version that worker is
 executing (so a daemon started before a CLI upgrade is visible as such),
-live API probe, config record, and log path. Also the recapture point: a
+live API probe, config record, code path (the repo path of each run
+currently executing on the worker's queue, or an idle display value),
+and log path. Also the recapture point: a
 running workflow whose outstanding activity attempt is held by a worker
 identity with no live poller (a worker that died mid-round) is recovered —
 the stuck attempt is failed so the workflow reschedules it, and a worker
@@ -882,8 +894,8 @@ FLAGS
   -c, --config <path>   Path to the config file (names the owning task
                         queue and the Temporal host).
 
--t/--type parses here but has no effect: it shapes only start, bare
-restart, and foreground.
+-t/--type is rejected here: it shapes only start, bare restart, and
+foreground.
 
 "daedalus worker --help" has the full worker reference.
 `,
