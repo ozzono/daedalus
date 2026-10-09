@@ -46,7 +46,7 @@ type streamMessage struct {
 	Result string `json:"result"`
 	// TerminalReason rides the result event when the run ended on a
 	// provider error: terminal_reason "api_error" marks a request the
-	// API rejected outright (the arete-img-upload incident — a healthy
+	// API rejected outright (the img-upload incident — a healthy
 	// 167-turn round ending in a single 400, exit 1), distinct from a
 	// genuine task-level failure. Read only by agentAPIError.
 	TerminalReason string `json:"terminal_reason"`
@@ -252,7 +252,7 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // agentAPIError reports the API-level failure a round's structured output
 // declares, "" when none: claude's terminal result event carries
 // terminal_reason "api_error" when the CLI died on a provider error
-// (shape verified against the arete-img-upload incident stdout), and pi's
+// (shape verified against the img-upload incident stdout), and pi's
 // json stream folds the same failures into a message whose stopReason is
 // "error" — with pi still exiting 0, so without reading it the round
 // would count as a success carrying an error-shaped body (shape verified

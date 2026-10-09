@@ -370,9 +370,10 @@ type OpenAIConfig struct {
 // BugFilingConfig toggles where jailed rounds record out-of-scope bugs.
 // Off (the section absent, or enabled: false — the default), no bug files
 // are written: bugs surface in the round's reply or review comments only,
-// alongside the Arete Memory note every round carries. On, the prompts
-// additionally instruct the agent to file every out-of-scope bug as a file
-// under dir — worktree-relative, resolved against the run's worktree root,
+// alongside the project-own record duty the prompts carry regardless. On,
+// the prompts additionally instruct the agent to file every out-of-scope
+// bug as a file under dir — worktree-relative, resolved against the run's
+// worktree root,
 // so the files are ordinary committed content of the branch. Dir empty
 // keeps the historical backlog/bugs path.
 type BugFilingConfig struct {
