@@ -33,9 +33,11 @@ const maxSlimStepRounds = 8
 //     rather than on the wire shape — and a parse round transcribes that
 //     plan into a strictly ordered queue of sub-tasks, each at most 1–2
 //     target files, each verifiable against its own acceptance criteria,
-//     emitted as a raw JSON array (template.SlimSubtask). One strict
-//     re-ask of the parse round absorbs a malformed reply (resumed in the
-//     parse round's own conversation, so the model sees and corrects its
+//     emitted as a raw JSON array (template.SlimSubtask). A deterministic
+//     trailing-comma strip absorbs that one purely decorative syntax class
+//     before anything costs budget, and one strict re-ask of the parse
+//     round absorbs any other malformed reply (resumed in the parse
+//     round's own conversation, so the model sees and corrects its
 //     previous reply); an unparseable second reply parks the run.
 //
 //  2. Atomic loops: each sub-task in order runs implement ↔ review on
@@ -213,7 +215,13 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 // broke an otherwise valid queue; under the two-phase planner the parse
 // round owns the wire format outright, so a full-string unmarshal is both
 // available and stricter. Validated for the fields the loop cannot run
-// without. Pure string/JSON work — deterministic, so it is safe to call
+// without. On a failed unmarshal, one deterministic repair is attempted
+// before the error is returned: trailing commas are stripped
+// (stripTrailingCommas) and the parse retried — the syntax class small
+// self-hosted models emit routinely, and repeat on correction, so it is
+// absorbed for free and the parse round's single re-ask stays available
+// for damage that actually needs the model (prose, truncation, wrong
+// shape). Pure string/JSON work — deterministic, so it is safe to call
 // from workflow code.
 func parseSlimPlan(text string) ([]template.SlimSubtask, error) {
 	if s := stripCodeFence(strings.TrimSpace(text)); s != "" {
@@ -221,7 +229,12 @@ func parseSlimPlan(text string) ([]template.SlimSubtask, error) {
 	}
 	var out []template.SlimSubtask
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		return nil, fmt.Errorf("reply is not the required raw JSON array: %w", err)
+		// Only a full parse of the stripped text is accepted; anything
+		// still broken keeps the original error — the re-ask quotes it,
+		// so it must describe the reply the model actually wrote.
+		if repaired := stripTrailingCommas([]byte(text)); json.Unmarshal(repaired, &out) != nil {
+			return nil, fmt.Errorf("reply is not the required raw JSON array: %w", err)
+		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("the JSON array is empty")
@@ -235,6 +248,58 @@ func parseSlimPlan(text string) ([]template.SlimSubtask, error) {
 		}
 	}
 	return out, nil
+}
+
+// stripTrailingCommas removes commas directly preceding a closing brace
+// or bracket — JSON's one purely decorative syntax error — walking the
+// bytes with string awareness: a comma inside a string literal (escapes
+// included) is content and is never touched, so the repair cannot corrupt
+// a value on its way to fixing the syntax. Multi-byte UTF-8 never carries
+// ASCII bytes, so the byte walk is encoding-safe. Deliberately not a
+// truncation repair: a reply cut off mid-array has no closing bracket for
+// the strip to act on, and auto-closing one would unmarshal a truncated
+// plan as a complete queue with subtasks silently missing — truncated
+// replies keep failing and spend the re-ask. Single pass, in place (w
+// never passes i), no parse: deterministic, so it is safe to call from
+// workflow code.
+func stripTrailingCommas(b []byte) []byte {
+	w, inString := 0, false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if inString {
+			b[w] = c
+			w++
+			switch {
+			case c == '\\' && i+1 < len(b): // escape: the next byte is content too
+				i++
+				b[w] = b[i]
+				w++
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+			b[w] = c
+			w++
+		case ',':
+			j := i + 1
+			for j < len(b) && (b[j] == ' ' || b[j] == '\t' || b[j] == '\n' || b[j] == '\r') {
+				j++
+			}
+			if j < len(b) && (b[j] == '}' || b[j] == ']') {
+				continue // drop the comma; the closing bracket copies on its own pass
+			}
+			b[w] = c
+			w++
+		default:
+			b[w] = c
+			w++
+		}
+	}
+	return b[:w]
 }
 
 // stripCodeFence drops one wrapping markdown code fence from a reply: a

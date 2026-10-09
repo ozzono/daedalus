@@ -753,7 +753,7 @@ func TestRunJailedKillMarkerInOutputNotForged(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeAPIErrorResultRescued pins the arete-img-upload face:
+// TestRunJailedClaudeAPIErrorResultRescued pins the img-upload face:
 // a claude round that exits 1 with a structured result event declaring
 // terminal_reason "api_error" — a provider rejection, not a task failure —
 // is classified ErrAPIExhausted so the flow is rescued (failover, then the

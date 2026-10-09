@@ -359,7 +359,7 @@ func excludeSuiteDirFromStatus(ctx context.Context, worktreePath, dir string) {
 // testOutputTailLimit bounds suite output that travels through Temporal
 // payloads (activity results and errors — both are payloads under the same
 // server limits; an over-limit error fails its own upload with TMPRL1103,
-// arete-nested-config 2026-09-27). Sized well under any plausible server
+// 2026-09-27 nested-config incident). Sized well under any plausible server
 // blob-error limit (historically 2 MB).
 const testOutputTailLimit = 512 << 10 // 512 KiB
 

@@ -337,8 +337,8 @@ type Jail struct {
 // Implement builds the phase-1 opener: the issue task, framed so the
 // implementation phase excludes tests — the test suite gets its own reviewed
 // phase. bugDir is the configured out-of-scope-bug filing folder; empty
-// drops the file-filing instruction from the bug policy (the Arete Memory
-// note and reply-reporting duty stay). A task that itself names .ai-jail
+// drops the file-filing instruction from the bug policy (the project-own
+// record note and reply-reporting duty stay). A task that itself names .ai-jail
 // gets the carve-out branch: editing .ai-jail is in scope instead of
 // barred.
 func Implement(task, bugDir string) (string, error) {

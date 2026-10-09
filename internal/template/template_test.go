@@ -55,7 +55,7 @@ func TestImplement(t *testing.T) {
 		"- Shortest working diff wins: one line before fifty, fewest files, no single-caller abstractions or pass-through wrappers.\n" +
 		"- Fix the root cause, not the symptom — one guard where all callers route through beats a guard per caller.\n" +
 		"- Never lazy about correctness: keep validation, error handling, edge cases, and cleanup intact. Mark a deliberate corner-cut with a `ponytail:` comment naming its ceiling.\n\n" +
-		"Bug policy — every bug you find, in your diff or anywhere you looked, is recorded in Arete Memory, with out-of-scope bugs reported in your reply. If it is in scope for this task, fix it now as part of the change. If it is out of scope, leave the code untouched — record it and add an alert about it in the docs."
+		"Bug policy — zero tolerance: every bug you find, in your diff or anywhere you looked, is either fixed or recorded in the project's own bug records if it keeps any, with out-of-scope bugs reported in your reply — never silently dropped. Scope decides fix versus record, and scope is never self-judged into filing: a bug in scope for this task is fixed now, as part of this change in this phase — never deferred to a later session, with a record as its paper trail and its regression coverage left to the test phase. A bug out of scope never widens the diff: leave the code untouched and record it. Every record carries two duties: verified — repro, probe output, or exact lines proving the bug, never \"this might be wrong\" — and deduplicated — the existing records searched first and a matching file extended instead of a duplicate opened; a bug an existing verified record already carries is dropped without a new record. If the project keeps its own bug-record convention (its tracker, folder, or docs), that convention governs where records go — resolve it from the project's own surface at round start; a configured records folder is only the carrier for projects that keep none."
 	if got != want {
 		t.Errorf("Implement = %q, want %q", got, want)
 	}
@@ -85,7 +85,7 @@ func TestTests(t *testing.T) {
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only test code, and ignore anything already differing in the worktree that this round did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
 		"While iterating, run only the tests covering the change — the test packages or files the change touched. Finish every round with the full suite: once the covering tests pass, run the whole suite, and the round is not done until it runs green — a known-red suite is not acceptable. Report the suite and its outcome in your reply: the pipeline runs the full suite again on the test worker and feeds that output to your reviewer, so your report is cross-checked, not taken on faith.\n\n" +
 		"Never buy a green suite by gaming the tests: removing, skipping, obfuscating, or tweaking tests so they pass is invalid. Test changes follow code changes — a test may change only because the behavior it verifies legitimately changed, never to force a pass. When a test is right and the code is wrong, leave both alone and say so in your reply; the reviewer routes the fix back to the implementation.\n\n" +
-		"Bug policy — every bug you find, in the tests or anywhere you looked, is recorded in Arete Memory, with out-of-scope bugs reported in your reply. A bug in the tests you are writing is in scope: fix it. Everything else — implementation bugs the tests expose included — is documented only, never fixed here; report what you found in your reply.\n\n" +
+		"Bug policy — zero tolerance: every bug you find, in the tests or anywhere you looked, is either fixed or recorded in the project's own bug records if it keeps any, with out-of-scope bugs reported in your reply — never silently dropped. Every record carries two duties: verified — repro, probe output, or exact lines proving the bug, never \"this might be wrong\" — and deduplicated — the existing records searched first and a matching file extended instead of a duplicate opened; a bug an existing verified record already carries is dropped without a new record. Scope decides who acts: a bug in the tests you are writing is in scope — fix it now, in this phase. Everything else — implementation bugs the tests expose included — is out of your scope to fix, never fixed here: report what you found in your reply so the reviewer can route it back to the implementation cycle. If the project keeps its own bug-record convention (its tracker, folder, or docs), that convention governs where records go — resolve it from the project's own surface; a configured records folder is only the carrier for projects that keep none.\n\n" +
 		"Keep it lazy and minimal: test observable behavior, not implementation details. Cover the change's behavior, edge cases, and error paths with the fewest tests that genuinely verify them — no redundant happy-path duplicates, no speculative tests, no over-mocking."
 	if got != want {
 		t.Errorf("Tests = %q, want %q", got, want)
@@ -119,19 +119,19 @@ func TestBugDirPolicy(t *testing.T) {
 		if strings.Contains(off, "backlog/bugs") || strings.Contains(off, "file under") {
 			t.Errorf("%s prompt with no bug dir must not instruct filing bug files, got %q", name, off)
 		}
-		if !strings.Contains(off, "recorded in Arete Memory") {
-			t.Errorf("%s prompt with no bug dir should keep the Arete Memory duty, got %q", name, off)
+		if !strings.Contains(off, "recorded in the project's own bug records if it keeps any") {
+			t.Errorf("%s prompt with no bug dir should keep the project-own record duty, got %q", name, off)
 		}
 
 		on, err := render("docs/known-bugs")
 		if err != nil {
 			t.Fatalf("%s (on): %v", name, err)
 		}
-		if !strings.Contains(on, "a file under docs/known-bugs/ (create the folder if missing; trigger, impact, where it lives)") {
+		if !strings.Contains(on, "recorded as a file under docs/known-bugs/ (create the folder if missing; trigger, impact, where it lives)") {
 			t.Errorf("%s prompt with a bug dir should file under it verbatim, got %q", name, on)
 		}
-		if !strings.Contains(on, "note in Arete Memory") {
-			t.Errorf("%s prompt with a bug dir should keep the Arete Memory note, got %q", name, on)
+		if !strings.Contains(on, "Every record carries two duties: verified") {
+			t.Errorf("%s prompt with a bug dir should keep the record duties, got %q", name, on)
 		}
 	}
 
@@ -196,7 +196,7 @@ func TestReview(t *testing.T) {
 		"When uncertain, request changes and state exactly what must be verified; approve only what you have checked in full.\n\n" +
 		"Everything here — your review included — runs inside the same sandbox, and git writes are forbidden to every agent: never request a git operation (stage, commit, branch, restore) or a change to anything beyond the implementing agent's reach. Your scope is the diff above and the code it touches, nothing else: changes outside it — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated worktree noise — are not part of this work; ignore them and never flag them, no matter how wrong they look. Every finding must be fixable by editing files in this worktree alone; anything that is not, is not a finding — unless it makes the task itself impossible to complete as stated, which is the one case where you halt instead (see NEEDS_MAINTAINER below).\n\n" +
 		"Tests are out of scope for this review. The test suite is written and reviewed in a separate phase after this one: missing, absent, or thin tests are not findings — do not request changes over test coverage. Judge only the implementation. (You may still build and run the existing suite to verify the change is sound.)\n\n" +
-		"Bug policy — every bug you find, in the diff or anywhere you looked, is recorded in Arete Memory, with out-of-scope bugs named in your comments. If it is in scope for this review, make it a finding and request changes. If it is out of scope, do not block approval over it — record it and add an alert about it in the docs.\n\n" +
+		"Bug policy — zero tolerance: every bug you find, in the diff or anywhere you looked, is either a finding or recorded in the project's own bug records if it keeps any, with out-of-scope bugs named in your comments — never silently dropped. Every record carries two duties: verified — repro, probe output, or exact lines proving the bug, never \"this might be wrong\" — and deduplicated — the existing records searched first and a matching file extended instead of a duplicate opened; a record without evidence or one duplicating an existing file is itself a finding, and a bug an existing verified record already carries is dropped without re-filing. If it is in scope for this review, make it a finding and request changes — in scope is fixed this round, never deferred. If it is out of scope, do not block approval over it and never widen the diff for it — record it and move on. If the project keeps its own bug-record convention (its tracker, folder, or docs), that convention governs where records go — resolve it from the project's own surface; a configured records folder is only the carrier for projects that keep none.\n\n" +
 		"End your response with a final line containing exactly APPROVED if it is acceptable as-is, " +
 		"CHANGES_REQUESTED if changes are required, " +
 		"or NEEDS_MAINTAINER if the task as stated cannot be completed by editing files in this worktree alone — " +
@@ -231,7 +231,7 @@ func TestReviewWithTestLogs(t *testing.T) {
 	if strings.Contains(got, "Tests are out of scope") {
 		t.Error("test review must not declare tests out of scope")
 	}
-	if !strings.Contains(got, "Only a bug in the tests under review is a finding") {
+	if !strings.Contains(got, "only a bug in the tests under review is in your scope to fix — a finding and grounds for changes") {
 		t.Error("test review should carry the test-scoped bug policy")
 	}
 	if !strings.Contains(got, "Your scope is the test packages and files the change touched") {
