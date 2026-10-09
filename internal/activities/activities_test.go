@@ -955,7 +955,7 @@ func TestAgentAPIErrorClassify(t *testing.T) {
 // boundaries — never a longer sibling (issue-4 vs issue-42) or a word that
 // merely contains the path as a substring.
 func TestReferencesPath(t *testing.T) {
-	const wt = "/wt/arete/issue-4"
+	const wt = "/wt/alpha/issue-4"
 	cases := []struct {
 		argv string
 		want bool
@@ -965,10 +965,10 @@ func TestReferencesPath(t *testing.T) {
 		{"vim " + wt + "/sub/dir/file.go", true},
 		{"tail -f " + wt + "/log", true},
 		{`grep "` + wt + `" -r .`, true},
-		{"/wt/arete/issue-42", false},              // sibling: longer id
-		{"/wt/arete/issue-42/sub", false},          // sibling's file
-		{"vim /wt/arete/issue-4xyz", false},        // path inside a longer word
-		{"echo /wt/arete/issue-4-and-more", false}, // path prefix of a longer token
+		{"/wt/alpha/issue-42", false},              // sibling: longer id
+		{"/wt/alpha/issue-42/sub", false},          // sibling's file
+		{"vim /wt/alpha/issue-4xyz", false},        // path inside a longer word
+		{"echo /wt/alpha/issue-4-and-more", false}, // path prefix of a longer token
 		{"flutter test", false},                    // no reference at all
 		{"/backup/copy-of" + wt, true},             // pinned as-is: the matcher has an end boundary but
 		// no start boundary, so a path merely *ending* with the worktree

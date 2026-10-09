@@ -185,8 +185,8 @@ func TestParseFlagsWorkerType(t *testing.T) {
 		for _, args := range [][]string{
 			{"worker", "restart", "all", "-t", "dev"},
 			{"-t", "dev", "worker", "restart", "all"},
-			{"worker", "restart", "arete", "-t", "dev"},
-			{"-t", "dev", "worker", "restart", "arete"},
+			{"worker", "restart", "alpha", "-t", "dev"},
+			{"-t", "dev", "worker", "restart", "alpha"},
 			{"worker", "status", "-t", "dev"},
 			{"worker", "status", "--type=test"},
 		} {

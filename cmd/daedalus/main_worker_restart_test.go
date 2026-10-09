@@ -207,12 +207,12 @@ func TestParseFlagsRecordDrivenRestartConfig(t *testing.T) {
 		},
 		{
 			name:    "-c before restart <worker>",
-			args:    []string{"-c", "cfg.yaml", "worker", "restart", "arete"},
+			args:    []string{"-c", "cfg.yaml", "worker", "restart", "alpha"},
 			wantErr: rejection,
 		},
 		{
 			name:    "flag after restart <worker>",
-			args:    []string{"worker", "restart", "arete", "--config=cfg.yaml"},
+			args:    []string{"worker", "restart", "alpha", "--config=cfg.yaml"},
 			wantErr: rejection,
 		},
 		{
@@ -259,14 +259,14 @@ func TestParseFlagsRecordDrivenRestartConfig(t *testing.T) {
 	if want := []string{"worker", "restart", "all"}; strings.Join(rest, ",") != strings.Join(want, ",") {
 		t.Errorf("parseFlags rest = %v, want %v", rest, want)
 	}
-	f, rest, err = parseFlags([]string{"worker", "restart", "arete"})
+	f, rest, err = parseFlags([]string{"worker", "restart", "alpha"})
 	if err != nil {
-		t.Fatalf("parseFlags(worker restart arete): %v", err)
+		t.Fatalf("parseFlags(worker restart alpha): %v", err)
 	}
 	if f.configSet {
 		t.Error("configSet should be false without an explicit -c")
 	}
-	if want := []string{"worker", "restart", "arete"}; strings.Join(rest, ",") != strings.Join(want, ",") {
+	if want := []string{"worker", "restart", "alpha"}; strings.Join(rest, ",") != strings.Join(want, ",") {
 		t.Errorf("parseFlags rest = %v, want %v", rest, want)
 	}
 }
@@ -337,22 +337,22 @@ func TestWorkerRestartNamed(t *testing.T) {
 	t.Run("restarts by worker_id, re-reading the recorded config", func(t *testing.T) {
 		useDaemonDir(t)
 		noDaemonSpawn(t)
-		cfgPath := writeWorkerIDConfig(t, "arete")
-		writeRecord(t, "arete", cfgPath)
+		cfgPath := writeWorkerIDConfig(t, "alpha")
+		writeRecord(t, "alpha", cfgPath)
 
 		out := captureStdout(t, func() {
-			if err := workerRestartNamed("arete"); err != nil {
+			if err := workerRestartNamed("alpha"); err != nil {
 				t.Errorf("workerRestartNamed: %v", err)
 			}
 		})
 		if !strings.Contains(out, "worker started") {
 			t.Errorf("restart output %q should report a started worker", out)
 		}
-		if got := recordedConfigPath("arete"); got != cfgPath {
+		if got := recordedConfigPath("alpha"); got != cfgPath {
 			t.Errorf("restart re-recorded %q, want the recorded config %q", got, cfgPath)
 		}
 		// The id, not the queue (q7), keyed the daemon files.
-		if _, err := os.Stat(filepath.Join(daemonDir, "worker-arete.pid")); err != nil {
+		if _, err := os.Stat(filepath.Join(daemonDir, "worker-alpha.pid")); err != nil {
 			t.Errorf("restart should key its files by the worker id: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(daemonDir, "worker-q7.pid")); err == nil {
@@ -396,8 +396,8 @@ func TestWorkerRestartNamed(t *testing.T) {
 
 	t.Run("record whose config now names another worker is an error", func(t *testing.T) {
 		useDaemonDir(t)
-		writeRecord(t, "arete", writeWorkerIDConfig(t, "elsewhere"))
-		err := workerRestartNamed("arete")
+		writeRecord(t, "alpha", writeWorkerIDConfig(t, "elsewhere"))
+		err := workerRestartNamed("alpha")
 		if err == nil || !strings.Contains(err.Error(), `now names worker "elsewhere"`) {
 			t.Errorf("workerRestartNamed(renamed) err = %v, want the renamed-worker diagnostic", err)
 		}
@@ -559,9 +559,9 @@ func TestMainRestartAllRejectsConfig(t *testing.T) {
 		t.Errorf("stderr should end with the usage text, got %q", stderr)
 	}
 
-	_, stderr, code = runMainIn(t, "", "-c", cfg, "worker", "restart", "arete")
+	_, stderr, code = runMainIn(t, "", "-c", cfg, "worker", "restart", "alpha")
 	if code != 1 {
-		t.Errorf("daedalus -c <config> worker restart arete exit code = %d, want 1", code)
+		t.Errorf("daedalus -c <config> worker restart alpha exit code = %d, want 1", code)
 	}
 	if !strings.HasPrefix(stderr, rejection+"\n\n") {
 		t.Errorf("stderr should start with the rejection and a blank line, got %q", stderr)
@@ -588,21 +588,21 @@ func TestMainRestartAllRejectsConfig(t *testing.T) {
 func TestMainRestartNamedNeedsNoConfig(t *testing.T) {
 	useDaemonDir(t)
 	noDaemonSpawn(t)
-	cfg := writeWorkerIDConfig(t, "arete")
-	writeRecord(t, "arete", cfg)
+	cfg := writeWorkerIDConfig(t, "alpha")
+	writeRecord(t, "alpha", cfg)
 
 	t.Setenv("HOME", t.TempDir()) // no ~/.config/daedalus/config.yaml fallback
 	t.Chdir(t.TempDir())          // no ./config.yaml
 
 	args := os.Args
-	os.Args = []string{"daedalus", "worker", "restart", "arete"}
+	os.Args = []string{"daedalus", "worker", "restart", "alpha"}
 	defer func() { os.Args = args }()
 	out := captureStdout(t, main)
 
 	if !strings.Contains(out, "worker started") {
-		t.Errorf("worker restart arete output %q should restart the recorded worker", out)
+		t.Errorf("worker restart alpha output %q should restart the recorded worker", out)
 	}
-	if got := recordedConfigPath("arete"); got != cfg {
+	if got := recordedConfigPath("alpha"); got != cfg {
 		t.Errorf("restart re-recorded %q, want %q", got, cfg)
 	}
 }
@@ -698,18 +698,18 @@ func TestWorkerStartReexecType(t *testing.T) {
 func TestWorkerRestartNamedRevivesUntyped(t *testing.T) {
 	useDaemonDir(t)
 	t.Setenv(reexecDumpArgsEnv, "1")
-	cfgPath := writeWorkerIDConfig(t, "arete")
-	writeRecord(t, "arete", cfgPath)
+	cfgPath := writeWorkerIDConfig(t, "alpha")
+	writeRecord(t, "alpha", cfgPath)
 
 	out := captureStdout(t, func() {
-		if err := workerRestartNamed("arete"); err != nil {
+		if err := workerRestartNamed("alpha"); err != nil {
 			t.Errorf("workerRestartNamed: %v", err)
 		}
 	})
 	if !strings.Contains(out, "worker started") {
 		t.Fatalf("workerRestartNamed output %q should report a started worker", out)
 	}
-	_, logFile, _ := daemonPaths("arete")
+	_, logFile, _ := daemonPaths("alpha")
 	got := daemonArgv(t, logFile)
 	if !reflect.DeepEqual(got, []string{"worker", "foreground", "-c", cfgPath}) {
 		t.Errorf("daemon argv = %v, want worker foreground -c %s with no -t", got, cfgPath)

@@ -56,7 +56,7 @@ func TestCompleteNoSecondPositional(t *testing.T) {
 		{"continue", "wf-1", ""},
 		{"frobnicate", ""},
 		{"worker", "status", ""},
-		{"worker", "restart", "arete", ""},
+		{"worker", "restart", "alpha", ""},
 	} {
 		if got := complete(words); got != nil {
 			t.Errorf("complete(%q) = %q, want nil", words, got)
@@ -97,13 +97,13 @@ func TestCompleteRestartTargets(t *testing.T) {
 	reset := daemonDir
 	t.Cleanup(func() { daemonDir = reset })
 	daemonDir = t.TempDir()
-	for _, name := range []string{"arete", "forge"} {
+	for _, name := range []string{"alpha", "forge"} {
 		if err := os.WriteFile(filepath.Join(daemonDir, "worker-"+name+".conf"), []byte("x\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Non-record files in the daemon directory are not worker names.
-	if err := os.WriteFile(filepath.Join(daemonDir, "worker-arete.pid"), []byte("123\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(daemonDir, "worker-alpha.pid"), []byte("123\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,9 +111,9 @@ func TestCompleteRestartTargets(t *testing.T) {
 		words []string
 		want  []string
 	}{
-		{[]string{"worker", "restart", ""}, []string{"all", "arete", "forge"}},
-		{[]string{"worker", "restart", "al"}, []string{"all"}},
-		{[]string{"worker", "restart", "ar"}, []string{"arete"}},
+		{[]string{"worker", "restart", ""}, []string{"all", "alpha", "forge"}},
+		{[]string{"worker", "restart", "all"}, []string{"all"}},
+		{[]string{"worker", "restart", "alp"}, []string{"alpha"}},
 		{[]string{"worker", "restart", "zz"}, nil},
 	} {
 		if got := complete(c.words); !reflect.DeepEqual(got, c.want) {

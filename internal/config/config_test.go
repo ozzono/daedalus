@@ -642,25 +642,25 @@ func TestProviderEnvVarsIncludesContextTokens(t *testing.T) {
 func TestWorkerName(t *testing.T) {
 	// An explicit worker_id names the worker, independently of the queue.
 	cfg, err := Load(writeConfig(t, `
-worker_id: arete
+worker_id: alpha
 temporal:
   task_queue: q7
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := cfg.WorkerName(); got != "arete" {
-		t.Errorf("WorkerName() = %q, want arete (the worker id, not the queue)", got)
+	if got := cfg.WorkerName(); got != "alpha" {
+		t.Errorf("WorkerName() = %q, want alpha (the worker id, not the queue)", got)
 	}
 
 	// Without one, the task queue names the worker — the single-queue
 	// default keeps working with no id to set.
-	cfg, err = Load(writeConfig(t, "temporal:\n  task_queue: arete\n"))
+	cfg, err = Load(writeConfig(t, "temporal:\n  task_queue: alpha\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got := cfg.WorkerName(); got != "arete" {
-		t.Errorf("WorkerName() = %q, want arete (the task queue)", got)
+	if got := cfg.WorkerName(); got != "alpha" {
+		t.Errorf("WorkerName() = %q, want alpha (the task queue)", got)
 	}
 }
 
@@ -673,7 +673,7 @@ func TestLoadWorkerID(t *testing.T) {
 			t.Errorf("Load(worker_id %q) err = %v, want a worker-id rejection", id, err)
 		}
 	}
-	for _, id := range []string{"", "arete", "worker.2", "a-b_c"} {
+	for _, id := range []string{"", "alpha", "worker.2", "a-b_c"} {
 		if _, err := Load(writeConfig(t, "worker_id: "+strconv.Quote(id)+"\n")); err != nil {
 			t.Errorf("Load(worker_id %q): %v, want accepted", id, err)
 		}
