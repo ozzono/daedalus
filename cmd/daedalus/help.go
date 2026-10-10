@@ -103,6 +103,7 @@ FLAGS
                           finalized — an out-of-scope diff parks the run.
   -d, --detach            Start the pipeline and return immediately instead of
                           blocking until it finishes; "daedalus attach" reconnects.
+                          Fresh runs and continue only — rejected in append mode.
   -p, --prefix <prefix>   Name this run's preserved branch
                           <prefix>/issue-<id>-<timestamp>, overriding the config's
                           branch_prefix (the issue part of the name stays as given).
@@ -162,8 +163,8 @@ FLAGS
                           of starting a new run — the prompt is folded into the
                           agent's next fix round (same as "daedalus guide").
                           -f works here too (the prompt only — it grants no
-                          folder); -d has no effect and -p and -folder are
-                          rejected: the run keeps what it started with.
+                          folder); -d, -p, and -folder are rejected: the run
+                          keeps what it started with.
 
 PREFLIGHT
 Before dispatching, run checks two things, in order. First, the target
@@ -399,13 +400,15 @@ ACTIONS
                 the run is still sleeping out its hourly retry — the operator's
                 alternative to waiting up to maxQuotaHeartbeats hours. No
                 prompt is taken (that is "guide"/"continue"); the run keeps
-                its id and worktree. A session that is running but not
-                sleeping buffers the wakeup, skipping only its next heartbeat.
-                A closed (canceled/failed/parked) or unknown id is a usage
-                error — closed sessions resume with "continue", and the id
-                can be checked against "daedalus list". The workflow must
-                belong to the active config's task queue: a mismatched -c
-                fails without acting.
+                its id and worktree. The signal has two consumers — the
+                quota heartbeat and the dependency gate's poll wait (a run
+                pending on a dependency ends that wait immediately); a
+                session sleeping in neither buffers the wakeup, skipping
+                only its next wait. A closed (canceled/failed/parked) or
+                unknown id is a usage error — closed sessions resume with
+                "continue", and the id can be checked against "daedalus
+                list". The workflow must belong to the active config's task
+                queue: a mismatched -c fails without acting.
 
 ARGUMENTS
   <action>              One of the actions above (default: start).
@@ -883,12 +886,14 @@ USAGE
 For when the provider recovered (or its fallback does) but the run is
 still sleeping out its hourly retry — the operator's alternative to
 waiting up to maxQuotaHeartbeats hours. No prompt is taken (that is
-"guide"/"continue"); the run keeps its id and worktree. A session that is
-running but not sleeping buffers the wakeup, skipping only its next
-heartbeat. A closed (canceled/failed/parked) or unknown id is a usage
-error — closed sessions resume with "continue", and the id can be checked
-against "daedalus list". The workflow must belong to the active config's
-task queue: a mismatched -c fails without acting.
+"guide"/"continue"); the run keeps its id and worktree. The signal has
+two consumers — the quota heartbeat and the dependency gate's poll wait
+(a run pending on a dependency ends that wait immediately); a session
+sleeping in neither buffers the wakeup, skipping only its next wait. A
+closed (canceled/failed/parked) or unknown id is a usage error — closed
+sessions resume with "continue", and the id can be checked against
+"daedalus list". The workflow must belong to the active config's task
+queue: a mismatched -c fails without acting.
 
 FLAGS
   -c, --config <path>   Path to the config file (names the owning task

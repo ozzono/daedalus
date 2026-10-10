@@ -908,7 +908,7 @@ func ValidateWorkerID(id string) error {
 		return nil
 	}
 	bad := func() error {
-		return fmt.Errorf("worker id %q must be a plain file-name-safe token (letters, digits, dashes, dots inside)", id)
+		return fmt.Errorf("worker id %q must be a plain file-name-safe token (letters, digits, dashes, underscores, dots inside)", id)
 	}
 	if strings.HasPrefix(id, "-") || id == "." || id == ".." || strings.ContainsAny(id, "/\\ \t\r\n") {
 		return bad()
