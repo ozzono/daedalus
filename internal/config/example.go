@@ -184,9 +184,10 @@ slim:
   # object. Prose is never
   # converted (reviewer verdicts are content), and any relay or parser
   # failure degrades to the old inert-text behavior — never a new run
-  # failure. Resolved against the openai section's url; create the tag on
-  # the model host before setting it. Empty (the default) keeps the relay
-  # off.
+  # failure. Resolved against the openai-channel upstream (the provider
+  # section's url when its type is openai, else the openai section's);
+  # create the tag on the model host before setting it. Empty (the
+  # default) keeps the relay off.
   parser_model: ""
   # Ceiling on the task input a slim run may embed, in o200k_base tokens,
   # counted after the automatic shrink pass (internal/shrink) has minimized
@@ -404,6 +405,79 @@ openai:
   # where it was the empirically decisive loop fix (its constants were
   # probe-verified live against the tenor litellm proxy but lost before
   # landing).
+  repetition_penalty: 0
+`
+
+// exampleProviderBlock is the wire-agnostic provider: section — the new
+// single home for a model's serving knobs. Base configuration: it appears
+// in every profile.
+const exampleProviderBlock = `
+# The wire-agnostic primary provider: type — not the section name — selects
+# the wire format, so one section fully determines how the model behind it
+# is served: endpoint, request ceiling, honest sizing, and (openai only) the
+# sampler knobs. Its values export on the env channel its type names
+# (ANTHROPIC_* or OPENAI_*), so every consumer — jailed claude, the
+# aider/pi/codex/opencode staging, "worker status", the slim tool relay —
+# serves a provider-served round exactly as it would the equivalent legacy
+# section. The legacy anthropic:/openai: sections keep working unchanged
+# and indefinitely; the one forbidden mix is this section plus the
+# same-wire legacy section (two sources of truth for one channel is a load
+# error, never a silent override) — across wires the mix is legal and is
+# the incremental migration path (e.g. this section with type: openai for
+# a self-hosted model while jailed claude stays on the anthropic: section;
+# keep the sizing pair in one place, it is one channel whichever wire
+# serves).
+provider:
+  # Wire format this section serves, and the env channel its values export
+  # on: "anthropic" or "openai". Required — a missing or unknown value is a
+  # load error, never a silent default.
+  type: anthropic
+  # API base URL, key, and model, injected into the jailed agent's
+  # environment on the channel type selects, with the same
+  # unset-means-inherit rule as the legacy sections: an empty field exports
+  # nothing. An aider/pi/codex/opencode round consumes them exactly as it
+  # would the legacy section of the same wire.
+  url: ""
+  key: ""
+  model: ""
+  # Small/fast model for tiny prompts, exported as
+  # ANTHROPIC_DEFAULT_HAIKU_MODEL and probed by "worker status" — an
+  # anthropic-wire knob (claude's var is its only consumer), so an
+  # openai-typed provider carrying it is a load error. Empty means the
+  # agent's own default.
+  heartbeat_model: ""
+  # API request timeout for the jailed agent, in milliseconds, exported as
+  # API_TIMEOUT_MS — both wire styles need it. Zero/unset falls back to the
+  # same generous default as the legacy sections (3000000 = 50 minutes), so
+  # a ceiling is always exported.
+  timeout_ms: 3000000
+  # Sizing pair, valid on both wire styles and deliberately wire-agnostic:
+  # they ride the same exports as their anthropic-section counterparts
+  # (CLAUDE_CODE_MAX_CONTEXT_TOKENS / DAEDALUS_MAX_OUTPUT_TOKENS), which is
+  # the point — an openai-served model's sizing used to be expressible only
+  # under anthropic:, the mis-sectioning this section removes. They reach
+  # every staging path that consumes sizing: claude's env re-export,
+  # aider's model metadata, the pi and opencode staged model entries. Load
+  # rejects negative values. Sizing caveat for pi rounds (the 2026-10-10
+  # RCA of three parked wa-termo bootstraps): pi computes each request's
+  # max_tokens as the staged contextWindow minus its prompt estimate minus
+  # a 4096-token reserve, floored at 1 (pi-ai simple-options.js
+  # clampMaxTokensToContext, 0.87.1) — an understaged context_tokens yields
+  # silent 1-token replies, so stage the window honestly.
+  context_tokens: 0 # both wire styles; see the pi clamp note above
+  max_output_tokens: 0
+  # Sampler knobs for rounds served by this section — the openai section's
+  # fields with the same absent-never-sent discipline (an explicit 0 is
+  # indistinguishable from unset, so the backend's own sampler values
+  # stand). An openai-wire property — chat-completions request params — so
+  # an anthropic-typed provider carrying any of them is a load error (no
+  # anthropic-wire staging consumes them; a knob must fail loud, never
+  # silently no-op).
+  top_p: 0
+  temperature: 0
+  presence_penalty: 0
+  top_k: 0
+  min_p: 0
   repetition_penalty: 0
 `
 
@@ -636,7 +710,7 @@ const examplePromptBlock = `
 // config-example.yaml by TestExampleYAMLMatchesRepoFile, and TestExampleYAML
 // pins that loading it yields exactly the default configuration.
 const ExampleYAML = exampleBase1 + exampleSlimBlock + exampleBase2 +
-	exampleSlimProviders + exampleBase3 + examplePromptBlock
+	exampleSlimProviders + exampleProviderBlock + exampleBase3 + examplePromptBlock
 
 // ExampleYAMLFor renders the example for a profiled `daedalus init`: the
 // base pieces always, the slim slices (the slim: section, the openai:
@@ -653,6 +727,7 @@ func ExampleYAMLFor(slim, prompt bool) string {
 	if slim {
 		b.WriteString(exampleSlimProviders)
 	}
+	b.WriteString(exampleProviderBlock)
 	b.WriteString(exampleBase3)
 	if prompt {
 		b.WriteString(examplePromptBlock)

@@ -515,7 +515,9 @@ CONFIGURATION REFERENCE
                         set, starts the worker's loopback tool-call relay,
                         which lifts text-encoded tool calls into the native
                         wire pi executes (the parser model is resolved
-                        against the openai section's url); the per-model
+                        against the openai-channel upstream — the provider
+                        section's url when its type is openai, else
+                        openai.url); the per-model
                         limits stay operator-side — see config-example.yaml
                         for the per-agent prerequisites
   max_concurrent_tests  Native test suites the test worker (the
@@ -606,6 +608,19 @@ CONFIGURATION REFERENCE
                         environment; aider and codex rounds consume the
                         section directly (aider via --model openai/<model>,
                         codex via per-invocation -c overrides)
+  provider              Wire-agnostic primary provider: type (required —
+                        anthropic or openai; missing or unknown is a load
+                        error) selects the wire format and the env channel
+                        the values export on, so one section fully serves a
+                        model: url/key/model and timeout_ms on both wires,
+                        the sizing pair on both (it rides the wire-agnostic
+                        exports), heartbeat_model on anthropic only, and
+                        the sampler knobs on openai only — a knob on the
+                        wire without a consumer is a load error, never
+                        inert. Setting it and the same-wire legacy section
+                        together is a load error (one channel, one source
+                        of truth); the other wire's legacy section stays
+                        legal. Legacy-only configs behave byte-identically
   fallback.enabled/url/key/model/heartbeat_model
                         Independent secondary provider: when a jailed round
                         fails with the primary's quota exhausted, the worker
@@ -641,9 +656,10 @@ Keys print verbatim, unredacted: the command shows the operator their own
 file in their own terminal — the same values cat on it would.
 
 A config daedalus cannot load (unknown agent, reserved task queue, negative
-timeout, enabled fallback missing url/key/model, bad branch prefix or
-worker id) fails with the usual "load config:" diagnostic — that error is
-itself the answer to why the current config is not a working one.
+timeout, enabled fallback missing url/key/model, an invalid provider
+section, bad branch prefix or worker id) fails with the usual "load
+config:" diagnostic — that error is itself the answer to why the current
+config is not a working one.
 
 EXAMPLE
   $ daedalus config

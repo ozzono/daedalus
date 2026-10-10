@@ -91,16 +91,19 @@ func runWorker(cfg config.Config, workerType string) error {
 	// The slim tool-call relay: a loopback reverse proxy that lifts pi
 	// rounds' text-encoded tool calls into the native tool_calls wire pi
 	// executes (internal/toolrelay). Started only when slim is enabled
-	// with a parser model AND the openai section provides an upstream —
-	// absent any of the three, the relay never starts and the env var
-	// below stays unset, byte-identical to the pre-relay behavior. The
-	// staged URL (relay address plus the upstream's path prefix) travels
-	// the env channel like every other knob; unset symmetrically, and
-	// scrubbed from the daemon spawn via ProviderEnvVars, so a stale
-	// export can never point a new worker's rounds at a dead relay.
+	// with a parser model AND the openai channel provides an upstream —
+	// the provider section's url when its type is openai, else the legacy
+	// openai section's. Absent any of the three, the relay never starts
+	// and the env var below stays unset, byte-identical to the pre-relay
+	// behavior. The staged URL (relay address plus the upstream's path
+	// prefix) travels the env channel like every other knob; unset
+	// symmetrically, and scrubbed from the daemon spawn via
+	// ProviderEnvVars, so a stale export can never point a new worker's
+	// rounds at a dead relay.
 	var relayURL string
-	if cfg.Slim.Enabled && cfg.Slim.ParserModel != "" && cfg.OpenAI.URL != "" {
-		r, err := toolrelay.Start(cfg.OpenAI.URL, cfg.Slim.ParserModel)
+	_, open := cfg.ProviderChannels()
+	if cfg.Slim.Enabled && cfg.Slim.ParserModel != "" && open.URL != "" {
+		r, err := toolrelay.Start(open.URL, cfg.Slim.ParserModel)
 		if err != nil {
 			return fmt.Errorf("start tool relay: %w", err)
 		}
