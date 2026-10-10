@@ -1952,3 +1952,54 @@ func TestProviderEnvVarsIncludesReviewerEnvs(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadReviewSkillList pins the review_skill_list parsing: entries load
+// in order, an absent key loads empty (the historical default-only
+// reviews), a blank entry is rejected at load — a skill-review round with
+// no instructions is a config bug, not a review — and the key survives a
+// strict render round-trip.
+func TestLoadReviewSkillList(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "review_skill_list:\n  - /the-style\n  - audit the error handling\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !slices.Equal(cfg.ReviewSkillList, []string{"/the-style", "audit the error handling"}) {
+		t.Errorf("ReviewSkillList = %q, want both entries in order", cfg.ReviewSkillList)
+	}
+
+	if cfg, err := Load(writeConfig(t, "")); err != nil || len(cfg.ReviewSkillList) != 0 {
+		t.Errorf("unset ReviewSkillList = %q (err %v), want empty", cfg.ReviewSkillList, err)
+	}
+
+	for _, doc := range []string{
+		"review_skill_list:\n  - /ok\n  - \"\"\n",
+		"review_skill_list:\n  - /ok\n  - \"   \"\n",
+	} {
+		_, err := Load(writeConfig(t, doc))
+		if err == nil || !strings.Contains(err.Error(), "review_skill_list: entry 2 is empty") {
+			t.Errorf("Load(%q) = %v, want the blank-entry rejection", doc, err)
+		}
+	}
+
+	// Durations set: a render of an all-unset config carries plain 0s the
+	// strict parser rejects (the recorded unset-durations render bug), which
+	// would fail this round-trip on everything but the key under test.
+	raw, err := LoadRaw(writeConfig(t, "tests_timeout: 30m\nagent_run_timeout: 1h\nreview_timeout: 15m\ncleanup_timeout: 5m\nreview_skill_list:\n  - /the-style\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	if !strings.Contains(out, "review_skill_list:") || !strings.Contains(out, "- /the-style") {
+		t.Errorf("RenderYAML output lost the list:\n%s", out)
+	}
+	back, err := LoadRaw(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("parse RenderYAML output: %v\n%s", err, out)
+	}
+	if !slices.Equal(back.ReviewSkillList, []string{"/the-style"}) {
+		t.Errorf("round-trip ReviewSkillList = %q, want [/the-style]", back.ReviewSkillList)
+	}
+}

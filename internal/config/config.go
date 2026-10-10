@@ -682,6 +682,25 @@ type Config struct {
 	// Reviewer is the reviewer rounds' own provider endpoint; empty (the
 	// section absent) means reviewers share the implementing agent's.
 	Reviewer ReviewerConfig `yaml:"reviewer"`
+	// ReviewSkillList is the ordered list of extra skill reviews each
+	// review-gated phase of the feature-dev flow appends after its default
+	// reviewer approves: the default daedalus review ping-pong runs first,
+	// then one ping-pong per entry, in order — the code phase routes each
+	// skill's feedback through the implementing agent's session, the test
+	// phase through the tester's (and a skill reviewing the suite may
+	// verdict REBUILD like the default reviewer, routing an implementation
+	// finding back through the dev cycle). Each entry is either "/name" —
+	// resolved at round time to <name>/SKILL.md under the run worktree's
+	// .claude/skills (project wins) or the worker's ~/.claude/skills — or
+	// hand-written prompt text passed through verbatim. Every skill's
+	// instructions render into the reviewer prompt under a fixed preamble
+	// restating the verdict protocol and the harness-parsed-output
+	// contract, so configured text can never reach a reviewer without
+	// daedalus's communication rules above it (one render path in the
+	// review template). The list is frozen into the run at submit (a
+	// continued run keeps its attempt's list); empty — the default — runs
+	// the historical default-only reviews.
+	ReviewSkillList []string `yaml:"review_skill_list"`
 	// BugFiling is the out-of-scope-bug filing toggle; inactive unless
 	// Enabled (see BugFilingConfig).
 	BugFiling BugFilingConfig `yaml:"bug_filing"`
@@ -792,6 +811,7 @@ type renderConfig struct {
 	OpenAI                 OpenAIConfig     `yaml:"openai"`
 	Fallback               FallbackConfig   `yaml:"fallback"`
 	Reviewer               ReviewerConfig   `yaml:"reviewer"`
+	ReviewSkillList        []string         `yaml:"review_skill_list"`
 	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
 	TestOutput             TestOutputConfig `yaml:"test_output"`
 	Dependency             DependencyConfig `yaml:"dependency"`
@@ -823,6 +843,7 @@ func (c Config) RenderYAML() (string, error) {
 		OpenAI:                 c.OpenAI,
 		Fallback:               c.Fallback,
 		Reviewer:               c.Reviewer,
+		ReviewSkillList:        c.ReviewSkillList,
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
 		Dependency:             c.Dependency,
@@ -1212,6 +1233,15 @@ func (c Config) validate(path string) error {
 	}
 	if c.Slim.MaxInputTokens < 0 {
 		return fmt.Errorf("config %s: slim.max_input_tokens: must not be negative", path)
+	}
+	// A blank review_skill_list entry would resolve to a skill-review round
+	// with no instructions at all — rejected at load. Named skills are not
+	// checked for existence here: resolution happens per round (worktree
+	// skills may be created after submit) and fails the round loudly.
+	for i, entry := range c.ReviewSkillList {
+		if strings.TrimSpace(entry) == "" {
+			return fmt.Errorf("config %s: review_skill_list: entry %d is empty — every entry is a /name or hand-written prompt text", path, i+1)
+		}
 	}
 	if c.Anthropic.ContextTokens < 0 {
 		return fmt.Errorf("config %s: anthropic.context_tokens: must not be negative", path)

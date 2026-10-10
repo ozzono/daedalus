@@ -400,6 +400,7 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 		Folders:         folders,
 		DependsOn:       depends,
 		Dependency:      cfg.Dependency,
+		ReviewSkillList: cfg.ReviewSkillList,
 	})
 	if err != nil {
 		return fmt.Errorf("start workflow: %w", err)
@@ -804,7 +805,11 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		Agent: prev.Agent,
 		// The continued run keeps the aborted attempt's folder grants,
 		// frozen at start like its write-scope policy.
-		Folders:         prev.Folders,
+		Folders: prev.Folders,
+		// The continued run keeps the aborted attempt's skill list, frozen
+		// at start like its policy fields; a pre-field attempt's empty list
+		// continues with none.
+		ReviewSkillList: prev.ReviewSkillList,
 		Authorship:      cfg.Authorship,
 		TestTimeout:     cfg.TestsTimeout,
 		AgentRunTimeout: cfg.AgentRunTimeout,

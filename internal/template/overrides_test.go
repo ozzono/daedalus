@@ -506,7 +506,8 @@ func TestPromptSpecs(t *testing.T) {
 	}
 	wantReview := []string{
 		"AcceptanceCriteria", "AgentReply", "BugDir", "Diff", "Focus", "Handoff",
-		"JailSpec", "ReproInScope", "TestLogs", "TestsInScope", "TouchesJail",
+		"JailSpec", "ReproInScope", "SkillInstructions", "TestLogs", "TestsInScope",
+		"TouchesJail",
 	}
 	if !slices.Equal(byName["review"].Fields, wantReview) {
 		t.Errorf("review fields = %v, want the exact review-data vocabulary %v", byName["review"].Fields, wantReview)
