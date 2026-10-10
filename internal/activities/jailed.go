@@ -51,8 +51,14 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// opencode reads the prompt from piped stdin just like claude -p;
 		// --auto approves everything not explicitly denied. Plain text
 		// mode, so Thinking stays empty; capturing it means parsing
-		// opencode's --format json event stream.
-		return "opencode", []string{"run", "--auto"}, nil
+		// opencode's --format json event stream. --standalone keeps the
+		// round off opencode's shared background server (its 2.x default):
+		// that server cannot persist across a one-shot jail, and the client
+		// hangs at "Starting background server..." (ai-jail 2.2.1's release
+		// note, issue 137) — the flag runs a private server for this
+		// invocation instead (verified present on the host opencode
+		// 2.0.25's run subcommand).
+		return "opencode", []string{"run", "--auto", "--standalone"}, nil
 	case "amp":
 		// -x is amp's execute mode (single-shot, prompt from stdin);
 		// --dangerously-allow-all approves all tool calls. It is absent
@@ -674,7 +680,13 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 		agentWaiters.Add(-1)
 		return jailResult{}, fmt.Errorf("agent slot: %w", ctx.Err())
 	}
-	args := []string{"--worktree", "--network"}
+	// --no-save-config keeps ai-jail 2.x from persisting the composed grants
+	// into a .ai-jail spec: daedalus supplies every grant on this argv each
+	// round, so a written spec is pure churn — the raw material of the
+	// duplicate-regrowth class and the round4-era in-diff .ai-jail hunks
+	// (probe-verified 2026-10-09 on 2.8.1: with the flag, no .ai-jail is
+	// written at all).
+	args := []string{"--worktree", "--network", "--no-save-config"}
 	// Mask the worktree's .claude/settings*.json: Claude Code applies a
 	// repo-committed settings file's env block over process env — a stale
 	// ANTHROPIC_AUTH_TOKEN there authenticated every jailed round as the
