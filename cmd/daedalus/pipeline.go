@@ -858,8 +858,10 @@ func guidePipeline(cfg config.Config, workflowID, message string) error {
 // wakeupPipeline interrupts a running pipeline's quota heartbeat so the
 // sleeping round resumes immediately — for when the operator has verified
 // the provider recovered and will not wait out the hourly sleep. The
-// "wakeup" signal lands in the workflow's heartbeat select; a running-but-
-// not-sleeping workflow buffers it and merely skips its next heartbeat.
+// "wakeup" signal has two consumers — the heartbeat select and the
+// dependency gate's poll wait (a run pending on a dependency ends that
+// wait immediately, granting its grace cadence); a workflow sleeping in
+// neither buffers it and merely shortens its next wait.
 // Closed sessions (canceled, failed, parked) have their own resume path —
 // `continue`, which takes a prompt — so they are a usage error here.
 func wakeupPipeline(cfg config.Config, workflowID string) error {
@@ -897,7 +899,7 @@ func wakeupPipeline(cfg config.Config, workflowID string) error {
 	if err := c.SignalWorkflow(context.Background(), workflowID, "", "wakeup", ""); err != nil {
 		return fmt.Errorf("signal workflow %s: %w", workflowID, err)
 	}
-	fmt.Printf("Wakeup sent to %s — a quota-heartbeat sleep it is in (or reaches next) ends immediately; mid-round it only shortens the next one.\n", workflowID)
+	fmt.Printf("Wakeup sent to %s — a quota-heartbeat or dependency-gate wait it is in (or reaches next) ends immediately; mid-round it only shortens the next one.\n", workflowID)
 	fmt.Printf("Reattach with: daedalus attach %s\n", workflowID)
 	return nil
 }

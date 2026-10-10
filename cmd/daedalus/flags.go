@@ -290,6 +290,27 @@ parse:
 	if f.workflowSet && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
 		return f, nil, errors.New("-w/--workflow only applies to a fresh run")
 	}
+	// Likewise -f/--file: the task description is read only by the run
+	// dispatch — a fresh run's "<prompt>" replacement and append mode's
+	// folded-in prompt — so any other command would parse the pattern (or
+	// glob) and drop it without a word.
+	if f.taskFile != "" && len(rest) > 0 && rest[0] != "run" {
+		return f, nil, errors.New("-f/--file only applies to run")
+	}
+	// Likewise -a/--append: targeting an already-running pipeline is the
+	// run dispatch's append mode alone — guide addresses a pipeline by
+	// positional id, and no other command takes one.
+	if f.appendID != "" && len(rest) > 0 && rest[0] != "run" {
+		return f, nil, errors.New("-a/--append only applies to run")
+	}
+	// And -d/--detach: it shapes the invoking process's own wait — a fresh
+	// run's block-until-finish and a continue's. Append mode returns after
+	// folding its prompt in regardless; attach is the reconnect half of
+	// `run -d` — blocking is its whole purpose, so -d has nothing to shape
+	// there — and no other command blocks on a pipeline at all.
+	if f.detach && len(rest) > 0 && ((rest[0] != "run" && rest[0] != "continue") || f.appendID != "") {
+		return f, nil, errors.New("-d/--detach only applies to a fresh run and continue")
+	}
 	// The record-driven worker commands (`worker restart all`, `worker
 	// restart <name>`, `worker status`) work from the recorded configs
 	// alone; an explicit -c there is silently ignored by every step —
