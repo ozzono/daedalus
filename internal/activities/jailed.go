@@ -51,8 +51,14 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// opencode reads the prompt from piped stdin just like claude -p;
 		// --auto approves everything not explicitly denied. Plain text
 		// mode, so Thinking stays empty; capturing it means parsing
-		// opencode's --format json event stream.
-		return "opencode", []string{"run", "--auto"}, nil
+		// opencode's --format json event stream. --standalone keeps the
+		// round off opencode's shared background server (its 2.x default):
+		// that server cannot persist across a one-shot jail, and the client
+		// hangs at "Starting background server..." (ai-jail 2.2.1's release
+		// note, issue 137) — the flag runs a private server for this
+		// invocation instead (verified present on the host opencode
+		// 2.0.25's run subcommand).
+		return "opencode", []string{"run", "--auto", "--standalone"}, nil
 	case "amp":
 		// -x is amp's execute mode (single-shot, prompt from stdin);
 		// --dangerously-allow-all approves all tool calls. It is absent
@@ -674,7 +680,13 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 		agentWaiters.Add(-1)
 		return jailResult{}, fmt.Errorf("agent slot: %w", ctx.Err())
 	}
-	args := []string{"--worktree", "--network"}
+	// --no-save-config keeps ai-jail 2.x from persisting the composed grants
+	// into a .ai-jail spec: daedalus supplies every grant on this argv each
+	// round, so a written spec is pure churn — the raw material of the
+	// duplicate-regrowth class and the round4-era in-diff .ai-jail hunks
+	// (probe-verified 2026-10-09 on 2.8.1: with the flag, no .ai-jail is
+	// written at all).
+	args := []string{"--worktree", "--network", "--no-save-config"}
 	// Mask the worktree's .claude/settings*.json: Claude Code applies a
 	// repo-committed settings file's env block over process env — a stale
 	// ANTHROPIC_AUTH_TOKEN there authenticated every jailed round as the
@@ -875,16 +887,32 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// pi ignores the base-URL env vars entirely (only OPENAI_API_KEY reaches
 	// its built-in openai provider — the 401-to-api.openai.com of
 	// 2026-09-26), so a pi round served by the openai section needs the
-	// section bridged into pi's own provider config: stagePiProvider
-	// rewrites the daedalus-owned entry in the host's
-	// ~/.pi/agent/models.json (rw-mounted by the jail's pi preset) and
-	// returns the --model flag selecting it. Failover rides the same bridge
-	// only for openai-type fallbacks — an anthropic-type fallback has no
-	// pi channel at all (pi reads no ANTHROPIC_BASE_URL), so the round
-	// stays pinned to the primary's staged entry (see
+	// section bridged into pi's own provider config: stagePiProvider stages
+	// a round-unique entry into the host's ~/.pi/agent/models.json
+	// (rw-mounted by the jail's pi preset) and returns the --model flag
+	// selecting it, so a concurrent round — another worker on this host, or
+	// another run in this worker — stages and reads its own entry, never
+	// this one's (the 2026-10-10 wa-termo/bb-eloparse cross-read). The
+	// cleanup drops the entry at the round's end, when nothing can read it
+	// anymore; a failed cleanup is logged, never surfaced as a round
+	// failure — the round already ran, and the leftover is inert (selected
+	// by no --model). The
+	// cleanup rides even an error return: a staging that fails after the
+	// entry landed (the timeout merge) must not leak it into a round that
+	// never launches. Failover rides the same bridge only for openai-type
+	// fallbacks — an anthropic-type fallback has no pi channel at all (pi
+	// reads no ANTHROPIC_BASE_URL), so the round stays pinned to the
+	// primary's staged entry (see
 	// backlog/bugs/pi-anthropic-fallback-unserveable.md).
 	if selected == "pi" {
-		modelArgs, err := stagePiProvider(env)
+		modelArgs, dropStaged, err := stagePiProvider(env)
+		if dropStaged != nil {
+			defer func() {
+				if err := dropStaged(); err != nil {
+					activityLogger(ctx).Info("pi provider entry left staged in models.json", "err", err)
+				}
+			}()
+		}
 		if err != nil {
 			return jailResult{}, err
 		}

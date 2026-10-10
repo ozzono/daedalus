@@ -188,6 +188,17 @@ slim:
   # the model host before setting it. Empty (the default) keeps the relay
   # off.
   parser_model: ""
+  # Ceiling on the task input a slim run may embed, in o200k_base tokens,
+  # counted after the automatic shrink pass (internal/shrink) has minimized
+  # it; a raw input whose biased-high chars/4 estimate is already over the
+  # ceiling is refused before the shrink runs (the strict counter is
+  # quadratic in one unbroken word, so it never sees oversized text). A run
+  # whose input still counts over this fails at submit — no workflow, no
+  # worktree, no worker round — and asks for the task to be split. Keep it
+  # under the smallest staged model's honest contextWindow minus the output
+  # budget it needs. 0 (or the key unset) = 4098; a negative value fails
+  # the config load.
+  max_input_tokens: 4098
 `
 
 // exampleBase2 is the remaining general fields plus the anthropic section
@@ -324,7 +335,10 @@ openai:
   # it too: pi honors OPENAI_API_KEY but has no base-URL env channel (a
   # key alone would silently dial api.openai.com), so the worker stages
   # the section as a provider entry in the host's ~/.pi/agent/models.json
-  # and selects the model with "--model daedalus-openai/<model>" — the
+  # and selects the model with "--model <id>/<model>", where <id> is a
+  # round-unique "daedalus-openai-<token>" entry — concurrent rounds (two
+  # workers on one host, or two runs in one worker) each stage and read
+  # their own entry, and it is removed when the round ends. The
   # entry carries the base URL, an ${OPENAI_API_KEY} template (the key
   # value itself never lands on disk), and the model with the window/output
   # cap and sampler knobs below; an openai section without url or without

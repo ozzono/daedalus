@@ -66,8 +66,11 @@ type pipelineRun struct {
 	guideCh workflow.ReceiveChannel
 	// wakeupCh carries `daedalus worker wakeup`: a signal that interrupts
 	// the quota heartbeat's sleep so a recovered provider resumes the
-	// round immediately. Received only inside heartbeat — mid-activity it
-	// stays buffered and merely short-circuits the next heartbeat.
+	// round immediately. The channel has two consumers — the quota
+	// heartbeat and awaitDependency's dependency gate (a poke ends that
+	// wait immediately, granting its grace cadence) — and a signal
+	// arriving mid-activity stays buffered, shortening the next wait of
+	// whichever is sleeping.
 	wakeupCh workflow.ReceiveChannel
 
 	branchName    string

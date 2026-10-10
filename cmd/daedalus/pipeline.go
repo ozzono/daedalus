@@ -21,6 +21,7 @@ import (
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/shrink"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
 
@@ -231,6 +232,57 @@ func resolveFolderGrants(flagFolders []string, taskFile string) ([]string, error
 		out = append(out, abs)
 	}
 	return out, nil
+}
+
+// slimInputGate applies the slim flow's input diet to a run's task input
+// before anything is submitted: the shrink pass first (internal/shrink —
+// structural collapse, prose minification, extractive trimming, gated by
+// the caveman invariants), then the token ceiling measured on the shrunk
+// text that would actually ship in the prompt. Both the run and continue
+// paths route through it — on a continue the prompt is the task input the
+// workflow re-plans from. The count is the max of the strict o200k_base
+// count and the biased-high chars/4 estimate — the estimator class pi's
+// own prompt sizing uses — so the gate cannot under-count against the
+// arithmetic that governs the wire budget. Over the cap the run never
+// starts — no Temporal workflow, no worktree, no worker round — and the
+// error asks the operator to split the task.
+//
+// The biased-high estimate also runs first, on the raw input, as an
+// instant refusal: the strict counter's BPE merge is quadratic in a
+// single unbroken word, so letting it near an oversized blob (a base64
+// wall, a minified one-liner) would hang the submit for minutes on the
+// exact input class the gate exists to reject. The trade: an input whose
+// raw estimate is already over the cap is refused before the shrink can
+// rescue it — the shrink's headroom applies within the estimate cap — and
+// an estimate at/below the cap bounds the strict counter's input to
+// ~4×cap characters, sub-second worst case.
+func slimInputGate(prompt string, cfg config.Config) (string, error) {
+	limit := cfg.Slim.MaxInputTokensOrDefault()
+	if est := shrink.Estimate(prompt); est > limit {
+		return "", slimOverCapErr(est, limit)
+	}
+	shrunk := shrink.Task(prompt)
+	n, err := shrink.Count(shrunk)
+	if err != nil {
+		return "", fmt.Errorf("count slim input: %w", err)
+	}
+	if est := shrink.Estimate(shrunk); est > n {
+		n = est
+	}
+	if n <= limit {
+		return shrunk, nil
+	}
+	return "", slimOverCapErr(n, limit)
+}
+
+// slimOverCapErr is the gate's one refusal diagnostic. n is the gate count
+// that lost to limit — the raw input's biased-high estimate when the early
+// arm refused, max(strict o200k count, estimate) of the shrunk text when
+// the post-shrink arm did.
+func slimOverCapErr(n, limit int) error {
+	return fmt.Errorf(
+		"slim input too large: %d tokens against the %d-token slim cap — split the work into a smaller task or pass smaller context (-f a smaller file), or raise slim.max_input_tokens in the config",
+		n, limit)
 }
 
 // startPipeline triggers the named workflow for the given issue on the
@@ -709,6 +761,18 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		return fmt.Errorf("workflow %s ran flow %q, which is no longer registered", workflowID, flow)
 	}
 
+	// A continued slim run re-plans from the continue prompt — it IS the
+	// task input the workflow embeds (the original task is not re-sent) —
+	// so the slim input gate applies here exactly as at start: shrink,
+	// cap, and fail before any submission side effect. The gate is
+	// deterministic and idempotent, so re-gating an already-shrunken
+	// prompt cannot double-shrink it.
+	if flow == "slim" {
+		if prompt, err = slimInputGate(prompt, cfg); err != nil {
+			return err
+		}
+	}
+
 	base, err := activities.AbortedBranchNameFor(prev.IssueID, workflows.FlowScope(flow))
 	if err != nil {
 		return err
@@ -858,8 +922,10 @@ func guidePipeline(cfg config.Config, workflowID, message string) error {
 // wakeupPipeline interrupts a running pipeline's quota heartbeat so the
 // sleeping round resumes immediately — for when the operator has verified
 // the provider recovered and will not wait out the hourly sleep. The
-// "wakeup" signal lands in the workflow's heartbeat select; a running-but-
-// not-sleeping workflow buffers it and merely skips its next heartbeat.
+// "wakeup" signal has two consumers — the heartbeat select and the
+// dependency gate's poll wait (a run pending on a dependency ends that
+// wait immediately, granting its grace cadence); a workflow sleeping in
+// neither buffers it and merely shortens its next wait.
 // Closed sessions (canceled, failed, parked) have their own resume path —
 // `continue`, which takes a prompt — so they are a usage error here.
 func wakeupPipeline(cfg config.Config, workflowID string) error {
@@ -897,7 +963,7 @@ func wakeupPipeline(cfg config.Config, workflowID string) error {
 	if err := c.SignalWorkflow(context.Background(), workflowID, "", "wakeup", ""); err != nil {
 		return fmt.Errorf("signal workflow %s: %w", workflowID, err)
 	}
-	fmt.Printf("Wakeup sent to %s — a quota-heartbeat sleep it is in (or reaches next) ends immediately; mid-round it only shortens the next one.\n", workflowID)
+	fmt.Printf("Wakeup sent to %s — a quota-heartbeat or dependency-gate wait it is in (or reaches next) ends immediately; mid-round it only shortens the next one.\n", workflowID)
 	fmt.Printf("Reattach with: daedalus attach %s\n", workflowID)
 	return nil
 }
