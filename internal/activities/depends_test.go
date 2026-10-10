@@ -3,9 +3,11 @@ package activities
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	workflowpb "go.temporal.io/api/workflow/v1"
@@ -164,6 +166,156 @@ func TestCheckDependencyActivity(t *testing.T) {
 		_, err := NewCheckDependencyActivity(c)(context.Background(), "tf-1")
 		if err == nil || !strings.Contains(err.Error(), "describe dependency tf-1") {
 			t.Errorf("probe(unreachable) err = %v, want a wrapped describe failure", err)
+		}
+	})
+}
+
+// pokeSignal is one recorded SignalWorkflow call — the dependent addressed
+// and the channel it was poked on.
+type pokeSignal struct {
+	workflowID string
+	runID      string
+	signalName string
+}
+
+// fakePokeClient answers only the two client calls the dependent-release
+// poke makes — ListWorkflow for the still-open dependents, SignalWorkflow
+// per hit. The embedded nil interface keeps the rest of client.Client out
+// of reach: a panic there means the poke grew a new dependency, which the
+// test wants loud (the same guard fakeDepClient uses).
+type fakePokeClient struct {
+	client.Client
+	pages   []*workflowservice.ListWorkflowExecutionsResponse
+	listErr error
+	lists   []*workflowservice.ListWorkflowExecutionsRequest
+	signals []pokeSignal
+	// signalFail fails the signal to a dependent whose workflow id it
+	// names — a dependent that closed between the listing and the signal.
+	signalFail map[string]error
+}
+
+func (f *fakePokeClient) ListWorkflow(ctx context.Context, req *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error) {
+	f.lists = append(f.lists, req)
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if len(f.pages) == 0 {
+		return &workflowservice.ListWorkflowExecutionsResponse{}, nil
+	}
+	page := f.pages[0]
+	f.pages = f.pages[1:]
+	return page, nil
+}
+
+func (f *fakePokeClient) SignalWorkflow(ctx context.Context, workflowID string, runID string, signalName string, arg interface{}) error {
+	f.signals = append(f.signals, pokeSignal{workflowID: workflowID, runID: runID, signalName: signalName})
+	if err, ok := f.signalFail[workflowID]; ok {
+		return err
+	}
+	return nil
+}
+
+// TestNotifyDependentsActivity pins the dependent-release poke's contract
+// over its client: it lists the still-open executions whose
+// DaedalusDependsOn names the completing workflow, signals each one's
+// "wakeup" — the channel the dependency gate races — counts only the
+// signals that landed, skips a dependent that closed between the listing
+// and the signal (the chain broke meanwhile; the fallback poll loses
+// nothing), follows the listing's pages to the end, and turns a failed
+// listing into the activity error that leaves every gate on its fallback.
+func TestNotifyDependentsActivity(t *testing.T) {
+	exec := func(id, runID string) *workflowpb.WorkflowExecutionInfo {
+		return &workflowpb.WorkflowExecutionInfo{
+			Execution: &commonpb.WorkflowExecution{WorkflowId: id, RunId: runID},
+		}
+	}
+
+	t.Run("running dependents are poked by id and run id", func(t *testing.T) {
+		c := &fakePokeClient{pages: []*workflowservice.ListWorkflowExecutionsResponse{{
+			Executions: []*workflowpb.WorkflowExecutionInfo{exec("tf-dep-1", "run-1"), exec("tf-dep-2", "run-2")},
+		}}}
+		poked, err := NewNotifyDependentsActivity(c)(context.Background(), "tf-1")
+		if err != nil {
+			t.Fatalf("poke: %v", err)
+		}
+		if poked != 2 {
+			t.Errorf("poked = %d, want one per listed dependent", poked)
+		}
+		if len(c.lists) != 1 {
+			t.Fatalf("list calls = %d, want one for a single-page listing", len(c.lists))
+		}
+		if req := c.lists[0]; req.Namespace != "default" {
+			t.Errorf("list namespace = %q, want default", req.Namespace)
+		} else if want := "DaedalusDependsOn = 'tf-1' AND ExecutionStatus = 'Running'"; req.Query != want {
+			t.Errorf("list query = %q, want %q — the dependent's own upsert names this workflow", req.Query, want)
+		}
+		want := []pokeSignal{
+			{workflowID: "tf-dep-1", runID: "run-1", signalName: "wakeup"},
+			{workflowID: "tf-dep-2", runID: "run-2", signalName: "wakeup"},
+		}
+		if !reflect.DeepEqual(c.signals, want) {
+			t.Errorf("signals = %v, want one wakeup per listed execution", c.signals)
+		}
+	})
+
+	t.Run("a dependent that closed before the signal is skipped, not an error", func(t *testing.T) {
+		c := &fakePokeClient{
+			pages: []*workflowservice.ListWorkflowExecutionsResponse{{
+				Executions: []*workflowpb.WorkflowExecutionInfo{exec("tf-dep-gone", "run-gone"), exec("tf-dep-live", "run-live")},
+			}},
+			signalFail: map[string]error{"tf-dep-gone": errors.New("execution already completed")},
+		}
+		poked, err := NewNotifyDependentsActivity(c)(context.Background(), "tf-1")
+		if err != nil {
+			t.Fatalf("poke: %v", err)
+		}
+		if poked != 1 {
+			t.Errorf("poked = %d, want only the signal that landed", poked)
+		}
+		if len(c.signals) != 2 {
+			t.Errorf("signal attempts = %d, want both listed dependents tried", len(c.signals))
+		}
+	})
+
+	t.Run("a failed listing fails the activity", func(t *testing.T) {
+		c := &fakePokeClient{listErr: errors.New("visibility store down")}
+		poked, err := NewNotifyDependentsActivity(c)(context.Background(), "tf-1")
+		if err == nil || !strings.Contains(err.Error(), "list dependents of tf-1") || !strings.Contains(err.Error(), "visibility store down") {
+			t.Errorf("poke(unreachable listing) err = %v, want the listing failure wrapped with the dependency id", err)
+		}
+		if poked != 0 {
+			t.Errorf("poked = %d, want zero on a failed listing", poked)
+		}
+		if len(c.signals) != 0 {
+			t.Errorf("signal attempts = %d, want none without a listing", len(c.signals))
+		}
+	})
+
+	t.Run("pages are followed until the token runs out", func(t *testing.T) {
+		c := &fakePokeClient{pages: []*workflowservice.ListWorkflowExecutionsResponse{
+			{
+				Executions:    []*workflowpb.WorkflowExecutionInfo{exec("tf-dep-1", "run-1")},
+				NextPageToken: []byte("page-2"),
+			},
+			{
+				Executions: []*workflowpb.WorkflowExecutionInfo{exec("tf-dep-2", "run-2"), exec("tf-dep-3", "run-3")},
+			},
+		}}
+		poked, err := NewNotifyDependentsActivity(c)(context.Background(), "tf-1")
+		if err != nil {
+			t.Fatalf("poke: %v", err)
+		}
+		if poked != 3 {
+			t.Errorf("poked = %d, want every dependent across both pages", poked)
+		}
+		if len(c.lists) != 2 {
+			t.Fatalf("list calls = %d, want one per page", len(c.lists))
+		}
+		if len(c.lists[0].GetNextPageToken()) != 0 {
+			t.Errorf("first page requested with token %q, want empty — the listing starts from the front", c.lists[0].GetNextPageToken())
+		}
+		if got := string(c.lists[1].GetNextPageToken()); got != "page-2" {
+			t.Errorf("second page requested with token %q, want the first page's token verbatim", got)
 		}
 	})
 }

@@ -248,9 +248,12 @@ func runWorker(cfg config.Config, workerType string) error {
 		w.RegisterActivity(activities.ReproFirstGateActivity)
 		// The dependency probe is a closure over this daemon's client (c is
 		// dialed above, before registration) — no second dial, no env
-		// channel. Its name is pinned as a string on both ends.
+		// channel. Its name is pinned as a string on both ends. The
+		// dependent-release poke shares the closure shape and the client.
 		w.RegisterActivityWithOptions(activities.NewCheckDependencyActivity(c),
 			activity.RegisterOptions{Name: activities.CheckDependencyActivityName})
+		w.RegisterActivityWithOptions(activities.NewNotifyDependentsActivity(c),
+			activity.RegisterOptions{Name: activities.NotifyDependentsActivityName})
 		workers = append(workers, w)
 	}
 

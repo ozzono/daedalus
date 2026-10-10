@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
@@ -192,11 +193,37 @@ const quotaHeartbeatInterval = time.Hour
 // healthy run — a cap would fail legitimately queued ones.
 const slotBackoffInterval = time.Minute
 
-// depPollInterval is how often a dependent run's gate re-probes its
-// dependency (awaitDependency). A package const, not config: the wait
-// schedules no work and spends nothing, so a minute's lag in starting an
-// approved chain is invisible next to a pipeline's runtime.
+// depPollInterval is the legacy dependency-gate wait: how often a
+// dependent run's gate re-probed its dependency (awaitDependency) before
+// the poke-when-done shape. Frozen at the historical minute — a run whose
+// history was recorded by the old loop replays with this exact timer, so
+// the value can never change again; the live gate waits on
+// depFallbackInterval instead.
 const depPollInterval = time.Minute
+
+// depFallbackInterval is the poke-when-done gate's fallback wait: how long
+// awaitDependency sleeps when no poke arrived. The poke (CompleteGreen's
+// NotifyDependentsActivity) releases the chain within seconds of the
+// dependency completing, so the fallback only serves ungraceful dependency
+// deaths — no wrapper survived to ring — and a half hour of lag there is
+// invisible next to the event volume the old minute poll cost.
+const depFallbackInterval = 30 * time.Minute
+
+// depReleaseGrace is the short re-probe delay a gate rides after a poke:
+// the poke is sent from the dependency's own workflow code, so it must
+// precede the completion event the approving probe reads — the probe the
+// poke triggers usually finds the dependency still running, and the grace
+// probes that follow catch the settled state seconds later.
+const depReleaseGrace = 10 * time.Second
+
+// maxPostPokeProbes bounds what a single poke buys: that many grace-wait
+// re-probes before the gate surrenders to the full fallback. Without the
+// bound, one miss — a completion event still not visible after the first
+// grace probe — would drop the wait to the whole fallback on the very next
+// round, a worse worst case than the legacy minute poll; with it, a poked
+// gate keeps probing at the grace cadence for
+// maxPostPokeProbes × depReleaseGrace (~100 seconds) before giving up.
+const maxPostPokeProbes = 10
 
 // maxQuotaHeartbeats caps the hourly retries; once the API is still
 // exhausted after this many heartbeats the run parks itself for a
@@ -249,11 +276,15 @@ func IsParkedResult(result string) bool { return strings.HasPrefix(result, Parke
 // and waiting from running, while LastActivityAt carries the last completed
 // round's time, the liveness signal a quota-heartbeat sleep lacks.
 // DaedalusDependsOn names a dependent run's dependency workflow id, upserted
-// once when the dependency gate engages.
+// once when the dependency gate engages. DaedalusStartedAt is the run's
+// first moment of real work — the gate's release on an approved dependency —
+// which the list rendering prefers over the dispatch time so a dependency
+// wait is not billed as runtime.
 const (
 	DaedalusStatusAttr    = "DaedalusStatus"
 	LastActivityAttr      = "LastActivityAt"
 	DaedalusDependsOnAttr = "DaedalusDependsOn"
+	DaedalusStartedAtAttr = "DaedalusStartedAt"
 )
 
 // RunStatus is the value space of the DaedalusStatus keyword attribute.
@@ -286,6 +317,19 @@ func visibilityEnabled(ctx workflow.Context) bool {
 	return workflow.GetVersion(ctx, visibilityChangeID, workflow.DefaultVersion, 1) == 1
 }
 
+// dependencyWakeupChangeID gates the dependency gate's second generation —
+// the poke-when-done wait shape, the DaedalusStartedAt stamp at gate
+// release, and the CompleteGreen poke — behind its own version marker, for
+// the same replay reason as visibilityChangeID: a run whose history was
+// recorded while the gate still slept the fixed poll interval must replay
+// with that loop and without the release stamp, or the new commands wedge
+// it with a nondeterminism failure at the next worker upgrade.
+const dependencyWakeupChangeID = "dependency-gate-wakeup"
+
+func dependencyWakeupEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, dependencyWakeupChangeID, workflow.DefaultVersion, 1) == 1
+}
+
 func setRunStatus(ctx workflow.Context, s RunStatus) {
 	workflow.UpsertSearchAttributes(ctx, map[string]interface{}{DaedalusStatusAttr: string(s)})
 }
@@ -306,8 +350,9 @@ func CompleteGreen(fn func(workflow.Context, PipelineInput) (string, error)) fun
 	return func(ctx workflow.Context, input PipelineInput) (string, error) {
 		// Every flow registers through this wrapper, so this is the one call
 		// site whose event-stream position every flow replays identically —
-		// the version marker is recorded here for the whole execution.
+		// the version markers are recorded here for the whole execution.
 		vis := visibilityEnabled(ctx)
+		wakeup := dependencyWakeupEnabled(ctx)
 		branch, err := fn(ctx, input)
 		if vis {
 			// Terminal status stamped at the single choke point: parks and
@@ -320,6 +365,26 @@ func CompleteGreen(fn func(workflow.Context, PipelineInput) (string, error)) fun
 				setRunStatus(ctx, StatusFailed)
 			default:
 				setRunStatus(ctx, StatusApproved)
+			}
+		}
+		if wakeup {
+			// Poke the dependents waiting on this run — approved and parked
+			// terminals alike (a parked dependency still breaks the chain,
+			// and the dependent learns it in seconds instead of at the
+			// fallback poll). Best-effort: a failed poke leaves the gate's
+			// fallback wait as the release path, so the completion must not
+			// fail over it. This run's own result is unchanged by the poke.
+			nctx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+				StartToCloseTimeout: 5 * time.Minute,
+				RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
+			})
+			var poked int
+			if nerr := workflow.ExecuteActivity(nctx, activities.NotifyDependentsActivityName,
+				workflow.GetInfo(ctx).WorkflowExecution.ID).Get(nctx, &poked); nerr != nil {
+				workflow.GetLogger(ctx).Warn("Could not poke dependents; they release on the fallback poll",
+					"Error", nerr)
+			} else if poked > 0 {
+				workflow.GetLogger(ctx).Info("Poked dependents waiting on this run", "Dependents", poked)
 			}
 		}
 		if err == nil || !errors.Is(err, ErrAwaitingMaintainer) {

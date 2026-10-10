@@ -544,13 +544,14 @@ func writeExampleConfig(dir string) error {
 	return nil
 }
 
-// runVisibility is the decoded trio of run-visibility search attributes the
+// runVisibility is the decoded run-visibility search attributes the
 // workflow upserts (workflows.DaedalusStatusAttr, LastActivityAttr,
-// DaedalusDependsOnAttr). Named fields, so no render site indexes a payload
-// map.
+// DaedalusDependsOnAttr, DaedalusStartedAtAttr). Named fields, so no render
+// site indexes a payload map.
 type runVisibility struct {
 	Status    string
 	LastAt    time.Time
+	StartedAt time.Time
 	DependsOn string
 }
 
@@ -568,6 +569,9 @@ func decodeRunVisibility(sa *commonpb.SearchAttributes, dc converter.DataConvert
 	}
 	if p, ok := sa.GetIndexedFields()[workflows.LastActivityAttr]; ok {
 		_ = dc.FromPayload(p, &vis.LastAt)
+	}
+	if p, ok := sa.GetIndexedFields()[workflows.DaedalusStartedAtAttr]; ok {
+		_ = dc.FromPayload(p, &vis.StartedAt)
 	}
 	if p, ok := sa.GetIndexedFields()[workflows.DaedalusDependsOnAttr]; ok {
 		_ = dc.FromPayload(p, &vis.DependsOn)
@@ -595,10 +599,15 @@ func dur(d time.Duration) string {
 // first. STATUS prefers the workflow's upserted DaedalusStatus over the raw
 // Temporal enum — parks and approvals are both Completed there — falling
 // back to the enum for old runs without the attribute. TIME is one merged
-// cell: while running, elapsed since the last completed round next to the
-// run's age (staleness while sleeping is the liveness signal); once closed,
-// total runtime next to how long ago it ended. A run predating the
-// attributes shows `-` for the elapsed half.
+// cell, and both of its halves count runtime from DaedalusStartedAt — the
+// dependency gate's release, the run's first moment of real work — falling
+// back to the dispatch time a run without the attribute worked from (a
+// wait is not runtime): while running, elapsed since the last completed
+// round next to the work's age (staleness while sleeping is the liveness
+// signal); once closed, total runtime next to how long ago it ended. A run
+// still pending in its dependency wait owns no work at all, so its cell
+// says so instead of counting either half. A run predating the attributes
+// shows `-` for the elapsed half.
 func listPipelines(cfg config.Config, max int) error {
 	c, err := newClient(cfg)
 	if err != nil {
@@ -627,7 +636,11 @@ func listPipelines(cfg config.Config, max int) error {
 		if dependsOn == "" {
 			dependsOn = "-"
 		}
-		started := info.GetStartTime().AsTime()
+		submitted := info.GetStartTime().AsTime()
+		workedFrom := submitted
+		if !vis.StartedAt.IsZero() {
+			workedFrom = vis.StartedAt
+		}
 		if closed := info.GetCloseTime(); closed.IsValid() {
 			// Closed: the enum is overridden only by a terminal
 			// DaedalusStatus — CompleteGreen stamps those alone. A run
@@ -640,18 +653,23 @@ func listPipelines(cfg config.Config, max int) error {
 				status = vis.Status
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t[%s | ended %s ago]\n",
-				id, status, dependsOn, dur(closed.AsTime().Sub(started)), dur(now.Sub(closed.AsTime())))
+				id, status, dependsOn, dur(closed.AsTime().Sub(workedFrom)), dur(now.Sub(closed.AsTime())))
 			continue
 		}
 		if vis.Status != "" {
 			status = vis.Status
+		}
+		if workflows.RunStatus(vis.Status) == workflows.StatusPending {
+			fmt.Fprintf(w, "%s\t%s\t%s\t[queued | submitted %s ago]\n",
+				id, status, dependsOn, dur(now.Sub(submitted)))
+			continue
 		}
 		elapsed := "-"
 		if !vis.LastAt.IsZero() {
 			elapsed = dur(now.Sub(vis.LastAt))
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t[%s | started %s ago]\n",
-			id, status, dependsOn, elapsed, dur(now.Sub(started)))
+			id, status, dependsOn, elapsed, dur(now.Sub(workedFrom)))
 	}
 	return w.Flush()
 }

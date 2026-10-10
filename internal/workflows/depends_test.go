@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/sdk/activity"
@@ -62,47 +63,108 @@ func (r *depProbeRecorder) record() {
 }
 
 // depVisSnapshot is the run-visibility reading a dependent-run probe takes:
-// the gate's pending stamp and the DaedalusDependsOn upsert (readVis in
-// visibility_test.go predates the third attribute).
+// the gate's pending stamp, the DaedalusDependsOn upsert (readVis in
+// visibility_test.go predates the third attribute), and the
+// DaedalusStartedAt release stamp — zero when absent (legacy replays, runs
+// still waiting).
 type depVisSnapshot struct {
 	Status    string
 	DependsOn string
+	StartedAt time.Time
+}
+
+// readDepVis reads the attributes from the executing workflow's info — the
+// raw payloads, decoded with the default converter exactly the way
+// `daedalus`'s list rendering decodes a listed execution.
+func readDepVis(ctx workflow.Context) depVisSnapshot {
+	dc := converter.GetDefaultDataConverter()
+	fields := workflow.GetInfo(ctx).SearchAttributes.GetIndexedFields()
+	var s depVisSnapshot
+	if p, ok := fields[DaedalusStatusAttr]; ok {
+		_ = dc.FromPayload(p, &s.Status)
+	}
+	if p, ok := fields[DaedalusDependsOnAttr]; ok {
+		_ = dc.FromPayload(p, &s.DependsOn)
+	}
+	if p, ok := fields[DaedalusStartedAtAttr]; ok {
+		_ = dc.FromPayload(p, &s.StartedAt)
+	}
+	return s
 }
 
 // runDepVisProbe executes flow behind a "vis" query handler and captures
 // the attributes read after the flow returned — the same shape as
-// runVisProbe, with the dependency attribute included.
+// runVisProbe, with the dependency attributes included.
 func runDepVisProbe(t *testing.T, env *testsuite.TestWorkflowEnvironment, flow func(workflow.Context, PipelineInput) (string, error), in PipelineInput) depVisSnapshot {
 	t.Helper()
 	final := new(depVisSnapshot)
 	env.RegisterWorkflowWithOptions(func(ctx workflow.Context, input PipelineInput) (string, error) {
 		if err := workflow.SetQueryHandler(ctx, "vis", func() (depVisSnapshot, error) {
-			dc := converter.GetDefaultDataConverter()
-			fields := workflow.GetInfo(ctx).SearchAttributes.GetIndexedFields()
-			var s depVisSnapshot
-			if p, ok := fields[DaedalusStatusAttr]; ok {
-				_ = dc.FromPayload(p, &s.Status)
-			}
-			if p, ok := fields[DaedalusDependsOnAttr]; ok {
-				_ = dc.FromPayload(p, &s.DependsOn)
-			}
-			return s, nil
+			return readDepVis(ctx), nil
 		}); err != nil {
 			return "", err
 		}
 		_, err := flow(ctx, input)
-		dc := converter.GetDefaultDataConverter()
-		fields := workflow.GetInfo(ctx).SearchAttributes.GetIndexedFields()
-		if p, ok := fields[DaedalusStatusAttr]; ok {
-			_ = dc.FromPayload(p, &final.Status)
-		}
-		if p, ok := fields[DaedalusDependsOnAttr]; ok {
-			_ = dc.FromPayload(p, &final.DependsOn)
-		}
+		*final = readDepVis(ctx)
 		return "", err
 	}, workflow.RegisterOptions{Name: "depVisProbe"})
 	env.ExecuteWorkflow("depVisProbe", in)
 	return *final
+}
+
+// runPokeProbe executes flow behind a wrapper that captures the run's own
+// workflow id, the flow's returned branch, and the final visibility
+// snapshot — the id the CompleteGreen release poke must name.
+func runPokeProbe(t *testing.T, env *testsuite.TestWorkflowEnvironment, flow func(workflow.Context, PipelineInput) (string, error), in PipelineInput) (string, string, depVisSnapshot) {
+	t.Helper()
+	selfID := ""
+	branch := ""
+	final := new(depVisSnapshot)
+	env.RegisterWorkflowWithOptions(func(ctx workflow.Context, input PipelineInput) (string, error) {
+		selfID = workflow.GetInfo(ctx).WorkflowExecution.ID
+		b, err := flow(ctx, input)
+		branch = b
+		*final = readDepVis(ctx)
+		return "", err
+	}, workflow.RegisterOptions{Name: "pokeProbe"})
+	env.ExecuteWorkflow("pokeProbe", in)
+	return selfID, branch, *final
+}
+
+// depPokeRecorder captures every NotifyDependentsActivity call — the
+// dependent-release poke CompleteGreen fires once a run reaches a terminal
+// state — and answers each with a successful single-dependent poke.
+// Maybe: the legacy replay path and gate-only runs never poke, and the
+// tests pin the call counts explicitly off ids.
+type depPokeRecorder struct {
+	env     *testsuite.TestWorkflowEnvironment
+	ids     []string
+	stubErr error
+}
+
+// register pins the poke's registered name (the worker's registration
+// shape) — the test environment refuses an OnActivity by name for an
+// unregistered activity, and refuses the registration itself once any
+// activity mock exists, so a test mixing recorders registers everything
+// before mocking anything.
+func (r *depPokeRecorder) register() {
+	r.env.RegisterActivityWithOptions(activities.NewNotifyDependentsActivity(nil),
+		activity.RegisterOptions{Name: activities.NotifyDependentsActivityName})
+}
+
+// record wires the recording mock. register must have run already.
+func (r *depPokeRecorder) record() {
+	r.env.OnActivity(activities.NotifyDependentsActivityName, mock.Anything, mock.Anything).Maybe().
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if id, ok := a.(string); ok {
+					r.ids = append(r.ids, id)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, id string) (int, error) {
+			return 1, r.stubErr
+		})
 }
 
 // stubDependentHappyPath wires the full feature-dev happy path, capturing
@@ -438,6 +500,7 @@ func TestDependentRunWaitsOutPausedDependency(t *testing.T) {
 		{probe: activities.DependencyProbe{Status: "paused"}},
 		{probe: activities.DependencyProbe{Status: "running"}},
 		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}},
+		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}},
 	}}
 	probe.record()
 	created, _ := stubDependentHappyPath(t, env)
@@ -462,4 +525,259 @@ func TestDependentRunWaitsOutPausedDependency(t *testing.T) {
 		t.Errorf("worktree BaseBranch = %q, want the dependency's preserved branch once it approved", created.BaseBranch)
 	}
 	env.AssertExpectations(t)
+}
+
+// TestDependentRunPokeReleasesGate pins the poke-when-done release: the
+// wakeup signal the dependency's CompleteGreen sends lands seconds into
+// the wait — long before any fallback-scale timer — the gate re-probes at
+// once and starts, stamping DaedalusStartedAt as the run's first moment of
+// real work.
+func TestDependentRunPokeReleasesGate(t *testing.T) {
+	env := newTestEnv(t)
+	probe := &depProbeRecorder{env: env, script: []depProbeStep{
+		{probe: activities.DependencyProbe{Status: "running"}},
+		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}},
+	}}
+	probe.record()
+	stubDependentHappyPath(t, env)
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow("wakeup", "") }, 5*time.Second)
+
+	in := baseInput()
+	in.DependsOn = "tf-issue-41"
+	start := env.Now()
+	final := runDepVisProbe(t, env, FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	// Under a minute: the signal plus one release-grace wait — not the
+	// 30-minute fallback, and not even the legacy minute poll.
+	if elapsed := env.Now().Sub(start); elapsed >= time.Minute {
+		t.Errorf("run released after %v, want the poke's grace cadence (signal, then one re-probe)", elapsed)
+	}
+	if len(probe.ids) != 2 {
+		t.Errorf("probe calls = %d (%v), want the initial poll then the poke-triggered re-probe", len(probe.ids), probe.ids)
+	}
+	if final.StartedAt.IsZero() {
+		t.Error("DaedalusStartedAt absent, want the release stamp — runtime bills from the gate's release, not the dispatch")
+	}
+	env.AssertExpectations(t)
+}
+
+// TestDependentRunPokeGraceIsBounded pins what a poke buys: one signal
+// grants the grace cadence for a bounded stretch — the poked gate keeps
+// re-probing through misses, but once the grant runs out the wait falls
+// back to the long timer instead of re-probing forever.
+func TestDependentRunPokeGraceIsBounded(t *testing.T) {
+	env := newTestEnv(t)
+	// The grant covers the poke's own re-probe plus maxPostPokeProbes
+	// grace waits' worth after it; the approving probe lands one wait
+	// later, on the fallback.
+	script := make([]depProbeStep, 0, maxPostPokeProbes+3)
+	for i := 0; i < maxPostPokeProbes+2; i++ {
+		script = append(script, depProbeStep{probe: activities.DependencyProbe{Status: "running"}})
+	}
+	script = append(script, depProbeStep{probe: activities.DependencyProbe{
+		Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}})
+	probe := &depProbeRecorder{env: env, script: script}
+	probe.record()
+	stubDependentHappyPath(t, env)
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow("wakeup", "") }, 5*time.Second)
+
+	in := baseInput()
+	in.DependsOn = "tf-issue-41"
+	start := env.Now()
+	runDepVisProbe(t, env, FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	// The initial poll, maxPostPokeProbes+1 probes at the grace cadence
+	// while the dependency stays running, then — the grant spent — the
+	// approving probe on the fallback timer.
+	if len(probe.ids) != maxPostPokeProbes+3 {
+		t.Errorf("probe calls = %d (%v), want the initial poll, %d grace probes, and the approving fallback probe", len(probe.ids), probe.ids, maxPostPokeProbes+1)
+	}
+	if elapsed := env.Now().Sub(start); elapsed < depFallbackInterval || elapsed >= 2*depFallbackInterval {
+		t.Errorf("run released after %v, want exactly one fallback wait after the grant runs out (%d grace probes, then the approving fallback probe)", elapsed, maxPostPokeProbes)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestDependentRunFallbackReleasesGate pins the no-poke path: an
+// ungraceful dependency death leaves nothing to signal, and the gate still
+// releases on the long fallback wait instead of pending forever.
+func TestDependentRunFallbackReleasesGate(t *testing.T) {
+	env := newTestEnv(t)
+	probe := &depProbeRecorder{env: env, script: []depProbeStep{
+		{probe: activities.DependencyProbe{Status: "running"}},
+		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}},
+	}}
+	probe.record()
+	stubDependentHappyPath(t, env)
+
+	in := baseInput()
+	in.DependsOn = "tf-issue-41"
+	start := env.Now()
+	runDepVisProbe(t, env, FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if elapsed := env.Now().Sub(start); elapsed < depFallbackInterval {
+		t.Errorf("run released after %v, want the fallback wait — nothing poked the gate", elapsed)
+	}
+	if len(probe.ids) != 2 {
+		t.Errorf("probe calls = %d (%v), want one poll then the fallback re-probe", len(probe.ids), probe.ids)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestDependentRunLegacyReplayGate pins the replay contract of the second
+// generation: with the dependency-gate-wakeup marker absent from the
+// recorded history — GetVersion hands back the default — the gate waits
+// out the frozen minute poll, the wrapper never pokes, and no
+// DaedalusStartedAt stamp exists, so an in-flight run replaying on an
+// upgraded worker neither wedges on new commands nor changes its clock.
+func TestDependentRunLegacyReplayGate(t *testing.T) {
+	env := newTestEnv(t)
+	poke := &depPokeRecorder{env: env}
+	poke.register()
+	probe := &depProbeRecorder{env: env, script: []depProbeStep{
+		{probe: activities.DependencyProbe{Status: "running"}},
+		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}},
+	}}
+	probe.record()
+	poke.record()
+	stubDependentHappyPath(t, env)
+
+	// Ordering is forced here rather than through runDepVisProbe: the
+	// environment refuses workflow registrations once a workflow mock
+	// exists, so the wrapper registers first and the version mock — the
+	// recorded history carrying no dependency-gate-wakeup marker, GetVersion
+	// hands back the default — lands between registration and execution.
+	final := new(depVisSnapshot)
+	env.RegisterWorkflowWithOptions(func(ctx workflow.Context, input PipelineInput) (string, error) {
+		_, err := CompleteGreen(FeatureDevWorkflow)(ctx, input)
+		*final = readDepVis(ctx)
+		return "", err
+	}, workflow.RegisterOptions{Name: "legacyDepProbe"})
+	env.OnGetVersion(dependencyWakeupChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+
+	in := baseInput()
+	in.DependsOn = "tf-issue-41"
+	start := env.Now()
+	env.ExecuteWorkflow("legacyDepProbe", in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	elapsed := env.Now().Sub(start)
+	if elapsed < depPollInterval || elapsed >= depFallbackInterval {
+		t.Errorf("run released after %v, want the legacy minute poll (>= %v) and not the new fallback (< %v)", elapsed, depPollInterval, depFallbackInterval)
+	}
+	if len(probe.ids) != 2 {
+		t.Errorf("probe calls = %d (%v), want one poll then the legacy re-probe", len(probe.ids), probe.ids)
+	}
+	if len(poke.ids) != 0 {
+		t.Errorf("poke calls = %v, want none — a legacy replay runs without the release poke", poke.ids)
+	}
+	if !final.StartedAt.IsZero() {
+		t.Errorf("DaedalusStartedAt = %v, want absent — a legacy replay records no release stamp", final.StartedAt)
+	}
+}
+
+// TestCompleteGreenPokesDependents pins the release poke at the
+// CompleteGreen choke point: a run reaching a terminal state — approved
+// and parked alike — pokes the dependents waiting on it, naming this run's
+// own workflow id (what their DaedalusDependsOn attribute matches), and a
+// failed poke leaves the run's own outcome and stamps untouched, the
+// fallback poll being the release path it falls back to.
+func TestCompleteGreenPokesDependents(t *testing.T) {
+	t.Run("an approved run pokes its dependents", func(t *testing.T) {
+		env := newTestEnv(t)
+		poke := &depPokeRecorder{env: env}
+		poke.register()
+		stubWorktree(t, env)
+		rec := &agentRecorder{env: env}
+		rec.record()
+		rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+		rev.record()
+		stubTestPhase(env)
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+		poke.record()
+
+		selfID, branch, final := runPokeProbe(t, env, CompleteGreen(FeatureDevWorkflow), baseInput())
+
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if branch != "daedalus/issue-42-1" {
+			t.Errorf("workflow branch = %q, want the preserved branch", branch)
+		}
+		if len(poke.ids) != 1 || poke.ids[0] != selfID {
+			t.Errorf("poke ids = %v, want exactly one naming this run (%q)", poke.ids, selfID)
+		}
+		if final.Status != string(StatusApproved) {
+			t.Errorf("final DaedalusStatus = %q, want %q — the poke sits beside the terminal stamp, not over it", final.Status, StatusApproved)
+		}
+		env.AssertExpectations(t)
+	})
+
+	t.Run("a parked run pokes its dependents too", func(t *testing.T) {
+		env := newTestEnv(t)
+		poke := &depPokeRecorder{env: env}
+		poke.register()
+		stubWorktree(t, env)
+		rec := &agentRecorder{env: env}
+		rec.record()
+		rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+			{NeedsMaintainer: true, Comments: "needs the maintainer's secret"},
+		}}
+		rev.record()
+		stubTestPhase(env)
+		poke.record()
+
+		selfID, branch, _ := runPokeProbe(t, env, CompleteGreen(FeatureDevWorkflow), baseInput())
+
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if !IsParkedResult(branch) {
+			t.Errorf("workflow branch = %q, want a green completion carrying the park marker", branch)
+		}
+		if len(poke.ids) != 1 || poke.ids[0] != selfID {
+			t.Errorf("poke ids = %v, want exactly one naming this run (%q) — a parked dependency still breaks the chain, and the dependent learns it in seconds", poke.ids, selfID)
+		}
+		env.AssertExpectations(t)
+	})
+
+	t.Run("a failed poke leaves the run's outcome untouched", func(t *testing.T) {
+		env := newTestEnv(t)
+		poke := &depPokeRecorder{env: env, stubErr: errors.New("visibility store down")}
+		poke.register()
+		stubWorktree(t, env)
+		rec := &agentRecorder{env: env}
+		rec.record()
+		rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+		rev.record()
+		stubTestPhase(env)
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+		poke.record()
+
+		_, branch, final := runPokeProbe(t, env, CompleteGreen(FeatureDevWorkflow), baseInput())
+
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v, want the poke failure swallowed — the gate's fallback poll is the release path it drops back to", err)
+		}
+		if branch != "daedalus/issue-42-1" {
+			t.Errorf("workflow branch = %q, want the preserved branch unchanged by the failed poke", branch)
+		}
+		if final.Status != string(StatusApproved) {
+			t.Errorf("final DaedalusStatus = %q, want %q", final.Status, StatusApproved)
+		}
+		env.AssertExpectations(t)
+	})
 }

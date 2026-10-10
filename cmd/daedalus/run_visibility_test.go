@@ -98,4 +98,26 @@ func TestDecodeRunVisibility(t *testing.T) {
 			t.Errorf("decodeRunVisibility = %+v, want only DependsOn set to %q", vis, "wf-1")
 		}
 	})
+
+	t.Run("all four attributes decode", func(t *testing.T) {
+		started := time.Date(2026, 10, 9, 8, 30, 0, 0, time.UTC)
+		startedPayload, err := dc.ToPayload(started)
+		if err != nil {
+			t.Fatal(err)
+		}
+		depPayload, err := dc.ToPayload("wf-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		vis := decodeRunVisibility(&commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
+			"DaedalusStatus":    statusPayload,
+			"LastActivityAt":    lastPayload,
+			"DaedalusStartedAt": startedPayload,
+			"DaedalusDependsOn": depPayload,
+		}}, dc)
+		want := runVisibility{Status: "parked", LastAt: last, StartedAt: started, DependsOn: "wf-1"}
+		if vis != want {
+			t.Errorf("decodeRunVisibility = %+v, want %+v — the release stamp decodes beside the rest", vis, want)
+		}
+	})
 }

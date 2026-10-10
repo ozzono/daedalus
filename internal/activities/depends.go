@@ -7,6 +7,7 @@ import (
 
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 )
 
@@ -16,6 +17,11 @@ import (
 // is a closure over the worker's client, whose reflected name would not
 // match on both sides by itself.
 const CheckDependencyActivityName = "CheckDependencyActivity"
+
+// NotifyDependentsActivityName is the registered name of the
+// dependent-release poke (NewNotifyDependentsActivity), pinned for the
+// same closure-name reason as CheckDependencyActivityName.
+const NotifyDependentsActivityName = "NotifyDependentsActivity"
 
 // DependencyProbe is one poll of a dependent run's dependency: what state
 // the chained workflow is in, and — once approved — the preserved branch
@@ -82,6 +88,44 @@ func NewCheckDependencyActivity(c client.Client) func(context.Context, string) (
 			return DependencyProbe{Terminal: true, Status: "timed out"}, nil
 		default:
 			return DependencyProbe{Terminal: true, Status: s.String()}, nil
+		}
+	}
+}
+
+// NewNotifyDependentsActivity builds the poke that releases a completed
+// run's chain without waiting out the gate's fallback poll: over the
+// worker's client (the same dial the probe reuses) it lists the still-open
+// executions whose DaedalusDependsOn names this workflow and signals each
+// one's "wakeup" — the same channel the quota heartbeat already races —
+// so the dependent's gate re-probes at once. Returned before completion on
+// purpose: the poke necessarily precedes the completion event, so the
+// probe it triggers may still read the dependency running; the gate rides
+// a short release grace after a poke to catch the settled state. The count
+// of poked dependents is best-effort throughout — a closed-between-listing-
+// and-signaling dependent (the chain broke meanwhile) is skipped, not an
+// error, and a failed poke leaves the fallback poll as the release path.
+func NewNotifyDependentsActivity(c client.Client) func(context.Context, string) (int, error) {
+	return func(ctx context.Context, workflowID string) (int, error) {
+		poked := 0
+		token := []byte(nil)
+		for {
+			resp, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+				Namespace:     "default",
+				NextPageToken: token,
+				Query:         fmt.Sprintf("DaedalusDependsOn = '%s' AND ExecutionStatus = 'Running'", workflowID),
+			})
+			if err != nil {
+				return 0, fmt.Errorf("list dependents of %s: %w", workflowID, err)
+			}
+			for _, e := range resp.GetExecutions() {
+				if err := c.SignalWorkflow(ctx, e.GetExecution().GetWorkflowId(), e.GetExecution().GetRunId(), "wakeup", ""); err == nil {
+					poked++
+				}
+			}
+			token = resp.GetNextPageToken()
+			if len(token) == 0 {
+				return poked, nil
+			}
 		}
 	}
 }
