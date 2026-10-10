@@ -302,7 +302,10 @@ openai:
   # it too: pi honors OPENAI_API_KEY but has no base-URL env channel (a
   # key alone would silently dial api.openai.com), so the worker stages
   # the section as a provider entry in the host's ~/.pi/agent/models.json
-  # and selects the model with "--model daedalus-openai/<model>" — the
+  # and selects the model with "--model <id>/<model>", where <id> is a
+  # round-unique "daedalus-openai-<token>" entry — concurrent rounds (two
+  # workers on one host, or two runs in one worker) each stage and read
+  # their own entry, and it is removed when the round ends. The
   # entry carries the base URL, an ${OPENAI_API_KEY} template (the key
   # value itself never lands on disk), and the model with the window/output
   # cap and sampler knobs below; an openai section without url or without

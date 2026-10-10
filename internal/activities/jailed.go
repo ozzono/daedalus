@@ -875,16 +875,32 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// pi ignores the base-URL env vars entirely (only OPENAI_API_KEY reaches
 	// its built-in openai provider — the 401-to-api.openai.com of
 	// 2026-09-26), so a pi round served by the openai section needs the
-	// section bridged into pi's own provider config: stagePiProvider
-	// rewrites the daedalus-owned entry in the host's
-	// ~/.pi/agent/models.json (rw-mounted by the jail's pi preset) and
-	// returns the --model flag selecting it. Failover rides the same bridge
-	// only for openai-type fallbacks — an anthropic-type fallback has no
-	// pi channel at all (pi reads no ANTHROPIC_BASE_URL), so the round
-	// stays pinned to the primary's staged entry (see
+	// section bridged into pi's own provider config: stagePiProvider stages
+	// a round-unique entry into the host's ~/.pi/agent/models.json
+	// (rw-mounted by the jail's pi preset) and returns the --model flag
+	// selecting it, so a concurrent round — another worker on this host, or
+	// another run in this worker — stages and reads its own entry, never
+	// this one's (the 2026-10-10 wa-termo/bb-eloparse cross-read). The
+	// cleanup drops the entry at the round's end, when nothing can read it
+	// anymore; a failed cleanup is logged, never surfaced as a round
+	// failure — the round already ran, and the leftover is inert (selected
+	// by no --model). The
+	// cleanup rides even an error return: a staging that fails after the
+	// entry landed (the timeout merge) must not leak it into a round that
+	// never launches. Failover rides the same bridge only for openai-type
+	// fallbacks — an anthropic-type fallback has no pi channel at all (pi
+	// reads no ANTHROPIC_BASE_URL), so the round stays pinned to the
+	// primary's staged entry (see
 	// backlog/bugs/pi-anthropic-fallback-unserveable.md).
 	if selected == "pi" {
-		modelArgs, err := stagePiProvider(env)
+		modelArgs, dropStaged, err := stagePiProvider(env)
+		if dropStaged != nil {
+			defer func() {
+				if err := dropStaged(); err != nil {
+					activityLogger(ctx).Info("pi provider entry left staged in models.json", "err", err)
+				}
+			}()
+		}
 		if err != nil {
 			return jailResult{}, err
 		}
