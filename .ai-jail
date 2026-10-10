@@ -16,7 +16,9 @@ rw_maps = [
     "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-bug-fix-round4.2/.daedalus-folders/daedalus",
     "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-cot-last-write/backlog/bugs",
     "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-cot-last-write/.daedalus-folders/daedalus",
-    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-cot-last-write/backlog/bugs",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-skip-preflight-arg/backlog/bugs",
+    "~/Projects/tasks/daedalus:~/.daedalus/worktrees/daedalus/issue-skip-preflight-arg/.daedalus-folders/daedalus",
+    "~/Projects/tasks/daedalus/bugs:~/.daedalus/worktrees/daedalus/issue-skip-preflight-arg/backlog/bugs",
 ]
 mask = [
     ".claude/settings.json",

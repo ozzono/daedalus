@@ -439,6 +439,54 @@ func TestSlimWorkflowNoSuiteParks(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestSlimWorkflowContinuedPreflightGate pins the gate skip through the one
+// flow that consumes the gate's return value: on a validated continue slim
+// executes no baseline suite, and the resolved command still rides out of
+// the skip — the run reaches its planner (never the suite-less park an
+// empty command would trigger) and keeps the per-round ground truth the
+// flow exists for. The feature-dev continue pins discard the return value,
+// so a skip that stopped returning the command leaves them green while
+// every continued slim run parks; the count here also catches a skip that
+// regressed into executing the baseline.
+func TestSlimWorkflowContinuedPreflightGate(t *testing.T) {
+	env, agents, reviews, suites := stubSlimRun(t)
+
+	agents.script = []agentStep{
+		{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
+		// The queue carries one sub-task: the loop converges after its
+		// first green round and finalizes.
+		{result: activities.AgentRunResult{Text: `[{"id":1,"type":"implement","target_files":["adder.go"],"description":"add the adder","acceptance_criteria":["adder.go defines Add","Add(2,2) returns 4"]}]`, SessionID: "dev-2"}},
+		{result: activities.AgentRunResult{Text: "step one done", SessionID: "dev-3"}},
+	}
+	reviews.stub = []activities.ReviewResult{{Approved: true}}
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+
+	in := baseInput()
+	in.Flow = "slim"
+	in.BaseBranch = "aborted/issue-42"
+	in.BaselineValidated = true
+	env.ExecuteWorkflow(SlimWorkflow, in)
+
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("branch = %q, want the finalize deliverable", branch)
+	}
+	if len(agents.inputs) == 0 {
+		t.Fatalf("no agent rounds ran on a validated continue — the skip must open the planner session, not park")
+	}
+	if p := agents.inputs[0].Prompt; !strings.Contains(p, "PLANNER") {
+		t.Errorf("first agent round prompt = %q, want the planner — the skip opens the session, it does not park the run", p)
+	}
+	if len(suites.runs) != 1 {
+		t.Errorf("suite ran %d times, want 1 (the sub-task round's ground truth alone — no baseline execution on a validated continue)", len(suites.runs))
+	}
+	env.AssertExpectations(t)
+}
+
 // TestSlimWorkflowReviewHaltsParks pins the maintainer-halt path: a review
 // that declares the sub-task impossible as stated parks the run with the
 // sub-task's identity and the reviewer's reason, instead of looping.
