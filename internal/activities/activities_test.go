@@ -2409,6 +2409,152 @@ func TestNativeTestsMakefileTargets(t *testing.T) {
 	}
 }
 
+// TestNativeTestsMakefileTestRuleWins pins the static-detection precedence:
+// a Makefile declaring a plain `test:` rule wins over the single-language
+// defaults — a repo that composes its own suite means to run the
+// composition, not the bare default its primary language would suggest
+// (daedalus run 01a125e2 resolved `go test ./...` for exactly such a repo) —
+// and over the split test-ui/test-api fallback too.
+func TestNativeTestsMakefileTestRuleWins(t *testing.T) {
+	log := newStubLog(t)
+	stubBin(t, "make", "echo 'suite green'; exit 0")
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mk := "build:\n\tgo build ./...\n\ntest:\n\tgo test ./...\n\tgo vet ./...\n\ntest-ui:\n\tnpx vitest run\n"
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte(mk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RunNativeTestsActivity(context.Background(), wt, "")
+	if err != nil {
+		t.Fatalf("RunNativeTestsActivity: %v", err)
+	}
+	if !result.Passed {
+		t.Error("Passed = false, want true")
+	}
+	if result.Command != "make test" {
+		t.Errorf("Command = %q, want make test — the repo's own composition", result.Command)
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("make called %d times, want 1", len(calls))
+	}
+	assertArgs(t, calls[0].Args, []string{"test"}, "make")
+	if !samePath(calls[0].Cwd, wt) {
+		t.Errorf("make cwd = %q, want %q", calls[0].Cwd, wt)
+	}
+}
+
+// TestDetectedTestCommandMakefilePrecedence pins the detection boundary the
+// end-to-end siblings run through: the plain `test:` rule beats every
+// single-language marker, an assignment sharing the prefix (`test:=v`,
+// POSIX `test::=v`) is a variable rather than a rule and leaves the
+// language default in place, and the split test-ui/test-api fallback stays
+// the tail — a Go repo whose Makefile splits its suites still resolves the
+// Go default.
+func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
+	// A `test:` rule beats each of the single-language markers.
+	for _, marker := range []struct{ name, content string }{
+		{"go.mod", "module example.com/x\n"},
+		{"package.json", `{"scripts":{"test":"vitest run"}}`},
+		{"pyproject.toml", "[tool.pytest.ini_options]\n"},
+	} {
+		wt := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\tnpm test\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, marker.name), []byte(marker.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if argv, ok := detectedTestCommand(wt); !ok || strings.Join(argv, " ") != "make test" {
+			t.Errorf("%s + test: rule → detectedTestCommand = %v, %v; want make test", marker.name, argv, ok)
+		}
+	}
+
+	// Assignment-only lines claim nothing: the Go default survives a
+	// Makefile whose test-prefixed lines are variables — the glued
+	// `:=`/`::=` forms and the target-specific `test: X := 3` form alike —
+	// and a Makefile carrying nothing but a target-specific assignment is
+	// not detected at all (the repo falls through to discovery, never to a
+	// `make test` nothing can run).
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:=\ntest::=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if argv, ok := detectedTestCommand(wt); !ok || strings.Join(argv, " ") != "go test ./..." {
+		t.Errorf("test:= Makefile → detectedTestCommand = %v, %v; want go test ./...", argv, ok)
+	}
+	assignOnly := t.TempDir()
+	if err := os.WriteFile(filepath.Join(assignOnly, "Makefile"), []byte("test: X := 3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if argv, ok := detectedTestCommand(assignOnly); ok {
+		t.Errorf("target-specific-assignment Makefile → detectedTestCommand = %v, %v; want no detection", argv, ok)
+	}
+
+	// The split-target fallback is still the tail: go.mod wins over a
+	// test-ui-only Makefile.
+	wt2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt2, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt2, "Makefile"), []byte("test-ui:\n\tnpx vitest run\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if argv, ok := detectedTestCommand(wt2); !ok || strings.Join(argv, " ") != "go test ./..." {
+		t.Errorf("go.mod + test-ui Makefile → detectedTestCommand = %v, %v; want go test ./...", argv, ok)
+	}
+}
+
+// TestMakefileHasTarget pins the rule recognition itself: `test:` at line
+// start is a rule — bare, with prerequisites, or in the POSIX double-colon
+// form — and any `=` in the post-colon remainder rejects the line as a
+// variable assignment, never a rule: the glued forms (`test:=v`, POSIX
+// `test::=v`), the target-specific assignments (`test: X := 3`,
+// `test: GOFLAGS = -race`, keyword forms included), and — the literal
+// scan's documented divergence — an `=` inside a $(…) prereq reference,
+// which make would parse as a rule but whose expanded prereqs are
+// unbuildable, so the rejection is a safe fall-through. A rule after an
+// assignment is still found, and the match is anchored at line start (a
+// `contest:` rule, a .PHONY mention, or a tab-indented recipe line is not
+// `test:`).
+func TestMakefileHasTarget(t *testing.T) {
+	for _, c := range []struct {
+		mk   string
+		want bool
+	}{
+		{"test:\n\tgo test ./...", true},
+		{"test: unit integration\n\tgo test ./...", true},
+		{"test::\n\tgo test ./...", true},
+		{"test:=x", false},
+		{"test:=$(shell date)\nlint:\n\tgolangci-lint run", false},
+		{"test::=x", false},
+		// Target-specific variable assignments — the "=" sits in a
+		// prerequisite position, so a prefix-shaped exclusion misses them.
+		{"test: X := 3", false},
+		{"test: GOFLAGS = -race", false},
+		{"test: override X = 1", false},
+		{"test: export X = 1", false},
+		// The literal scan also rejects this rule-shaped line ("=" inside
+		// the $(…)); documented safe fall-through, per the helper's comment.
+		{"test: $(shell echo a=b)", false},
+		{"test:=x\ntest:\n\tgo test ./...", true},
+		{"contest:\n\ttrue", false},
+		{"\ttest:\n\tgo test ./...", false},
+		{".PHONY: test\n", false},
+	} {
+		if got := makefileHasTarget(c.mk, "test"); got != c.want {
+			t.Errorf("makefileHasTarget(%q) = %v, want %v", c.mk, got, c.want)
+		}
+	}
+}
+
 // TestNativeTestsAIDiscovery pins the general fallback: with no static
 // markers, a short jailed agent round names the command — and the reply is
 // only trusted after the existence probe passes, so the suite round runs
@@ -2447,20 +2593,21 @@ func TestNativeTestsAIDiscovery(t *testing.T) {
 }
 
 // TestNativeTestsAIDiscoveryAgentOverride pins that the run's -cli selection
-// reaches the discovery round too: with no static markers, the discovery jail
-// runs the overridden agent — not the worker's DAEDALUS_AGENT claude. The
-// Makefile carries a `test:` target (not test-ui/test-api, which static
-// detection would claim first), so the probed reply is real.
+// reaches the discovery round too: with nothing static detection claims, the
+// discovery jail runs the overridden agent — not the worker's DAEDALUS_AGENT
+// claude. The Makefile carries a `check:` target — a rule static detection
+// ignores (only `test:`, test-ui, test-api are claimed) — so the probed
+// reply is real without discovery being short-circuited.
 func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 	scrubBugFilingEnv(t)
 	ocMount := opencodeTestEnv(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail",
-		`printf '%s\n' '{"type":"result","subtype":"success","result":"make test"}'; exit 0`)
+		`printf '%s\n' '{"type":"result","subtype":"success","result":"make check"}'; exit 0`)
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "claude")
 	wt := t.TempDir()
-	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\techo 'suite green'\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("check:\n\techo 'suite green'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4268,14 +4415,15 @@ func TestParseRoundOutput(t *testing.T) {
 func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 	scrubBugFilingEnv(t)
 	log := newStubLog(t)
-	stubBin(t, "ai-jail", "echo 'make test'; exit 0")
+	stubBin(t, "ai-jail", "echo 'make check'; exit 0")
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "pi")
-	// The Makefile's `test:` target backs the reply, so the existence
-	// probe passes (test, not test-ui/test-api, keeps static detection
+	// The Makefile's `check:` target backs the reply, so the existence
+	// probe passes (check is a rule static detection ignores — only
+	// `test:`, test-ui, test-api are claimed — keeping static detection
 	// out of the discovery path).
 	wt := t.TempDir()
-	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\techo 'suite green'\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("check:\n\techo 'suite green'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4286,7 +4434,7 @@ func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 	if !result.Passed {
 		t.Error("Passed = false, want true")
 	}
-	if result.Command != "sh -c make test" {
+	if result.Command != "sh -c make check" {
 		t.Errorf("Command = %q, want the pi-discovered command", result.Command)
 	}
 	calls := readCalls(t, log)
@@ -4318,11 +4466,13 @@ func TestNativeTestsAIDiscoveryPlainText(t *testing.T) {
 	// effect only; the jail argv itself is pinned by the override siblings.
 	opencodeTestEnv(t)
 	newStubLog(t)
-	stubBin(t, "ai-jail", "echo 'make test'; exit 0")
+	stubBin(t, "ai-jail", "echo 'make check'; exit 0")
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
 	t.Setenv("DAEDALUS_AGENT", "opencode")
+	// `check:` — a rule static detection ignores — keeps the discovery
+	// path live while the Makefile still backs the probed reply.
 	wt := t.TempDir()
-	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\techo 'suite green'\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("check:\n\techo 'suite green'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4333,7 +4483,7 @@ func TestNativeTestsAIDiscoveryPlainText(t *testing.T) {
 	if !result.Passed {
 		t.Error("Passed = false, want true")
 	}
-	if result.Command != "sh -c make test" {
+	if result.Command != "sh -c make check" {
 		t.Errorf("Command = %q, want the raw reply as the discovered command", result.Command)
 	}
 }

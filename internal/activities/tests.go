@@ -440,8 +440,9 @@ func ResolveTestCommandActivity(ctx context.Context, worktreePath, agent string)
 // nativeTestCommand resolves how to run the worktree's own test suite:
 //  1. a `tests:` declaration in the repo's .daedalus.yaml — the repo owner's
 //     explicit word, always winning;
-//  2. static detection: marker files (go.mod, package.json with a test
-//     script, pytest config) and Makefile test-ui/test-api targets;
+//  2. static detection: a plain Makefile test: rule, then the language
+//     marker files (go.mod, package.json with a test script, pytest
+//     config), then Makefile test-ui/test-api targets;
 //  3. an AI discovery round — a short jailed agent run that answers with
 //     the command — for repositories none of the above recognize.
 //
@@ -476,9 +477,13 @@ func declaredTestCommand(worktreePath string) (string, bool) {
 }
 
 // detectedTestCommand recognizes the common test entrypoints from marker
-// files. Order matters only in that go.mod wins over a Makefile — a Go repo
-// that also has make targets usually wraps the same suite.
+// files. A plain Makefile test: rule wins over the single-language defaults
+// — a repo that declares its own test composition means to run it, not the
+// bare default its primary language would suggest.
 func detectedTestCommand(worktreePath string) ([]string, bool) {
+	if mk, err := os.ReadFile(filepath.Join(worktreePath, "Makefile")); err == nil && makefileHasTarget(string(mk), "test") {
+		return []string{"make", "test"}, true
+	}
 	if _, err := os.Stat(filepath.Join(worktreePath, "go.mod")); err == nil {
 		return []string{"go", "test", "./..."}, true
 	}
@@ -512,10 +517,23 @@ func detectedTestCommand(worktreePath string) ([]string, bool) {
 }
 
 // makefileHasTarget reports whether the Makefile declares target as a rule
-// ("target:" starting a line).
+// ("target:" starting a line). Variable assignments sharing the prefix do
+// not match — plain "target:=v", POSIX "target::=v", and target-specific
+// assignments like "target: X = 3" ("?=", "+=", "!=", also after an
+// override/export keyword). The rejection is a literal "=" scan: in that
+// position make does read a bare "target: foo=bar" as an assignment, not a
+// rule (GNU-make-probed). The scan is literal, so an "=" inside a $(…)
+// prereq reference is rejected too — make actually parses those as rules
+// (probed: "test: $(shell echo a=b)" → "No rule to make target 'a=b',
+// needed by 'test'") — but their expanded prereqs are unbuildable in
+// practice, so the rejection is a safe fall-through to the next detection
+// step, never a false rule.
 func makefileHasTarget(mk, target string) bool {
 	for line := range strings.SplitSeq(mk, "\n") {
 		if strings.HasPrefix(line, target+":") {
+			if strings.Contains(line[len(target)+1:], "=") {
+				continue // variable assignment, not a rule
+			}
 			return true
 		}
 	}
