@@ -15,11 +15,18 @@ import (
 
 // piTestHome redirects the host home the staging writes through
 // (~/.pi/agent/models.json) at a fresh temp dir and returns it — a test
-// must never touch the real ~/.pi of whatever host runs the suite.
+// must never touch the real ~/.pi of whatever host runs the suite. It also
+// empties the slim relay's env var: a suite launched by a relay-configured
+// worker inherits DAEDALUS_TOOL_RELAY_URL through os.Environ(), and the
+// staging prefers it over OPENAI_BASE_URL on a plain round — the relay-wins
+// contract is pinned by TestStagePiProviderToolRelayURL through an explicit
+// round env, so here the var must be absent, not ambient
+// (backlog/bugs/pi-staging-tests-inherit-ambient-toolrelay-url.md).
 func piTestHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv(config.ToolRelayURLEnv, "")
 	return home
 }
 
