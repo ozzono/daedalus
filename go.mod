@@ -3,6 +3,7 @@ module github.com/ozzono/daedalus
 go 1.26.5
 
 require (
+	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/stretchr/testify v1.10.0
 	go.temporal.io/api v1.63.4
 	go.temporal.io/sdk v1.48.0
@@ -11,6 +12,7 @@ require (
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/dlclark/regexp2 v1.10.0 // indirect
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/mock v1.6.0 // indirect

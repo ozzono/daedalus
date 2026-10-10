@@ -290,6 +290,15 @@ func main() {
 			if workflowName == defaultWorkflowName && !configPath.workflowSet && cfg.Slim.Enabled {
 				workflowName = "slim"
 			}
+			// The slim input gate runs before any submission side effect:
+			// the task input is shrunk (internal/shrink), capped against
+			// slim.max_input_tokens, and the shrunken text — never the
+			// original — is what the workflow embeds when it passes.
+			if workflowName == "slim" {
+				if prompt, err = slimInputGate(prompt, cfg); err != nil {
+					exitf("%v", err)
+				}
+			}
 			err = startPipelineFolders(cfg, configPath.configPath, workflowName, args[1], args[2], prompt, configPath.detach,
 				resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI, folders, configPath.depends)
 			if err != nil {
