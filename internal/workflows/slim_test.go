@@ -42,14 +42,20 @@ func stubSlimRun(t *testing.T) (*testsuite.TestWorkflowEnvironment, *agentRecord
 // round owns the wire format outright); an empty array, a reply without an
 // array, malformed JSON, and a sub-task missing its description or
 // acceptance criteria are all rejected too, because the atomic loop cannot
-// run without them.
+// run without them. The one absorbed syntax class is trailing commas: a
+// comma directly before a closing bracket is stripped and the parse
+// retried before the reply costs its re-ask — string content is never
+// touched, a truncated reply (no closing bracket) is deliberately left
+// failing, and a failure after repair still reports the error for the
+// reply as written.
 func TestParseSlimPlan(t *testing.T) {
 	valid := twoSubtaskPlan
 	for _, c := range []struct {
-		name    string
-		text    string
-		wantN   int
-		wantErr string
+		name     string
+		text     string
+		wantN    int
+		wantErr  string
+		wantDesc string
 	}{{
 		name:  "raw array",
 		text:  valid,
@@ -71,6 +77,72 @@ func TestParseSlimPlan(t *testing.T) {
 		name:    "array wrapped in prose",
 		text:    "Here is the plan:\n" + valid + "\nLet me know if this works!",
 		wantErr: "reply is not the required raw JSON array",
+	}, {
+		// The deterministic trailing-comma repair: the one syntax class
+		// small models emit routinely is stripped and the parse retried
+		// before the reply spends its re-ask — after the last subtask, the
+		// last field, inside a nested array, across a newline, and inside
+		// the code fence the reply may wrap.
+		name:  "trailing comma after the last subtask",
+		text:  valid[:len(valid)-1] + ",]",
+		wantN: 2,
+	}, {
+		name:  "trailing comma after the last field",
+		text:  `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"],}]`,
+		wantN: 1,
+	}, {
+		name:  "trailing comma in a nested criteria array",
+		text:  `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists","it compiles",]}]`,
+		wantN: 1,
+	}, {
+		name: "trailing comma across a newline",
+		text: `[
+  {"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]},
+]`,
+		wantN: 1,
+	}, {
+		name:  "trailing comma inside a code fence",
+		text:  "```json\n" + `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]},]` + "\n```",
+		wantN: 1,
+	}, {
+		// A comma inside a string literal is content, never a repair
+		// candidate: the value must survive the strip byte-exact — a naive
+		// byte sweep would silently rewrite it to "fix a] bug".
+		name:     "comma inside a string survives the repair",
+		text:     `[{"id":1,"type":"implement","target_files":["a.go"],"description":"fix a,] bug","acceptance_criteria":["a.go exists"],}]`,
+		wantN:    1,
+		wantDesc: "fix a,] bug",
+	}, {
+		// Escaped quotes keep the scanner inside the string: the in-string
+		// comma after one stays and the value round-trips exactly — a
+		// quote-toggle scanner would leave the string at the escape and
+		// strip that comma, silently rewriting the description.
+		name:     "escaped quotes keep string state during the repair",
+		text:     `[{"id":1,"type":"implement","target_files":["a.go"],"description":"say \"a,] ok","acceptance_criteria":["a.go exists"],}]`,
+		wantN:    1,
+		wantDesc: `say "a,] ok`,
+	}, {
+		// Deliberately not a truncation repair: a reply cut off mid-array
+		// has no closing bracket for the strip to act on, and auto-closing
+		// one would unmarshal a truncated plan as a complete queue with
+		// subtasks silently missing. Truncated replies keep failing and
+		// spend the re-ask.
+		name:    "truncated reply is not auto-closed",
+		text:    `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]},`,
+		wantErr: "reply is not the required raw JSON array",
+	}, {
+		// The error the re-ask quotes must describe the reply as written:
+		// a failure after the strip keeps the original unmarshal error
+		// (']' after the comma), not the repaired text's ('H' in the prose).
+		name:    "repair failure keeps the original error",
+		text:    valid[:len(valid)-1] + ",]\nHope this helps!",
+		wantErr: "invalid character ']'",
+	}, {
+		// The repair never skips validation: a stripped-down empty object
+		// still needs the fields the atomic loop cannot run without.
+		name:    "repaired subtask still validated",
+		text:    `[{"id":1,}]`,
+		wantErr: "carries no description",
 	}, {
 		// ponytail ceiling of the line-based fence strip (slim.go): a
 		// single-line fence-plus-array is invisible to it and spends the
@@ -112,6 +184,9 @@ func TestParseSlimPlan(t *testing.T) {
 			}
 			if len(got) != c.wantN {
 				t.Fatalf("parsed %d subtasks, want %d", len(got), c.wantN)
+			}
+			if c.wantDesc != "" && got[0].Description != c.wantDesc {
+				t.Fatalf("parsed description = %q, want %q (the repair must not touch string content)", got[0].Description, c.wantDesc)
 			}
 		})
 	}

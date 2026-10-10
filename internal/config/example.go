@@ -448,14 +448,15 @@ reviewer:
 # enabled: false): jailed rounds report out-of-scope bugs in their reply or
 # review comments only, and no bug files are written into your repos. When
 # enabled, the prompts additionally instruct every round to file each
-# out-of-scope bug it finds as a file under dir (with the same Arete Memory
-# note as before): dir is worktree-relative and resolves against each run's
-# worktree root, so the files are ordinary committed content of the branch
-# and reach the real repo on merge. dir empty keeps the historical
-# backlog/bugs path. While filing is enabled, load rejects an absolute dir,
-# one escaping the worktree root (".."), a ~-prefixed one (~ is not
-# expanded for dirs — use mirror for host paths), or one with empty or dot
-# path components; any other bytes render verbatim into the round prompts.
+# out-of-scope bug it finds as a file under dir (with the same project-own
+# record note as before): dir is worktree-relative and resolves against
+# each run's worktree root, so the files are ordinary committed content
+# of the branch and reach the real repo on merge. dir empty keeps the
+# historical backlog/bugs path. While filing is enabled, load rejects an
+# absolute dir, one escaping the worktree root (".."), a ~-prefixed one
+# (~ is not expanded for dirs — use mirror for host paths), or one with
+# empty or dot path components; any other bytes render verbatim into the
+# round prompts.
 # mirror, when set, names a host directory each filed bug file lands in:
 # absolute, or ~/… expanded against the worker's home (a relative mirror,
 # the filesystem root, or a colon is rejected at load). The host dir is

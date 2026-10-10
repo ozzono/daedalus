@@ -786,6 +786,18 @@ func dependencyReleases(d config.DependencyConfig, state string) bool {
 // to know the activity) must fail loudly instead of pending forever. The
 // first probe races nothing — a dependency already approved at submit
 // resolves here without a single sleep.
+//
+// Between probes the gate waits on its "wakeup" channel — the same one the
+// quota heartbeat races — next to a long fallback timer: the dependency's
+// CompleteGreen pokes its dependents the moment it reaches a terminal
+// state, so an approved chain starts in seconds and the wait's history
+// stays quiet, while an ungraceful dependency death (nothing left to poke)
+// still releases — or breaks — the chain on the fallback. A poke
+// necessarily precedes the completion event it announces, so the probe it
+// triggers usually reads the dependency still running; the gate then
+// re-probes at the grace cadence for a bounded stretch (maxPostPokeProbes)
+// before surrendering to the fallback. Runs recorded by the old
+// fixed-interval loop replay with it, per dependencyWakeupChangeID.
 func (r *pipelineRun) awaitDependency() error {
 	dep := r.input.DependsOn
 	if r.vis {
@@ -793,8 +805,17 @@ func (r *pipelineRun) awaitDependency() error {
 	}
 	r.setStatus(StatusPending)
 	r.logger.Info("Waiting on dependency", "Dependency", dep)
+	wakeup := dependencyWakeupEnabled(r.ctx)
 	failures := 0
 	pausedSeen := false
+	// graceProbes is how many release-grace waits the gate still owes: a
+	// poke grants maxPostPokeProbes of them, spent one per wait, so a poke
+	// whose probe still finds the dependency running (its completion event
+	// not yet visible) — or whose probe transiently errors — keeps the
+	// grace cadence instead of dropping to the full fallback on the first
+	// miss. Derived only from which selector branch fired, so it replays
+	// exactly.
+	graceProbes := 0
 	for {
 		var probe activities.DependencyProbe
 		err := workflow.ExecuteActivity(r.ctx, activities.CheckDependencyActivityName, dep).Get(r.ctx, &probe)
@@ -802,6 +823,12 @@ func (r *pipelineRun) awaitDependency() error {
 			failures = 0
 			switch {
 			case probe.Completed && !IsParkedResult(probe.Result):
+				// The wait ends here, exactly once: stamp the run's first
+				// moment of real work so the list TIME cells bill runtime
+				// from release, not from the dispatch that started the wait.
+				if wakeup && r.vis {
+					workflow.UpsertSearchAttributes(r.ctx, map[string]interface{}{DaedalusStartedAtAttr: workflow.Now(r.ctx)})
+				}
 				r.setStatus(StatusRunning)
 				r.logger.Info("Dependency approved; starting from its preserved branch",
 					"Dependency", dep, "Branch", probe.Result)
@@ -834,11 +861,31 @@ func (r *pipelineRun) awaitDependency() error {
 			if failures >= maxConsecutiveTimeouts {
 				return fmt.Errorf("dependency check for %s failed %d probes in a row: %w", dep, failures, err)
 			}
-			r.logger.Warn("Dependency probe failed; retrying after the poll interval",
+			r.logger.Warn("Dependency probe failed; retrying after the wait interval",
 				"Dependency", dep, "Failures", failures, "Error", err)
 		}
-		if serr := workflow.Sleep(r.ctx, depPollInterval); serr != nil {
-			return fmt.Errorf("dependency poll (%s): %w", dep, serr)
+		if !wakeup {
+			if serr := workflow.Sleep(r.ctx, depPollInterval); serr != nil {
+				return fmt.Errorf("dependency poll (%s): %w", dep, serr)
+			}
+			continue
 		}
+		// Both branches are single history events, replay-safe like the
+		// quota heartbeat's selector. A wakeup arriving mid-probe stays
+		// buffered and only shortens the next wait; the timer branch just
+		// waits out whatever cadence was chosen below.
+		wait := depFallbackInterval
+		if graceProbes > 0 {
+			wait = depReleaseGrace
+			graceProbes--
+		}
+		sel := workflow.NewSelector(r.ctx)
+		sel.AddFuture(workflow.NewTimer(r.ctx, wait), func(workflow.Future) {})
+		sel.AddReceive(r.wakeupCh, func(c workflow.ReceiveChannel, more bool) {
+			var woken string
+			c.Receive(r.ctx, &woken)
+			graceProbes = maxPostPokeProbes
+		})
+		sel.Select(r.ctx)
 	}
 }
