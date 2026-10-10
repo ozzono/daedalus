@@ -136,6 +136,21 @@ type PipelineInput struct {
 	// started. Empty — no chain, or a run whose input predates the field —
 	// skips the gate entirely, replay-safe like every other input field.
 	DependsOn string
+	// ReviewSkillList is the ordered list of extra skill reviews each
+	// review-gated phase of the feature-dev flow appends after its default
+	// reviewer approves (config review_skill_list, resolved at submit).
+	// One ping-pong per entry, in order — the code phase routes each
+	// skill's feedback through the dev session, the test phase through the
+	// tester's — each with its own reviewer conversation, the same verdict
+	// protocol, and the same park and loop caps as the default reviewer; a
+	// test-phase skill may verdict REBUILD like the default reviewer. A
+	// "/name" entry resolves to a skill file at round time (the worktree's
+	// .claude/skills — project wins — then the worker's ~/.claude/skills);
+	// any other entry is hand-written prompt text, passed through
+	// verbatim. Empty — no list, or a run whose input predates the field —
+	// runs exactly the historical default-only reviews, replay-safe like
+	// every other input field.
+	ReviewSkillList []string
 	// Dependency carries the config dependency section, resolved at start
 	// (cmd.startPipelineFolders fills FallbackBranch with the invocation
 	// branch when the section is enabled and the key unset). The gate reads
@@ -406,10 +421,25 @@ func WorkflowTypeName(fn func(workflow.Context, PipelineInput) (string, error)) 
 	return strings.TrimSuffix(elements[len(elements)-1], "-fm")
 }
 
+// skillLabel names a review_skill_list entry for logs and park reasons: a
+// /name entry by its name, a hand-written entry by its position — the
+// hand-written text itself can be a paragraph, no place for a log line.
+func skillLabel(i int, entry string) string {
+	if name, ok := strings.CutPrefix(entry, "/"); ok && strings.TrimSpace(name) != "" {
+		return strings.TrimSpace(name)
+	}
+	return fmt.Sprintf("#%d", i+1)
+}
+
 // FeatureDevWorkflow drives a full issue-development cycle in two
 // review-gated phases: (1) implementation ↔ code review until the reviewer
 // approves, then (2) tests ↔ test review until the reviewer approves AND the
-// native test suite passes. On success the approved work is committed and
+// native test suite passes. When the run carries a review_skill_list, each
+// phase's gate extends to one more ping-pong per listed skill after the
+// default reviewer approves — the code phase routing a skill's feedback
+// through the dev session, the test phase through the tester's, both with
+// the same verdict protocol, park handling, and loop caps. On success the
+// approved work is committed and
 // the run's branch renamed to its preserved prefix; the workflow
 // returns that branch name. The loops run until approval with no cap on
 // ordinary fix rounds — each round is durable, auditable, and individually
@@ -444,10 +474,32 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return "", err
 	}
 
+	// devFixRound feeds one round of review comments back to the dev
+	// session — the default reviewer's and each skill reviewer's fixes ride
+	// the same implementing conversation.
+	devFixRound := func(comments string) error {
+		fixPrompt, err := template.ImplementFix(comments, template.Jail{Touches: touchesJail})
+		if err != nil {
+			return fmt.Errorf("build implement-fix prompt: %w", err)
+		}
+		if g := run.drainGuidance(); g != "" {
+			run.logger.Info("Operator guidance received, folding into fix prompt")
+			fixPrompt = g + "\n\n" + fixPrompt
+		}
+		if _, err := run.runAgent(fixPrompt, "implement-fix", activities.RoleDev, &run.devSession); err != nil {
+			return fmt.Errorf("agent run after code review: %w", err)
+		}
+		return nil
+	}
+
 	// codeReviewLoop runs implementation ↔ code-review rounds until the
-	// code reviewer approves, parking on NEEDS_MAINTAINER. Both the first
-	// pass and a test-phase REBUILD land here, so the rebuild re-enters the
-	// same reviewer conversation instead of starting cold.
+	// code reviewer approves, parking on NEEDS_MAINTAINER — then one
+	// ping-pong per review_skill_list entry, in order, each a reviewer
+	// conversation of its own riding the same dev session for its fixes.
+	// The phase's gate is the whole chain: every skill must approve too.
+	// Both the first pass and a test-phase REBUILD land here, so the
+	// rebuild re-enters the same reviewer conversations instead of starting
+	// cold.
 	codeReviewLoop := func() error {
 		for {
 			verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
@@ -461,21 +513,36 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			}
 			if verdict.Approved {
 				run.logger.Info("Code review approved")
-				return nil
+				break
 			}
 			run.logger.Info("Code review requested changes")
-			fixPrompt, err := template.ImplementFix(verdict.Comments, template.Jail{Touches: touchesJail})
-			if err != nil {
-				return fmt.Errorf("build implement-fix prompt: %w", err)
-			}
-			if g := run.drainGuidance(); g != "" {
-				run.logger.Info("Operator guidance received, folding into fix prompt")
-				fixPrompt = g + "\n\n" + fixPrompt
-			}
-			if _, err := run.runAgent(fixPrompt, "implement-fix", activities.RoleDev, &run.devSession); err != nil {
-				return fmt.Errorf("agent run after code review: %w", err)
+			if err := devFixRound(verdict.Comments); err != nil {
+				return err
 			}
 		}
+		for i, entry := range run.input.ReviewSkillList {
+			label := skillLabel(i, entry)
+			for {
+				verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.skillDevReviewSessions[i], touchesJail, entry)
+				if err != nil {
+					return fmt.Errorf("skill review %s: %w", label, err)
+				}
+				if verdict.NeedsMaintainer {
+					run.logger.Info("Skill review halted the run for maintainer input")
+					return run.park(fmt.Sprintf("skill review (%s) halted the run — the task cannot be completed as stated: %s",
+						label, verdict.Comments))
+				}
+				if verdict.Approved {
+					run.logger.Info("Skill review approved", "Skill", label)
+					break
+				}
+				run.logger.Info("Skill review requested changes", "Skill", label)
+				if err := devFixRound(verdict.Comments); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	}
 
 	// rebuild routes a test-review REBUILD finding back through the dev
@@ -525,16 +592,86 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return "", fmt.Errorf("test-phase agent run: %w", err)
 	}
 	rebuilds := 0
-	for {
+
+	// suiteRound resolves the entrypoint and executes the suite once —
+	// the ground truth a review round is put against.
+	suiteRound := func() (activities.TestResult, error) {
 		command, err := run.resolveTestCommand()
 		if err != nil {
-			return "", err
+			return activities.TestResult{}, err
 		}
-		result, err := run.runSuite(command)
+		return run.runSuite(command)
+	}
+
+	// reviewSuite puts one reviewer on an already-collected suite result:
+	// the default reviewer when skillIdx is negative, that skill's
+	// reviewer otherwise (its conversation, its entry's resolved
+	// instructions).
+	reviewSuite := func(result activities.TestResult, skillIdx int) (activities.ReviewResult, error) {
+		session := &run.testReviewSession
+		entry := ""
+		if skillIdx >= 0 {
+			session = &run.skillTestReviewSessions[skillIdx]
+			entry = run.input.ReviewSkillList[skillIdx]
+		}
+		return run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, session, false, entry)
+	}
+
+	// testFixRound feeds a failed round back to the tester: the red suite
+	// output, the review comments, or both — the default reviewer's and
+	// each skill reviewer's fixes ride the same tester conversation.
+	testFixRound := func(result activities.TestResult, verdict activities.ReviewResult) error {
+		testFix := testFixPrompt(result, verdict)
+		if g := run.drainGuidance(); g != "" {
+			run.logger.Info("Operator guidance received, folding into fix prompt")
+			testFix = g + "\n\n" + testFix
+		}
+		fixResult, err := run.runAgent(testFix, "tests-fix", activities.RoleTest, &run.testSession)
+		if err != nil {
+			return fmt.Errorf("test-fix agent run: %w", err)
+		}
+		testerReply = fixResult
+		return nil
+	}
+
+	// rebuildRound spends one REBUILD against the green stage's cap,
+	// routing the finding through the dev cycle (which re-enters the whole
+	// code gate). restart reports whether the test phase must start over;
+	// false is a park (cap spent) or a failed rebuild round — its error is
+	// the workflow's return, never dropped.
+	rebuildRound := func(finding string) (restart bool, err error) {
+		rebuilds++
+		if rebuilds > maxTestPhaseRebuilds {
+			run.logger.Info("Green stage exceeded the rebuild cap; parking the run")
+			return false, run.park(fmt.Sprintf("green stage failed to converge — the test review issued rebuild %d and suite green and review approval never coincided; last finding: %s",
+				rebuilds, finding))
+		}
+		run.logger.Info("Test review requested a rebuild; returning to the dev cycle",
+			"Rebuilds", rebuilds, "Of", maxTestPhaseRebuilds)
+		if err := rebuild(finding); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// The gate is green suite + every reviewer's approval: the default
+	// reviewer first, then one ping-pong per review_skill_list entry in
+	// order, each able to park, request test fixes, or verdict REBUILD
+	// exactly like the default reviewer — a skill's rebuild re-enters the
+	// whole phase at the top (fresh suite, default reviewer first), the
+	// same "re-enter this test phase once it approves" semantics. A
+	// skill's first round reviews the suite result already in hand: no
+	// agent round ran since it was collected, so the worktree cannot have
+	// changed, a re-run is pure spend, and on a flaky suite it could show
+	// the skill a failure the diff did not cause. Only a fix round, which
+	// moves the tree, triggers a fresh execution.
+testPhase:
+	for {
+		result, err := suiteRound()
 		if err != nil {
 			return "", err
 		}
-		verdict, err := run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false)
+		verdict, err := reviewSuite(result, -1)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
@@ -544,32 +681,54 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				verdict.Comments))
 		}
 		if verdict.Rebuild {
-			rebuilds++
-			if rebuilds > maxTestPhaseRebuilds {
-				run.logger.Info("Green stage exceeded the rebuild cap; parking the run")
-				return "", run.park(fmt.Sprintf("green stage failed to converge — the test review issued rebuild %d and suite green and review approval never coincided; last finding: %s",
-					rebuilds, verdict.Comments))
-			}
-			run.logger.Info("Test review requested a rebuild; returning to the dev cycle",
-				"Rebuilds", rebuilds, "Of", maxTestPhaseRebuilds)
-			if err := rebuild(verdict.Comments); err != nil {
-				return "", err
+			restart, rerr := rebuildRound(verdict.Comments)
+			if !restart {
+				return "", rerr
 			}
 			continue
 		}
 		if result.Passed && verdict.Approved {
+			for i, entry := range run.input.ReviewSkillList {
+				label := skillLabel(i, entry)
+				for first := true; ; first = false {
+					if !first {
+						// A fix round moved the tree: this skill's next
+						// round reviews a fresh suite execution.
+						result, err = suiteRound()
+						if err != nil {
+							return "", err
+						}
+					}
+					verdict, err := reviewSuite(result, i)
+					if err != nil {
+						return "", fmt.Errorf("test skill review %s: %w", label, err)
+					}
+					if verdict.NeedsMaintainer {
+						run.logger.Info("Skill test review halted the run for maintainer input")
+						return "", run.park(fmt.Sprintf("skill test review (%s) halted the run — the task cannot be completed as stated: %s",
+							label, verdict.Comments))
+					}
+					if verdict.Rebuild {
+						restart, rerr := rebuildRound(verdict.Comments)
+						if !restart {
+							return "", rerr
+						}
+						continue testPhase
+					}
+					if result.Passed && verdict.Approved {
+						run.logger.Info("Skill test review approved", "Skill", label)
+						break
+					}
+					if err := testFixRound(result, verdict); err != nil {
+						return "", err
+					}
+				}
+			}
 			return run.finalize()
 		}
-		testFix := testFixPrompt(result, verdict)
-		if g := run.drainGuidance(); g != "" {
-			run.logger.Info("Operator guidance received, folding into fix prompt")
-			testFix = g + "\n\n" + testFix
+		if err := testFixRound(result, verdict); err != nil {
+			return "", err
 		}
-		fixResult, err := run.runAgent(testFix, "tests-fix", activities.RoleTest, &run.testSession)
-		if err != nil {
-			return "", fmt.Errorf("test-fix agent run: %w", err)
-		}
-		testerReply = fixResult
 	}
 }
 
