@@ -817,6 +817,28 @@ func TestReviewSkillSection(t *testing.T) {
 		t.Errorf("SlimReview = %q, want the skill section alongside the sub-task framing", slim)
 	}
 
+	// The repro framing carries the section too: a skill reviewing a
+	// filed-bug's repro gets the same preamble guard.
+	repro, err := ReviewRepro("the repro for the reported bug", "A repro_test.go", "", "", "",
+		Skill{Instructions: instructions})
+	if err != nil {
+		t.Fatalf("ReviewRepro: %v", err)
+	}
+	if !strings.Contains(repro, "This round is also a skill review") ||
+		!strings.Contains(repro, instructions) {
+		t.Errorf("ReviewRepro = %q, want the skill section alongside the repro framing", repro)
+	}
+
+	// Two Skill extras: the last wins, like every attachment kind.
+	both, err := Review("the implementation", "M foo.go", "", false, "", "",
+		Skill{Instructions: "first instructions"}, Skill{Instructions: "second instructions"})
+	if err != nil {
+		t.Fatalf("Review (two skills): %v", err)
+	}
+	if !strings.Contains(both, "second instructions") || strings.Contains(both, "first instructions") {
+		t.Errorf("Review = %q, want only the last Skill extra's instructions", both)
+	}
+
 	// No Skill extra, no section — even alongside the other attachments.
 	plain, err := Review("the implementation", "M foo.go", "", false, "", "", Jail{})
 	if err != nil {

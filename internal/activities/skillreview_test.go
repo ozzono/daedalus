@@ -124,6 +124,105 @@ func TestResolveSkillInstructions(t *testing.T) {
 			t.Errorf("resolveSkillInstructions = %v, want the home-resolution error", err)
 		}
 	})
+
+	t.Run("a skill file that is nothing but frontmatter fails resolution", func(t *testing.T) {
+		wt := t.TempDir()
+		writeSkill(t, filepath.Join(wt, ".claude", "skills"), "empty",
+			"---\nname: empty\ndescription: metadata only\n---\n")
+		_, err := resolveSkillInstructions(wt, "/empty")
+		if err == nil || !strings.Contains(err.Error(), "no instruction content") {
+			t.Errorf("resolveSkillInstructions = %v, want the instruction-less rejection", err)
+		}
+	})
+}
+
+// TestResolveSkillInstructionsSymlinks pins the worktree skills lookup's
+// symlink refusal: the jailed agent can plant a symlink under .claude/skills
+// mid-run, and the worker-side read would follow it out of the sandbox — so
+// a symlinked component anywhere below the worktree root refuses the round
+// loudly even when the skill behind it resolves. The worktree root itself
+// (base is excluded — the operator's own affair) and the home leg (the
+// worker's own home, no round can write it) stay unchecked.
+func TestResolveSkillInstructionsSymlinks(t *testing.T) {
+	t.Run("a symlinked .claude refuses even a resolvable skill", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		wt := t.TempDir()
+		outside := t.TempDir()
+		writeSkill(t, filepath.Join(outside, ".claude", "skills"), "style", "host body")
+		if err := os.Symlink(filepath.Join(outside, ".claude"), filepath.Join(wt, ".claude")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		_, err := resolveSkillInstructions(wt, "/style")
+		if err == nil {
+			t.Fatal("resolveSkillInstructions = nil error, want the symlink refusal")
+		}
+		for _, want := range []string{
+			`review skill "/style"`,
+			"is a symlink",
+			filepath.Join(wt, ".claude", "skills", "style", "SKILL.md"),
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should contain %q", err, want)
+			}
+		}
+	})
+
+	t.Run("a symlinked skill directory refuses", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		wt := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(wt, ".claude", "skills"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		outside := t.TempDir()
+		writeSkill(t, outside, "style", "host body")
+		if err := os.Symlink(filepath.Join(outside, "style"), filepath.Join(wt, ".claude", "skills", "style")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		_, err := resolveSkillInstructions(wt, "/style")
+		if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+			t.Errorf("resolveSkillInstructions = %v, want the symlink refusal", err)
+		}
+	})
+
+	t.Run("a symlinked worktree root still resolves", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		realWt := t.TempDir()
+		writeSkill(t, filepath.Join(realWt, ".claude", "skills"), "style", "worktree body")
+		link := filepath.Join(t.TempDir(), "wt-link")
+		if err := os.Symlink(realWt, link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		got, err := resolveSkillInstructions(link, "/style")
+		if err != nil {
+			t.Fatalf("resolveSkillInstructions: %v", err)
+		}
+		if got != "worktree body" {
+			t.Errorf("resolveSkillInstructions = %q, want the skill (a symlinked worktree location is the operator's own affair)", got)
+		}
+	})
+
+	t.Run("a symlinked home skill resolves", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		outside := t.TempDir()
+		writeSkill(t, outside, "style", "home body")
+		if err := os.MkdirAll(filepath.Join(home, ".claude", "skills"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Symlink(filepath.Join(outside, "style"), filepath.Join(home, ".claude", "skills", "style")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		got, err := resolveSkillInstructions(t.TempDir(), "/style")
+		if err != nil {
+			t.Fatalf("resolveSkillInstructions: %v", err)
+		}
+		if got != "home body" {
+			t.Errorf("resolveSkillInstructions = %q, want the home skill (the global leg is not the agent-writable one)", got)
+		}
+	})
 }
 
 // TestStripFrontmatter pins the skill-file body extraction: a leading ---

@@ -1,8 +1,10 @@
 package workflows
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 
@@ -49,10 +51,10 @@ func TestFeatureDevWorkflowSkillReviewsChain(t *testing.T) {
 		// then approves.
 		{result: activities.ReviewResult{Approved: false, Comments: "no passive voice", SessionID: "style-s1"}},
 		{result: activities.ReviewResult{Approved: true, SessionID: "style-s1"}},
-		{result: activities.ReviewResult{Approved: true}}, // the hand-written entry's code review
-		{result: activities.ReviewResult{Approved: true}}, // default test review
+		{result: activities.ReviewResult{Approved: true}},                         // the hand-written entry's code review
+		{result: activities.ReviewResult{Approved: true}},                         // default test review
 		{result: activities.ReviewResult{Approved: true, SessionID: "tstyle-s1"}}, // /style's suite review
-		{result: activities.ReviewResult{Approved: true}}, // the hand-written entry's suite review
+		{result: activities.ReviewResult{Approved: true}},                         // the hand-written entry's suite review
 	}}
 	rev.record()
 
@@ -379,4 +381,234 @@ func TestFeatureDevWorkflowTestPhaseSkillReviews(t *testing.T) {
 		}
 		env.AssertExpectations(t)
 	})
+}
+
+// TestFeatureDevWorkflowRedSuiteSkipsSkillReviews pins the phase-2 gate's
+// order: the skill reviews extend an already-green, already-approved phase —
+// a red suite with the default reviewer's approval runs the tests-fix round
+// and no skill reviewer sees the red run; the skill's first look is the
+// post-fix green suite.
+func TestFeatureDevWorkflowRedSuiteSkipsSkillReviews(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	rec := &agentRecorder{env: env, result: activities.AgentRunResult{Text: "tester reply", SessionID: "test-s1"}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: activities.ReviewResult{Approved: true}}, // default code review
+		{result: activities.ReviewResult{Approved: true}}, // the entry's code review
+		// The default test review approves, but the suite is red: the gate
+		// is green AND approved, so a fix round runs before any skill looks
+		// at anything.
+		{result: activities.ReviewResult{Approved: true}},
+		{result: activities.ReviewResult{Approved: true}},                        // default test review of the green run
+		{result: activities.ReviewResult{Approved: true, SessionID: "suite-s1"}}, // the entry's suite review
+	}}
+	rev.record()
+	_, suiteRec := stubTestPhase(env)
+	suiteRec.script = []suiteStep{
+		{result: activities.TestResult{Passed: true, Logs: "baseline"}},
+		{result: activities.TestResult{Passed: false, Logs: "FAIL: TestBroken"}},
+		// Script exhausted: the post-fix round falls back to green "ok".
+	}
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.ReviewSkillList = []string{"/suite"}
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+
+	if len(rev.inputs) != 5 {
+		t.Fatalf("reviewer ran %d times, want 5 (code + entry code + red test + green test + entry test)", len(rev.inputs))
+	}
+	wantEntries := []string{"", "/suite", "", "", "/suite"}
+	for i, want := range wantEntries {
+		if got := rev.inputs[i].SkillEntry; got != want {
+			t.Errorf("review %d SkillEntry = %q, want %q (the skill only reviews the green run)", i, got, want)
+		}
+	}
+	for _, i := range []int{3, 4} {
+		if got := rev.inputs[i].TestLogs; got != "ok" {
+			t.Errorf("review %d logs = %q, want the post-fix green execution — the red run reached no reviewer but the fix loop", i, got)
+		}
+	}
+	// The fix round carried the red logs (the approval left no comments to
+	// relay) and rode the tester conversation.
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement, tests, tests-fix)", len(rec.inputs))
+	}
+	if !strings.Contains(rec.inputs[2].Prompt, "FAIL: TestBroken") {
+		t.Errorf("fix prompt %q should carry the red suite output", rec.inputs[2].Prompt)
+	}
+	if got := rec.inputs[2].SessionID; got != "test-s1" {
+		t.Errorf("fix round SessionID = %q, want the tester session", got)
+	}
+	if len(suiteRec.runs) != 3 {
+		t.Errorf("suite ran %d times, want 3 (baseline, the red round, post-fix)", len(suiteRec.runs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowTestSkillFixesAdvanceForward pins the phase-2 skill
+// chain's direction: a fix round advances — a later skill's changes move the
+// tree and that skill re-reviews a fresh suite, but an earlier skill's
+// approval is never re-consulted (only a REBUILD verdict walks back to the
+// phase top). The suite-execution count and /one's single round pin it.
+func TestFeatureDevWorkflowTestSkillFixesAdvanceForward(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	rec := &agentRecorder{env: env, result: activities.AgentRunResult{Text: "tester reply", SessionID: "test-s1"}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: activities.ReviewResult{Approved: true}}, // default code review
+		{result: activities.ReviewResult{Approved: true}}, // /one's code review
+		{result: activities.ReviewResult{Approved: true}}, // /two's code review
+		{result: activities.ReviewResult{Approved: true}}, // default test review
+		{result: activities.ReviewResult{Approved: true}}, // /one approves the collected suite
+		// /two rejects the same collected result, its fix rides the tester
+		// session, and its next look approves the fresh suite.
+		{result: activities.ReviewResult{Approved: false, Comments: "assert the boundary case"}},
+		{result: activities.ReviewResult{Approved: true}},
+	}}
+	rev.record()
+	_, suiteRec := stubTestPhase(env)
+	suiteRec.script = []suiteStep{
+		{result: activities.TestResult{Passed: true, Logs: "baseline"}},
+		{result: activities.TestResult{Passed: true, Logs: "phase2"}},
+		// Script exhausted: the post-fix round falls back to green "ok".
+	}
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.ReviewSkillList = []string{"/one", "/two"}
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rev.inputs) != 7 {
+		t.Fatalf("reviewer ran %d times, want 7 (3 code + default test + /one + /two x2) — /one must not be re-consulted after /two's fix", len(rev.inputs))
+	}
+	wantEntries := []string{"", "/one", "/two", "", "/one", "/two", "/two"}
+	for i, want := range wantEntries {
+		if got := rev.inputs[i].SkillEntry; got != want {
+			t.Errorf("review %d SkillEntry = %q, want %q", i, got, want)
+		}
+	}
+	// /one and /two's first looks reviewed the same collected result; only
+	// /two's second look saw the post-fix fresh execution.
+	for _, i := range []int{4, 5} {
+		if got := rev.inputs[i].TestLogs; got != "phase2" {
+			t.Errorf("review %d logs = %q, want the collected suite (no agent round ran since)", i, got)
+		}
+	}
+	if got := rev.inputs[6].TestLogs; got != "ok" {
+		t.Errorf("/two's second look logs = %q, want the post-fix fresh execution", got)
+	}
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement, tests, tests-fix)", len(rec.inputs))
+	}
+	if len(suiteRec.runs) != 3 {
+		t.Errorf("suite ran %d times, want 3 (baseline, phase 2, post-fix) — no re-run for the earlier skill's approval", len(suiteRec.runs))
+	}
+	env.AssertExpectations(t)
+}
+
+// skillChainRebuildScript builds the reviewer verdicts for a one-entry skill
+// run that absorbs n default-reviewer REBUILD cycles: the phase-1 default
+// and skill code reviews approve, and every rebuild cycle's re-entered dev
+// gate approves immediately (default first, then the skill). Each finding
+// body is suffixed with its round number — a real non-converging loop rewords
+// its findings, and a constant body would trip the identical-verdict runaway
+// guard long before the rebuild cap this script exists to pin.
+func skillChainRebuildScript(n int, finding string) []activities.ReviewResult {
+	script := []activities.ReviewResult{
+		{Approved: true}, // phase-1 default code review
+		{Approved: true}, // phase-1 skill code review
+	}
+	for i := 0; i < n; i++ {
+		script = append(script,
+			activities.ReviewResult{Rebuild: true, Comments: fmt.Sprintf("%s (rebuild %d)", finding, i+1)}, // default test review
+			activities.ReviewResult{Approved: true},                                                        // the rebuild's code review
+			activities.ReviewResult{Approved: true})                                                        // the skill's code review
+	}
+	return script
+}
+
+// TestFeatureDevWorkflowSkillRebuildSharesTheCap pins the green stage's cap
+// ownership: the rebuild counter is the phase's, not the default reviewer's —
+// after eight default-reviewer rebuilds, a skill's first REBUILD is already
+// rebuild 9 and parks the run. A per-reviewer counter would let the two
+// reviewers cycle twice the budget.
+func TestFeatureDevWorkflowSkillRebuildSharesTheCap(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: append(skillChainRebuildScript(8, "the handler drops the error path"),
+		activities.ReviewResult{Approved: true}, // the re-entered phase's default test review of the green suite
+		activities.ReviewResult{Rebuild: true, Comments: "the suite pins the wrong invariant (skill rebuild 9)"})}
+	rev.record()
+
+	_, suiteRec := stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	// If the cap regresses, the repeating stub would feed this loop forever
+	// — bound the test so the regression fails fast instead of hanging
+	// until the go-test timeout.
+	env.SetTestTimeout(30 * time.Second)
+
+	in := baseInput()
+	in.ReviewSkillList = []string{"/suite"}
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from the rebuild cap parking the run")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"green stage failed to converge",
+		"issued rebuild 9",
+		"the suite pins the wrong invariant (skill rebuild 9)",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	// The parking rebuild was the skill's, not the default reviewer's.
+	if got := rev.inputs[len(rev.inputs)-1].SkillEntry; got != "/suite" {
+		t.Errorf("parking review SkillEntry = %q, want the skill's", got)
+	}
+	// Eight rebuild rounds ran (implement + tests + 8 rebuilds); the park
+	// precedes a ninth dev round.
+	if len(rec.inputs) != 10 {
+		t.Errorf("agent ran %d times, want 10 (implement + tests + 8 rebuilds; none after the park)", len(rec.inputs))
+	}
+	// Phase-1 default+skill code reviews, then per rebuild cycle a default
+	// test review and its two code reviews, then the re-entered phase's
+	// default test review and the skill's parking one: 2 + 3*8 + 2.
+	if len(rev.inputs) != 28 {
+		t.Errorf("reviewer ran %d times, want 28 (2 phase-1 + 8×[test + code + skill code] + green test + parking skill test)", len(rev.inputs))
+	}
+	if len(suiteRec.runs) != 10 {
+		t.Errorf("suite ran %d times, want 10 (baseline, phase 2, and one per rebuild re-entry)", len(suiteRec.runs))
+	}
+	env.AssertExpectations(t)
 }
