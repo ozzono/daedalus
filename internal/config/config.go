@@ -496,6 +496,33 @@ type SlimConfig struct {
 	// from text-emitting models stay inert (pi executes only native
 	// tool_calls).
 	ParserModel string `yaml:"parser_model"`
+	// MaxInputTokens is the slim input gate's ceiling: a `daedalus run` that
+	// resolves to the slim flow refuses to start when its task input — the
+	// shrunken text (internal/shrink) the run would embed in every round
+	// prompt — counts more than this many tokens. The gate fires at submit,
+	// before any workflow, worktree, or worker round, and the error tells
+	// the operator to split the task. Zero (the key unset or empty) means
+	// DefaultSlimMaxInputTokens; a negative value is a config load error.
+	// It is a ceiling on input, not a model window — hence not
+	// context_tokens — and matches the max_output_tokens precedent.
+	MaxInputTokens int `yaml:"max_input_tokens"`
+}
+
+// DefaultSlimMaxInputTokens is the slim input gate's ceiling when
+// slim.max_input_tokens is unset: just over the 4096-token prompt budget
+// of the smallest staged self-hosted window this flow targets, so a task
+// that fills it leaves the model no output budget at all (the pi
+// max_tokens clamp: request max_tokens = contextWindow − prompt estimate −
+// 4096 reserve).
+const DefaultSlimMaxInputTokens = 4098
+
+// MaxInputTokensOrDefault returns the configured slim input ceiling, or
+// DefaultSlimMaxInputTokens when unset.
+func (s SlimConfig) MaxInputTokensOrDefault() int {
+	if s.MaxInputTokens > 0 {
+		return s.MaxInputTokens
+	}
+	return DefaultSlimMaxInputTokens
 }
 
 // UnmarshalYAML migrates the historical top-level `slim: true/false`
@@ -526,6 +553,10 @@ func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
 			}
 		case "parser_model":
 			if err := val.Decode(&s.ParserModel); err != nil {
+				return err
+			}
+		case "max_input_tokens":
+			if err := val.Decode(&s.MaxInputTokens); err != nil {
 				return err
 			}
 		default:
@@ -1178,6 +1209,9 @@ func (c Config) validate(path string) error {
 	}
 	if c.MaxConcurrentTests < 0 {
 		return fmt.Errorf("config %s: max_concurrent_tests: must not be negative", path)
+	}
+	if c.Slim.MaxInputTokens < 0 {
+		return fmt.Errorf("config %s: slim.max_input_tokens: must not be negative", path)
 	}
 	if c.Anthropic.ContextTokens < 0 {
 		return fmt.Errorf("config %s: anthropic.context_tokens: must not be negative", path)

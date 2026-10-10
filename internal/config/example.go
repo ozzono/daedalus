@@ -188,6 +188,17 @@ slim:
   # the model host before setting it. Empty (the default) keeps the relay
   # off.
   parser_model: ""
+  # Ceiling on the task input a slim run may embed, in o200k_base tokens,
+  # counted after the automatic shrink pass (internal/shrink) has minimized
+  # it; a raw input whose biased-high chars/4 estimate is already over the
+  # ceiling is refused before the shrink runs (the strict counter is
+  # quadratic in one unbroken word, so it never sees oversized text). A run
+  # whose input still counts over this fails at submit — no workflow, no
+  # worktree, no worker round — and asks for the task to be split. Keep it
+  # under the smallest staged model's honest contextWindow minus the output
+  # budget it needs. 0 (or the key unset) = 4098; a negative value fails
+  # the config load.
+  max_input_tokens: 4098
 `
 
 // exampleBase2 is the remaining general fields plus the anthropic section

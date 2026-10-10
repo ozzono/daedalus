@@ -254,6 +254,66 @@ func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
 	}
 }
 
+// TestLoadSlimMaxInputTokens pins the slim input gate's ceiling: absent or
+// zero resolves to DefaultSlimMaxInputTokens, an explicit value loads
+// verbatim, a negative value fails the load up front, and the strict decode
+// still rejects a typo'd key. The shipped example documents the default
+// itself, so the two cannot drift apart silently.
+func TestLoadSlimMaxInputTokens(t *testing.T) {
+	if DefaultSlimMaxInputTokens != 4098 {
+		t.Errorf("DefaultSlimMaxInputTokens = %d, want the documented 4098 (just over a 4096-token prompt budget)", DefaultSlimMaxInputTokens)
+	}
+
+	cfg, err := Load(writeConfig(t, ""))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Slim.MaxInputTokens != 0 {
+		t.Errorf("slim MaxInputTokens = %d, want 0 (the key is unset)", cfg.Slim.MaxInputTokens)
+	}
+	if got := cfg.Slim.MaxInputTokensOrDefault(); got != DefaultSlimMaxInputTokens {
+		t.Errorf("MaxInputTokensOrDefault() = %d, want %d", got, DefaultSlimMaxInputTokens)
+	}
+
+	cfg, err = Load(writeConfig(t, "slim:\n  max_input_tokens: 8192\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Slim.MaxInputTokens != 8192 || cfg.Slim.MaxInputTokensOrDefault() != 8192 {
+		t.Errorf("slim MaxInputTokens = %d (OrDefault %d), want the explicit 8192", cfg.Slim.MaxInputTokens, cfg.Slim.MaxInputTokensOrDefault())
+	}
+
+	cfg, err = Load(writeConfig(t, "slim:\n  max_input_tokens: 0\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Slim.MaxInputTokensOrDefault(); got != DefaultSlimMaxInputTokens {
+		t.Errorf("MaxInputTokensOrDefault() with an explicit 0 = %d, want %d", got, DefaultSlimMaxInputTokens)
+	}
+
+	_, err = Load(writeConfig(t, "slim:\n  max_input_tokens: -1\n"))
+	if err == nil || !strings.Contains(err.Error(), "slim.max_input_tokens") || !strings.Contains(err.Error(), "must not be negative") {
+		t.Errorf("Load(negative max_input_tokens) error = %v, want the slim.max_input_tokens rejection", err)
+	}
+
+	_, err = Load(writeConfig(t, "slim:\n  max_input_token: 5\n"))
+	if err == nil || !strings.Contains(err.Error(), "field max_input_token not found") {
+		t.Errorf("Load(typo'd max_input_token) error = %v, want the field-not-found rejection", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config-example.yaml")
+	if err := os.WriteFile(path, []byte(ExampleYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load(ExampleYAML): %v", err)
+	}
+	if cfg.Slim.MaxInputTokens != DefaultSlimMaxInputTokens {
+		t.Errorf("ExampleYAML slim.max_input_tokens = %d, want the documented default %d", cfg.Slim.MaxInputTokens, DefaultSlimMaxInputTokens)
+	}
+}
+
 // TestLoadThinkingDisabled pins the thinking toggle's pointer semantics: an
 // absent key and an explicit true both mean pi follows its host default;
 // only an explicit false disables thinking on jailed pi rounds.
