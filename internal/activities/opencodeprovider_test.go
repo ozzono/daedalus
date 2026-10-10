@@ -474,6 +474,7 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
 				"--network",
+				"--no-save-config",
 				"--mask",
 				".claude/settings.json",
 				"--mask",
@@ -487,6 +488,7 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 				"opencode",
 				"run",
 				"--auto",
+				"--standalone",
 				"-m",
 				opencodeProviderID + "/glm-selfhost"},
 		), "ai-jail")
@@ -529,6 +531,7 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
 				"--network",
+				"--no-save-config",
 				"--mask",
 				".claude/settings.json",
 				"--mask",
@@ -536,7 +539,7 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 				"--mask",
 				homeClaudeMask(t)},
 			ocMount,
-			[]string{"--", "opencode", "run", "--auto"},
+			[]string{"--", "opencode", "run", "--auto", "--standalone"},
 		), "ai-jail")
 	})
 
@@ -564,6 +567,7 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
 				"--network",
+				"--no-save-config",
 				"--mask",
 				".claude/settings.json",
 				"--mask",
@@ -579,6 +583,7 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 				"-s",
 				"oc-1",
 				"--auto",
+				"--standalone",
 				"-m",
 				opencodeProviderID + "/glm-selfhost"},
 		), "ai-jail")

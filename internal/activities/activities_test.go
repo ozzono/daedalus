@@ -1260,6 +1260,7 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
@@ -1321,6 +1322,7 @@ func TestRunJailedClaudeActivityResume(t *testing.T) {
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
@@ -1371,6 +1373,7 @@ func TestRunJailedClaudeActivityMasksHomeSettings(t *testing.T) {
 	assertArgs(t, args[:cutoff], []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
@@ -1431,12 +1434,12 @@ func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
 			t.Fatalf("ai-jail called %d times, want 1", len(calls))
 		}
 		assertArgs(t, calls[0].Args, append(slices.Concat(
-			[]string{"--worktree", "--network",
+			[]string{"--worktree", "--network", "--no-save-config",
 				"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
 				"--mask", homeClaudeMask(t)},
 			ocMount,
 			[]string{"--", "opencode"},
-		), "run", "-s", "sess-7", "--auto"), "ai-jail")
+		), "run", "-s", "sess-7", "--auto", "--standalone"), "ai-jail")
 	})
 
 	t.Run("codex resumes via exec resume, staging trails", func(t *testing.T) {
@@ -1465,7 +1468,7 @@ func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
 			t.Fatalf("ai-jail called %d times, want 1", len(calls))
 		}
 		assertArgs(t, calls[0].Args, append(slices.Concat(
-			[]string{"--worktree", "--network",
+			[]string{"--worktree", "--network", "--no-save-config",
 				"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
 				"--mask", homeClaudeMask(t)},
 			cxMount,
@@ -1609,6 +1612,7 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 	assertArgs(t, calls[0].Args, slices.Concat(
 		[]string{"--worktree",
 			"--network",
+			"--no-save-config",
 			"--mask",
 			".claude/settings.json",
 			"--mask",
@@ -1619,7 +1623,8 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 		[]string{"--",
 			"opencode",
 			"run",
-			"--auto"},
+			"--auto",
+			"--standalone"},
 	), "ai-jail")
 	if calls[0].Stdin != "fix the bug" {
 		t.Errorf("ai-jail stdin = %q, want the prompt", calls[0].Stdin)
@@ -1653,6 +1658,7 @@ func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 	assertArgs(t, calls[0].Args, slices.Concat(
 		[]string{"--worktree",
 			"--network",
+			"--no-save-config",
 			"--mask",
 			".claude/settings.json",
 			"--mask",
@@ -1663,7 +1669,8 @@ func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 		[]string{"--",
 			"opencode",
 			"run",
-			"--auto"},
+			"--auto",
+			"--standalone"},
 	), "ai-jail")
 }
 
@@ -1712,6 +1719,7 @@ func TestRunJailedClaudeActivityAmp(t *testing.T) {
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
@@ -1727,6 +1735,7 @@ func TestRunJailedClaudeActivityAmp(t *testing.T) {
 	assertArgs(t, calls[1].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
@@ -2002,6 +2011,7 @@ exit 0`)
 	assertArgs(t, calls[3].Args, slices.Concat(
 		[]string{"--worktree",
 			"--network",
+			"--no-save-config",
 			"--mask",
 			".claude/settings.json",
 			"--mask",
@@ -2012,7 +2022,8 @@ exit 0`)
 		[]string{"--",
 			"opencode",
 			"run",
-			"--auto"},
+			"--auto",
+			"--standalone"},
 	), "review jail")
 }
 
@@ -2076,6 +2087,7 @@ exit 0`)
 	assertArgs(t, calls[3].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
@@ -2622,6 +2634,7 @@ func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 	assertArgs(t, calls[0].Args, slices.Concat(
 		[]string{"--worktree",
 			"--network",
+			"--no-save-config",
 			"--mask",
 			".claude/settings.json",
 			"--mask",
@@ -2632,7 +2645,8 @@ func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 		[]string{"--",
 			"opencode",
 			"run",
-			"--auto"},
+			"--auto",
+			"--standalone"},
 	), "discovery jail")
 }
 
@@ -4039,6 +4053,7 @@ func TestRunJailedClaudeActivityPi(t *testing.T) {
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
@@ -4444,6 +4459,7 @@ func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",
