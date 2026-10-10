@@ -909,6 +909,7 @@ exit 0`)
 	assertArgs(t, calls[0].Args, []string{
 		"--worktree",
 		"--network",
+		"--no-save-config",
 		"--mask",
 		".claude/settings.json",
 		"--mask",

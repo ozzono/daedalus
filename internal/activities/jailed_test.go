@@ -1259,7 +1259,7 @@ func TestAgentResumeArgs(t *testing.T) {
 		{"pi", "pi", "sess-2", []string{"-p"},
 			[]string{"--session", "sess-2", "-p"}},
 		{"opencode", "opencode", "oc-3", nil,
-			[]string{"run", "-s", "oc-3", "--auto"}},
+			[]string{"run", "-s", "oc-3", "--auto", "--standalone"}},
 		{"codex", "codex", "cx-4", nil,
 			[]string{"exec", "resume", "cx-4", "-", "--dangerously-bypass-approvals-and-sandbox"}},
 	} {
@@ -1307,6 +1307,7 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		want := slices.Concat(
 			[]string{"--worktree",
 				"--network",
+				"--no-save-config",
 				"--mask",
 				".claude/settings.json",
 				"--mask",
@@ -1344,6 +1345,7 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
 				"--network",
+				"--no-save-config",
 				"--mask",
 				".claude/settings.json",
 				"--mask",

@@ -471,11 +471,13 @@ issue never share live state). Re-running
   the implementing agent.
 - **The repo's own test suite**, whatever it is: the test command is
   resolved per repository — a `tests:` declaration in `.daedalus.yaml` wins;
-  otherwise marker files are detected (`go.mod` → `go test ./...`,
-  `package.json` with a test script → `npm test`, pytest configs →
-  `pytest -q`, Makefile `test-ui`/`test-api` targets → `make …`); for
-  repositories none of that recognizes, a short jailed agent run discovers
-  the command. The resolved command is recorded in the workflow history.
+  otherwise a Makefile with a plain `test:` rule → `make test` (the repo's
+  own composition beats any single-language default), then marker files
+  (`go.mod` → `go test ./...`, `package.json` with a test script →
+  `npm test`, pytest configs → `pytest -q`), then Makefile
+  `test-ui`/`test-api` targets → `make …`; for repositories none of that
+  recognizes, a short jailed agent run discovers the command. The resolved
+  command is recorded in the workflow history.
 - **Branch lifecycle**: `feat/issue-<id>-<unix>` is the in-flight branch
   (always cleaned up, along with stale `feat/` branches from crashed runs);
   `<branch_prefix>/issue-<id>-<unix>` (default `daedalus`) is the committed,
