@@ -172,12 +172,16 @@ func LoadOverrides(dir, baseDir string) error {
 		// of the embedded shape — an override with a broken access behind
 		// a surviving {{if .Handoff}} fails here instead of on the first
 		// oversized diff), and the test-review framing the verdict check
-		// below reads.
+		// below reads. Both extra shapes carry SkillInstructions too, so
+		// the skill-review branch's guard is exercised in the same renders
+		// — a broken reference behind a surviving {{if .SkillInstructions}}
+		// fails the start instead of killing the first configured skill
+		// round mid-flight.
 		if _, err := renderOverride(ov, representativeData[name]); err != nil {
 			return fmt.Errorf("prompt overrides: %s: %w", path, err)
 		}
 		if name == "review" {
-			if _, err := renderOverride(ov, reviewData{Handoff: &DiffHandoff{}}); err != nil {
+			if _, err := renderOverride(ov, reviewData{Handoff: &DiffHandoff{}, SkillInstructions: "skill instructions"}); err != nil {
 				return fmt.Errorf("prompt overrides: %s (with a diff handoff attached): %w", path, err)
 			}
 			// The wholesale-replacement guard runs against the test-review
@@ -191,7 +195,7 @@ func LoadOverrides(dir, baseDir string) error {
 			// would silently break every review loop, and each round would
 			// burn a NoVerdict strike. Whole-word matching, so DISAPPROVED
 			// cannot vouch for APPROVED.
-			framed, err := renderOverride(ov, reviewData{TestsInScope: true})
+			framed, err := renderOverride(ov, reviewData{TestsInScope: true, SkillInstructions: "skill instructions"})
 			if err != nil {
 				return fmt.Errorf("prompt overrides: %s (in the test-review framing): %w", path, err)
 			}
@@ -527,40 +531,59 @@ type DiffHandoff struct {
 }
 
 // ReviewExtra is one optional attachment to a reviewer prompt. The
-// interface is sealed by its unexported method to this package's two
-// concrete kinds: Jail (the jail carve-out) and *DiffHandoff (the
-// oversized-diff file handoff).
+// interface is sealed by its unexported method to this package's three
+// concrete kinds: Jail (the jail carve-out), *DiffHandoff (the
+// oversized-diff file handoff), and Skill (one skill review's resolved
+// instructions).
 type ReviewExtra interface{ reviewExtra() }
 
 func (Jail) reviewExtra() {}
 
 func (*DiffHandoff) reviewExtra() {}
 
+// Skill is one skill review's attachment: Instructions is the resolved
+// instruction text of one review_skill_list entry — a skill file's body
+// or hand-written prompt text, resolved by the caller (the reviewer
+// activity). The review template renders it under its own preamble, which
+// restates the verdict protocol and the harness-parsed-output contract
+// above the text — the one structural guarantee that configured
+// instructions can never reach a reviewer without daedalus's
+// communication rules sitting above them.
+type Skill struct{ Instructions string }
+
+func (Skill) reviewExtra() {}
+
 // reviewExtras splits a review builder's optional attachments into their
 // parts. At most one of each kind is meaningful; the last one wins.
-func reviewExtras(extra []ReviewExtra) (Jail, *DiffHandoff) {
+func reviewExtras(extra []ReviewExtra) (Jail, *DiffHandoff, Skill) {
 	var j Jail
 	var h *DiffHandoff
+	var s Skill
 	for _, e := range extra {
 		switch v := e.(type) {
 		case Jail:
 			j = v
 		case *DiffHandoff:
 			h = v
+		case Skill:
+			s = v
 		}
 	}
-	return j, h
+	return j, h, s
 }
 
 // reviewData is the shared data of review.md. AcceptanceCriteria, when
 // non-empty, switches the template's framing to the slim flow's atomic
 // sub-task review (see SlimReview); the other framings leave it nil.
 // Handoff, when set, replaces the embedded diff with the file handoff.
+// SkillInstructions, when non-empty, adds the skill-review section (see
+// Skill).
 type reviewData struct {
 	Focus, Diff, TestLogs, AgentReply, BugDir, JailSpec string
 	TestsInScope, ReproInScope, TouchesJail             bool
 	AcceptanceCriteria                                  []string
 	Handoff                                             *DiffHandoff
+	SkillInstructions                                   string
 }
 
 // review renders the shared reviewer template for all framings.
@@ -585,20 +608,21 @@ func review(d reviewData) (string, error) {
 // scope clause then audits .ai-jail changes (with the spec content relayed)
 // instead of blanket-ignoring them. Further extra attachments trail in the
 // same variadic — a *DiffHandoff swaps the embedded diff for the file
-// handoff (see DiffHandoff). They trail as variadic so existing callers
-// stay valid.
+// handoff (see DiffHandoff), and a Skill adds the skill-review section (see
+// Skill). They trail as variadic so existing callers stay valid.
 func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string, extra ...ReviewExtra) (string, error) {
-	jail, handoff := reviewExtras(extra)
+	jail, handoff, skill := reviewExtras(extra)
 	return review(reviewData{
-		Focus:        focus,
-		Diff:         diff,
-		TestLogs:     testLogs,
-		TestsInScope: testsInScope,
-		AgentReply:   agentReply,
-		BugDir:       bugDir,
-		TouchesJail:  jail.Touches,
-		JailSpec:     jail.Spec,
-		Handoff:      handoff,
+		Focus:             focus,
+		Diff:              diff,
+		TestLogs:          testLogs,
+		TestsInScope:      testsInScope,
+		AgentReply:        agentReply,
+		BugDir:            bugDir,
+		TouchesJail:       jail.Touches,
+		JailSpec:          jail.Spec,
+		Handoff:           handoff,
+		SkillInstructions: skill.Instructions,
 	})
 }
 
@@ -606,19 +630,20 @@ func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir 
 // its deliverable, and the reviewer must judge whether the repro actually
 // captures the reported bug — something the repro-first gate cannot. No
 // REBUILD verdict exists in this framing. The trailing extras are Review's
-// (jail carve-out, diff file handoff).
+// (jail carve-out, diff file handoff, skill section).
 func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, extra ...ReviewExtra) (string, error) {
-	jail, handoff := reviewExtras(extra)
+	jail, handoff, skill := reviewExtras(extra)
 	return review(reviewData{
-		Focus:        focus,
-		Diff:         diff,
-		TestLogs:     testLogs,
-		ReproInScope: true,
-		AgentReply:   agentReply,
-		BugDir:       bugDir,
-		TouchesJail:  jail.Touches,
-		JailSpec:     jail.Spec,
-		Handoff:      handoff,
+		Focus:             focus,
+		Diff:              diff,
+		TestLogs:          testLogs,
+		ReproInScope:      true,
+		AgentReply:        agentReply,
+		BugDir:            bugDir,
+		TouchesJail:       jail.Touches,
+		JailSpec:          jail.Spec,
+		Handoff:           handoff,
+		SkillInstructions: skill.Instructions,
 	})
 }
 
@@ -628,9 +653,9 @@ func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, extra ...Revi
 // criteria belonging to later sub-tasks are not findings. No test-phase
 // framing exists (the slim loop runs the suite itself and relays it via
 // testLogs), and no REBUILD verdict. The trailing extras are Review's
-// (jail carve-out, diff file handoff).
+// (jail carve-out, diff file handoff, skill section).
 func SlimReview(focus, diff, testLogs, bugDir string, criteria []string, extra ...ReviewExtra) (string, error) {
-	jail, handoff := reviewExtras(extra)
+	jail, handoff, skill := reviewExtras(extra)
 	return review(reviewData{
 		Focus:              focus,
 		Diff:               diff,
@@ -640,6 +665,7 @@ func SlimReview(focus, diff, testLogs, bugDir string, criteria []string, extra .
 		Handoff:            handoff,
 		TouchesJail:        jail.Touches,
 		JailSpec:           jail.Spec,
+		SkillInstructions:  skill.Instructions,
 	})
 }
 

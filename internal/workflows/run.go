@@ -123,6 +123,15 @@ type pipelineRun struct {
 
 	devSession, testSession             string
 	devReviewSession, testReviewSession string
+
+	// skillDevReviewSessions and skillTestReviewSessions chain each entry
+	// of the run's review_skill_list to its own reviewer conversation —
+	// one ping-pong per skill per phase, each resuming its own session
+	// across rounds exactly like the default reviewer's. Indexed by skill
+	// list position; sized at startRun and untouched (all empty) when the
+	// run carries no skill list.
+	skillDevReviewSessions  []string
+	skillTestReviewSessions []string
 }
 
 // startRun builds the run's shared machinery and returns it with the
@@ -239,6 +248,9 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func(), 
 		guideCh:           workflow.GetSignalChannel(ctx, "guide"),
 		wakeupCh:          workflow.GetSignalChannel(ctx, "wakeup"),
 		branchName:        fmt.Sprintf("feat/%sissue-%s-%d", branchScope, input.IssueID, workflow.Now(ctx).Unix()),
+		// One reviewer conversation per skill review, per phase.
+		skillDevReviewSessions:  make([]string, len(input.ReviewSkillList)),
+		skillTestReviewSessions: make([]string, len(input.ReviewSkillList)),
 	}
 	r.worktreeInput = activities.WorktreeInput{
 		RepoPath:     input.RepoPath,
@@ -477,8 +489,14 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 // the only review whose agent can act on jail findings (test, docs, bugfix,
 // and refactor rounds pass false: their agents are barred from touching
 // .ai-jail, so an audit mandate there would be a demand no round can
-// satisfy).
-func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string, touchesJail bool) (activities.ReviewResult, error) {
+// satisfy). The trailing skill carries the skill-review entry, if any: at
+// most one is meaningful (the last wins, like every attachment); empty
+// keeps the round an ordinary default review.
+func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string, touchesJail bool, skill ...string) (activities.ReviewResult, error) {
+	skillEntry := ""
+	if len(skill) > 0 {
+		skillEntry = skill[len(skill)-1]
+	}
 	// Same lost-session fallback as the agent rounds: one fresh retry.
 	freshFallback := false
 	for {
@@ -505,6 +523,8 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			FreshReview: r.freshReviews,
 			// Slim's per-sub-task acceptance criteria; nil elsewhere.
 			AcceptanceCriteria: r.reviewCriteria,
+			// The skill-review round's entry, if any; empty elsewhere.
+			SkillEntry: skillEntry,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.reviewTimeouts = 0

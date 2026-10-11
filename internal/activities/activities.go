@@ -127,6 +127,15 @@ type ReviewInput struct {
 	// criteria instead of the whole-task lens. Empty keeps the ordinary
 	// whole-change review prompt.
 	AcceptanceCriteria []string
+	// SkillEntry is one review_skill_list entry for a skill-review round:
+	// "/name" resolves to a skill file at round time (the worktree's
+	// .claude/skills first — the project wins — then the worker's
+	// ~/.claude/skills), any other entry is hand-written prompt text
+	// passed through verbatim. The resolved instructions render into the
+	// reviewer prompt under a fixed preamble restating the verdict
+	// protocol (template.Skill); empty keeps the round an ordinary
+	// default review.
+	SkillEntry string
 	// FreshReview marks the slim flow's context isolation: the reviewer
 	// starts a brand-new conversation every round — no session resume and
 	// no recorded-session fallback, ever. Everything else about the role
@@ -349,12 +358,23 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 			}
 		}
 		// The jail carve-out always rides along; the diff file handoff
-		// joins it only when the diff was too large to embed.
+		// joins it only when the diff was too large to embed, and a
+		// skill-review round's resolved instructions join both. The
+		// entry resolves here — the only place that has both the
+		// worktree (whose project skills win) and the worker's home
+		// (the global skills dir).
 		extras := []template.ReviewExtra{
 			template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec},
 		}
 		if handoff != nil {
 			extras = append(extras, handoff)
+		}
+		if input.SkillEntry != "" {
+			skill, serr := resolveSkillInstructions(input.WorktreePath, input.SkillEntry)
+			if serr != nil {
+				return "", serr
+			}
+			extras = append(extras, template.Skill{Instructions: skill})
 		}
 		if input.ReproInScope {
 			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir, extras...)
@@ -436,6 +456,117 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	verdict.SessionID = session
 	verdict.Usage = usage
 	return verdict, nil
+}
+
+// resolveSkillInstructions resolves one review_skill_list entry into the
+// instruction text a skill-review round renders. A leading "/" names a
+// skill file — <name>/SKILL.md under the worktree's .claude/skills (the
+// project, tried first) or the worker's ~/.claude/skills — read whole with
+// its frontmatter header (the --- fenced name/description block the skill
+// registries read) stripped, since only the body is instructions; any
+// other entry is hand-written prompt text, passed through verbatim. A
+// named skill that resolves nowhere — or to nothing but frontmatter —
+// fails the round loudly: a skill review that silently degrades to the
+// default one would report approvals the configured discipline never
+// gave.
+func resolveSkillInstructions(worktreePath, entry string) (string, error) {
+	if name, ok := strings.CutPrefix(entry, "/"); ok {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return "", fmt.Errorf("review skill entry %q: empty skill name", entry)
+		}
+		home, herr := os.UserHomeDir()
+		if herr != nil {
+			return "", fmt.Errorf("review skill %q: resolve home directory: %w", entry, herr)
+		}
+		var tried []string
+		for _, root := range []string{
+			filepath.Join(worktreePath, ".claude", "skills"),
+			filepath.Join(home, ".claude", "skills"),
+		} {
+			path := filepath.Join(root, name, "SKILL.md")
+			// The worktree leg is the agent-writable one: the jailed agent
+			// can plant a symlink under .claude/skills mid-run, and this
+			// worker-side read would follow it out of the sandbox — host
+			// file content rendered into the reviewer prompt and shipped to
+			// the provider. A symlinked component anywhere below the
+			// worktree root is rejected loudly rather than skipped: the
+			// global lookup would otherwise silently serve a same-named
+			// skill over a tampered project copy. The global leg reads the
+			// worker's own home, which no round can write.
+			if root == filepath.Join(worktreePath, ".claude", "skills") {
+				if link, lerr := symlinkedComponent(worktreePath, path); lerr != nil {
+					return "", lerr
+				} else if link {
+					return "", fmt.Errorf("review skill %q: %s is a symlink — the worktree skills lookup refuses symlinked components (a jailed round can plant one to walk this worker-side read outside the sandbox)",
+						entry, path)
+				}
+			}
+			if b, rerr := os.ReadFile(path); rerr == nil {
+				return stripFrontmatter(string(b))
+			}
+			tried = append(tried, path)
+		}
+		return "", fmt.Errorf("review skill %q: no SKILL.md found (tried %s)",
+			entry, strings.Join(tried, ", "))
+	}
+	if strings.TrimSpace(entry) == "" {
+		return "", errors.New("review skill entry is empty — every entry is a /name or hand-written prompt text")
+	}
+	return entry, nil
+}
+
+// symlinkedComponent reports whether any path component below base — base
+// itself excluded, so a symlinked worktree location stays the operator's
+// own affair — is a symlink. base is the run worktree, agent-writable
+// mid-run: a symlink planted under it would walk a worker-side
+// os.ReadFile outside the sandbox on the agent's behalf.
+func symlinkedComponent(base, path string) (bool, error) {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return false, fmt.Errorf("resolve %q under %q: %w", path, base, err)
+	}
+	cur := base
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, part)
+		fi, lerr := os.Lstat(cur)
+		if lerr != nil {
+			// A missing component is an ordinary miss, not a link.
+			return false, nil
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// stripFrontmatter removes a skill file's leading frontmatter block — a
+// "---" line, the metadata, and the closing "---" line — leaving the body.
+// Fence lines are recognized with or without a trailing CR (a CRLF file),
+// a closing fence needs no trailing newline, and the body keeps its own
+// line endings. A file with no leading fence passes through whole; a
+// leading fence that never closes is malformed and fails loudly rather
+// than leaking the metadata block into the prompt as instructions. The
+// result must not be blank: an instruction-less skill is a config bug,
+// not a review.
+func stripFrontmatter(s string) (string, error) {
+	strip := func(body string) (string, error) {
+		if strings.TrimSpace(body) == "" {
+			return "", errors.New("skill file carries no instruction content")
+		}
+		return strings.TrimSpace(body), nil
+	}
+	lines := strings.Split(s, "\n")
+	if strings.TrimRight(lines[0], "\r") != "---" {
+		return strip(s)
+	}
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimRight(lines[i], "\r") == "---" {
+			return strip(strings.Join(lines[i+1:], "\n"))
+		}
+	}
+	return "", errors.New("skill file opens with an unterminated --- frontmatter fence — no closing --- line")
 }
 
 // mirrorToHost copies each file directly under <worktreePath>/<relDir>

@@ -432,6 +432,37 @@ reviewer:
   url: ""
   key: ""
 
+# Extra skill reviews appended to each review-gated phase of the
+# feature-dev flow. Empty (the default): every phase runs the historical
+# default-only reviews. With entries, each phase runs the default daedalus
+# review ping-pong first, then one ping-pong per entry, in order — the
+# code phase routes each skill's feedback through the implementing
+# agent's session, the test phase through the tester's — each with its
+# own reviewer conversation, the same verdict protocol (APPROVED /
+# CHANGES_REQUESTED / NEEDS_MAINTAINER, plus the test phase's REBUILD),
+# and the same park handling and loop caps as the default reviewer. A
+# skill reviewing the test suite may verdict REBUILD exactly like the
+# default reviewer, routing an implementation-level finding back through
+# the dev cycle. Each entry is either /name — resolved at round time to
+# <name>/SKILL.md under the run worktree's .claude/skills (the project
+# wins) or the worker's ~/.claude/skills — or hand-written prompt text,
+# passed through verbatim; a skill that resolves nowhere, or to nothing
+# but its frontmatter header, fails the round loudly — a skill review
+# never silently degrades to the default one. A leading / is what marks a
+# skill name, so hand-written text cannot begin with one. The worktree
+# copy winning is deliberate (skills may be created after submit), but
+# .claude/skills there is the implementing agent's to write mid-run — the
+# agent can author or replace the discipline its own skill reviewer
+# applies, so the fixed preamble's verdict contract, not that directory,
+# is the trust boundary. Whatever the instructions say, they render into
+# the reviewer prompt under a fixed preamble restating the verdict marker
+# contract and the harness-parsed-output rule, so configured text can
+# never reach a reviewer without daedalus's communication rules above it.
+# The list is frozen into the run at submit;
+# a continued run keeps its attempt's list; blank entries are rejected at
+# load.
+review_skill_list: []
+
 # Out-of-scope-bug filing. Off by default (the section absent, or
 # enabled: false): jailed rounds report out-of-scope bugs in their reply or
 # review comments only, and no bug files are written into your repos. When
