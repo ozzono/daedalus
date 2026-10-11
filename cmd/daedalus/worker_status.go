@@ -135,12 +135,13 @@ func workerCodePath(confPath string) string {
 // providerStatus live-probes the provider a worker's recorded config
 // names, so a row answers "will this worker's next round reach the API?"
 // The main provider is probed — the provider: section's endpoint in the
-// wire style its type names when set, the legacy anthropic: section
-// otherwise; when it is not ok and the config arms a fallback, the
-// fallback is probed too and reported as the active one — mirroring the
-// worker's own failover choice. Values that cannot be determined (no
-// record, unloadable config, provider not fully configured) are reported
-// as such rather than as failures.
+// wire style its type names when set, the legacy anthropic: section, or
+// the legacy openai: section when the anthropic side is unset (the served
+// channel of an openai-only config); when it is not ok and the config arms
+// a fallback, the fallback is probed too and reported as the active one —
+// mirroring the worker's own failover choice. Values that cannot be
+// determined (no record, unloadable config, provider not fully configured)
+// are reported as such rather than as failures.
 func providerStatus(confPath string) string {
 	if confPath == "" {
 		return "n/a (no config record)"
@@ -156,6 +157,12 @@ func providerStatus(confPath string) string {
 		// The openai-typed provider is the primary: probe its endpoint in
 		// its own wire style (heartbeat_model cannot be set on it — load
 		// rejects the combination — so the probe names Model).
+		url, key, model, style = open.URL, open.Key, open.Model, provider.StyleOpenAI
+	} else if url == "" || key == "" {
+		// No anthropic-wire endpoint to probe: a legacy-only config whose
+		// openai section stands alone serves its rounds on the OPENAI_*
+		// channel, so that channel is the primary and the thing to probe —
+		// reporting n/a here would call a working worker unconfigured.
 		url, key, model, style = open.URL, open.Key, open.Model, provider.StyleOpenAI
 	}
 	if url == "" || key == "" {

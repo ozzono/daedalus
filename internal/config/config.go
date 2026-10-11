@@ -978,13 +978,12 @@ func (c Config) TestOutputDir() string {
 // durationValue marshals a time.Duration the way config files express them:
 // a canonical duration string ("30m0s"), never the raw nanosecond count a
 // plain re-marshal would emit. Zero — the unset marker a pre-defaults view
-// renders — prints as plain 0.
+// renders — prints as "0s", zero's own canonical string: a plain 0 would be
+// an !!int scalar, which yaml.v3 refuses to decode into a time.Duration
+// ("cannot unmarshal !!int `0`"), so the rendered file would not load.
 type durationValue time.Duration
 
 func (d durationValue) MarshalYAML() (any, error) {
-	if time.Duration(d) == 0 {
-		return 0, nil
-	}
 	return time.Duration(d).String(), nil
 }
 

@@ -1273,9 +1273,12 @@ prompt: overrides/
 }
 
 // TestRenderYAMLUnsetFields pins the pre-defaults view of an empty config:
-// unset durations print plain 0 — the "documented default applies" marker,
-// not an actual zero ceiling — unset strings print empty, and the inactive
-// fallback prints disabled.
+// unset durations print as "0s" — zero's own canonical string, still the
+// "documented default applies" marker rather than an actual zero ceiling —
+// unset strings print empty, and the inactive fallback prints disabled.
+// The s matters: a plain 0 is an !!int scalar, which the yaml decoder
+// refuses to read into a time.Duration, so the rendered file would not
+// load back — pinned below by parsing the render.
 func TestRenderYAMLUnsetFields(t *testing.T) {
 	raw, err := LoadRaw(writeConfig(t, ""))
 	if err != nil {
@@ -1285,13 +1288,34 @@ func TestRenderYAMLUnsetFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderYAML: %v", err)
 	}
-	for _, want := range []string{"tests_timeout: 0", "agent_run_timeout: 0", `agent: ""`, "authorship: false", "enabled: false", `prompt: ""`} {
+	for _, want := range []string{
+		"tests_timeout: 0s", "agent_run_timeout: 0s", "review_timeout: 0s", "cleanup_timeout: 0s",
+		`agent: ""`, "authorship: false", "enabled: false", `prompt: ""`,
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderYAML(empty) output is missing %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "600000000000") {
-		t.Errorf("RenderYAML(empty) leaked a nanosecond count for a duration:\n%s", out)
+	for _, leaked := range []string{"tests_timeout: 0\n", "600000000000"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("RenderYAML(empty) printed a duration as %q instead of its canonical string:\n%s", leaked, out)
+		}
+	}
+
+	// The render must load: a rendered config file the decoder rejects is
+	// worse than no render at all. Re-rendering the parse must reproduce
+	// the output byte for byte — "0s" decodes to zero and marshals right
+	// back to "0s", so the file is idempotent under `config render`.
+	back, err := LoadRaw(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("parse RenderYAML(empty) output: %v\n%s", err, out)
+	}
+	roundTrip, err := back.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML round-trip: %v", err)
+	}
+	if roundTrip != out {
+		t.Errorf("RenderYAML(empty) round-trip =\n%s\nwant\n%s", roundTrip, out)
 	}
 }
 
