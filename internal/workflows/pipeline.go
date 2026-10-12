@@ -516,7 +516,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 				break
 			}
 			run.logger.Info("Code review requested changes")
-			if err := devFixRound(verdict.Comments); err != nil {
+			if err := devFixRound(verdict.Comments + verdictNote(verdict)); err != nil {
 				return err
 			}
 		}
@@ -537,7 +537,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 					break
 				}
 				run.logger.Info("Skill review requested changes", "Skill", label)
-				if err := devFixRound(verdict.Comments); err != nil {
+				if err := devFixRound(verdict.Comments + verdictNote(verdict)); err != nil {
 					return err
 				}
 			}
@@ -800,7 +800,7 @@ func testFixPrompt(result activities.TestResult, verdict activities.ReviewResult
 	}
 	comments := ""
 	if !verdict.Approved {
-		comments = verdict.Comments
+		comments = verdict.Comments + verdictNote(verdict)
 	}
 	prompt, err := template.TestsFix(logs, comments)
 	if err != nil {

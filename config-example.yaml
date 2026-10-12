@@ -532,6 +532,30 @@ reviewer:
 # load.
 review_skill_list: []
 
+# Decision-model repair of marker-less review verdicts. When a reviewer
+# round's output carries no parseable verdict marker, the review activity
+# asks this classify-only model to read the review and name the most likely
+# verdict among the four markers (APPROVED, CHANGES_REQUESTED,
+# NEEDS_MAINTAINER, REBUILD). A high-confidence APPROVED promotes the round
+# to approval; every other outcome only annotates the round — it continues
+# as changes requested, and a NEEDS_MAINTAINER or REBUILD classification
+# never triggers its lifecycle action. The endpoint is dialed with one
+# plain OpenAI-style chat-completions request — no tools, no session, no
+# streaming; only the model name differs from the traffic the serving relay
+# already carries — so url typically names the same loopback relay (or
+# upstream) that serves the rounds. Any failure — section unset, endpoint
+# unreachable, slow, or answering garbage — degrades to the historical
+# behavior: the round counts as changes requested with the whole output as
+# comments, and the marker-less strike is counted exactly as before; three
+# consecutive marker-less rounds park. key is optional (a local relay needs
+# none). With slim.enabled: true the section is required — url and model
+# must be set or the config fails to load — because slim's small models are
+# the marker-less-exit generator and this layer is its recovery mechanism.
+verdict_repair:
+  url: ""
+  model: ""
+  key: ""
+
 # Out-of-scope-bug filing. Off by default (the section absent, or
 # enabled: false): jailed rounds report out-of-scope bugs in their reply or
 # review comments only, and no bug files are written into your repos. When

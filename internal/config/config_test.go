@@ -191,9 +191,12 @@ func TestLoadMaxConcurrentAgentRuns(t *testing.T) {
 // boolean still loads (it decodes into enabled — the README-documented
 // migration for the 2026-10-02 reshape), so an upgrading operator's config
 // keeps working while the strict decode still rejects a typo'd section key
-// and a section-shaped value that is neither.
+// and a section-shaped value that is neither. The slim configs carry the
+// verdict_repair section — required under slim mode, since the decision
+// model classifying marker-less review verdicts is the recovery mechanism
+// for slim's marker-less-exit generator.
 func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
-	cfg, err := Load(writeConfig(t, "slim:\n  enabled: true\n  parser_model: qwen2.5-coder:3b-parser\nmax_concurrent_agent_runs: 4\nmax_concurrent_tests: 3\n"))
+	cfg, err := Load(writeConfig(t, "slim:\n  enabled: true\n  parser_model: qwen2.5-coder:3b-parser\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\nmax_concurrent_agent_runs: 4\nmax_concurrent_tests: 3\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -223,7 +226,7 @@ func TestLoadSlimClampsAgentConcurrency(t *testing.T) {
 	// The legacy top-level boolean spelling loads — it decodes into
 	// enabled, so an un-migrated config clamps exactly like the section
 	// shape instead of failing with a struct-name decode error.
-	cfg, err = Load(writeConfig(t, "slim: true\nmax_concurrent_agent_runs: 4\n"))
+	cfg, err = Load(writeConfig(t, "slim: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\nmax_concurrent_agent_runs: 4\n"))
 	if err != nil {
 		t.Fatalf("Load(legacy slim: true): %v", err)
 	}
@@ -941,12 +944,101 @@ func TestLoadDuplicateKeys(t *testing.T) {
 	})
 
 	t.Run("no duplicate, no alert", func(t *testing.T) {
-		_, _, alerts, err := loadCapturingAlerts(t, "agent: claude\nslim:\n  enabled: true\n")
+		_, _, alerts, err := loadCapturingAlerts(t, "agent: claude\nslim:\n  enabled: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n")
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
 		if alerts != "" {
 			t.Errorf("alerts = %q, want stderr untouched for an ordinary config", alerts)
+		}
+	})
+}
+
+// TestLoadVerdictRepair pins the decision-model repair section's load
+// contract. Absent (the default) the section is inert: marker-less review
+// rounds keep the pre-repair behavior and nothing is exported. Outside slim
+// even a partial section loads — every repair failure fails open, so there
+// is nothing to misconfigure into a broken run — but under slim mode url
+// and model are required: slim's small models are the marker-less-exit
+// generator and the repair layer is its recovery mechanism. Whatever loads
+// reaches the review activity only through the env channel: AgentEnv
+// exports each value only when set (the key is optional, a local relay
+// needs none), and the daemon-spawn scrub list carries all three names so a
+// stale export can never outlive its config.
+func TestLoadVerdictRepair(t *testing.T) {
+	t.Run("slim mode requires url and model", func(t *testing.T) {
+		_, err := Load(writeConfig(t, "slim:\n  enabled: true\n"))
+		if err == nil || !strings.Contains(err.Error(), "verdict_repair") {
+			t.Fatalf("Load(slim without verdict_repair) error = %v, want the verdict_repair requirement", err)
+		}
+		_, err = Load(writeConfig(t, "slim:\n  enabled: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n"))
+		if err == nil || !strings.Contains(err.Error(), "verdict_repair") {
+			t.Fatalf("Load(slim, url only) error = %v, want the verdict_repair requirement", err)
+		}
+		_, err = Load(writeConfig(t, "slim:\n  enabled: true\nverdict_repair:\n  model: qwen2.5-coder:3b\n"))
+		if err == nil || !strings.Contains(err.Error(), "verdict_repair") {
+			t.Fatalf("Load(slim, model only) error = %v, want the verdict_repair requirement", err)
+		}
+		cfg, err := Load(writeConfig(t, "slim:\n  enabled: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n"))
+		if err != nil {
+			t.Fatalf("Load(slim, url and model): %v", err)
+		}
+		if cfg.VerdictRepair.URL != "http://127.0.0.1:11434/v1" || cfg.VerdictRepair.Model != "qwen2.5-coder:3b" {
+			t.Errorf("VerdictRepair = %+v, want url and model through", cfg.VerdictRepair)
+		}
+	})
+
+	t.Run("absent or partial outside slim loads inert", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "agent: claude\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.VerdictRepair != (VerdictRepairConfig{}) {
+			t.Errorf("VerdictRepair = %+v, want the zero section when absent", cfg.VerdictRepair)
+		}
+		// key alone never satisfies the requirement either, but outside
+		// slim a partial section is merely inert, not a load error.
+		cfg, err = Load(writeConfig(t, "verdict_repair:\n  url: http://127.0.0.1:11434/v1\n  key: sk-local\n"))
+		if err != nil {
+			t.Fatalf("Load(non-slim, partial verdict_repair): %v", err)
+		}
+		if cfg.VerdictRepair.Key != "sk-local" {
+			t.Errorf("VerdictRepair.Key = %q, want the partial section through", cfg.VerdictRepair.Key)
+		}
+	})
+
+	t.Run("AgentEnv exports only the set values", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "verdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		env := cfg.AgentEnv()
+		for _, want := range []string{
+			"DAEDALUS_VERDICT_REPAIR_URL=http://127.0.0.1:11434/v1",
+			"DAEDALUS_VERDICT_REPAIR_MODEL=qwen2.5-coder:3b",
+		} {
+			if !slices.Contains(env, want) {
+				t.Errorf("AgentEnv() = %v, want %q", env, want)
+			}
+		}
+		// The key is optional: unset, it exports nothing — a local relay
+		// needs no Authorization header and must not get an empty one.
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "DAEDALUS_VERDICT_REPAIR_KEY=") {
+				t.Errorf("AgentEnv() = %v, want no key export when the key is unset", env)
+			}
+		}
+	})
+
+	t.Run("ProviderEnvVars scrubs all three from the daemon spawn", func(t *testing.T) {
+		for _, name := range []string{
+			VerdictRepairURLEnv,
+			VerdictRepairModelEnv,
+			VerdictRepairKeyEnv,
+		} {
+			if !slices.Contains(ProviderEnvVars(), name) {
+				t.Errorf("ProviderEnvVars() = %v, want %q listed", ProviderEnvVars(), name)
+			}
 		}
 	})
 }

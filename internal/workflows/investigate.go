@@ -56,7 +56,7 @@ func InvestigateWorkflow(ctx workflow.Context, input PipelineInput) (string, err
 			break
 		}
 		run.logger.Info("Docs review requested changes")
-		fixPrompt, err := template.InvestigateFix(verdict.Comments)
+		fixPrompt, err := template.InvestigateFix(verdict.Comments + verdictNote(verdict))
 		if err != nil {
 			return "", fmt.Errorf("build investigate-fix prompt: %w", err)
 		}

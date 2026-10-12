@@ -180,6 +180,17 @@ const (
 	// from the daemon spawn (ProviderEnvVars) so a stale export can never
 	// point a new worker's rounds at a dead relay.
 	ToolRelayURLEnv = "DAEDALUS_TOOL_RELAY_URL"
+	// VerdictRepairURLEnv, VerdictRepairModelEnv, and VerdictRepairKeyEnv
+	// carry the verdict_repair section's endpoint (url / model / key) to
+	// the review activity's decision-model repair pass, which classifies a
+	// marker-less reviewer output into one of the four verdict markers.
+	// Exported only when set — absent means the repair layer is off and
+	// marker-less rounds keep the pre-repair behavior. The key is optional
+	// (a local relay needs none); all three are scrubbed from the daemon
+	// spawn (ProviderEnvVars) like every other provider-derived value.
+	VerdictRepairURLEnv   = "DAEDALUS_VERDICT_REPAIR_URL"
+	VerdictRepairModelEnv = "DAEDALUS_VERDICT_REPAIR_MODEL"
+	VerdictRepairKeyEnv   = "DAEDALUS_VERDICT_REPAIR_KEY"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -282,6 +293,23 @@ type FallbackConfig struct {
 type ReviewerConfig struct {
 	URL string `yaml:"url"`
 	Key string `yaml:"key"`
+}
+
+// VerdictRepairConfig points the decision-model repair pass at its
+// classify-only endpoint: when a reviewer round's output carries no
+// parseable verdict marker, the review activity asks this model to read the
+// review and name the most likely verdict among the four markers. url is an
+// OpenAI-compatible chat-completions base — typically the same loopback
+// relay that serves the rounds, the request differing only in the model
+// name. key is optional (a local relay needs none). Absent (the default)
+// the repair layer is off: marker-less rounds keep the pre-repair
+// behavior. Under slim mode the section is required (url and model), since
+// slim's small models are the marker-less-exit generator and this layer is
+// its recovery mechanism.
+type VerdictRepairConfig struct {
+	URL   string `yaml:"url"`
+	Model string `yaml:"model"`
+	Key   string `yaml:"key"`
 }
 
 // ThinkingDisabled reports an explicit thinking: false — the only setting
@@ -899,6 +927,10 @@ type Config struct {
 	// continued run keeps its attempt's list); empty — the default — runs
 	// the historical default-only reviews.
 	ReviewSkillList []string `yaml:"review_skill_list"`
+	// VerdictRepair is the decision-model endpoint that repairs marker-less
+	// review verdicts (see VerdictRepairConfig). Empty (the section absent)
+	// means the repair layer is off.
+	VerdictRepair VerdictRepairConfig `yaml:"verdict_repair"`
 	// BugFiling is the out-of-scope-bug filing toggle; inactive unless
 	// Enabled (see BugFilingConfig).
 	BugFiling BugFilingConfig `yaml:"bug_filing"`
@@ -991,29 +1023,30 @@ func (d durationValue) MarshalYAML() (any, error) {
 // field in struct order with the durations carried by durationValue; the
 // nested sections marshal as themselves.
 type renderConfig struct {
-	Agent                  string           `yaml:"agent"`
-	BranchPrefix           string           `yaml:"branch_prefix"`
-	Authorship             bool             `yaml:"authorship"`
-	WorkerID               string           `yaml:"worker_id"`
-	TestsTimeout           durationValue    `yaml:"tests_timeout"`
-	AgentRunTimeout        durationValue    `yaml:"agent_run_timeout"`
-	ReviewTimeout          durationValue    `yaml:"review_timeout"`
-	CleanupTimeout         durationValue    `yaml:"cleanup_timeout"`
-	MaxConcurrentAgentRuns int              `yaml:"max_concurrent_agent_runs"`
-	MaxConcurrentTests     int              `yaml:"max_concurrent_tests"`
-	SharedTestQueue        *bool            `yaml:"shared_test_queue"`
-	Slim                   SlimConfig       `yaml:"slim"`
-	Temporal               TemporalConfig   `yaml:"temporal"`
-	Anthropic              AnthropicConfig  `yaml:"anthropic"`
-	OpenAI                 OpenAIConfig     `yaml:"openai"`
-	Provider               *ProviderConfig  `yaml:"provider"`
-	Fallback               FallbackConfig   `yaml:"fallback"`
-	Reviewer               ReviewerConfig   `yaml:"reviewer"`
-	ReviewSkillList        []string         `yaml:"review_skill_list"`
-	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
-	TestOutput             TestOutputConfig `yaml:"test_output"`
-	Dependency             DependencyConfig `yaml:"dependency"`
-	Prompt                 string           `yaml:"prompt"`
+	Agent                  string              `yaml:"agent"`
+	BranchPrefix           string              `yaml:"branch_prefix"`
+	Authorship             bool                `yaml:"authorship"`
+	WorkerID               string              `yaml:"worker_id"`
+	TestsTimeout           durationValue       `yaml:"tests_timeout"`
+	AgentRunTimeout        durationValue       `yaml:"agent_run_timeout"`
+	ReviewTimeout          durationValue       `yaml:"review_timeout"`
+	CleanupTimeout         durationValue       `yaml:"cleanup_timeout"`
+	MaxConcurrentAgentRuns int                 `yaml:"max_concurrent_agent_runs"`
+	MaxConcurrentTests     int                 `yaml:"max_concurrent_tests"`
+	SharedTestQueue        *bool               `yaml:"shared_test_queue"`
+	Slim                   SlimConfig          `yaml:"slim"`
+	Temporal               TemporalConfig      `yaml:"temporal"`
+	Anthropic              AnthropicConfig     `yaml:"anthropic"`
+	OpenAI                 OpenAIConfig        `yaml:"openai"`
+	Provider               *ProviderConfig     `yaml:"provider"`
+	Fallback               FallbackConfig      `yaml:"fallback"`
+	Reviewer               ReviewerConfig      `yaml:"reviewer"`
+	ReviewSkillList        []string            `yaml:"review_skill_list"`
+	VerdictRepair          VerdictRepairConfig `yaml:"verdict_repair"`
+	BugFiling              BugFilingConfig     `yaml:"bug_filing"`
+	TestOutput             TestOutputConfig    `yaml:"test_output"`
+	Dependency             DependencyConfig    `yaml:"dependency"`
+	Prompt                 string              `yaml:"prompt"`
 }
 
 // RenderYAML renders the config as YAML covering every field of the struct,
@@ -1043,6 +1076,7 @@ func (c Config) RenderYAML() (string, error) {
 		Fallback:               c.Fallback,
 		Reviewer:               c.Reviewer,
 		ReviewSkillList:        c.ReviewSkillList,
+		VerdictRepair:          c.VerdictRepair,
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
 		Dependency:             c.Dependency,
@@ -1255,6 +1289,9 @@ func (c Config) AgentEnv() []string {
 	}
 	add(ReviewerURLEnv, c.Reviewer.URL)
 	add(ReviewerKeyEnv, c.Reviewer.Key)
+	add(VerdictRepairURLEnv, c.VerdictRepair.URL)
+	add(VerdictRepairModelEnv, c.VerdictRepair.Model)
+	add(VerdictRepairKeyEnv, c.VerdictRepair.Key)
 	return env
 }
 
@@ -1291,6 +1328,9 @@ func ProviderEnvVars() []string {
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
 		ReviewerURLEnv,
 		ReviewerKeyEnv,
+		VerdictRepairURLEnv,
+		VerdictRepairModelEnv,
+		VerdictRepairKeyEnv,
 		ToolRelayURLEnv,
 		BugDirEnv,
 		BugMirrorEnv,
@@ -1575,6 +1615,15 @@ func (c Config) validate(path string) error {
 		if f.URL == "" || f.Key == "" || f.Model == "" {
 			return fmt.Errorf("config %s: fallback: enabled fallback needs url, key, and model", path)
 		}
+	}
+	// The verdict-repair decision model is required exactly when slim is on:
+	// slim's small models are the marker-less-exit generator, and the repair
+	// layer is its recovery mechanism. Outside slim a partial or absent
+	// section is merely inert — every repair failure fails open to the
+	// historical marker-less behavior, so there is nothing to misconfigure
+	// into a broken run.
+	if c.Slim.Enabled && (c.VerdictRepair.URL == "" || c.VerdictRepair.Model == "") {
+		return fmt.Errorf("config %s: verdict_repair: slim mode requires url and model — the decision model that classifies marker-less review verdicts", path)
 	}
 	if !slices.Contains(fallbackTypes, c.Fallback.Type) {
 		return fmt.Errorf("config %s: fallback: unknown type %q (available: %s)",

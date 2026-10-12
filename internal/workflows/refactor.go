@@ -67,7 +67,7 @@ func RefactorWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 			}
 			return run.finalize()
 		}
-		fixPrompt, err := template.RefactorFix(failureLogs(result), verdict.Comments)
+		fixPrompt, err := template.RefactorFix(failureLogs(result), verdict.Comments+verdictNote(verdict))
 		if err != nil {
 			return "", fmt.Errorf("build refactor-fix prompt: %w", err)
 		}

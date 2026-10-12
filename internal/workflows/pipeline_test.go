@@ -2472,6 +2472,208 @@ func TestFeatureDevWorkflowVerdictResetsVerdictlessStreak(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestVerdictNote pins the repair annotation's rendering at its two empty
+// edges and its one filled shape: a round with no annotation — a parseable
+// marker, or a marker-less one the repair layer never classified — renders
+// nothing, so every existing relay site is byte-identical to the
+// pre-repair behavior; an annotated round renders a daedalus-owned
+// postscript naming the most-likely verdict and confidence, appended after
+// the comments (never merged into them — the reviewer cannot plant it in
+// its own output).
+func TestVerdictNote(t *testing.T) {
+	for _, v := range []activities.ReviewResult{
+		{},
+		{Approved: true},
+		{NoVerdict: true, Comments: "folded"},
+	} {
+		if got := verdictNote(v); got != "" {
+			t.Errorf("verdictNote(%+v) = %q, want empty without an annotation", v, got)
+		}
+	}
+	got := verdictNote(activities.ReviewResult{LikelyVerdict: "CHANGES_REQUESTED", LikelyConfidence: 0.42})
+	if !strings.HasPrefix(got, "\n\n---\n") {
+		t.Errorf("verdictNote = %q, want a postscript introduced by a separator, never merged prose", got)
+	}
+	for _, want := range []string{
+		"Daedalus verdict note:",
+		"most likely CHANGES_REQUESTED (confidence 0.42)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("verdictNote = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// repairPromoted is a review round the decision-model repair promoted:
+// approval set over a marker-less result — the only producer of the
+// Approved∧NoVerdict pair, which parseReviewVerdict never emits.
+var repairPromoted = activities.ReviewResult{
+	Approved:         true,
+	NoVerdict:        true,
+	Comments:         "the change is correct, but the marker line never arrived",
+	LikelyVerdict:    "APPROVED",
+	LikelyConfidence: 0.95,
+}
+
+// TestFeatureDevWorkflowRepairPromotionEndsReviewLoop pins the promotion's
+// routing: a marker-less round the repair promoted ends the review loop
+// exactly as a parsed approval would — the run proceeds to the test phase,
+// no fix round is driven by the promoted round's comments, and the run
+// completes.
+func TestFeatureDevWorkflowRepairPromotionEndsReviewLoop(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		repairPromoted,
+		{Approved: true},
+	}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(rec.inputs) != 2 {
+		t.Errorf("agent ran %d times, want 2 (implement + tests; a promoted round drives no fix round)", len(rec.inputs))
+	}
+	if len(rev.inputs) != 2 {
+		t.Errorf("reviewer ran %d times, want 2 (one code review + the test review)", len(rev.inputs))
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowPromotionNotStruck pins the review loop's ordering:
+// approval is decided before the verdictless strike accounting, so a
+// promoted round never counts toward the marker-less park — two verdictless
+// rounds followed by a promoted third complete the run instead of parking
+// at strike three with the promotion discarded. The annotated verdictless
+// rounds still behave as changes-requested: their fix prompts carry both
+// the round's comments and the daedalus verdict note, in that order.
+func TestFeatureDevWorkflowPromotionNotStruck(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	annotated := activities.ReviewResult{
+		Approved:         false,
+		NoVerdict:        true,
+		Comments:         "connection reset by peer",
+		LikelyVerdict:    "CHANGES_REQUESTED",
+		LikelyConfidence: 0.42,
+	}
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: annotated},
+		{result: annotated},
+		{result: repairPromoted},
+	}, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-5", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(rec.inputs) != 4 {
+		t.Errorf("agent ran %d times, want 4 (implement, two fixes, tests)", len(rec.inputs))
+	}
+	if len(rev.inputs) != 4 {
+		t.Errorf("reviewer ran %d times, want 4 (three code rounds + the test review)", len(rev.inputs))
+	}
+	fix := rec.inputs[1].Prompt
+	commentsAt := strings.Index(fix, "connection reset by peer")
+	noteAt := strings.Index(fix, "most likely CHANGES_REQUESTED (confidence 0.42)")
+	if commentsAt < 0 || noteAt < 0 || noteAt < commentsAt {
+		t.Errorf("fix prompt after an annotated verdictless round = %q, want the comments with the verdict note appended after them", fix)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-5" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowVerdictlessParkCarriesRepairNote pins the park
+// record's annotation: a marker-less round the repair classified but could
+// not promote still parks at the strike budget — the repair outcome never
+// touches strike accounting — and the park error carries the daedalus
+// verdict note so the parked run records what the classifier thought.
+func TestFeatureDevWorkflowVerdictlessParkCarriesRepairNote(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	annotated := activities.ReviewResult{
+		Approved:         false,
+		NoVerdict:        true,
+		Comments:         "the request folded at the provider timeout",
+		LikelyVerdict:    "CHANGES_REQUESTED",
+		LikelyConfidence: 0.42,
+	}
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{annotated}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	// If the strike budget regresses, the repeating stub would feed this
+	// loop forever — bound the test so the regression fails fast instead
+	// of hanging until the go-test timeout.
+	env.SetTestTimeout(30 * time.Second)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from three verdictless review rounds in a row")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"without any verdict 3 rounds in a row",
+		"Daedalus verdict note:",
+		"most likely CHANGES_REQUESTED (confidence 0.42)",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if len(rec.inputs) != 3 {
+		t.Errorf("agent ran %d times, want 3 (implement plus two fix rounds; none after the park)", len(rec.inputs))
+	}
+	if len(rev.inputs) != 3 {
+		t.Errorf("reviewer ran %d times, want 3", len(rev.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowIdenticalVerdictsPark pins the identical-verdict
 // cap: three review rounds in a row returning a whitespace-identical
 // non-approved comments body park the run — a well-formed reviewer that
