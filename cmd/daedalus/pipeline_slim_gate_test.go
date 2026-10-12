@@ -115,7 +115,7 @@ func TestSlimGateRunWiring(t *testing.T) {
 
 	t.Run("slim.enabled reroute gates before any side effect", func(t *testing.T) {
 		cfg := filepath.Join(t.TempDir(), "config.yaml")
-		if err := os.WriteFile(cfg, []byte("agent: claude\nslim:\n  enabled: true\n"), 0o644); err != nil {
+		if err := os.WriteFile(cfg, []byte("agent: claude\nslim:\n  enabled: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		// A nonexistent repo path: if the gate failed to fire (or fired

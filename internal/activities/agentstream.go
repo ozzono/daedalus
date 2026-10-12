@@ -313,6 +313,11 @@ func agentAPIError(agent, stdout string) string {
 	return ""
 }
 
+// verdictMarkers are the four daedalus review verdict markers — the set
+// parseReviewVerdict exact-matches and the NoVerdict repair's classifier
+// chooses among, declared once so the two cannot drift.
+var verdictMarkers = []string{"APPROVED", "CHANGES_REQUESTED", "NEEDS_MAINTAINER", "REBUILD"}
+
 // parseReviewVerdict extracts the verdict from reviewer output: the last
 // non-empty line decides. APPROVED approves; NEEDS_MAINTAINER parks the run
 // for a maintainer; REBUILD (offered only to the test reviewer) routes the
@@ -331,8 +336,7 @@ func parseReviewVerdict(out string) ReviewResult {
 		if line == "" {
 			continue
 		}
-		switch line {
-		case "APPROVED", "CHANGES_REQUESTED", "NEEDS_MAINTAINER", "REBUILD":
+		if slices.Contains(verdictMarkers, line) {
 			return ReviewResult{
 				Approved:        line == "APPROVED",
 				NeedsMaintainer: line == "NEEDS_MAINTAINER",

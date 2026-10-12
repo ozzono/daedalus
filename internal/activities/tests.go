@@ -517,25 +517,33 @@ func detectedTestCommand(worktreePath string) ([]string, bool) {
 }
 
 // makefileHasTarget reports whether the Makefile declares target as a rule
-// ("target:" starting a line). Variable assignments sharing the prefix do
-// not match — plain "target:=v", POSIX "target::=v", and target-specific
-// assignments like "target: X = 3" ("?=", "+=", "!=", also after an
-// override/export keyword). The rejection is a literal "=" scan: in that
-// position make does read a bare "target: foo=bar" as an assignment, not a
-// rule (GNU-make-probed). The scan is literal, so an "=" inside a $(…)
-// prereq reference is rejected too — make actually parses those as rules
-// (probed: "test: $(shell echo a=b)" → "No rule to make target 'a=b',
-// needed by 'test'") — but their expanded prereqs are unbuildable in
-// practice, so the rejection is a safe fall-through to the next detection
-// step, never a false rule.
+// ("target:" starting a line — make ignores whitespace between the name
+// and the colon, so "target :" is the same rule). Variable assignments
+// sharing the prefix do not match — plain "target:=v", spaced "target :=
+// v", POSIX "target::=v", and target-specific assignments like
+// "target: X = 3" ("?=", "+=", "!=", also after an override/export
+// keyword). The rejection is a literal "=" scan: in that position make
+// does read a bare "target: foo=bar" as an assignment, not a rule
+// (GNU-make-probed). The scan is literal, so an "=" inside a $(…) prereq
+// reference is rejected too — make actually parses those as rules (probed:
+// "test: $(shell echo a=b)" → "No rule to make target 'a=b', needed by
+// 'test'") — but their expanded prereqs are unbuildable in practice, so
+// the rejection is a safe fall-through to the next detection step, never a
+// false rule.
 func makefileHasTarget(mk, target string) bool {
 	for line := range strings.SplitSeq(mk, "\n") {
-		if strings.HasPrefix(line, target+":") {
-			if strings.Contains(line[len(target)+1:], "=") {
-				continue // variable assignment, not a rule
-			}
-			return true
+		rest, ok := strings.CutPrefix(line, target)
+		if !ok {
+			continue
 		}
+		rest = strings.TrimLeft(rest, " \t")
+		if !strings.HasPrefix(rest, ":") {
+			continue
+		}
+		if strings.Contains(rest[1:], "=") {
+			continue // variable assignment, not a rule
+		}
+		return true
 	}
 	return false
 }

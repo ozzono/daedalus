@@ -189,7 +189,7 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 			logs = result.Logs
 		}
 		if !verdict.Approved {
-			comments = verdict.Comments
+			comments = verdict.Comments + verdictNote(verdict)
 		}
 		fixPrompt, err := template.SlimFix(st.Description, logs, comments)
 		if err != nil {

@@ -76,6 +76,19 @@ func writeProviderConfig(t *testing.T, url, key, extra string) string {
 	return path
 }
 
+// writeOpenAILegacyConfig writes a loadable config whose legacy openai
+// section stands alone — no provider: section, no anthropic: section — the
+// openai-only shape whose served channel the status probe must find.
+func writeOpenAILegacyConfig(t *testing.T, url, key, extra string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	doc := "agent: claude\ntemporal:\n  task_queue: q\nopenai:\n  url: " + url + "\n  key: " + key + "\n  model: m\n" + extra
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // providerModelServer stands in for a healthy provider endpoint and
 // records the model named in the probe request body.
 func providerModelServer(t *testing.T) (url string, model *string) {
@@ -229,6 +242,223 @@ func TestProviderStatus(t *testing.T) {
 		got := providerStatus(cfg)
 		if !strings.Contains(got, "429 rate limited") || strings.Contains(got, "fallback") {
 			t.Errorf("providerStatus = %q, want main's detail only", got)
+		}
+	})
+
+	t.Run("openai-only config probes the openai wire", func(t *testing.T) {
+		var path, auth, model string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path = r.URL.Path
+			auth = r.Header.Get("Authorization")
+			var b struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			model = b.Model
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(srv.Close)
+		// No anthropic section at all: the openai section is the served
+		// channel, so reporting n/a here would call a working worker
+		// unconfigured.
+		if got := providerStatus(writeOpenAILegacyConfig(t, srv.URL, "k", "")); !strings.Contains(got, "ok (http 200)") {
+			t.Errorf("providerStatus = %q, want ok", got)
+		}
+		if path != "/chat/completions" {
+			t.Errorf("probe path = %q, want /chat/completions", path)
+		}
+		if auth != "Bearer k" {
+			t.Errorf("probe auth = %q, want the Bearer scheme with the openai key", auth)
+		}
+		if model != "m" {
+			t.Errorf("probe model = %q, want the openai section's model", model)
+		}
+	})
+
+	t.Run("configured anthropic section is still the primary over the legacy openai section", func(t *testing.T) {
+		var hits int
+		open := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(open.Close)
+		var path, key string
+		anth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path, key = r.URL.Path, r.Header.Get("x-api-key")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(anth.Close)
+		// Both legacy sections configured: the anthropic wire stays the
+		// primary — the openai section is probed only when the anthropic
+		// side is unset, never alongside it.
+		extra := "openai:\n  url: " + open.URL + "\n  key: sk-oa\n  model: gpt-x\n"
+		if got := providerStatus(writeProviderConfig(t, anth.URL, "k", extra)); !strings.Contains(got, "ok (http 200)") {
+			t.Errorf("providerStatus = %q, want ok", got)
+		}
+		if path != "/v1/messages" || key != "k" {
+			t.Errorf("probe = %q with x-api-key %q, want the anthropic wire with the anthropic key", path, key)
+		}
+		if hits != 0 {
+			t.Errorf("openai endpoint hit %d times, want 0 (anthropic is the primary)", hits)
+		}
+	})
+
+	t.Run("anthropic url without a key falls to the openai channel", func(t *testing.T) {
+		var hits int
+		anth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(anth.Close)
+		open := providerServer(t, 200, `{}`)
+		// A keyless anthropic endpoint cannot serve a round, so the openai
+		// section is the probeable channel — mirroring the worker's own
+		// unset-side choice.
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		doc := "agent: claude\ntemporal:\n  task_queue: q\nanthropic:\n  url: " + anth.URL + "\n  model: claude-x\nopenai:\n  url: " + open + "\n  key: sk-oa\n  model: gpt-x\n"
+		if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := providerStatus(path); !strings.Contains(got, "ok (http 200)") {
+			t.Errorf("providerStatus = %q, want ok", got)
+		}
+		if hits != 0 {
+			t.Errorf("keyless anthropic endpoint hit %d times, want 0 (the openai channel is the probeable one)", hits)
+		}
+	})
+
+	t.Run("openai-only main with live fallback reports the fallback active", func(t *testing.T) {
+		main := providerServer(t, 429, `rate limited`)
+		fallback := providerServer(t, 200, `{}`)
+		extra := "fallback:\n  enabled: true\n  url: " + fallback + "\n  key: fb\n  model: fbm\n"
+		got := providerStatus(writeOpenAILegacyConfig(t, main, "k", extra))
+		for _, want := range []string{"main: 429 rate limited", "fallback: ok (http 200)", "[active: fallback]"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("providerStatus = %q, want it to contain %q", got, want)
+			}
+		}
+	})
+}
+
+// writeProviderSectionConfig writes a loadable config whose provider:
+// section — the wire-agnostic primary — is typed typ and points at url with
+// key, plus the optional extra YAML (e.g. a fallback or legacy block), and
+// returns its path.
+func writeProviderSectionConfig(t *testing.T, typ, url, key, extra string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	doc := "agent: claude\ntemporal:\n  task_queue: q\nprovider:\n  type: " + typ + "\n  url: " + url + "\n  key: " + key + "\n  model: m\n" + extra
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestProviderStatusProviderSection pins the status probe's primary
+// dispatch through the provider section: an anthropic-typed provider is
+// probed on the anthropic wire (with its heartbeat model naming the probe),
+// an openai-typed provider on the chat-completions wire — and the
+// openai-typed provider is the primary even when a legacy anthropic section
+// also stands, so an unconfigured provider section still reports n/a rather
+// than probing the legacy channel. The fallback handoff keeps working with
+// a provider-served primary.
+func TestProviderStatusProviderSection(t *testing.T) {
+	t.Run("anthropic-typed provider probes the anthropic wire", func(t *testing.T) {
+		var path, key string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path, key = r.URL.Path, r.Header.Get("x-api-key")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(srv.Close)
+		if got := providerStatus(writeProviderSectionConfig(t, "anthropic", srv.URL, "k", "")); !strings.Contains(got, "ok (http 200)") {
+			t.Errorf("providerStatus = %q, want ok", got)
+		}
+		if path != "/v1/messages" {
+			t.Errorf("probe path = %q, want /v1/messages", path)
+		}
+		if key != "k" {
+			t.Errorf("probe x-api-key = %q, want the provider section's key", key)
+		}
+	})
+
+	t.Run("provider heartbeat model names the probe", func(t *testing.T) {
+		url, model := providerModelServer(t)
+		cfg := writeProviderSectionConfig(t, "anthropic", url, "k", "  heartbeat_model: hb-air\n")
+		if got := providerStatus(cfg); !strings.Contains(got, "ok (http 200)") {
+			t.Errorf("providerStatus = %q, want ok", got)
+		}
+		if *model != "hb-air" {
+			t.Errorf("probe model = %q, want the provider section's heartbeat model", *model)
+		}
+	})
+
+	t.Run("openai-typed provider probes the chat-completions wire", func(t *testing.T) {
+		var path, auth, model string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path = r.URL.Path
+			auth = r.Header.Get("Authorization")
+			var b struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			model = b.Model
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(srv.Close)
+		if got := providerStatus(writeProviderSectionConfig(t, "openai", srv.URL, "k", "")); !strings.Contains(got, "ok (http 200)") {
+			t.Errorf("providerStatus = %q, want ok", got)
+		}
+		if path != "/chat/completions" {
+			t.Errorf("probe path = %q, want /chat/completions", path)
+		}
+		if auth != "Bearer k" {
+			t.Errorf("probe auth = %q, want the Bearer scheme with the provider section's key", auth)
+		}
+		if model != "m" {
+			t.Errorf("probe model = %q, want the provider section's model (no heartbeat on the openai wire)", model)
+		}
+	})
+
+	t.Run("openai-typed provider is the primary over a legacy anthropic section", func(t *testing.T) {
+		var hits int
+		legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(legacy.Close)
+		open := providerServer(t, 200, `{}`)
+		extra := "anthropic:\n  url: " + legacy.URL + "\n  key: sk\n  model: claude-x\n"
+		if got := providerStatus(writeProviderSectionConfig(t, "openai", open, "k", extra)); !strings.Contains(got, "ok (http 200)") {
+			t.Errorf("providerStatus = %q, want ok", got)
+		}
+		if hits != 0 {
+			t.Errorf("legacy anthropic endpoint hit %d times, want 0 (the openai-typed provider is the primary)", hits)
+		}
+	})
+
+	t.Run("provider section without url or key reports n/a", func(t *testing.T) {
+		got := providerStatus(writeProviderSectionConfig(t, "anthropic", "", "k", ""))
+		if !strings.Contains(got, "n/a (provider not configured)") {
+			t.Errorf("providerStatus = %q, want n/a", got)
+		}
+	})
+
+	t.Run("provider-served main with live fallback reports the fallback active", func(t *testing.T) {
+		main := providerServer(t, 429, `rate limited`)
+		fallback := providerServer(t, 200, `{}`)
+		extra := "fallback:\n  enabled: true\n  url: " + fallback + "\n  key: fb\n  model: fbm\n"
+		got := providerStatus(writeProviderSectionConfig(t, "openai", main, "k", extra))
+		for _, want := range []string{"main: 429 rate limited", "fallback: ok (http 200)", "[active: fallback]"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("providerStatus = %q, want it to contain %q", got, want)
+			}
 		}
 	})
 }

@@ -84,7 +84,7 @@ func BugFixWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 				return run.finalize()
 			}
 		}
-		fixPrompt, err := template.BugFixFix(failureLogs(result), verdict.Comments)
+		fixPrompt, err := template.BugFixFix(failureLogs(result), verdict.Comments+verdictNote(verdict))
 		if err != nil {
 			return "", fmt.Errorf("build bug-fix prompt: %w", err)
 		}

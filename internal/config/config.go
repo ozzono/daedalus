@@ -180,6 +180,17 @@ const (
 	// from the daemon spawn (ProviderEnvVars) so a stale export can never
 	// point a new worker's rounds at a dead relay.
 	ToolRelayURLEnv = "DAEDALUS_TOOL_RELAY_URL"
+	// VerdictRepairURLEnv, VerdictRepairModelEnv, and VerdictRepairKeyEnv
+	// carry the verdict_repair section's endpoint (url / model / key) to
+	// the review activity's decision-model repair pass, which classifies a
+	// marker-less reviewer output into one of the four verdict markers.
+	// Exported only when set — absent means the repair layer is off and
+	// marker-less rounds keep the pre-repair behavior. The key is optional
+	// (a local relay needs none); all three are scrubbed from the daemon
+	// spawn (ProviderEnvVars) like every other provider-derived value.
+	VerdictRepairURLEnv   = "DAEDALUS_VERDICT_REPAIR_URL"
+	VerdictRepairModelEnv = "DAEDALUS_VERDICT_REPAIR_MODEL"
+	VerdictRepairKeyEnv   = "DAEDALUS_VERDICT_REPAIR_KEY"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -284,6 +295,23 @@ type ReviewerConfig struct {
 	Key string `yaml:"key"`
 }
 
+// VerdictRepairConfig points the decision-model repair pass at its
+// classify-only endpoint: when a reviewer round's output carries no
+// parseable verdict marker, the review activity asks this model to read the
+// review and name the most likely verdict among the four markers. url is an
+// OpenAI-compatible chat-completions base — typically the same loopback
+// relay that serves the rounds, the request differing only in the model
+// name. key is optional (a local relay needs none). Absent (the default)
+// the repair layer is off: marker-less rounds keep the pre-repair
+// behavior. Under slim mode the section is required (url and model), since
+// slim's small models are the marker-less-exit generator and this layer is
+// its recovery mechanism.
+type VerdictRepairConfig struct {
+	URL   string `yaml:"url"`
+	Model string `yaml:"model"`
+	Key   string `yaml:"key"`
+}
+
 // ThinkingDisabled reports an explicit thinking: false — the only setting
 // under which daedalus sends an off signal to jailed rounds (translated to
 // each agent's own lever in the jailed-round builder; see Config.Thinking).
@@ -365,6 +393,199 @@ type OpenAIConfig struct {
 	// output-loop bug the constants fixed — so it joins the decided list
 	// as a fifth knob rather than being silently omitted.
 	RepetitionPenalty float64 `yaml:"repetition_penalty"`
+}
+
+// configured reports whether the section carries any operator-set value —
+// the provider mixing rule's "both set" test. Validation runs after
+// applyDefaults, which fills the timeout on every loaded config, so the
+// comparison is against the defaulted zero section rather than the bare
+// zero with the field excluded: an absent section and one that named only
+// timeout_ms differ by that field alone, and excluding the field (the
+// earlier shape) called the only-timeout section absent — slipping it
+// past the mixing gate with its value sitting unused in favor of the
+// provider section's.
+// ponytail: zero-ness still cannot see an explicit timeout_ms equal to
+// DefaultAnthropicTimeoutMS — it reads as absent, and the value only
+// survives because it equals what the provider channel exports anyway;
+// telling every explicit value apart needs tracking which fields the
+// file actually named, not just their zero-ness.
+func (a AnthropicConfig) configured() bool {
+	return a != (AnthropicConfig{TimeoutMS: DefaultAnthropicTimeoutMS})
+}
+
+// configured is AnthropicConfig.configured's openai-side counterpart; no
+// field of this section is defaulted before validation.
+func (o OpenAIConfig) configured() bool { return o != (OpenAIConfig{}) }
+
+// ProviderConfig is the wire-agnostic primary provider section: its type
+// field — not the section name — selects the wire format, so one section
+// fully determines how the model behind it is served. It is the single home
+// for the per-model-class knobs a round needs: the endpoint surface
+// (url/key/model), the request ceiling (timeout_ms), the honest-sizing pair
+// (context_tokens/max_output_tokens — wire-agnostic by design, since the
+// staging paths that consume sizing key on the exports, not on a section;
+// that is the fix for sizing keys that used to be expressible only under
+// anthropic:), and the sampler fields (an openai-wire property — request
+// params only an OpenAI-compatible backend accepts).
+//
+// The legacy anthropic:/openai: sections keep working unchanged and
+// indefinitely. The accepted mixes: a provider section alone, or one plus
+// the *other* wire's legacy section (e.g. type: openai for a self-hosted
+// model while jailed claude stays on anthropic:) — the incremental
+// migration path. The same-wire legacy section alongside is a load error,
+// never a silent override: two sources of truth for one channel is exactly
+// the section-name confusion this section removes.
+//
+// Which jailed CLI consumes the section is still agent:'s decision (it
+// stays top-level, as do the agent-native levers thinking/stream): staging
+// keys off the exported env vars, and the type dispatches those onto the
+// ANTHROPIC_*/OPENAI_* channels, so every existing consumer — the
+// aider/pi/codex/opencode staging, the status probe, the slim tool relay —
+// serves a provider-served round with no per-agent knowledge of the
+// section.
+type ProviderConfig struct {
+	// Type selects the wire format and the env channel the values export
+	// on: "anthropic" (ANTHROPIC_*) or "openai" (OPENAI_*). Required — a
+	// missing or unknown value is a load error, never a silent default: a
+	// defaulted wire would recreate the section-name ambiguity the section
+	// replaces.
+	Type string `yaml:"type"`
+	// API base URL, key, and model, injected into the jailed agent's
+	// environment on the channel Type selects, with the legacy sections'
+	// unset-means-inherit rule: an empty field exports nothing.
+	URL   string `yaml:"url"`
+	Key   string `yaml:"key"`
+	Model string `yaml:"model"`
+	// HeartbeatModel is AnthropicConfig.HeartbeatModel's counterpart:
+	// exported as ANTHROPIC_DEFAULT_HAIKU_MODEL and probed by `worker
+	// status`. It is an anthropic-wire knob (claude's small/fast-model var
+	// is its only consumer), so an openai-typed provider carrying it is a
+	// load error — a knob on the wire without a consumer must fail loud,
+	// never silently no-op. Empty means the agent's own default.
+	HeartbeatModel string `yaml:"heartbeat_model"`
+	// TimeoutMS bounds the jailed agent's API requests, exported as
+	// API_TIMEOUT_MS — both wire styles need it. Zero (unset) defaults to
+	// DefaultAnthropicTimeoutMS, so a ceiling is always exported.
+	TimeoutMS int `yaml:"timeout_ms"`
+	// ContextTokens and MaxOutputTokens are the sizing knobs, identical in
+	// shape and channel to their AnthropicConfig counterparts — and
+	// deliberately wire-agnostic: they export as ContextTokensEnv /
+	// MaxOutputTokensEnv whichever type is set, reaching every staging path
+	// that consumes sizing (claude's env re-export, aider's model
+	// metadata, the pi and opencode staged model entries). Load rejects
+	// negative values.
+	//
+	// Sizing caveat for pi rounds, from the 2026-10-10 RCA of three parked
+	// wa-termo bootstraps: pi computes each request's max_tokens as the
+	// staged contextWindow minus its prompt estimate minus a 4096-token
+	// safety reserve, floored at 1 (pi-ai simple-options.js
+	// clampMaxTokensToContext, release 0.87.1) — an understaged
+	// context_tokens yields silent 1-token replies, so stage the window
+	// honestly.
+	ContextTokens int `yaml:"context_tokens"`
+	// See ContextTokens.
+	MaxOutputTokens int `yaml:"max_output_tokens"`
+	// Sampler knobs for rounds served by this section — OpenAIConfig's
+	// fields with the same absent-never-sent discipline (an explicit 0 is
+	// indistinguishable from unset, so the backend's own sampler values
+	// stand; NaN/Inf and negatives other than presence_penalty's legal
+	// [-2, 2] range are load errors). An openai-wire property —
+	// chat-completions request params — so an anthropic-typed provider
+	// carrying any of them is a load error.
+	TopP              float64 `yaml:"top_p"`
+	Temperature       float64 `yaml:"temperature"`
+	PresencePenalty   float64 `yaml:"presence_penalty"`
+	TopK              float64 `yaml:"top_k"`
+	MinP              float64 `yaml:"min_p"`
+	RepetitionPenalty float64 `yaml:"repetition_penalty"`
+}
+
+// anthropicChannel projects the section onto the ANTHROPIC_* channel —
+// every field the channel's exports read, nothing else.
+func (p ProviderConfig) anthropicChannel() AnthropicConfig {
+	return AnthropicConfig{
+		URL:             p.URL,
+		Key:             p.Key,
+		Model:           p.Model,
+		HeartbeatModel:  p.HeartbeatModel,
+		TimeoutMS:       p.TimeoutMS,
+		ContextTokens:   p.ContextTokens,
+		MaxOutputTokens: p.MaxOutputTokens,
+	}
+}
+
+// openaiChannel projects the section onto the OPENAI_* channel. The sizing
+// pair is absent by construction: those exports are read off the
+// anthropic-side struct, which ProviderChannels feeds for an openai-typed
+// provider.
+func (p ProviderConfig) openaiChannel() OpenAIConfig {
+	return OpenAIConfig{
+		URL:               p.URL,
+		Key:               p.Key,
+		Model:             p.Model,
+		TimeoutMS:         p.TimeoutMS,
+		TopP:              p.TopP,
+		Temperature:       p.Temperature,
+		PresencePenalty:   p.PresencePenalty,
+		TopK:              p.TopK,
+		MinP:              p.MinP,
+		RepetitionPenalty: p.RepetitionPenalty,
+	}
+}
+
+// validate rejects the provider sections Load refuses, with Load's
+// diagnostics (Config.validate wraps them with the section name). Call it
+// on a defaults-applied section.
+func (p ProviderConfig) validate() error {
+	if p.Type == "" {
+		return fmt.Errorf("type is required — %q or %q; it selects which env channel the section's values export on",
+			FallbackTypeAnthropic, FallbackTypeOpenAI)
+	}
+	if !slices.Contains(fallbackTypes, p.Type) {
+		return fmt.Errorf("unknown type %q (available: %s)", p.Type, strings.Join(fallbackTypes, ", "))
+	}
+	if p.ContextTokens < 0 {
+		return fmt.Errorf("context_tokens: must not be negative")
+	}
+	if p.MaxOutputTokens < 0 {
+		return fmt.Errorf("max_output_tokens: must not be negative")
+	}
+	if p.TimeoutMS < 0 {
+		return fmt.Errorf("timeout_ms: must not be negative")
+	}
+	// The sampler checks mirror the openai section's (Config.validate's
+	// loop): presence_penalty is exempt from the negative check because its
+	// API range is [-2, 2], and NaN/Inf are rejected for all six — they
+	// would render as non-float literals in the staged files, silently
+	// dropping them.
+	for _, s := range []struct {
+		name  string
+		v     float64
+		negOK bool
+	}{
+		{"top_p", p.TopP, false},
+		{"temperature", p.Temperature, false},
+		{"presence_penalty", p.PresencePenalty, true},
+		{"top_k", p.TopK, false},
+		{"min_p", p.MinP, false},
+		{"repetition_penalty", p.RepetitionPenalty, false},
+	} {
+		if math.IsNaN(s.v) || math.IsInf(s.v, 0) {
+			return fmt.Errorf("%s: must be a finite number", s.name)
+		}
+		if !s.negOK && s.v < 0 {
+			return fmt.Errorf("%s: must not be negative", s.name)
+		}
+	}
+	if p.Type == FallbackTypeOpenAI && p.HeartbeatModel != "" {
+		return fmt.Errorf("heartbeat_model: only the anthropic wire consumes it (claude's small/fast-model var) — remove it from an openai-typed provider")
+	}
+	if p.Type == FallbackTypeAnthropic &&
+		(p.TopP != 0 || p.Temperature != 0 || p.PresencePenalty != 0 ||
+			p.TopK != 0 || p.MinP != 0 || p.RepetitionPenalty != 0) {
+		return fmt.Errorf("sampler knobs apply only to the openai wire (chat-completions request params; no anthropic-wire staging consumes them) — remove them from an anthropic-typed provider")
+	}
+	return nil
 }
 
 // BugFilingConfig toggles where jailed rounds record out-of-scope bugs.
@@ -676,6 +897,11 @@ type Config struct {
 	Temporal        TemporalConfig  `yaml:"temporal"`
 	Anthropic       AnthropicConfig `yaml:"anthropic"`
 	OpenAI          OpenAIConfig    `yaml:"openai"`
+	// Provider is the wire-agnostic primary provider section (see
+	// ProviderConfig). Nil — the key absent, the default — means the legacy
+	// anthropic:/openai: sections stand alone, behavior byte-identical to
+	// before the section existed.
+	Provider *ProviderConfig `yaml:"provider"`
 	// Fallback is the independent secondary provider failover uses when
 	// the primary is API-exhausted. Inactive unless Enabled.
 	Fallback FallbackConfig `yaml:"fallback"`
@@ -701,6 +927,10 @@ type Config struct {
 	// continued run keeps its attempt's list); empty — the default — runs
 	// the historical default-only reviews.
 	ReviewSkillList []string `yaml:"review_skill_list"`
+	// VerdictRepair is the decision-model endpoint that repairs marker-less
+	// review verdicts (see VerdictRepairConfig). Empty (the section absent)
+	// means the repair layer is off.
+	VerdictRepair VerdictRepairConfig `yaml:"verdict_repair"`
 	// BugFiling is the out-of-scope-bug filing toggle; inactive unless
 	// Enabled (see BugFilingConfig).
 	BugFiling BugFilingConfig `yaml:"bug_filing"`
@@ -780,13 +1010,12 @@ func (c Config) TestOutputDir() string {
 // durationValue marshals a time.Duration the way config files express them:
 // a canonical duration string ("30m0s"), never the raw nanosecond count a
 // plain re-marshal would emit. Zero — the unset marker a pre-defaults view
-// renders — prints as plain 0.
+// renders — prints as "0s", zero's own canonical string: a plain 0 would be
+// an !!int scalar, which yaml.v3 refuses to decode into a time.Duration
+// ("cannot unmarshal !!int `0`"), so the rendered file would not load.
 type durationValue time.Duration
 
 func (d durationValue) MarshalYAML() (any, error) {
-	if time.Duration(d) == 0 {
-		return 0, nil
-	}
 	return time.Duration(d).String(), nil
 }
 
@@ -794,28 +1023,30 @@ func (d durationValue) MarshalYAML() (any, error) {
 // field in struct order with the durations carried by durationValue; the
 // nested sections marshal as themselves.
 type renderConfig struct {
-	Agent                  string           `yaml:"agent"`
-	BranchPrefix           string           `yaml:"branch_prefix"`
-	Authorship             bool             `yaml:"authorship"`
-	WorkerID               string           `yaml:"worker_id"`
-	TestsTimeout           durationValue    `yaml:"tests_timeout"`
-	AgentRunTimeout        durationValue    `yaml:"agent_run_timeout"`
-	ReviewTimeout          durationValue    `yaml:"review_timeout"`
-	CleanupTimeout         durationValue    `yaml:"cleanup_timeout"`
-	MaxConcurrentAgentRuns int              `yaml:"max_concurrent_agent_runs"`
-	MaxConcurrentTests     int              `yaml:"max_concurrent_tests"`
-	SharedTestQueue        *bool            `yaml:"shared_test_queue"`
-	Slim                   SlimConfig       `yaml:"slim"`
-	Temporal               TemporalConfig   `yaml:"temporal"`
-	Anthropic              AnthropicConfig  `yaml:"anthropic"`
-	OpenAI                 OpenAIConfig     `yaml:"openai"`
-	Fallback               FallbackConfig   `yaml:"fallback"`
-	Reviewer               ReviewerConfig   `yaml:"reviewer"`
-	ReviewSkillList        []string         `yaml:"review_skill_list"`
-	BugFiling              BugFilingConfig  `yaml:"bug_filing"`
-	TestOutput             TestOutputConfig `yaml:"test_output"`
-	Dependency             DependencyConfig `yaml:"dependency"`
-	Prompt                 string           `yaml:"prompt"`
+	Agent                  string              `yaml:"agent"`
+	BranchPrefix           string              `yaml:"branch_prefix"`
+	Authorship             bool                `yaml:"authorship"`
+	WorkerID               string              `yaml:"worker_id"`
+	TestsTimeout           durationValue       `yaml:"tests_timeout"`
+	AgentRunTimeout        durationValue       `yaml:"agent_run_timeout"`
+	ReviewTimeout          durationValue       `yaml:"review_timeout"`
+	CleanupTimeout         durationValue       `yaml:"cleanup_timeout"`
+	MaxConcurrentAgentRuns int                 `yaml:"max_concurrent_agent_runs"`
+	MaxConcurrentTests     int                 `yaml:"max_concurrent_tests"`
+	SharedTestQueue        *bool               `yaml:"shared_test_queue"`
+	Slim                   SlimConfig          `yaml:"slim"`
+	Temporal               TemporalConfig      `yaml:"temporal"`
+	Anthropic              AnthropicConfig     `yaml:"anthropic"`
+	OpenAI                 OpenAIConfig        `yaml:"openai"`
+	Provider               *ProviderConfig     `yaml:"provider"`
+	Fallback               FallbackConfig      `yaml:"fallback"`
+	Reviewer               ReviewerConfig      `yaml:"reviewer"`
+	ReviewSkillList        []string            `yaml:"review_skill_list"`
+	VerdictRepair          VerdictRepairConfig `yaml:"verdict_repair"`
+	BugFiling              BugFilingConfig     `yaml:"bug_filing"`
+	TestOutput             TestOutputConfig    `yaml:"test_output"`
+	Dependency             DependencyConfig    `yaml:"dependency"`
+	Prompt                 string              `yaml:"prompt"`
 }
 
 // RenderYAML renders the config as YAML covering every field of the struct,
@@ -841,9 +1072,11 @@ func (c Config) RenderYAML() (string, error) {
 		Temporal:               c.Temporal,
 		Anthropic:              c.Anthropic,
 		OpenAI:                 c.OpenAI,
+		Provider:               c.Provider,
 		Fallback:               c.Fallback,
 		Reviewer:               c.Reviewer,
 		ReviewSkillList:        c.ReviewSkillList,
+		VerdictRepair:          c.VerdictRepair,
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
 		Dependency:             c.Dependency,
@@ -942,6 +1175,36 @@ func ValidateWorkerID(id string) error {
 	return nil
 }
 
+// ProviderChannels resolves the config's two provider channels — the
+// structs whose fields AgentEnv exports and worker tooling probes/dials. A
+// legacy-only config resolves to its own sections verbatim. A provider
+// section owns the channel its type names (validation has already rejected
+// a same-wire legacy section, so ownership is unambiguous) while the other
+// wire's legacy section passes through untouched, and its wire-agnostic
+// knobs land where their exporters read them: an openai-typed provider's
+// sizing pair rides the anthropic-side struct — the same channel those
+// exports have always used, now fed from the section that may legally
+// carry them.
+func (c Config) ProviderChannels() (AnthropicConfig, OpenAIConfig) {
+	if c.Provider == nil {
+		return c.Anthropic, c.OpenAI
+	}
+	p := *c.Provider
+	if p.Type == FallbackTypeAnthropic {
+		return p.anthropicChannel(), c.OpenAI
+	}
+	anth := c.Anthropic
+	// The sizing pair: the provider section wins when it sizes (validation
+	// has rejected the both-set case, so this only ever overwrites a zero).
+	if p.ContextTokens != 0 {
+		anth.ContextTokens = p.ContextTokens
+	}
+	if p.MaxOutputTokens != 0 {
+		anth.MaxOutputTokens = p.MaxOutputTokens
+	}
+	return anth, p.openaiChannel()
+}
+
 // AgentEnv translates provider configuration into environment variables for
 // the jailed agent process. Only explicitly-set values are exported — an
 // unset field means "inherit whatever the worker's environment already
@@ -951,26 +1214,27 @@ func ValidateWorkerID(id string) error {
 // through — the values never travel through workflow history or activity
 // inputs.
 func (c Config) AgentEnv() []string {
+	anth, open := c.ProviderChannels()
 	var env []string
 	add := func(key, value string) {
 		if value != "" {
 			env = append(env, key+"="+value)
 		}
 	}
-	add("ANTHROPIC_BASE_URL", c.Anthropic.URL)
-	add("ANTHROPIC_API_KEY", c.Anthropic.Key)
-	add("ANTHROPIC_MODEL", c.Anthropic.Model)
-	add("ANTHROPIC_DEFAULT_HAIKU_MODEL", c.Anthropic.HeartbeatModel)
+	add("ANTHROPIC_BASE_URL", anth.URL)
+	add("ANTHROPIC_API_KEY", anth.Key)
+	add("ANTHROPIC_MODEL", anth.Model)
+	add("ANTHROPIC_DEFAULT_HAIKU_MODEL", anth.HeartbeatModel)
 	// The context window rides the same env-only channel; unset means the
 	// agents' own defaults, so nothing is exported.
-	if c.Anthropic.ContextTokens > 0 {
-		add(ContextTokensEnv, strconv.Itoa(c.Anthropic.ContextTokens))
+	if anth.ContextTokens > 0 {
+		add(ContextTokensEnv, strconv.Itoa(anth.ContextTokens))
 	}
 	// The completion cap rides the same channel; the jailed-round builder
 	// re-exports it under claude's own var and the aider staging consumes
 	// it (see MaxOutputTokens).
-	if c.Anthropic.MaxOutputTokens > 0 {
-		add(MaxOutputTokensEnv, strconv.Itoa(c.Anthropic.MaxOutputTokens))
+	if anth.MaxOutputTokens > 0 {
+		add(MaxOutputTokensEnv, strconv.Itoa(anth.MaxOutputTokens))
 	}
 	// Sampler knobs export only when set — absent means the field is
 	// omitted from the staged request entirely (see OpenAIConfig).
@@ -979,32 +1243,36 @@ func (c Config) AgentEnv() []string {
 			env = append(env, key+"="+strconv.FormatFloat(v, 'g', -1, 64))
 		}
 	}
-	addFloat(TopPEnv, c.OpenAI.TopP)
-	addFloat(TemperatureEnv, c.OpenAI.Temperature)
-	addFloat(PresencePenaltyEnv, c.OpenAI.PresencePenalty)
-	addFloat(TopKEnv, c.OpenAI.TopK)
-	addFloat(MinPEnv, c.OpenAI.MinP)
-	addFloat(RepetitionPenaltyEnv, c.OpenAI.RepetitionPenalty)
-	add("OPENAI_BASE_URL", c.OpenAI.URL)
-	add("OPENAI_API_KEY", c.OpenAI.Key)
-	add("OPENAI_MODEL", c.OpenAI.Model)
+	addFloat(TopPEnv, open.TopP)
+	addFloat(TemperatureEnv, open.Temperature)
+	addFloat(PresencePenaltyEnv, open.PresencePenalty)
+	addFloat(TopKEnv, open.TopK)
+	addFloat(MinPEnv, open.MinP)
+	addFloat(RepetitionPenaltyEnv, open.RepetitionPenalty)
+	add("OPENAI_BASE_URL", open.URL)
+	add("OPENAI_API_KEY", open.Key)
+	add("OPENAI_MODEL", open.Model)
 	// Both URL vars carry the same value: aider's litellm layer standardizes
 	// on OPENAI_API_BASE while other tooling reads OPENAI_BASE_URL, and
 	// litellm versions disagree on which they honor — export both so either
 	// resolution lands on the configured endpoint.
-	add("OPENAI_API_BASE", c.OpenAI.URL)
-	// API_TIMEOUT_MS comes from whichever provider section is serving: an
-	// openai section replaces the anthropic one as the jailed round's
-	// backend, so its timeout applies instead. An openai section set without
-	// a timeout falls back to anthropic's value (Load defaults it), keeping
-	// the invariant that the jailed agent gets an explicit ceiling either
-	// way — exporting "0" would zero the client's ceiling rather than clear
-	// it, and exporting nothing would leave a mixed config's claude rounds
-	// (anthropic-served, openai configured for tooling) with no ceiling at
-	// all.
-	timeoutMS := c.Anthropic.TimeoutMS
-	if c.OpenAI.URL != "" && c.OpenAI.TimeoutMS != 0 {
-		timeoutMS = c.OpenAI.TimeoutMS
+	add("OPENAI_API_BASE", open.URL)
+	// API_TIMEOUT_MS comes from whichever channel is serving the jailed
+	// round. With a provider section, that is the provider channel's
+	// ceiling (applyDefaults always gives it one): the cross-wire legacy
+	// timeout this ordering once resolved silently is rejected at load, so
+	// the override below can only replace a value the operator never set.
+	// Legacy-only configs keep the historical ordering: an openai section
+	// with a timeout wins when its URL is set, and an openai section
+	// without one falls back to anthropic's value (Load defaults it),
+	// keeping the invariant that the jailed agent gets an explicit ceiling
+	// either way — exporting "0" would zero the client's ceiling rather
+	// than clear it, and exporting nothing would leave a mixed config's
+	// claude rounds (anthropic-served, openai configured for tooling) with
+	// no ceiling at all.
+	timeoutMS := anth.TimeoutMS
+	if open.URL != "" && open.TimeoutMS != 0 {
+		timeoutMS = open.TimeoutMS
 	}
 	add("API_TIMEOUT_MS", strconv.Itoa(timeoutMS))
 	if f := c.Fallback; f.Active() {
@@ -1021,6 +1289,9 @@ func (c Config) AgentEnv() []string {
 	}
 	add(ReviewerURLEnv, c.Reviewer.URL)
 	add(ReviewerKeyEnv, c.Reviewer.Key)
+	add(VerdictRepairURLEnv, c.VerdictRepair.URL)
+	add(VerdictRepairModelEnv, c.VerdictRepair.Model)
+	add(VerdictRepairKeyEnv, c.VerdictRepair.Key)
 	return env
 }
 
@@ -1057,6 +1328,9 @@ func ProviderEnvVars() []string {
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
 		ReviewerURLEnv,
 		ReviewerKeyEnv,
+		VerdictRepairURLEnv,
+		VerdictRepairModelEnv,
+		VerdictRepairKeyEnv,
 		ToolRelayURLEnv,
 		BugDirEnv,
 		BugMirrorEnv,
@@ -1101,8 +1375,15 @@ func LoadRaw(path string) (Config, error) {
 	}
 	// Validation sees the defaulted values (an unset fallback.type loads as
 	// "anthropic", an unset agent as "claude"), so validate a copy — the
-	// returned view must stay raw.
+	// returned view must stay raw. The provider section is copied deep:
+	// it is the one pointer field applyDefaults writes through, and the
+	// struct copy alone would alias it, letting the defaults pass stamp
+	// its timeout into the returned raw view.
 	d := c
+	if c.Provider != nil {
+		p := *c.Provider
+		d.Provider = &p
+	}
 	d.applyDefaults()
 	return c, d.validate(path)
 }
@@ -1249,6 +1530,16 @@ func (c Config) validate(path string) error {
 	if c.Anthropic.MaxOutputTokens < 0 {
 		return fmt.Errorf("config %s: anthropic.max_output_tokens: must not be negative", path)
 	}
+	// The ceiling joins every other numeric knob in the negative check:
+	// applyDefaults only fills zero, so a negative survives defaulting and
+	// would export verbatim as API_TIMEOUT_MS=-5 — a negative ceiling on
+	// the jailed agent's client rather than a load error.
+	if c.Anthropic.TimeoutMS < 0 {
+		return fmt.Errorf("config %s: anthropic.timeout_ms: must not be negative", path)
+	}
+	if c.OpenAI.TimeoutMS < 0 {
+		return fmt.Errorf("config %s: openai.timeout_ms: must not be negative", path)
+	}
 	// presence_penalty is exempt from the negative check: its API range is
 	// [-2, 2], so a negative value is a legal request, not a typo.
 	// NaN/Inf are rejected for all five: they pass every comparison
@@ -1273,10 +1564,66 @@ func (c Config) validate(path string) error {
 			return fmt.Errorf("config %s: openai.%s: must not be negative", path, p.name)
 		}
 	}
+	// The provider section: its own field rules, then the mixing rules —
+	// one channel, one source of truth. The provider section and the
+	// same-wire legacy section are a load error (an override would silently
+	// resurrect the mis-sectioned-keys confusion the section removes),
+	// while the other wire's legacy section stays legal — the incremental
+	// migration path. The sizing pair and the request ceiling are one
+	// channel regardless of wire, so a cross-wire legacy section may not
+	// size or time what the provider section also governs: AgentEnv's
+	// legacy ordering (the openai channel's timeout wins when its URL is
+	// set) predates type dispatch and would silently pick between two
+	// values the file's own sections disagree on — precedence flipping
+	// with which side the provider section sits.
+	if p := c.Provider; p != nil {
+		if err := p.validate(); err != nil {
+			return fmt.Errorf("config %s: provider: %w", path, err)
+		}
+		if p.Type == FallbackTypeAnthropic {
+			if c.Anthropic.configured() {
+				return fmt.Errorf("config %s: provider (type anthropic) and the legacy anthropic: section are both set — both configure the anthropic channel, and the provider section is that section's replacement; keep one of the two (mixing across wires is legal)", path)
+			}
+			// The provider section always carries a post-default ceiling
+			// (applyDefaults fills it set or not), so the cross-wire
+			// openai side alone decides this clash.
+			if c.OpenAI.TimeoutMS != 0 {
+				return fmt.Errorf("config %s: provider.timeout_ms and openai.timeout_ms are both set — the request ceiling is one channel whichever wire serves; keep it in one place", path)
+			}
+		} else {
+			if c.OpenAI.configured() {
+				return fmt.Errorf("config %s: provider (type openai) and the legacy openai: section are both set — both configure the openai channel, and the provider section is that section's replacement; keep one of the two (mixing across wires is legal)", path)
+			}
+			if p.ContextTokens != 0 && c.Anthropic.ContextTokens != 0 {
+				return fmt.Errorf("config %s: provider.context_tokens and anthropic.context_tokens are both set — sizing is one channel whichever wire serves; keep it in one place", path)
+			}
+			if p.MaxOutputTokens != 0 && c.Anthropic.MaxOutputTokens != 0 {
+				return fmt.Errorf("config %s: provider.max_output_tokens and anthropic.max_output_tokens are both set — sizing is one channel whichever wire serves; keep it in one place", path)
+			}
+			// The same one-channel rule for the ceiling: the provider
+			// side always carries a post-default value, so the legacy
+			// side alone decides. The default-filled absent section reads
+			// as unset, and an explicit value equal to the default is
+			// accepted as the same — the provider channel would export
+			// exactly that number either way.
+			if t := c.Anthropic.TimeoutMS; t != 0 && t != DefaultAnthropicTimeoutMS {
+				return fmt.Errorf("config %s: provider.timeout_ms and anthropic.timeout_ms are both set — the request ceiling is one channel whichever wire serves; keep it in one place", path)
+			}
+		}
+	}
 	if f := c.Fallback; f.Active() {
 		if f.URL == "" || f.Key == "" || f.Model == "" {
 			return fmt.Errorf("config %s: fallback: enabled fallback needs url, key, and model", path)
 		}
+	}
+	// The verdict-repair decision model is required exactly when slim is on:
+	// slim's small models are the marker-less-exit generator, and the repair
+	// layer is its recovery mechanism. Outside slim a partial or absent
+	// section is merely inert — every repair failure fails open to the
+	// historical marker-less behavior, so there is nothing to misconfigure
+	// into a broken run.
+	if c.Slim.Enabled && (c.VerdictRepair.URL == "" || c.VerdictRepair.Model == "") {
+		return fmt.Errorf("config %s: verdict_repair: slim mode requires url and model — the decision model that classifies marker-less review verdicts", path)
 	}
 	if !slices.Contains(fallbackTypes, c.Fallback.Type) {
 		return fmt.Errorf("config %s: fallback: unknown type %q (available: %s)",
@@ -1468,6 +1815,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Fallback.Type == "" {
 		c.Fallback.Type = DefaultFallbackType
+	}
+	// The provider section's ceiling follows the legacy sections' rule: an
+	// explicit timeout is never required, but a ceiling is always exported,
+	// so unset defaults here rather than at the export.
+	if c.Provider != nil && c.Provider.TimeoutMS == 0 {
+		c.Provider.TimeoutMS = DefaultAnthropicTimeoutMS
 	}
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS

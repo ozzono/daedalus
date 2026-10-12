@@ -651,7 +651,13 @@ func dur(d time.Duration) string {
 // listPipelines prints the most recent sessions on this task queue, newest
 // first. STATUS prefers the workflow's upserted DaedalusStatus over the raw
 // Temporal enum — parks and approvals are both Completed there — falling
-// back to the enum for old runs without the attribute. TIME is one merged
+// back to the enum for old runs without the attribute. Closed runs render
+// by the display taxonomy: approved → completed, parked and aborted
+// (Canceled) → paused, everything else unchanged; a park not carrying the
+// stamp — pre-marker history, or a live-state attribute a close the stamps
+// don't cover left behind — hides in a green (or, on the oldest workers,
+// failed) close and is recognized by probing that row's own outcome.
+// TIME is one merged
 // cell, and both of its halves count runtime from DaedalusStartedAt — the
 // dependency gate's release, the run's first moment of real work — falling
 // back to the dispatch time a run without the attribute worked from (a
@@ -695,15 +701,37 @@ func listPipelines(cfg config.Config, max int) error {
 			workedFrom = vis.StartedAt
 		}
 		if closed := info.GetCloseTime(); closed.IsValid() {
-			// Closed: the enum is overridden only by a terminal
-			// DaedalusStatus — CompleteGreen stamps those alone. A run
-			// closed by other means keeps a live-state attribute (a wipe
-			// cancel mid-heartbeat carries waiting, a killed worker leaves
+			// Closed: a terminal DaedalusStatus — CompleteGreen stamps
+			// those alone — classifies the run for display. A run closed
+			// by other means keeps a live-state attribute (a wipe cancel
+			// mid-heartbeat carries waiting, a killed worker leaves
 			// running on a TimedOut run), which must not shadow what
-			// Temporal recorded.
+			// Temporal recorded. Display taxonomy: only an approved run
+			// earns completed; parked and aborted render as paused — a
+			// park is a wait on the maintainer and an abort (the wipe
+			// cancel, Canceled here) preserved its work for `daedalus
+			// continue`, so neither is an end. A run without a terminal
+			// attribute — pre-marker history, or a live-state one a close
+			// the stamps don't cover left behind — classifies by close
+			// enum: Canceled is an abort; a park without the parked stamp
+			// hides in the outcome probe below; everything else keeps the
+			// raw enum.
 			switch workflows.RunStatus(vis.Status) {
-			case workflows.StatusApproved, workflows.StatusParked, workflows.StatusFailed:
+			case workflows.StatusApproved:
+				status = "completed"
+			case workflows.StatusParked:
+				status = "paused"
+			case workflows.StatusFailed:
 				status = vis.Status
+			default:
+				switch info.GetStatus() {
+				case enums.WORKFLOW_EXECUTION_STATUS_CANCELED:
+					status = "paused"
+				case enums.WORKFLOW_EXECUTION_STATUS_COMPLETED, enums.WORKFLOW_EXECUTION_STATUS_FAILED:
+					if closedRunParked(c, id, info.GetExecution().GetRunId()) {
+						status = "paused"
+					}
+				}
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t[%s | ended %s ago]\n",
 				id, status, dependsOn, dur(closed.AsTime().Sub(workedFrom)), dur(now.Sub(closed.AsTime())))
@@ -725,6 +753,28 @@ func listPipelines(cfg config.Config, max int) error {
 			id, status, dependsOn, elapsed, dur(now.Sub(workedFrom)))
 	}
 	return w.Flush()
+}
+
+// closedRunParked probes one closed run's outcome for a park — the green
+// completion CompleteGreen gives parks on current workers, or the failure
+// message the pre-CompleteGreen workers parked with (the same two shapes
+// wipe recognizes). The run ID is the row's own execution, never empty:
+// `continue` restarts under the same workflow ID, and an empty run ID
+// would resolve the latest execution — classifying an old row from its
+// continuation's outcome, and blocking on a live one. Only runs without a
+// terminal DaedalusStatus are probed: a stamped run already says parked.
+// The timeout is far tighter than wipe's single probe — this runs once per
+// ambiguous row inside a table render — and any read failure degrades to
+// false: the row keeps the enum's rendering, the table never fails over a
+// probe.
+func closedRunParked(c client.Client, workflowID, runID string) bool {
+	pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var out string
+	if err := c.GetWorkflow(pctx, workflowID, runID).Get(pctx, &out); err != nil {
+		return strings.Contains(err.Error(), workflows.ErrAwaitingMaintainer.Error())
+	}
+	return workflows.IsParkedResult(out)
 }
 
 // continuePipeline resumes a closed pipeline (canceled, failed — including

@@ -533,6 +533,19 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			if !r.freshReviews {
 				*session = result.SessionID
 			}
+			// Approval is decided before the verdictless strike accounting:
+			// parseReviewVerdict never pairs Approved with NoVerdict, but the
+			// marker-less repair's promoted rounds do (Approved set over a
+			// NoVerdict result), and they must end the loop exactly as a
+			// parsed approval would — strike streak and identical-verdict
+			// counters reset, no strike counting toward the park that would
+			// discard the promotion.
+			if result.Approved {
+				// The role's loop ends on approval — progress by definition.
+				r.verdictlessReviews = 0
+				r.lastVerdictBody[role], r.identicalVerdicts[role] = "", 0
+				return result, nil
+			}
 			if result.NoVerdict {
 				r.verdictlessReviews++
 				// The reviewer's last non-empty line is what a fold and a
@@ -549,17 +562,12 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 					"Focus", focus, "ConsecutiveVerdictless", r.verdictlessReviews,
 					"Of", maxVerdictlessReviews, "LastLine", lastLine)
 				if r.verdictlessReviews >= maxVerdictlessReviews {
-					return result, r.park(fmt.Sprintf("reviewer exited without any verdict %d rounds in a row (focus %q; last line: %q) — either the reviewer's provider channel is folding before a verdict line (e.g. pi at its request timeout) or the review never emitted the exact marker line, and neither hypothesis is resolvable by the implementing agent",
-						r.verdictlessReviews, focus, lastLine))
+					return result, r.park(fmt.Sprintf("reviewer exited without any verdict %d rounds in a row (focus %q; last line: %q) — either the reviewer's provider channel is folding before a verdict line (e.g. pi at its request timeout) or the review never emitted the exact marker line, and neither hypothesis is resolvable by the implementing agent%s",
+						r.verdictlessReviews, focus, lastLine, verdictNote(result)))
 				}
 				return result, nil
 			}
 			r.verdictlessReviews = 0
-			if result.Approved {
-				// The role's loop ends on approval — progress by definition.
-				r.lastVerdictBody[role], r.identicalVerdicts[role] = "", 0
-				return result, nil
-			}
 			// The identical-verdict streak, per role: a repeat of the last
 			// real verdict's comments body from the same reviewer means the
 			// implementer did not move that review an inch
@@ -632,6 +640,23 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 // string work is deterministic, so this is replay-safe.
 func normalizedVerdictBody(comments string) string {
 	return strings.Join(strings.Fields(comments), " ")
+}
+
+// verdictNote renders a review's decision-model repair annotation as a
+// labeled postscript for the consumers that relay review feedback onward —
+// fix prompts and park records. Empty when the round carries no annotation:
+// a parseable-marker round, or a marker-less one the repair layer never
+// classified (unconfigured endpoint, or any fail-open outcome). The
+// annotation travels typed on ReviewResult exactly so this rendering stays
+// a daedalus-owned note the reviewer cannot plant in its own output — the
+// block is appended after the comments, never merged into them.
+// Workflow-code string work is deterministic, so this is replay-safe.
+func verdictNote(v activities.ReviewResult) string {
+	if v.LikelyVerdict == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n\n---\nDaedalus verdict note: this round's review ended without a parseable verdict marker; the decision-model repair pass classified it as most likely %s (confidence %.2f).",
+		v.LikelyVerdict, v.LikelyConfidence)
 }
 
 // resolveTestCommand resolves the worktree's test-suite entrypoint,

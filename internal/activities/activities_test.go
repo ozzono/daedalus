@@ -2502,6 +2502,18 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 	if argv, ok := detectedTestCommand(wt); !ok || strings.Join(argv, " ") != "go test ./..." {
 		t.Errorf("test:= Makefile → detectedTestCommand = %v, %v; want go test ./...", argv, ok)
 	}
+	// The spaced-colon spelling is the same declared rule: a Go repo whose
+	// Makefile says `test :` gets make test, not the bare Go default.
+	wtSpaced := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wtSpaced, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtSpaced, "Makefile"), []byte("test :\n\tgo test ./...\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if argv, ok := detectedTestCommand(wtSpaced); !ok || strings.Join(argv, " ") != "make test" {
+		t.Errorf("spaced `test :` Makefile → detectedTestCommand = %v, %v; want make test", argv, ok)
+	}
 	assignOnly := t.TempDir()
 	if err := os.WriteFile(filepath.Join(assignOnly, "Makefile"), []byte("test: X := 3\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -2526,16 +2538,19 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 
 // TestMakefileHasTarget pins the rule recognition itself: `test:` at line
 // start is a rule — bare, with prerequisites, or in the POSIX double-colon
-// form — and any `=` in the post-colon remainder rejects the line as a
-// variable assignment, never a rule: the glued forms (`test:=v`, POSIX
-// `test::=v`), the target-specific assignments (`test: X := 3`,
-// `test: GOFLAGS = -race`, keyword forms included), and — the literal
-// scan's documented divergence — an `=` inside a $(…) prereq reference,
-// which make would parse as a rule but whose expanded prereqs are
-// unbuildable, so the rejection is a safe fall-through. A rule after an
-// assignment is still found, and the match is anchored at line start (a
-// `contest:` rule, a .PHONY mention, or a tab-indented recipe line is not
-// `test:`).
+// form — and make's whitespace tolerance between the name and the colon is
+// honored, so `test :`, `test\t:`, and the spaced double-colon `test ::`
+// are the same rule. Any `=` in the post-colon remainder rejects the line
+// as a variable assignment, never a rule: the glued forms (`test:=v`, POSIX
+// `test::=v`), their spaced spellings (`test := v`, `test : X := 3`), the
+// target-specific assignments (`test: X := 3`, `test: GOFLAGS = -race`,
+// keyword forms included), and — the literal scan's documented divergence —
+// an `=` inside a $(…) prereq reference, which make would parse as a rule
+// but whose expanded prereqs are unbuildable, so the rejection is a safe
+// fall-through. A rule after an assignment is still found, and the match is
+// anchored at line start (a `contest:` rule, a `testx :` line whose name
+// merely extends the target, a .PHONY mention, or a tab-indented recipe
+// line is not `test:`).
 func TestMakefileHasTarget(t *testing.T) {
 	for _, c := range []struct {
 		mk   string
@@ -2544,7 +2559,14 @@ func TestMakefileHasTarget(t *testing.T) {
 		{"test:\n\tgo test ./...", true},
 		{"test: unit integration\n\tgo test ./...", true},
 		{"test::\n\tgo test ./...", true},
+		// Whitespace between the name and the colon — make treats all of
+		// these as the same rule (GNU-make-probed).
+		{"test :\n\tgo test ./...", true},
+		{"test : unit integration\n\tgo test ./...", true},
+		{"test\t:\n\tgo test ./...", true},
+		{"test ::\n\tgo test ./...", true},
 		{"test:=x", false},
+		{"test := x", false},
 		{"test:=$(shell date)\nlint:\n\tgolangci-lint run", false},
 		{"test::=x", false},
 		// Target-specific variable assignments — the "=" sits in a
@@ -2553,11 +2575,13 @@ func TestMakefileHasTarget(t *testing.T) {
 		{"test: GOFLAGS = -race", false},
 		{"test: override X = 1", false},
 		{"test: export X = 1", false},
+		{"test : X := 3", false},
 		// The literal scan also rejects this rule-shaped line ("=" inside
 		// the $(…)); documented safe fall-through, per the helper's comment.
 		{"test: $(shell echo a=b)", false},
 		{"test:=x\ntest:\n\tgo test ./...", true},
 		{"contest:\n\ttrue", false},
+		{"testx :\n\ttrue", false},
 		{"\ttest:\n\tgo test ./...", false},
 		{".PHONY: test\n", false},
 	} {

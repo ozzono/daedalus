@@ -62,7 +62,7 @@ func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) 
 			return run.finalize()
 		}
 		run.logger.Info("Code review requested changes")
-		fixPrompt, err := template.ImplementFix(verdict.Comments, template.Jail{Touches: touchesJail})
+		fixPrompt, err := template.ImplementFix(verdict.Comments+verdictNote(verdict), template.Jail{Touches: touchesJail})
 		if err != nil {
 			return "", fmt.Errorf("build implement-fix prompt: %w", err)
 		}

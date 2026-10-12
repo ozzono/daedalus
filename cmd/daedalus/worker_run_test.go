@@ -181,6 +181,60 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	}
 }
 
+// TestRunWorkerRelayProviderUpstream pins the relay's upstream resolution
+// through the provider channels: an openai-typed provider section serves as
+// the relay's upstream exactly as the legacy openai section does (the
+// staged URL keeps the upstream's path prefix), an anthropic-typed provider
+// leaves the relay off (its wire names no openai channel), and the
+// cross-wire mix arms the relay from the legacy openai section.
+func TestRunWorkerRelayProviderUpstream(t *testing.T) {
+	restoreProcessEnv(t, "DAEDALUS_SLIM", config.ToolRelayURLEnv,
+		"OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_KEY", "OPENAI_MODEL", "API_TIMEOUT_MS")
+
+	// An openai-typed provider: the relay arms on the section's url.
+	if err := runWorker(config.Config{
+		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
+		Provider: &config.ProviderConfig{Type: config.FallbackTypeOpenAI, URL: "http://127.0.0.1:11434/v1", Key: "k"},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	staged, err := url.Parse(os.Getenv(config.ToolRelayURLEnv))
+	if err != nil {
+		t.Fatalf("parse staged %s: %v", config.ToolRelayURLEnv, err)
+	}
+	if staged.Scheme != "http" || staged.Hostname() != "127.0.0.1" || staged.Path != "/v1" {
+		t.Errorf("staged relay URL %q, want the loopback relay keeping the provider url's /v1 prefix", staged)
+	}
+
+	// An anthropic-typed provider: no openai-channel upstream, the relay
+	// stays off and the staged URL unset — the pre-relay behavior.
+	if err := runWorker(config.Config{
+		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
+		Provider: &config.ProviderConfig{Type: config.FallbackTypeAnthropic, URL: "http://127.0.0.1:8082", Key: "k"},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv(config.ToolRelayURLEnv); got != "" {
+		t.Errorf("%s = %q after an anthropic-typed provider, want it unset (relay off)", config.ToolRelayURLEnv, got)
+	}
+
+	// The cross-wire mix: the legacy openai section still arms the relay.
+	if err := runWorker(config.Config{
+		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
+		Provider: &config.ProviderConfig{Type: config.FallbackTypeAnthropic, URL: "http://127.0.0.1:8082", Key: "k"},
+		OpenAI:   config.OpenAIConfig{URL: "http://127.0.0.1:11434/v1"},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	staged, err = url.Parse(os.Getenv(config.ToolRelayURLEnv))
+	if err != nil {
+		t.Fatalf("parse staged %s: %v", config.ToolRelayURLEnv, err)
+	}
+	if staged.Path != "/v1" {
+		t.Errorf("staged relay URL %q, want the legacy openai upstream's /v1 prefix", staged)
+	}
+}
+
 // TestRunWorkerBugDirEnvExports pins the bug-filing toggle's env channel:
 // DAEDALUS_BUG_DIR (the effective bug_filing.dir, default applied) is
 // exported only when filing is enabled — absent means off — and a stale

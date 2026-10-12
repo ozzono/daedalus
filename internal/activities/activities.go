@@ -172,6 +172,20 @@ type ReviewResult struct {
 	// request at its request timeout), not requesting changes, and the
 	// equivalence otherwise converts the failure into an unbounded loop.
 	NoVerdict bool
+	// LikelyVerdict and LikelyConfidence carry the decision-model repair
+	// layer's annotation for a marker-less round: the classify-only pass
+	// (repairReviewVerdict) reads the review and names the verdict the
+	// reviewer most likely intended, with its confidence. Zero when the
+	// round carried a parseable marker or the repair did not produce a
+	// classification (unconfigured endpoint, or any fail-open outcome) —
+	// the annotation exists only when the classifier answered. It never
+	// routes: only a high-confidence APPROVED promotes the round (Approved,
+	// set by the repair itself, since approval is the terminal no-action
+	// outcome); a most-likely NEEDS_MAINTAINER or REBUILD is rendered into
+	// fix prompts and park records and triggers no lifecycle action.
+	LikelyVerdict string
+	// See LikelyVerdict.
+	LikelyConfidence float64
 	// SessionID identifies the reviewer conversation the round ran in, so
 	// the next round of the same review role can resume it (see
 	// ReviewInput.SessionID). Empty when the agent reports none.
@@ -453,6 +467,13 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 		text = res.Stdout
 	}
 	verdict := parseReviewVerdict(text)
+	if verdict.NoVerdict {
+		// The NoVerdict repair: one classify-only decision-model pass over
+		// the marker-less output (see repairReviewVerdict). Fail-open — an
+		// unconfigured or failing endpoint hands back the round exactly as
+		// parsed, the pre-repair behavior.
+		verdict = repairReviewVerdict(ctx, verdict)
+	}
 	verdict.SessionID = session
 	verdict.Usage = usage
 	return verdict, nil
