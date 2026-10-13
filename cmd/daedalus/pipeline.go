@@ -285,6 +285,27 @@ func slimOverCapErr(n, limit int) error {
 		n, limit)
 }
 
+// issueIDGate rejects ids a workflow id cannot safely carry: the id is
+// interpolated verbatim into NotifyDependents' single-quoted Temporal
+// visibility filter (internal/activities/depends.go), whose string
+// literals have no escape — a character outside the token set (the spirit
+// of config.ValidateWorkerID) breaks that filter, so the run's completion
+// poke would fail every time and its dependents release only on the
+// fallback poll. Named and extracted like slimInputGate so the rejection
+// is unit-pinnable without a Temporal frontend, and fired at the top of
+// startPipelineFolders so bad input fails before any submit-path side
+// effect (worker preflight, daemon dial).
+func issueIDGate(issueID string) error {
+	for _, r := range issueID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return fmt.Errorf("issue id %q: character %q is not allowed — use only letters, digits, '.', '_' and '-' (rename the issue and rerun); the id is interpolated into the dependent-wakeup search filter, where other characters break it", issueID, string(r))
+		}
+	}
+	return nil
+}
+
 // startPipeline triggers the named workflow for the given issue on the
 // configured task queue. configPath is the resolved config file the run
 // loaded (the preflight-started daemon is re-executed with it).
@@ -300,6 +321,9 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 // chained behind (-dep/--depends). (Split so startPipeline's existing
 // signature — and the tests pinning it — stays untouched.)
 func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string, folders []string, depends string) error {
+	if err := issueIDGate(issueID); err != nil {
+		return err
+	}
 	spec, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())

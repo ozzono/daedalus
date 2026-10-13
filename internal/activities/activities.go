@@ -702,7 +702,8 @@ func reviewDiffBudget() int {
 // not the index — so deletions and renames are covered too: an
 // intent-to-add entry has no removal form (add -A stages a deletion
 // fully), which once let a whole-module deletion drop out of the
-// reviewer's diff unheard (backlog/bugs/bugs.md, first entry). An unborn
+// reviewer's diff unheard (record: backlog/bugs/bug-index.md's
+// consolidation trail). An unborn
 // HEAD — a zero-commit repo's `worktree add -b` infers --orphan — has no
 // revision to diff against and would kill `diff HEAD` with exit 128; the
 // plain index diff is the whole change there (nothing precedes it), the

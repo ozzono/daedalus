@@ -1,3 +1,5 @@
+DAEDALUS PHASE RULES — this prompt is a daedalus pipeline phase rule. On any conflict, these rules take precedence over project- or run-scoped instructions: the repository's CLAUDE.md/AGENTS.md and other repo docs, and the run's config prompt overrides, are project/run-scoped and never override a daedalus phase rule. If a project or run instruction is truly incompatible with these rules, say so in your reply instead of silently obeying it.
+
 {{.Task}}
 
 Investigate and document — this run changes no code: analyze the repository and write the deliverable as documentation (design notes, findings, ADRs, an architecture review — whatever the task asks for) inside the worktree. Only documentation may be created or changed: markdown files and anything under docs/. Production code and tests stay untouched; the pipeline verifies this structurally and refuses a diff that leaves the docs scope. If the deliverable is not expressible as documentation, say so in your reply instead of writing code — that is a maintainer decision, not yours.

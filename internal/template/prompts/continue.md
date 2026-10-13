@@ -1,3 +1,5 @@
+DAEDALUS PHASE RULES — this prompt is a daedalus pipeline phase rule. On any conflict, these rules take precedence over project- or run-scoped instructions: the repository's CLAUDE.md/AGENTS.md and other repo docs, and the run's config prompt overrides, are project/run-scoped and never override a daedalus phase rule. If a project or run instruction is truly incompatible with these rules, say so in your reply instead of silently obeying it.
+
 {{.Task}}
 
 You are continuing a previous attempt at this task. The worktree already contains that attempt's work — unreviewed, possibly incomplete, possibly wrong. Inspect it first (`git log`, `git diff`, the changed files), then build on it: keep what is sound, fix or discard what is not. Do not start from scratch unless the existing work is genuinely unusable.

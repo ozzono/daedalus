@@ -2514,6 +2514,19 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 	if argv, ok := detectedTestCommand(wtSpaced); !ok || strings.Join(argv, " ") != "make test" {
 		t.Errorf("spaced `test :` Makefile → detectedTestCommand = %v, %v; want make test", argv, ok)
 	}
+	// `test` named among several targets on one rule line is the same
+	// declared rule: a Go repo whose Makefile says `lint test:` gets
+	// make test, not the bare Go default.
+	wtMulti := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wtMulti, "go.mod"), []byte("module example.com/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtMulti, "Makefile"), []byte("lint test:\n\tnpm test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if argv, ok := detectedTestCommand(wtMulti); !ok || strings.Join(argv, " ") != "make test" {
+		t.Errorf("multi-name `lint test:` Makefile → detectedTestCommand = %v, %v; want make test", argv, ok)
+	}
 	assignOnly := t.TempDir()
 	if err := os.WriteFile(filepath.Join(assignOnly, "Makefile"), []byte("test: X := 3\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -2540,17 +2553,25 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 // start is a rule — bare, with prerequisites, or in the POSIX double-colon
 // form — and make's whitespace tolerance between the name and the colon is
 // honored, so `test :`, `test\t:`, and the spaced double-colon `test ::`
-// are the same rule. Any `=` in the post-colon remainder rejects the line
-// as a variable assignment, never a rule: the glued forms (`test:=v`, POSIX
-// `test::=v`), their spaced spellings (`test := v`, `test : X := 3`), the
-// target-specific assignments (`test: X := 3`, `test: GOFLAGS = -race`,
-// keyword forms included), and — the literal scan's documented divergence —
+// are the same rule. A rule line may name several targets before one colon
+// (make creates a rule for every name on the line), so a match in any
+// pre-colon name counts, with leading spaces tolerated — while a name that
+// merely extends the target or sits in prerequisite position does not. Any
+// `=` in the line rejects it as a variable assignment, never a rule: the
+// glued forms (`test:=v`, POSIX `test::=v`), their spaced spellings
+// (`test := v`, `test : X := 3`), the target-specific assignments
+// (`test: X := 3`, `test: GOFLAGS = -race`, keyword forms included), a
+// plain assignment whose value carries the colon (`X = foo test: bar` — its
+// `=` precedes the colon), and — the literal scan's documented divergence —
 // an `=` inside a $(…) prereq reference, which make would parse as a rule
 // but whose expanded prereqs are unbuildable, so the rejection is a safe
-// fall-through. A rule after an assignment is still found, and the match is
-// anchored at line start (a `contest:` rule, a `testx :` line whose name
-// merely extends the target, a .PHONY mention, or a tab-indented recipe
-// line is not `test:`).
+// fall-through. Comment text is stripped before matching (make drops
+// "#"-to-end-of-line before parsing): a commented rule is not one, and an
+// `=` inside a trailing comment no longer poisons a real rule. A define
+// body is variable value text, never rules — a `test:` between define and
+// endef does not count, one after the body does. A rule after an assignment
+// is still found, and a tab-indented recipe line is never a rule, even when
+// the echoed text is rule-shaped.
 func TestMakefileHasTarget(t *testing.T) {
 	for _, c := range []struct {
 		mk   string
@@ -2565,6 +2586,28 @@ func TestMakefileHasTarget(t *testing.T) {
 		{"test : unit integration\n\tgo test ./...", true},
 		{"test\t:\n\tgo test ./...", true},
 		{"test ::\n\tgo test ./...", true},
+		// Several targets on one rule line: make creates a rule for every
+		// name, so the target matching any pre-colon name counts — with
+		// leading spaces tolerated too, while a name merely extending the
+		// target or sitting in prerequisite position never does.
+		{"all test: unit\n\tgo test ./...", true},
+		{"test all : unit\n\tgo test ./...", true},
+		{"lint test check:\n\tgo test ./...", true},
+		{"  test:\n\tgo test ./...", true},
+		{"testbar foo:\n\ttrue", false},
+		{"all: test\n\ttrue", false},
+		// Comment text never matches: make strips "#"-to-end-of-line as a
+		// comment before parsing, so a commented rule is not one — and an
+		// "=" inside a trailing comment no longer poisons a real rule.
+		{"# test:", false},
+		{"contest: # test:\n\ttrue", false},
+		{"test: unit # e2e=1\n\tgo test ./...", true},
+		// A define body is variable value text, never rules — a "test:"
+		// between define and endef is not a rule, one after the body is.
+		{"define X\ntest:\nendef\n", false},
+		{"define X :=\ntest:\nendef\n", false},
+		{"define X\ntest:\nendef\ntest:\n\tgo test ./...", true},
+		{"endef\ntest:\n\tgo test ./...", true},
 		{"test:=x", false},
 		{"test := x", false},
 		{"test:=$(shell date)\nlint:\n\tgolangci-lint run", false},
@@ -2583,6 +2626,14 @@ func TestMakefileHasTarget(t *testing.T) {
 		{"contest:\n\ttrue", false},
 		{"testx :\n\ttrue", false},
 		{"\ttest:\n\tgo test ./...", false},
+		// A recipe line is never a rule, even when the echoed text is
+		// rule-shaped.
+		{"all:\n\techo 'test:'", false},
+		// A plain assignment whose value carries the colon is an
+		// assignment: its "=" precedes the colon, so the whole line
+		// rejects.
+		{"X = foo test: bar", false},
+		{"X := foo test: bar", false},
 		{".PHONY: test\n", false},
 	} {
 		if got := makefileHasTarget(c.mk, "test"); got != c.want {

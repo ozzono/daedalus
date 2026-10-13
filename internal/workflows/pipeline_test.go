@@ -837,6 +837,48 @@ func TestFeatureDevWorkflowContinuedPreflightGate(t *testing.T) {
 		}
 		env.AssertExpectations(t)
 	})
+
+	// The pre-marker replay half: history recorded before the
+	// preflight-baseline-validated marker carries the gate's suite execution
+	// as a recorded command, and replay must keep issuing it — GetVersion
+	// hands back the default, the skip stays disabled, and the gate re-runs
+	// the suite in the preserved worktree (modelled on the sibling gate's
+	// TestDependentRunLegacyReplayGate; the version mock lands after the
+	// registrations and before execution).
+	t.Run("a pre-marker replay re-issues the gate suite", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+			Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+		rec := &agentRecorder{env: env}
+		rec.record()
+		rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+		rev.record()
+		_, suiteRec := stubTestPhase(env)
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+		env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+			Return(nil).Once()
+		env.OnGetVersion(preflightSkipChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+
+		in := baseInput()
+		in.BaseBranch = "aborted/issue-42"
+		in.BaselineValidated = true
+		env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if len(suiteRec.runs) != 2 {
+			t.Fatalf("suite ran %d times, want 2 — the disabled skip re-issues the gate suite before phase 2", len(suiteRec.runs))
+		}
+		if got := suiteRec.runs[0].WorktreePath; got != "/wt/issue-42" {
+			t.Errorf("gate suite worktree = %q, want the preserved worktree the recorded command ran in", got)
+		}
+		if len(rec.inputs) == 0 {
+			t.Error("agent never ran — the re-run gate passing must still open the first session")
+		}
+		env.AssertExpectations(t)
+	})
 }
 
 // TestFeatureDevWorkflowAuthorshipWiring pins that the authorship flag

@@ -345,6 +345,24 @@ func dependencyWakeupEnabled(ctx workflow.Context) bool {
 	return workflow.GetVersion(ctx, dependencyWakeupChangeID, workflow.DefaultVersion, 1) == 1
 }
 
+// preflightSkipChangeID gates the preflight gate's BaselineValidated skip
+// behind its own version marker, for the same replay reason as the two
+// markers above: a continued run whose history was recorded before the
+// skip (or before the field it keys on) carries the gate's suite execution
+// as a recorded command, and replay must keep issuing that command — a
+// pre-marker replay gets DefaultVersion, disabling the skip, so the gate
+// re-executes the suite exactly as the history recorded it. Post-marker
+// replays skip, and any future skip-shaped change must land after this
+// marker (or gated behind another of its own) so the marker-carrying
+// histories in flight at that release replay coherently. The skip windows
+// already shipped unversioned before this marker are outside its reach —
+// no marker can distinguish them after the fact.
+const preflightSkipChangeID = "preflight-baseline-validated-skip"
+
+func baselineValidatedSkipEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, preflightSkipChangeID, workflow.DefaultVersion, 1) == 1
+}
+
 func setRunStatus(ctx workflow.Context, s RunStatus) {
 	workflow.UpsertSearchAttributes(ctx, map[string]interface{}{DaedalusStatusAttr: string(s)})
 }
@@ -760,10 +778,10 @@ testPhase:
 // mid-flight work as the baseline and may re-park: fail-loud, and rarer
 // than the silent skip keying on the branch alone would have swallowed
 // (backlog/bugs/preflight-skip-continue-unvalidated-baseline.md).
-// ponytail: the skip is unversioned, so a continued run in flight across
-// a worker binary swap replays its recorded gate suite execution against
-// code that no longer issues it — nondeterminism wedge, same accepted
-// class as the unversioned loop caps
+// The skip itself is version-gated (preflightSkipChangeID): a continued
+// run in flight across a worker binary swap replays coherently — history
+// recorded before the marker keeps issuing the recorded gate suite
+// execution, marker-carrying history skips
 // (backlog/bugs/preflight-skip-replay-nondeterminism.md).
 func (r *pipelineRun) preFlightGate() (string, error) {
 	command, err := r.resolveTestCommand()
@@ -774,7 +792,7 @@ func (r *pipelineRun) preFlightGate() (string, error) {
 		}
 		return "", err
 	}
-	if r.input.BaselineValidated {
+	if r.input.BaselineValidated && baselineValidatedSkipEnabled(r.ctx) {
 		r.logger.Info("Continued run: baseline validated by a green suite round earlier in this chain; skipping the gate", "Command", command)
 		return command, nil
 	}
