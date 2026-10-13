@@ -386,6 +386,117 @@ func pidAlive(pid int) bool {
 	return true
 }
 
+// deletedExeSuffix is what /proc/<pid>/exe readlink appends when the
+// binary a running process was exec'd from no longer exists on disk.
+const deletedExeSuffix = " (deleted)"
+
+// sweepStaleWorkers reaps leftover worker processes a stop/restart cannot
+// take down: a worker whose binary has since been deleted or replaced on
+// disk — /proc/<pid>/exe ends " (deleted)" — can never be the current code,
+// yet it keeps polling its task queue as a live, invisible poller. The pid
+// file no longer names it (a stop removes the file, a restart's start
+// rewrites it), so workerStop addresses nothing and the orphan survives
+// silently. The sweep runs from the worker startup path, where a stale
+// leftover is detectable: a deleted exe can never be the binary now
+// starting. Identification is deliberately precise — deleted exe, the
+// daedalus basename, AND a consecutive "worker foreground" argv (the
+// daemon's re-exec shape) — so a healthy worker of another deployment
+// (binary intact) or any other deleted-binary process of ours is never
+// touched, and the sweep skips its own pid: it runs from the just-starting
+// worker itself. Matched processes get workerStop's own semantics — SIGTERM,
+// then a workerStopGrace drain watched through pidAlive — and the daemon-dir
+// pid file naming a reaped pid is removed. Survivors are named loudly and
+// left alone; nothing here signals a process group (ai-jail/bwrap children
+// live under the worker's pid), only the one stale pid. Best-effort by
+// contract: a candidate whose /proc entries cannot be read is skipped, and
+// a failed sweep never fails the start.
+func sweepStaleWorkers() {
+	self := os.Getpid()
+	ownExe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	ownName := filepath.Base(strings.TrimSuffix(ownExe, deletedExeSuffix))
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	var stale []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		if err != nil || !strings.HasSuffix(exe, deletedExeSuffix) {
+			continue
+		}
+		if filepath.Base(strings.TrimSuffix(exe, deletedExeSuffix)) != ownName {
+			continue
+		}
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(bytes.TrimRight(data, "\x00")), "\x00")
+		if !isWorkerForegroundArgv(args) {
+			continue
+		}
+		stale = append(stale, pid)
+	}
+	for _, pid := range stale {
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+			continue
+		}
+		deadline := time.Now().Add(workerStopGrace)
+		for time.Now().Before(deadline) && pidAlive(pid) {
+			time.Sleep(200 * time.Millisecond)
+		}
+		if pidAlive(pid) {
+			fmt.Printf("worker sweep: stale worker pid %d is running a deleted binary and ignored SIGTERM — still alive; kill it by hand\n", pid)
+			continue
+		}
+		fmt.Printf("worker sweep: reaped stale worker pid %d (was running a deleted binary)\n", pid)
+		removePidFilesFor(pid)
+	}
+}
+
+// isWorkerForegroundArgv reports whether args is a `worker foreground`
+// command line — the daemon's re-exec shape (workerStart's childArgs).
+// Consecutive tokens, so flag position does not matter.
+func isWorkerForegroundArgv(args []string) bool {
+	for i, a := range args {
+		if a == "worker" && i+1 < len(args) && args[i+1] == "foreground" {
+			return true
+		}
+	}
+	return false
+}
+
+// removePidFilesFor removes every worker-*.pid file in the daemon dir whose
+// content names pid — daemon files are keyed by worker name (worker_id, else
+// task queue) and the sweep is name-agnostic by design: the stale worker may
+// belong to any of them. Best-effort.
+func removePidFilesFor(pid int) {
+	entries, err := os.ReadDir(daemonDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "worker-") || !strings.HasSuffix(name, ".pid") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(daemonDir, name))
+		if err != nil {
+			continue
+		}
+		if content, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && content == pid {
+			os.Remove(filepath.Join(daemonDir, name))
+		}
+	}
+}
+
 // pruneOldLogs removes daemon logs untouched for longer than the retention
 // window. Best-effort: a failed prune never blocks the daemon.
 func pruneOldLogs() {

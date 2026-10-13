@@ -66,6 +66,16 @@ func TestMainInitPromptScaffold(t *testing.T) {
 	if !strings.Contains(string(readme), strings.Join(review.Fields, ", ")) {
 		t.Errorf("scaffold README does not list review's field vocabulary %v", review.Fields)
 	}
+	// The guide documents the phase-rules marker mechanism: every sample's
+	// first line is the marker (pinned across the embedded set in the
+	// template package, and the samples are byte-identical above), and an
+	// edited file is re-scoped by flipping that first line — the guide
+	// names both sentences.
+	for _, want := range []string{"DAEDALUS PHASE RULES", "PROJECT/RUN-SCOPED PROMPT"} {
+		if !strings.Contains(string(readme), want) {
+			t.Errorf("scaffold README does not document %q", want)
+		}
+	}
 	if _, err := os.Stat(filepath.Join(target, "README.md")); !os.IsNotExist(err) {
 		t.Errorf("scaffold wrote README.md (stat err %v) — a stray .md stem stops the worker", err)
 	}

@@ -516,34 +516,68 @@ func detectedTestCommand(worktreePath string) ([]string, bool) {
 	return nil, false
 }
 
-// makefileHasTarget reports whether the Makefile declares target as a rule
-// ("target:" starting a line — make ignores whitespace between the name
-// and the colon, so "target :" is the same rule). Variable assignments
-// sharing the prefix do not match — plain "target:=v", spaced "target :=
-// v", POSIX "target::=v", and target-specific assignments like
-// "target: X = 3" ("?=", "+=", "!=", also after an override/export
-// keyword). The rejection is a literal "=" scan: in that position make
-// does read a bare "target: foo=bar" as an assignment, not a rule
-// (GNU-make-probed). The scan is literal, so an "=" inside a $(…) prereq
-// reference is rejected too — make actually parses those as rules (probed:
-// "test: $(shell echo a=b)" → "No rule to make target 'a=b', needed by
-// 'test'") — but their expanded prereqs are unbuildable in practice, so
-// the rejection is a safe fall-through to the next detection step, never a
-// false rule.
+// makefileHasTarget reports whether the Makefile declares target as a
+// rule. A rule line may name several targets before one colon — "test:",
+// "test :", "foo test: dep", "test foo :" — and make creates a rule for
+// every name on a rule line, so any whitespace-separated name in the
+// pre-colon segment matching the target counts. Comment text and define
+// bodies never match — make strips "#"-to-end-of-line as a comment before
+// parsing (targets cannot contain an unescaped "#" in practice, so the
+// strip cannot hide a rule), and everything between define and endef is
+// variable value text, not rules — a "test:" inside either is not a rule
+// (GNU-make-probed: "make test" fails with "No rule to make target
+// 'test'" for a Makefile whose only "test:" is a comment or a define
+// body). Recipe lines (tab-prefixed) never match — a tab line is recipe
+// text, and a "test:" inside an echo is not a rule. Variable assignments
+// do not match — plain "test:=v", spaced "test := v", POSIX "test::=v",
+// target-specific assignments like "test: X = 3" ("?=", "+=", "!=", also
+// after an override/export keyword), and a plain assignment whose value
+// carries the colon, "X = foo test: bar", which make reads as an
+// assignment because its "=" precedes the colon. The rejection is a
+// literal "=" scan of the (comment-stripped) line: in the post-colon
+// position make does read a bare "test: foo=bar" as an assignment, not a
+// rule (GNU-make-probed). The scan is literal, so an "=" inside a $(…)
+// prereq reference is rejected too — make actually parses those as rules
+// (probed: "test: $(shell echo a=b)" → "No rule to make target 'a=b',
+// needed by 'test'") — but their expanded prereqs are unbuildable in
+// practice, so the rejection is a safe fall-through to the next detection
+// step, never a false rule.
 func makefileHasTarget(mk, target string) bool {
+	inDefine := false // inside a define body: variable value text, never rules
 	for line := range strings.SplitSeq(mk, "\n") {
-		rest, ok := strings.CutPrefix(line, target)
-		if !ok {
+		code, _, _ := strings.Cut(line, "#") // a make comment runs to end of line
+		if inDefine {
+			if strings.TrimSpace(code) == "endef" {
+				inDefine = false
+			}
 			continue
 		}
-		rest = strings.TrimLeft(rest, " \t")
-		if !strings.HasPrefix(rest, ":") {
+		if strings.HasPrefix(line, "\t") {
+			continue // recipe line, never a rule
+			// ponytail: assumes the default recipe prefix; a Makefile that
+			// sets .RECIPEPREFIX could slip a recipe line past this guard.
+		}
+		t := strings.TrimSpace(code)
+		keyword := t
+		if i := strings.IndexAny(t, " \t"); i >= 0 {
+			keyword = t[:i]
+		}
+		switch keyword {
+		case "define":
+			inDefine = true
 			continue
+		case "endef":
+			continue // stray endef outside any define body
 		}
-		if strings.Contains(rest[1:], "=") {
-			continue // variable assignment, not a rule
+		names, rest, ok := strings.Cut(code, ":")
+		if !ok || strings.Contains(names, "=") || strings.Contains(rest, "=") {
+			continue // not a rule line, or a variable assignment
 		}
-		return true
+		for name := range strings.FieldsSeq(names) {
+			if name == target {
+				return true
+			}
+		}
 	}
 	return false
 }

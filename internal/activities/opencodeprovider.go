@@ -35,7 +35,7 @@ type opencodeStagedConfig struct {
 // the host's own custom providers use (verified against opencode 1.18.31
 // and a working host opencode.json, 2026-10-06): the @ai-sdk/openai-compatible
 // npm package speaks the OpenAI-compatible chat-completions wire — what
-// litellm/ollama/vLLM/Mistral self-hosted endpoints serve.
+// standard OpenAI-compatible self-hosted endpoints serve.
 type opencodeProviderConfig struct {
 	NPM     string                         `json:"npm"`
 	Options opencodeProviderOptionsConfig  `json:"options"`

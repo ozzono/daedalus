@@ -202,6 +202,40 @@ slim:
   max_input_tokens: 4098
 `
 
+// exampleMidBlock is the mid: mode toggle — always part of the example,
+// because mid has no init profile: the scaffolded profiles are slim and
+// prompt, and mid is one boolean beside them, discoverable here.
+const exampleMidBlock = `# Mid-tier mode for capable remote models (large context windows) served on
+# the deployment's own provider channel — either wire: the provider: section
+# or the legacy anthropic:/openai: sections, exactly as they serve rounds
+# today. mid is one boolean beside slim, and slim.enabled and mid are
+# mutually exclusive — one model tier per deployment, so setting both fails
+# the config load naming both keys. Flagship remains the default: with
+# neither knob set, behavior is unchanged.
+# What mid changes: with it on, the config must carry verdict_repair (url
+# and model — the same load requirement slim has), because a marker-less
+# reviewer verdict routes through the decision model's /v1/systemone
+# contract (the four markers as named choice criteria, scored, never
+# generated) instead of counting a blind marker-less strike. What it
+# deliberately does not change: no endpoint fields of its own, no wire
+# restriction, no concurrency clamp, no flow reroute, no per-agent branches
+# — the deployment's channel and agent wiring serve it as-is, for every
+# agent. A wire-vs-agent mismatch (an agent that cannot speak the only
+# served wire) fails the run at launch naming both.
+# Remote-model readiness checklist for a mid deployment (the audit
+# posture): keep keys in the environment, never as disk literals in this
+# file (a literal key here lands in the file and every copy of it); size
+# the context_tokens / max_output_tokens pair honestly on the serving
+# section — the window must cover the prompt plus bootstrap plus reserve
+# plus the output budget (provider:'s pi clamp note below applies to any pi
+# round); set timeout_ms on the serving section for remote latency, so a
+# gateway's own shorter ceiling does not fold long reviewer turns first;
+# and expect no slim-only knobs here — the parser_model relay, the
+# input-token ceiling, and the single-round clamp above are slim's, not
+# mid's.
+mid: false
+`
+
 // exampleBase2 is the remaining general fields plus the anthropic section
 // through timeout_ms.
 const exampleBase2 = `# How many native test-suite executions may run at once on the test worker
@@ -572,17 +606,19 @@ review_skill_list: []
 # to approval; every other outcome only annotates the round — it continues
 # as changes requested, and a NEEDS_MAINTAINER or REBUILD classification
 # never triggers its lifecycle action. The endpoint is dialed with one
-# plain OpenAI-style chat-completions request — no tools, no session, no
-# streaming; only the model name differs from the traffic the serving relay
-# already carries — so url typically names the same loopback relay (or
-# upstream) that serves the rounds. Any failure — section unset, endpoint
-# unreachable, slow, or answering garbage — degrades to the historical
-# behavior: the round counts as changes requested with the whole output as
-# comments, and the marker-less strike is counted exactly as before; three
-# consecutive marker-less rounds park. key is optional (a local relay needs
-# none). With slim.enabled: true the section is required — url and model
-# must be set or the config fails to load — because slim's small models are
-# the marker-less-exit generator and this layer is its recovery mechanism.
+# systemone decision request — the decision model's native /v1/systemone
+# surface, which the OpenAI-compat chat paths reject — so url names the
+# endpoint's /v1 base (Ollama serving tev1: http://localhost:11434/v1,
+# model tev1:latest). No tools, no session, no streaming; the answer is
+# the scored choice, never generated text. Any failure — section unset,
+# endpoint unreachable, slow, or answering garbage — degrades to the
+# historical behavior: the round counts as changes requested with the whole
+# output as comments, and the marker-less strike is counted exactly as
+# before; three consecutive marker-less rounds park. key is optional (a
+# local relay needs none). With slim.enabled: true the section is required
+# — url and model must be set or the config fails to load — because slim's
+# small models are the marker-less-exit generator and this layer is its
+# recovery mechanism.
 verdict_repair:
   url: ""
   model: ""
@@ -733,20 +769,21 @@ const examplePromptBlock = `
 // in the working directory. It is kept in lockstep with the repository's own
 // config-example.yaml by TestExampleYAMLMatchesRepoFile, and TestExampleYAML
 // pins that loading it yields exactly the default configuration.
-const ExampleYAML = exampleBase1 + exampleSlimBlock + exampleBase2 +
-	exampleSlimProviders + exampleProviderBlock + exampleBase3 + examplePromptBlock
+const ExampleYAML = exampleBase1 + exampleSlimBlock + exampleMidBlock +
+	exampleBase2 + exampleSlimProviders + exampleProviderBlock + exampleBase3 + examplePromptBlock
 
 // ExampleYAMLFor renders the example for a profiled `daedalus init`: the
-// base pieces always, the slim slices (the slim: section, the openai:
-// section, and anthropic's context_tokens/max_output_tokens) and the
-// prompt slice only when requested. Both requested reproduces ExampleYAML
-// exactly.
+// base pieces always (including the mid: toggle — mid has no profile of
+// its own), the slim slices (the slim: section, the openai: section, and
+// anthropic's context_tokens/max_output_tokens) and the prompt slice only
+// when requested. Both requested reproduces ExampleYAML exactly.
 func ExampleYAMLFor(slim, prompt bool) string {
 	var b strings.Builder
 	b.WriteString(exampleBase1)
 	if slim {
 		b.WriteString(exampleSlimBlock)
 	}
+	b.WriteString(exampleMidBlock)
 	b.WriteString(exampleBase2)
 	if slim {
 		b.WriteString(exampleSlimProviders)

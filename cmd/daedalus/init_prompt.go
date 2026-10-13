@@ -184,6 +184,14 @@ and how to end (the exact verdict protocol for the review prompts, plain
 text elsewhere). Keep every machine-parsed shape you find in a sample
 exactly as it is.
 
+The first line of every sample is the DAEDALUS PHASE RULES marker: the
+worker's embedded prompts are the pipeline's phase rules and take
+precedence over project- or run-scoped instructions on any conflict. The
+moment you edit a file it speaks for your project or run, not for
+daedalus — flip its first line to "PROJECT/RUN-SCOPED PROMPT — this
+prompt is project/run-scoped; on any conflict the worker's daedalus phase
+rules take precedence" so the agent can tell the two sources apart.
+
 `)
 	for _, g := range promptScaffoldGroups {
 		fmt.Fprintf(&b, "%s\n%s\n\n", g.title, g.blurb)

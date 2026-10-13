@@ -58,8 +58,8 @@ type piModelConfig struct {
 // compat from the base URL — any URL outside its known-provider list counts
 // as standard OpenAI and gets supportsStore, so buildParams hardcodes
 // `store: false` into every chat-completions body — which strict
-// OpenAI-compatible validators (Mistral) reject with 422
-// extra_forbidden. Staging the override makes pi omit the param, always
+// OpenAI-compatible validators reject with 422 extra_forbidden.
+// Staging the override makes pi omit the param, always
 // equivalent-or-better: store defaults to false on OpenAI itself. SupportsStore
 // is a *bool because omitempty on a plain bool would drop the very false the
 // override exists to send.
@@ -85,10 +85,16 @@ type piProviderConfig struct {
 // config for one jailed round, derived from the round's provider env — so
 // failover rounds re-derive the entry for free when the fallback is
 // openai-type (whose OPENAI_* overrides carry the fallback's endpoint, see
-// provider_failover.go; an anthropic-type fallback has no pi channel at
-// all — no ANTHROPIC_BASE_URL exists in pi — and the round stays pinned to
-// the primary's staged entry, see backlog/bugs/pi-anthropic-fallback-
-// unserveable.md). It returns the --model args selecting the staged entry —
+// provider_failover.go; an anthropic-type fallback stays unserved — env
+// alone cannot redirect pi, which has no ANTHROPIC_BASE_URL var and pins
+// its built-in anthropic provider to the public API base, and daedalus
+// stages no anthropic-side entry, so the round stays pinned to the
+// primary's staged one. pi itself is stageable on the anthropic wire —
+// ProviderConfigSchema takes api+baseUrl entries, the same shape this
+// staging uses — so the gap is missing staging, not a missing channel;
+// re-verified against pi's source 2026-10-13, recorded under
+// pi-anthropic-fallback-unserveable in backlog/bugs/bug-index.md).
+// It returns the --model args selecting the staged entry —
 // pi rereads models.json at startup and never mid-process — plus a cleanup
 // that removes the entry again, for the round's end: a staged entry is
 // addressable only through its own --model flag, so nothing else ever reads

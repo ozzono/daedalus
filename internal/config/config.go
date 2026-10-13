@@ -298,11 +298,13 @@ type ReviewerConfig struct {
 // VerdictRepairConfig points the decision-model repair pass at its
 // classify-only endpoint: when a reviewer round's output carries no
 // parseable verdict marker, the review activity asks this model to read the
-// review and name the most likely verdict among the four markers. url is an
-// OpenAI-compatible chat-completions base — typically the same loopback
-// relay that serves the rounds, the request differing only in the model
-// name. key is optional (a local relay needs none). Absent (the default)
-// the repair layer is off: marker-less rounds keep the pre-repair
+// review and name the most likely verdict among the four markers. url is
+// the /v1 base of a decision-model endpoint speaking the systemone
+// contract (POST <url>/systemone — the OpenAI-compat chat paths reject
+// decision-capable models, so a chat-completions URL cannot serve here);
+// with Ollama serving tev1 that is http://localhost:11434/v1 and model
+// tev1:latest. key is optional (a local relay needs none). Absent (the
+// default) the repair layer is off: marker-less rounds keep the pre-repair
 // behavior. Under slim mode the section is required (url and model), since
 // slim's small models are the marker-less-exit generator and this layer is
 // its recovery mechanism.
@@ -857,6 +859,20 @@ type Config struct {
 	// context/output budgets) stay operator-side — see
 	// config-example.yaml's slim entry for the per-agent prerequisites.
 	Slim SlimConfig `yaml:"slim"`
+	// Mid targets mid-tier remote models: capable endpoints on either wire
+	// (OpenAI-compatible or anthropic) with large context windows, served
+	// through the same provider sections as any other round. Mid adds no
+	// endpoint fields of its own, no wire restriction, no concurrency clamp,
+	// no flow reroute, and no per-agent branches — the deployment's existing
+	// channel and agent wiring serve it as-is. What it changes is the review
+	// verdict path: mid requires verdict_repair (url and model, validated at
+	// load like slim's requirement) because marker-less reviewer rounds route
+	// through the /v1/systemone decision contract. Flagship remains the
+	// default: with neither this nor Slim.Enabled set, behavior is
+	// byte-for-byte the pre-mid behavior. Mutually exclusive with
+	// slim.enabled — one model tier per deployment; setting both is a load
+	// error naming both keys.
+	Mid bool `yaml:"mid"`
 	// Thinking is the agents' thinking toggle, independent of Slim: nil
 	// (the key absent, the default) and an explicit true mean daedalus
 	// sends no thinking signal at all and every agent follows its own
@@ -1035,6 +1051,7 @@ type renderConfig struct {
 	MaxConcurrentTests     int                 `yaml:"max_concurrent_tests"`
 	SharedTestQueue        *bool               `yaml:"shared_test_queue"`
 	Slim                   SlimConfig          `yaml:"slim"`
+	Mid                    bool                `yaml:"mid"`
 	Temporal               TemporalConfig      `yaml:"temporal"`
 	Anthropic              AnthropicConfig     `yaml:"anthropic"`
 	OpenAI                 OpenAIConfig        `yaml:"openai"`
@@ -1069,6 +1086,7 @@ func (c Config) RenderYAML() (string, error) {
 		MaxConcurrentTests:     c.MaxConcurrentTests,
 		SharedTestQueue:        c.SharedTestQueue,
 		Slim:                   c.Slim,
+		Mid:                    c.Mid,
 		Temporal:               c.Temporal,
 		Anthropic:              c.Anthropic,
 		OpenAI:                 c.OpenAI,
@@ -1203,6 +1221,43 @@ func (c Config) ProviderChannels() (AnthropicConfig, OpenAIConfig) {
 		anth.MaxOutputTokens = p.MaxOutputTokens
 	}
 	return anth, p.openaiChannel()
+}
+
+// AgentWireConflict reports whether this config's serving channels leave
+// agent misdirected: a launch whose agent cannot take the only configured
+// endpoint dials whatever the agent's own ambient/default wiring reaches —
+// the silent misdirection the per-agent staging exists to prevent. The
+// matrix is the repo's documented wiring, not the wire names: claude dials
+// ANTHROPIC_* and is served by an anthropic channel with a url (custom base)
+// or a key alone (the public base with that key); codex, opencode, and
+// aider have no anthropic channel at all (openai-only wiring — aider's
+// model wiring, opencode's staged-config bridge, codex's config overrides);
+// pi is staged on the openai channel, and — reading no ANTHROPIC_BASE_URL
+// and getting no anthropic-side staging — an anthropic channel's custom URL
+// never reaches it, though a key with no url still does (the public base
+// with the exported key); amp authenticates through AMP_API_KEY alone and
+// is exempt. A conflict fires only when a serving endpoint EXISTS and no
+// channel serves the agent; an all-unset config is the ambient posture and
+// never fires. Deliberately not a validate() rule: an openai-url-only
+// section under the default agent is a pinned-legal load — the env channel
+// serves tooling and openai-wire agents — so the conflict is a property of
+// the launch, checked before any worktree or round exists, on the start
+// path and the continue path alike, never a silent degradation mid-run.
+func (c Config) AgentWireConflict(agent string) error {
+	anth, open := c.ProviderChannels()
+	switch agent {
+	case "amp":
+		return nil
+	case "claude":
+		if open.URL != "" && anth.URL == "" && anth.Key == "" {
+			return fmt.Errorf("agent %q cannot be served by this config: claude dials only the anthropic wire and the config's only serving endpoint is OpenAI-wire — set an anthropic url or key, or run an agent that speaks the OpenAI wire", agent)
+		}
+	case "pi", "codex", "opencode", "aider":
+		if open.URL == "" && anth.URL != "" {
+			return fmt.Errorf("agent %q cannot be served by this config: it is served only through the openai channel and the config's only serving endpoint is the anthropic wire's custom URL — pi reads no ANTHROPIC_BASE_URL (and daedalus stages no anthropic-side entry), and codex/opencode/aider have no anthropic channel at all; set an openai url or run an agent that speaks the anthropic wire", agent)
+		}
+	}
+	return nil
 }
 
 // AgentEnv translates provider configuration into environment variables for
@@ -1616,14 +1671,23 @@ func (c Config) validate(path string) error {
 			return fmt.Errorf("config %s: fallback: enabled fallback needs url, key, and model", path)
 		}
 	}
-	// The verdict-repair decision model is required exactly when slim is on:
-	// slim's small models are the marker-less-exit generator, and the repair
-	// layer is its recovery mechanism. Outside slim a partial or absent
-	// section is merely inert — every repair failure fails open to the
-	// historical marker-less behavior, so there is nothing to misconfigure
-	// into a broken run.
-	if c.Slim.Enabled && (c.VerdictRepair.URL == "" || c.VerdictRepair.Model == "") {
-		return fmt.Errorf("config %s: verdict_repair: slim mode requires url and model — the decision model that classifies marker-less review verdicts", path)
+	// One model tier per deployment: slim and mid are disjoint serving
+	// postures (a clamped single-round self-hosted lane vs. remote
+	// mid-tier models on the deployment's own channels), not layers — a
+	// both-set config has no defined meaning, so it fails at load naming
+	// both keys instead of silently picking one.
+	if c.Slim.Enabled && c.Mid {
+		return fmt.Errorf("config %s: slim.enabled and mid are mutually exclusive — one model tier per deployment; keep one of the two", path)
+	}
+	// The verdict-repair decision model is required exactly when slim or mid
+	// is on: slim's small models are the marker-less-exit generator, and mid
+	// is defined by its verdicts routing through the decision contract — the
+	// repair layer is both modes' recovery mechanism. Outside them a partial
+	// or absent section is merely inert — every repair failure fails open to
+	// the historical marker-less behavior, so there is nothing to
+	// misconfigure into a broken run.
+	if (c.Slim.Enabled || c.Mid) && (c.VerdictRepair.URL == "" || c.VerdictRepair.Model == "") {
+		return fmt.Errorf("config %s: verdict_repair: slim and mid modes require url and model — the decision model that classifies marker-less review verdicts", path)
 	}
 	if !slices.Contains(fallbackTypes, c.Fallback.Type) {
 		return fmt.Errorf("config %s: fallback: unknown type %q (available: %s)",

@@ -285,6 +285,27 @@ func slimOverCapErr(n, limit int) error {
 		n, limit)
 }
 
+// issueIDGate rejects ids a workflow id cannot safely carry: the id is
+// interpolated verbatim into NotifyDependents' single-quoted Temporal
+// visibility filter (internal/activities/depends.go), whose string
+// literals have no escape — a character outside the token set (the spirit
+// of config.ValidateWorkerID) breaks that filter, so the run's completion
+// poke would fail every time and its dependents release only on the
+// fallback poll. Named and extracted like slimInputGate so the rejection
+// is unit-pinnable without a Temporal frontend, and fired at the top of
+// startPipelineFolders so bad input fails before any submit-path side
+// effect (worker preflight, daemon dial).
+func issueIDGate(issueID string) error {
+	for _, r := range issueID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return fmt.Errorf("issue id %q: character %q is not allowed — use only letters, digits, '.', '_' and '-' (rename the issue and rerun); the id is interpolated into the dependent-wakeup search filter, where other characters break it", issueID, string(r))
+		}
+	}
+	return nil
+}
+
 // startPipeline triggers the named workflow for the given issue on the
 // configured task queue. configPath is the resolved config file the run
 // loaded (the preflight-started daemon is re-executed with it).
@@ -300,6 +321,25 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 // chained behind (-dep/--depends). (Split so startPipeline's existing
 // signature — and the tests pinning it — stays untouched.)
 func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string, folders []string, depends string) error {
+	if err := issueIDGate(issueID); err != nil {
+		return err
+	}
+	// The wire-vs-agent gate: a launch whose effective agent has no channel
+	// on this config's served wire would dial whatever the agent's own
+	// ambient/default endpoint is — fail here, before any worktree, worker
+	// ping, or round exists. Load-time validation deliberately omits this
+	// (an openai-url-only section under the default agent is a legal load:
+	// the section's env channel serves tooling and other agents), so the
+	// launch is where the conflict can be named with both the agent and the
+	// wire. The CLI's --cli override wins when set, mirroring the effective
+	// agent everywhere else.
+	effectiveAgent := agent
+	if effectiveAgent == "" {
+		effectiveAgent = cfg.Agent
+	}
+	if err := cfg.AgentWireConflict(effectiveAgent); err != nil {
+		return err
+	}
 	spec, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
@@ -822,6 +862,20 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		if prompt, err = slimInputGate(prompt, cfg); err != nil {
 			return err
 		}
+	}
+
+	// The wire-vs-agent gate applies here exactly as at start: the continued
+	// run carries prev.Agent against the CURRENT config's channels, and a
+	// deployment that flipped its served wire between the abort and this
+	// continue would otherwise launch rounds with no channel to their agent.
+	// A pre-field attempt's empty agent ran as the worker config's agent, so
+	// the effective-agent resolution mirrors the start path's.
+	effectiveAgent := prev.Agent
+	if effectiveAgent == "" {
+		effectiveAgent = cfg.Agent
+	}
+	if err := cfg.AgentWireConflict(effectiveAgent); err != nil {
+		return err
 	}
 
 	base, err := activities.AbortedBranchNameFor(prev.IssueID, workflows.FlowScope(flow))

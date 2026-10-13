@@ -500,6 +500,15 @@ func TestsFix(testLogs, comments string) (string, error) {
 		}
 		parts = append(parts, p)
 	}
+	// Both arms open with the same DAEDALUS PHASE RULES marker line; when
+	// both render, state it once. Keyed on the first part's own opening
+	// line, so an override that dropped (or changed) the marker in one arm
+	// strips nothing — no constant in Go to drift from the embedded text.
+	if len(parts) == 2 {
+		if head, _, _ := strings.Cut(parts[0], "\n"); head != "" && strings.HasPrefix(parts[1], head+"\n\n") {
+			parts[1] = parts[1][len(head)+2:]
+		}
+	}
 	return strings.Join(parts, "\n\n"), nil
 }
 

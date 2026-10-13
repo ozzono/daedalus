@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"slices"
@@ -74,13 +73,63 @@ func repairConfigured() bool {
 	return os.Getenv(config.VerdictRepairURLEnv) != "" && os.Getenv(config.VerdictRepairModelEnv) != ""
 }
 
+// systemoneQuestion is one named entry of the decision request's questions
+// field map. A choice question names its answer set in criteria — option
+// key to description, 2–26 entries (the endpoint rejects anything else).
+type systemoneQuestion struct {
+	Type         string            `json:"type"`
+	Instructions string            `json:"instructions"`
+	Criteria     map[string]string `json:"criteria"`
+}
+
+// systemoneRequest is the decision endpoint's whole request body: the model
+// name, one state carried as data (never instructions), and a named
+// question map — no positional fields, no generation parameters (the
+// answer is scored by the pointer head, not generated).
+type systemoneRequest struct {
+	Model     string                       `json:"model"`
+	State     string                       `json:"state"`
+	Questions map[string]systemoneQuestion `json:"questions"`
+}
+
+// systemoneAnswer is one question's answer: the chosen criteria key with
+// the full score distribution and the confidence in the choice.
+type systemoneAnswer struct {
+	Type          string             `json:"type"`
+	Choice        string             `json:"choice"`
+	Probabilities map[string]float64 `json:"probabilities"`
+	Confidence    float64            `json:"confidence"`
+}
+
+// verdictQuestionKey is the named questions-map key of the review verdict
+// question — the same name on the request and the answers lookup.
+const verdictQuestionKey = "verdict"
+
+// verdictDescriptions anchor each marker's semantics in the decision
+// question's criteria. Keyed by marker and iterated under verdictMarkers,
+// so the choice set cannot drift from the set the verdict parser
+// exact-matches — a marker added to verdictMarkers without an entry here
+// fails the classify open like any other malformed answer, never an empty
+// criterion: add both together.
+var verdictDescriptions = map[string]string{
+	"APPROVED":          "the review accepts the change as-is",
+	"CHANGES_REQUESTED": "the review asks for changes or lists findings to address",
+	"NEEDS_MAINTAINER":  "the review halts for maintainer input (the task cannot be completed as stated)",
+	"REBUILD":           "the review asks for an implementation change rather than a test change",
+}
+
 // classifyReviewVerdict dials the decision endpoint with one classify-only
-// request — a plain typed HTTP client in the activity path: no tools, no
-// session, no jail, no streaming; only the model name differs from the
-// chat-completions traffic the same relay serves. It returns the
-// most-likely marker, the classifier's confidence in it, and ok — false on
-// any unconfigured, budget-starved, unreachable, timed-out, or unparseable
-// outcome (the caller's fail-open). Never retried.
+// request — the decision model's native systemone contract
+// (POST <url>/systemone; the OpenAI-compat chat paths reject
+// decision-capable models, so no chat-completions fallback exists): state
+// carries the marker-less review as data, and the named "verdict" choice
+// question offers the four markers as criteria, making the answer the
+// pointer head's scored choice rather than generated text. A plain typed
+// HTTP client in the activity path: no tools, no session, no jail, no
+// streaming. It returns the most-likely marker, the classifier's
+// confidence in it, and ok — false on any unconfigured, budget-starved,
+// unreachable, timed-out, or unparseable outcome (the caller's fail-open).
+// Never retried.
 func classifyReviewVerdict(ctx context.Context, review string) (verdict string, confidence float64, ok bool) {
 	endpoint, model := os.Getenv(config.VerdictRepairURLEnv), os.Getenv(config.VerdictRepairModelEnv)
 	if endpoint == "" || model == "" {
@@ -97,33 +146,34 @@ func classifyReviewVerdict(ctx context.Context, review string) (verdict string, 
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < repairTimeout {
 		return "", 0, false
 	}
-	// The prompt names the choice set in prose; verdictMarkers below is the
-	// machine-checked copy of that list — any marker change touches both.
-	prompt := fmt.Sprintf(`You are a strict classifier. Below is a code review's output whose final verdict marker line is missing. Decide which of these four verdicts the reviewer most likely intended:
-
-- APPROVED: the review accepts the change as-is.
-- CHANGES_REQUESTED: the review asks for changes or lists findings to address.
-- NEEDS_MAINTAINER: the review halts for maintainer input (the task cannot be completed as stated).
-- REBUILD: the review asks for an implementation change rather than a test change.
-
-Reply with ONLY a JSON object, no other text:
-{"verdict": "<one of APPROVED, CHANGES_REQUESTED, NEEDS_MAINTAINER, REBUILD>", "confidence": <a number between 0 and 1>}
-
-Review output:
-
-%s`, review)
-	reqBody, err := json.Marshal(map[string]any{
-		"model":    model,
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
-		"stream":   false,
+	// The criteria are the marker set itself — verdictMarkers is the single
+	// source, so the choice keys cannot drift from the parser's set.
+	criteria := make(map[string]string, len(verdictMarkers))
+	for _, marker := range verdictMarkers {
+		desc, known := verdictDescriptions[marker]
+		if !known {
+			return "", 0, false
+		}
+		criteria[marker] = desc
+	}
+	reqBody, err := json.Marshal(systemoneRequest{
+		Model: model,
+		State: review,
+		Questions: map[string]systemoneQuestion{
+			verdictQuestionKey: {
+				Type:         "choice",
+				Instructions: "Which final review verdict does this review round support?",
+				Criteria:     criteria,
+			},
+		},
 	})
-	if err != nil { // unreachable: map of marshalable values
+	if err != nil { // unreachable: struct of marshalable values
 		return "", 0, false
 	}
 	callCtx, cancel := context.WithTimeout(ctx, repairTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(callCtx, http.MethodPost,
-		strings.TrimSuffix(endpoint, "/")+"/chat/completions", bytes.NewReader(reqBody))
+		strings.TrimSuffix(endpoint, "/")+"/systemone", bytes.NewReader(reqBody))
 	if err != nil {
 		return "", 0, false
 	}
@@ -140,57 +190,20 @@ Review output:
 		return "", 0, false
 	}
 	var completion struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		Answers map[string]systemoneAnswer `json:"answers"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&completion); err != nil {
 		return "", 0, false
 	}
-	if len(completion.Choices) == 0 {
+	answer, answered := completion.Answers[verdictQuestionKey]
+	if !answered || !slices.Contains(verdictMarkers, answer.Choice) {
 		return "", 0, false
 	}
-	var answer struct {
-		Verdict    string  `json:"verdict"`
-		Confidence float64 `json:"confidence"`
-	}
-	// Small local models fence their JSON about half the time — the same
-	// tolerance the tool relay's parser applies to the same model class.
-	if err := json.Unmarshal([]byte(stripJSONFence(completion.Choices[0].Message.Content)), &answer); err != nil {
-		return "", 0, false
-	}
-	verdict = strings.ToUpper(strings.TrimSpace(answer.Verdict))
-	if !slices.Contains(verdictMarkers, verdict) {
-		return "", 0, false
-	}
-	// A confidence outside [0,1] — a different scale ("90"), a misread
-	// prompt — is garbage like any other malformed answer: fail open rather
-	// than let a rescaled number impersonate certainty.
+	// A confidence outside [0,1] — a different scale, a misread field — is
+	// garbage like any other malformed answer: fail open rather than let a
+	// rescaled number impersonate certainty.
 	if answer.Confidence < 0 || answer.Confidence > 1 {
 		return "", 0, false
 	}
-	return verdict, answer.Confidence, true
-}
-
-// stripJSONFence trims content and, when it opens with a code fence, strips
-// the fence and its info string. Shapes the strip cannot make a single
-// object (prose plus a block, two blocks) fail the downstream unmarshal and
-// fail the repair open.
-func stripJSONFence(content string) string {
-	s := strings.TrimSpace(content)
-	if !strings.HasPrefix(s, "```") {
-		return s
-	}
-	s = strings.TrimPrefix(s, "```")
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		s = s[i+1:]
-	} else {
-		return s
-	}
-	if i := strings.LastIndex(s, "```"); i >= 0 {
-		s = s[:i]
-	}
-	return strings.TrimSpace(s)
+	return answer.Choice, answer.Confidence, true
 }

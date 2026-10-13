@@ -248,6 +248,58 @@ func TestEnsureWorkerActive(t *testing.T) {
 	})
 }
 
+// TestIssueIDGate pins the submit-time charset gate: every id travels
+// verbatim into the workflow id and from there into NotifyDependents'
+// single-quoted Temporal visibility filter, whose string literals have no
+// escape — so exactly the token classes (letters, digits, '.', '_', '-')
+// pass, the empty id passes (the run-scoped spelling has no issue component
+// to guard), and each hazard class fails loud naming the id and the
+// offending character. The gate fires first in startPipelineFolders, so a
+// rejection costs no repo confirm, worker preflight, or daemon dial.
+func TestIssueIDGate(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		id     string
+		reject string // the id+character fragment the error must carry; empty when the gate passes
+	}{
+		{name: "lowercase", id: "feature"},
+		{name: "uppercase", id: "Feature"},
+		{name: "digit", id: "42"},
+		{name: "dot", id: "fix.parser"},
+		{name: "underscore", id: "fix_parser"},
+		{name: "dash", id: "fix-parser"},
+		{name: "every class composed", id: "Fix.Parser_2-beta"},
+		{name: "empty id passes", id: ""},
+		{name: "single quote breaks the filter literal", id: "ba'd", reject: `"ba'd": character "'"`},
+		{name: "space", id: "my issue", reject: `"my issue": character " "`},
+		{name: "tab", id: "my\tissue", reject: `"my\tissue": character "\t"`},
+		{name: "path separator", id: "a/b", reject: `"a/b": character "/"`},
+		{name: "glob metachar", id: "iss*e", reject: `"iss*e": character "*"`},
+		{name: "non-ascii", id: "café", reject: `"café": character "é"`},
+		{name: "control character", id: "a\x7fb", reject: `"a\x7fb": character "\x7f"`},
+	} {
+		if got := issueIDGate(c.id); c.reject == "" {
+			if got != nil {
+				t.Errorf("issueIDGate(%q) = %v, want nil", c.id, got)
+			}
+			continue
+		} else if got == nil {
+			t.Errorf("issueIDGate(%q) = nil, want the charset rejection", c.id)
+			continue
+		} else if !strings.Contains(got.Error(), c.reject) {
+			t.Errorf("issueIDGate(%q) error %q should carry %q", c.id, got, c.reject)
+		}
+	}
+	// The rejection names the fix and why: the rename guidance plus the
+	// dependent-wakeup filter the charset protects.
+	err := issueIDGate("iss*e")
+	if err == nil ||
+		!strings.Contains(err.Error(), "rename the issue and rerun") ||
+		!strings.Contains(err.Error(), "dependent-wakeup search filter") {
+		t.Errorf("issueIDGate rejection = %v, want the fix and the filter mechanism named", err)
+	}
+}
+
 // TestStartPipelinePreflight pins the preflights' place in startPipeline's
 // sequence: a dirty repo cancels before the worker check runs — no daemon
 // file is ever touched — and a clean repo reaches the worker preflight with
