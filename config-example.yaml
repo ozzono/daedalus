@@ -186,6 +186,35 @@ slim:
   # budget it needs. 0 (or the key unset) = 4098; a negative value fails
   # the config load.
   max_input_tokens: 4098
+# Mid-tier mode for capable remote models (large context windows) served on
+# the deployment's own provider channel — either wire: the provider: section
+# or the legacy anthropic:/openai: sections, exactly as they serve rounds
+# today. mid is one boolean beside slim, and slim.enabled and mid are
+# mutually exclusive — one model tier per deployment, so setting both fails
+# the config load naming both keys. Flagship remains the default: with
+# neither knob set, behavior is unchanged.
+# What mid changes: with it on, the config must carry verdict_repair (url
+# and model — the same load requirement slim has), because a marker-less
+# reviewer verdict routes through the decision model's /v1/systemone
+# contract (the four markers as named choice criteria, scored, never
+# generated) instead of counting a blind marker-less strike. What it
+# deliberately does not change: no endpoint fields of its own, no wire
+# restriction, no concurrency clamp, no flow reroute, no per-agent branches
+# — the deployment's channel and agent wiring serve it as-is, for every
+# agent. A wire-vs-agent mismatch (an agent that cannot speak the only
+# served wire) fails the run at launch naming both.
+# Remote-model readiness checklist for a mid deployment (the audit
+# posture): keep keys in the environment, never as disk literals in this
+# file (a literal key here lands in the file and every copy of it); size
+# the context_tokens / max_output_tokens pair honestly on the serving
+# section — the window must cover the prompt plus bootstrap plus reserve
+# plus the output budget (provider:'s pi clamp note below applies to any pi
+# round); set timeout_ms on the serving section for remote latency, so a
+# gateway's own shorter ceiling does not fold long reviewer turns first;
+# and expect no slim-only knobs here — the parser_model relay, the
+# input-token ceiling, and the single-round clamp above are slim's, not
+# mid's.
+mid: false
 # How many native test-suite executions may run at once on the test worker
 # (the deployment's suite task queue); further suites queue until a slot
 # frees (heartbeating while they wait). Suites are CPU-bound host work,

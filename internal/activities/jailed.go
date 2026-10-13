@@ -709,8 +709,8 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// worktree masks above guard against — so the operator's own
 	// ANTHROPIC_BASE_URL/API_KEY/MODEL there override AgentEnv's injected
 	// values and every jailed claude round dials the operator's config
-	// instead of the worker's (live 2026-10-05: maestro workflows served
-	// by Mistral model names nothing in the worker config produces). It
+	// instead of the worker's — the live failure that motivated this mask
+	// (2026-10-05). It
 	// also removes the AUTH_TOKEN trap: claude prefers
 	// ANTHROPIC_AUTH_TOKEN over ANTHROPIC_API_KEY when both are set, and
 	// operator home files typically carry the former while daedalus only

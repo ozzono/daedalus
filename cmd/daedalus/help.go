@@ -485,7 +485,14 @@ still wins over it; see "daedalus run --help".
 CONFIGURATION REFERENCE
   agent                 Jailed agent CLI: claude, opencode, amp, pi, aider
                         (deprecated), or codex (default claude; run
-                        -cli/--cli overrides per run)
+                        -cli/--cli overrides per run). Launch gate: a run
+                        whose agent cannot take the config's only serving
+                        endpoint fails at launch (start and continue) —
+                        claude needs an anthropic channel (url, or key
+                        alone on the public base); codex/opencode/aider are
+                        openai-only; pi is staged on the openai channel
+                        only; amp exempt; an all-unset config never trips
+                        it
   thinking              Thinking toggle: an explicit false sends each
                         agent its own off lever (pi --thinking off, aider
                         --thinking-tokens 0, claude MAX_THINKING_TOKENS=0);
@@ -520,6 +527,14 @@ CONFIGURATION REFERENCE
                         openai.url); the per-model
                         limits stay operator-side — see config-example.yaml
                         for the per-agent prerequisites
+  mid                   Mid-tier mode for capable remote models on the
+                        deployment's own provider channel (either wire):
+                        requires verdict_repair (marker-less review
+                        verdicts route through the /v1/systemone decision
+                        contract), adds no endpoint fields, wire
+                        restriction, clamp, or flow reroute, and is
+                        mutually exclusive with slim.enabled (flagship
+                        stays the default with neither set)
   max_concurrent_tests  Native test suites the test worker (the
                         deployment's suite queue) runs at once; further
                         suites queue (default 2)

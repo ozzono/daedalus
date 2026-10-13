@@ -324,6 +324,22 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 	if err := issueIDGate(issueID); err != nil {
 		return err
 	}
+	// The wire-vs-agent gate: a launch whose effective agent has no channel
+	// on this config's served wire would dial whatever the agent's own
+	// ambient/default endpoint is — fail here, before any worktree, worker
+	// ping, or round exists. Load-time validation deliberately omits this
+	// (an openai-url-only section under the default agent is a legal load:
+	// the section's env channel serves tooling and other agents), so the
+	// launch is where the conflict can be named with both the agent and the
+	// wire. The CLI's --cli override wins when set, mirroring the effective
+	// agent everywhere else.
+	effectiveAgent := agent
+	if effectiveAgent == "" {
+		effectiveAgent = cfg.Agent
+	}
+	if err := cfg.AgentWireConflict(effectiveAgent); err != nil {
+		return err
+	}
 	spec, ok := workflowRegistry[workflowName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
@@ -846,6 +862,20 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		if prompt, err = slimInputGate(prompt, cfg); err != nil {
 			return err
 		}
+	}
+
+	// The wire-vs-agent gate applies here exactly as at start: the continued
+	// run carries prev.Agent against the CURRENT config's channels, and a
+	// deployment that flipped its served wire between the abort and this
+	// continue would otherwise launch rounds with no channel to their agent.
+	// A pre-field attempt's empty agent ran as the worker config's agent, so
+	// the effective-agent resolution mirrors the start path's.
+	effectiveAgent := prev.Agent
+	if effectiveAgent == "" {
+		effectiveAgent = cfg.Agent
+	}
+	if err := cfg.AgentWireConflict(effectiveAgent); err != nil {
+		return err
 	}
 
 	base, err := activities.AbortedBranchNameFor(prev.IssueID, workflows.FlowScope(flow))

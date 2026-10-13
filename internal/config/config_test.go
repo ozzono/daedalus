@@ -1057,8 +1057,8 @@ func TestExampleYAML(t *testing.T) {
 	if cfg.Agent != DefaultAgent || cfg.BranchPrefix != DefaultBranchPrefix ||
 		cfg.Temporal.Host != DefaultTemporalHost ||
 		cfg.Temporal.UIPort != DefaultTemporalUIPort || cfg.Temporal.TaskQueue != DefaultTaskQueue ||
-		cfg.WorkerID != "" {
-		t.Errorf("ExampleYAML values = %+v, want the documented defaults", cfg)
+		cfg.WorkerID != "" || cfg.Mid {
+		t.Errorf("ExampleYAML values = %+v, want the documented defaults (mid false — flagship stays the default with the key present)", cfg)
 	}
 	if cfg.Anthropic.URL != "" || cfg.Anthropic.Key != "" || cfg.Anthropic.Model != "" ||
 		cfg.Anthropic.TimeoutMS != DefaultAnthropicTimeoutMS || cfg.OpenAI != (OpenAIConfig{}) {
@@ -1084,20 +1084,23 @@ func TestExampleYAML(t *testing.T) {
 // profiles reproducing ExampleYAML byte for byte.
 func TestExampleYAMLFor(t *testing.T) {
 	// Key-level markers, each unique to its piece of the example: the base
-	// ones ride exampleBase1/3, the slim and prompt ones a profile's slices.
+	// ones ride exampleBase1/3, the mid toggle rides its always-present
+	// block (mid has no profile of its own), and the slim and prompt ones a
+	// profile's slices.
 	markers := []struct {
 		label string
 		mark  string
 	}{
 		{"agent", "\nagent: claude\n"},
 		{"thinking", "\nthinking: true\n"},
+		{"mid section", "\nmid: false\n"},
 		{"slim section", "\nslim:\n"},
 		{"openai section", "\nopenai:\n"},
 		{"anthropic context_tokens", "\n  context_tokens: 0\n"},
 		{"provider section", "\nprovider:\n"},
 		{"prompt section", "# Project-wise prompt overrides"},
 	}
-	inBase := map[string]bool{"agent": true, "thinking": true, "provider section": true}
+	inBase := map[string]bool{"agent": true, "thinking": true, "mid section": true, "provider section": true}
 	inSlim := map[string]bool{"slim section": true, "openai section": true, "anthropic context_tokens": true}
 	inPrompt := map[string]bool{"prompt section": true}
 
@@ -1251,6 +1254,10 @@ review_timeout: 15m
 cleanup_timeout: 5m
 max_concurrent_agent_runs: 3
 max_concurrent_tests: 2
+mid: true
+verdict_repair:
+  url: https://repair.example/v1
+  model: tev1:latest
 temporal:
   host: temporal.example:7233
   ui_port: 8234
@@ -1299,7 +1306,7 @@ prompt: overrides/
 		"agent:", "branch_prefix:", "authorship:", "worker_id:",
 		"tests_timeout:", "agent_run_timeout:", "review_timeout:", "cleanup_timeout:",
 		"max_concurrent_agent_runs:", "max_concurrent_tests:",
-		"temporal:", "anthropic:", "openai:", "fallback:", "reviewer:", "dependency:", "prompt:",
+		"mid:", "temporal:", "anthropic:", "openai:", "fallback:", "reviewer:", "dependency:", "prompt:",
 	} {
 		i := strings.Index(out, key)
 		if i < 0 {
@@ -1317,6 +1324,8 @@ prompt: overrides/
 	for _, want := range []string{
 		"tests_timeout: 45m0s", "agent_run_timeout: 1h0m0s",
 		"review_timeout: 15m0s", "cleanup_timeout: 5m0s",
+		// The mode toggle prints the value it carries, set or not.
+		"mid: true",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderYAML output is missing %q:\n%s", want, out)
@@ -1382,7 +1391,7 @@ func TestRenderYAMLUnsetFields(t *testing.T) {
 	}
 	for _, want := range []string{
 		"tests_timeout: 0s", "agent_run_timeout: 0s", "review_timeout: 0s", "cleanup_timeout: 0s",
-		`agent: ""`, "authorship: false", "enabled: false", `prompt: ""`,
+		`agent: ""`, "authorship: false", "enabled: false", "mid: false", `prompt: ""`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderYAML(empty) output is missing %q:\n%s", want, out)
@@ -2709,4 +2718,174 @@ func TestRenderYAMLProvider(t *testing.T) {
 	if reloaded.Provider != nil {
 		t.Errorf("reloaded Provider = %+v, want nil (the render of a legacy config stays legacy)", reloaded.Provider)
 	}
+}
+
+// TestLoadMid pins the mid toggle's load contract: the boolean decodes both
+// ways; slim.enabled and mid are mutually exclusive at load, naming both
+// keys, with the legacy top-level slim boolean tripping the same gate (it
+// decodes into enabled, so the migration must not reopen a both-set hole);
+// verdict_repair's url and model are required exactly as under slim; and mid
+// adds no concurrency clamp of its own — the deployment's agent-run capacity
+// survives mid unchanged.
+func TestLoadMid(t *testing.T) {
+	const vr = "verdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: tev1:latest\n"
+
+	t.Run("the boolean loads both ways", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "mid: true\n"+vr))
+		if err != nil {
+			t.Fatalf("Load(mid: true): %v", err)
+		}
+		if !cfg.Mid {
+			t.Error("Mid = false, want true")
+		}
+		cfg, err = Load(writeConfig(t, "mid: false\n"))
+		if err != nil {
+			t.Fatalf("Load(mid: false): %v", err)
+		}
+		if cfg.Mid {
+			t.Error("Mid = true, want the flagship default false")
+		}
+	})
+
+	t.Run("slim.enabled and mid are mutually exclusive", func(t *testing.T) {
+		for _, c := range []struct {
+			name string
+			yaml string
+		}{
+			{"section shape", "slim:\n  enabled: true\nmid: true\n"},
+			{"legacy boolean shape", "slim: true\nmid: true\n"},
+		} {
+			_, err := Load(writeConfig(t, c.yaml))
+			if err == nil || !strings.Contains(err.Error(), "slim.enabled and mid are mutually exclusive") {
+				t.Errorf("Load(%s, slim+mid) error = %v, want the mutual-exclusion naming both keys", c.name, err)
+			}
+		}
+		// Mid alone is a legal posture.
+		if _, err := Load(writeConfig(t, "mid: true\n"+vr)); err != nil {
+			t.Errorf("Load(mid alone): %v", err)
+		}
+	})
+
+	t.Run("mid requires verdict_repair url and model", func(t *testing.T) {
+		for _, c := range []struct {
+			name string
+			yaml string
+		}{
+			{"absent", "mid: true\n"},
+			{"url only", "mid: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n"},
+			{"model only", "mid: true\nverdict_repair:\n  model: tev1:latest\n"},
+		} {
+			_, err := Load(writeConfig(t, c.yaml))
+			if err == nil || !strings.Contains(err.Error(), "verdict_repair") {
+				t.Errorf("Load(mid, %s) error = %v, want the verdict_repair requirement", c.name, err)
+			}
+		}
+		cfg, err := Load(writeConfig(t, "mid: true\n"+vr))
+		if err != nil {
+			t.Fatalf("Load(mid, url and model): %v", err)
+		}
+		if cfg.VerdictRepair.URL != "http://127.0.0.1:11434/v1" || cfg.VerdictRepair.Model != "tev1:latest" {
+			t.Errorf("VerdictRepair = %+v, want url and model through", cfg.VerdictRepair)
+		}
+	})
+
+	t.Run("mid adds no concurrency clamp", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "mid: true\n"+vr+"max_concurrent_agent_runs: 4\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MaxConcurrentAgentRuns != 4 {
+			t.Errorf("mid MaxConcurrentAgentRuns = %d, want the configured 4 (the single-round clamp is slim's, not mid's)", cfg.MaxConcurrentAgentRuns)
+		}
+	})
+}
+
+// TestAgentWireConflict pins the launch gate's matrix over the config's
+// serving channels. The gate answers the repo's documented wiring, not the
+// wire names: claude dials ANTHROPIC_* and is served by an anthropic url or
+// a key alone (the public base with that key); codex, opencode, and aider
+// have no anthropic channel at all; pi is staged on the openai channel only,
+// though a bare anthropic key still reaches it through the exported env; amp
+// authenticates through AMP_API_KEY alone and is exempt. A conflict fires
+// only when a serving endpoint exists and no channel serves the agent — an
+// all-unset config is the ambient posture and never trips it.
+func TestAgentWireConflict(t *testing.T) {
+	anthURL := AnthropicConfig{URL: "https://a.example", Key: "sk-a"}
+	anthKey := AnthropicConfig{Key: "sk-a"}
+	openURL := OpenAIConfig{URL: "https://o.example/v1", Key: "sk-o"}
+	openKey := OpenAIConfig{Key: "sk-o"}
+
+	postures := []struct {
+		name string
+		cfg  Config
+		// agents the posture leaves unserved; every other agent passes.
+		unserved []string
+	}{
+		{"an all-unset config is the ambient posture", Config{}, nil},
+		{"an openai url as the only serving endpoint", Config{OpenAI: openURL}, []string{"claude"}},
+		{"an anthropic url as the only serving endpoint", Config{Anthropic: anthURL}, []string{"pi", "codex", "opencode", "aider"}},
+		{"an anthropic key alone serves the public base", Config{Anthropic: anthKey}, nil},
+		{"an openai key alone serves nothing", Config{OpenAI: openKey}, nil},
+		{"both channels served", Config{Anthropic: anthURL, OpenAI: openURL}, nil},
+		{"an openai url beside an anthropic key serves both wires", Config{Anthropic: anthKey, OpenAI: openURL}, nil},
+		{"an anthropic url beside an openai key still leaves the openai-wire agents unserved", Config{Anthropic: anthURL, OpenAI: openKey}, []string{"pi", "codex", "opencode", "aider"}},
+	}
+	agents := []string{"claude", "pi", "codex", "opencode", "aider", "amp"}
+	for _, p := range postures {
+		t.Run(p.name, func(t *testing.T) {
+			for _, agent := range agents {
+				err := p.cfg.AgentWireConflict(agent)
+				if !slices.Contains(p.unserved, agent) {
+					if err != nil {
+						t.Errorf("AgentWireConflict(%s) = %v, want nil", agent, err)
+					}
+					continue
+				}
+				if err == nil {
+					t.Errorf("AgentWireConflict(%s) = nil, want the unserved-agent refusal", agent)
+					continue
+				}
+				// The refusal names the agent it failed — the launch
+				// diagnostic's whole point.
+				if !strings.Contains(err.Error(), fmt.Sprintf("agent %q", agent)) {
+					t.Errorf("AgentWireConflict(%s) error %q should name the agent", agent, err)
+				}
+			}
+		})
+	}
+
+	// Each arm's refusal names the wire that cannot serve and the remedy.
+	if err := (Config{OpenAI: openURL}).AgentWireConflict("claude"); err == nil ||
+		!strings.Contains(err.Error(), "OpenAI-wire") || !strings.Contains(err.Error(), "anthropic") {
+		t.Errorf("claude refusal = %v, want it to name the OpenAI wire and the anthropic remedy", err)
+	}
+	if err := (Config{Anthropic: anthURL}).AgentWireConflict("opencode"); err == nil ||
+		!strings.Contains(err.Error(), "anthropic wire") || !strings.Contains(err.Error(), "openai") {
+		t.Errorf("opencode refusal = %v, want it to name the anthropic wire and the openai remedy", err)
+	}
+
+	// The provider section serves through the same projection, so its
+	// channel counts for the gate exactly as the legacy section's would.
+	t.Run("the provider section's channels count", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "provider:\n  type: openai\n  url: https://oa.example/v1\n  key: k\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if err := cfg.AgentWireConflict("claude"); err == nil {
+			t.Error("AgentWireConflict(claude, openai-typed provider) = nil, want the unserved-agent refusal")
+		}
+
+		cfg, err = Load(writeConfig(t, "provider:\n  type: anthropic\n  url: https://pa.example\n  key: sk\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		for _, agent := range []string{"pi", "codex", "opencode", "aider"} {
+			if err := cfg.AgentWireConflict(agent); err == nil {
+				t.Errorf("AgentWireConflict(%s, anthropic-typed provider) = nil, want the unserved-agent refusal", agent)
+			}
+		}
+		if err := cfg.AgentWireConflict("claude"); err != nil {
+			t.Errorf("AgentWireConflict(claude, anthropic-typed provider) = %v, want nil", err)
+		}
+	})
 }

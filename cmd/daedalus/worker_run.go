@@ -47,6 +47,11 @@ func wantsTestWorker(workerType string) bool { return workerType != workerTypeDe
 // before this runs, so a bad override fails the start before any poller
 // registers.
 func runWorker(cfg config.Config, workerType string) error {
+	// Reap leftover workers first: a stale worker running a deleted binary
+	// polls the same task queue this start is about to join, and once the
+	// pollers below register, two live workers are indistinguishable from
+	// the outside. Best-effort — it never fails the start.
+	sweepStaleWorkers()
 	// Export provider settings into the worker's environment — but only the
 	// ones actually set in the config. A missing key is not an error: the
 	// jailed agent may authenticate through the worker's inherited

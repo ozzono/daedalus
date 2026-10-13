@@ -32,12 +32,25 @@ const reexecEnv = "DAEDALUS_TEST_REEXEC_ARGS"
 // the daemon log, which is where the test reads the line back.
 const reexecDumpArgsEnv = "DAEDALUS_TEST_DUMP_OSARGS"
 
+// reexecSweepSleepEnv turns a re-exec'd test binary into a stand-in worker:
+// it writes the env value's path as a ready marker and sleeps until
+// signaled, running no tests. The sweep tests plant it on a copy of the test
+// binary so a real, killable process exists with the argv shape the sweep
+// identifies — without it the child would re-run the whole test suite.
+const reexecSweepSleepEnv = "DAEDALUS_TEST_SWEEP_SLEEP"
+
 // TestMain is the re-exec guard for the exit-code paths: exitf, fail,
 // usageFail, and loadConfig all call os.Exit(1), so they cannot run inside a
 // test process. Tests route them through runMainIn, which execs this same
 // binary with reexecEnv set; here that arrival is detected before the test
 // framework starts.
 func TestMain(m *testing.M) {
+	if marker := os.Getenv(reexecSweepSleepEnv); marker != "" {
+		_ = os.WriteFile(marker, []byte("ready"), 0o644)
+		for {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	if os.Getenv(reexecDumpArgsEnv) == "1" {
 		fmt.Println(strings.Join(os.Args[1:], "\x1f"))
 		os.Exit(0)
