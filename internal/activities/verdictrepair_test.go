@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,52 +12,63 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 )
 
-// classifyServer stubs the decision endpoint: every request is recorded and
-// answered with the given content as the single choice's message. The
-// requests slice and a mutex keep the handlers race-safe under the
-// -race-defaulted suite.
+// classifyServer stubs the decision endpoint's systemone surface: every
+// request is recorded and answered with the named choice and confidence as
+// the "verdict" question's scored answer. The request body is decoded into
+// a locally-tagged shape — not the production structs — so a wire-tag drift
+// in the implementation fails these pins. The requests slice and a mutex
+// keep the handlers race-safe under the -race-defaulted suite.
 type classifyServer struct {
 	srv      *httptest.Server
 	mu       sync.Mutex
 	requests []classifyRequest
-	content  string
+	choice   string
+	conf     float64
 	status   int
-	rawBody  string // when non-empty, sent verbatim instead of the wrapper
+	rawBody  string // when non-empty, sent verbatim instead of the scored answer
 }
 
 type classifyRequest struct {
+	method      string
 	path        string
 	model       string
 	auth        string
 	contentType string
-	// content is the first message's payload — the classify prompt the
-	// marker-less review must ride in on.
-	content string
+	// state is the request's state field — the marker-less review the
+	// decision model must classify.
+	state string
+	// questions is the request's named question map, decoded with the wire
+	// tags the endpoint contract fixes.
+	questions map[string]struct {
+		Type         string            `json:"type"`
+		Instructions string            `json:"instructions"`
+		Criteria     map[string]string `json:"criteria"`
+	}
 }
 
-func newClassifyServer(t *testing.T, content string) *classifyServer {
+func newClassifyServer(t *testing.T, choice string, conf float64) *classifyServer {
 	t.Helper()
-	cs := &classifyServer{content: content, status: http.StatusOK}
+	cs := &classifyServer{choice: choice, conf: conf, status: http.StatusOK}
 	cs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Model    string `json:"model"`
-			Messages []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
+			Model     string `json:"model"`
+			State     string `json:"state"`
+			Questions map[string]struct {
+				Type         string            `json:"type"`
+				Instructions string            `json:"instructions"`
+				Criteria     map[string]string `json:"criteria"`
+			} `json:"questions"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		prompt := ""
-		if len(body.Messages) > 0 {
-			prompt = body.Messages[0].Content
-		}
 		cs.mu.Lock()
 		cs.requests = append(cs.requests, classifyRequest{
+			method:      r.Method,
 			path:        r.URL.Path,
 			model:       body.Model,
 			auth:        r.Header.Get("Authorization"),
 			contentType: r.Header.Get("Content-Type"),
-			content:     prompt,
+			state:       body.State,
+			questions:   body.Questions,
 		})
 		cs.mu.Unlock()
 		if cs.status != http.StatusOK {
@@ -68,8 +78,13 @@ func newClassifyServer(t *testing.T, content string) *classifyServer {
 		payload := cs.rawBody
 		if payload == "" {
 			b, _ := json.Marshal(map[string]any{
-				"choices": []map[string]any{
-					{"message": map[string]string{"role": "assistant", "content": cs.content}},
+				"answers": map[string]any{
+					"verdict": map[string]any{
+						"type":          "choice",
+						"choice":        cs.choice,
+						"probabilities": map[string]float64{cs.choice: cs.conf},
+						"confidence":    cs.conf,
+					},
 				},
 			})
 			payload = string(b)
@@ -98,46 +113,76 @@ func (cs *classifyServer) last() classifyRequest {
 func armVerdictRepair(t *testing.T, cs *classifyServer, key string) {
 	t.Helper()
 	t.Setenv(config.VerdictRepairURLEnv, cs.srv.URL)
-	t.Setenv(config.VerdictRepairModelEnv, "qwen2.5-coder:3b")
+	t.Setenv(config.VerdictRepairModelEnv, "tev1:latest")
 	if key != "" {
 		t.Setenv(config.VerdictRepairKeyEnv, key)
 	}
 }
 
+// assertVerdictQuestion pins the classify request's question shape: the
+// named "verdict" question is a choice question whose criteria offer
+// exactly the parser's marker set — the choice set cannot drift from the
+// set the verdict parser exact-matches — each with a non-empty description.
+func assertVerdictQuestion(t *testing.T, req classifyRequest) {
+	t.Helper()
+	q, ok := req.questions["verdict"]
+	if !ok {
+		t.Fatalf("questions = %v, want a named \"verdict\" question", req.questions)
+	}
+	if q.Type != "choice" {
+		t.Errorf("verdict question type = %q, want \"choice\" (the answer is a scored pick, not generated text)", q.Type)
+	}
+	if q.Instructions == "" {
+		t.Error("verdict question instructions are empty, want the question instructed")
+	}
+	if len(q.Criteria) != len(verdictMarkers) {
+		t.Errorf("criteria = %v, want exactly the %d markers the verdict parser accepts", q.Criteria, len(verdictMarkers))
+	}
+	for _, marker := range verdictMarkers {
+		if q.Criteria[marker] == "" {
+			t.Errorf("criteria = %v, want a non-empty description for the marker %q", q.Criteria, marker)
+		}
+	}
+}
+
 // TestRepairReviewVerdictPromotes pins the repair's one routing decision at
-// the promotion boundary: an APPROVED classification at repairPromotionThreshold
-// promotes the marker-less round to approval — the promoted round ends the
-// review loop exactly as a parsed approval would (the workflow decides
-// approval before its strike accounting) — while one below it, and every
-// other verdict at any confidence, only annotates the round (LikelyVerdict
-// and LikelyConfidence) and keeps it a changes-requested round: NEEDS_MAINTAINER
-// and REBUILD inferences never trigger their lifecycle actions, and the
-// repair outcome never touches strike accounting (only the workflow counts
-// strikes). The 0.9/0.899 pair is the threshold's mutation pin both
-// directions: moving the constant in either direction flips one case.
+// the promotion boundary — and the systemone wire that feeds it: the request
+// is a POST to <url>/systemone carrying the configured model, the marker-less
+// review as state data, and the named verdict choice question; the scored
+// answer's choice and confidence ride back as the round's annotation. An
+// APPROVED classification at repairPromotionThreshold promotes the
+// marker-less round to approval — the promoted round ends the review loop
+// exactly as a parsed approval would (the workflow decides approval before
+// its strike accounting) — while one below it, and every other verdict at
+// any confidence, only annotates the round (LikelyVerdict and
+// LikelyConfidence) and keeps it a changes-requested round:
+// NEEDS_MAINTAINER and REBUILD inferences never trigger their lifecycle
+// actions, and the repair outcome never touches strike accounting (only the
+// workflow counts strikes). The 0.9/0.899 pair is the threshold's mutation
+// pin both directions: moving the constant in either direction flips one
+// case.
 func TestRepairReviewVerdictPromotes(t *testing.T) {
 	cases := []struct {
 		label        string
-		content      string
+		choice       string
+		conf         float64
 		key          string
 		wantApproved bool
 		wantVerdict  string
 		wantConf     float64
 	}{
-		{"APPROVED at the threshold promotes", `{"verdict": "APPROVED", "confidence": 0.9}`, "", true, "APPROVED", 0.9},
-		{"APPROVED below the threshold only annotates", `{"verdict": "APPROVED", "confidence": 0.899}`, "", false, "APPROVED", 0.899},
-		{"APPROVED above the threshold promotes", `{"verdict": "APPROVED", "confidence": 1}`, "", true, "APPROVED", 1},
-		{"confidence zero is in range and never promotes", `{"verdict": "APPROVED", "confidence": 0}`, "", false, "APPROVED", 0},
-		{"changes-requested annotates without routing", `{"verdict": "CHANGES_REQUESTED", "confidence": 0.99}`, "", false, "CHANGES_REQUESTED", 0.99},
-		{"needs-maintainer annotates without parking", `{"verdict": "NEEDS_MAINTAINER", "confidence": 0.99}`, "", false, "NEEDS_MAINTAINER", 0.99},
-		{"rebuild annotates without routing", `{"verdict": "REBUILD", "confidence": 0.7}`, "", false, "REBUILD", 0.7},
-		{"the answer is normalized, not exact-matched", `{"verdict": " approved ", "confidence": 0.95}`, "", true, "APPROVED", 0.95},
-		{"fenced JSON answers fine", "```json\n{\"verdict\": \"APPROVED\", \"confidence\": 0.95}\n```", "", true, "APPROVED", 0.95},
-		{"an armed key rides the request", `{"verdict": "APPROVED", "confidence": 0.95}`, "sk-local", true, "APPROVED", 0.95},
+		{"APPROVED at the threshold promotes", "APPROVED", 0.9, "", true, "APPROVED", 0.9},
+		{"APPROVED below the threshold only annotates", "APPROVED", 0.899, "", false, "APPROVED", 0.899},
+		{"APPROVED above the threshold promotes", "APPROVED", 1, "", true, "APPROVED", 1},
+		{"confidence zero is in range and never promotes", "APPROVED", 0, "", false, "APPROVED", 0},
+		{"changes-requested annotates without routing", "CHANGES_REQUESTED", 0.99, "", false, "CHANGES_REQUESTED", 0.99},
+		{"needs-maintainer annotates without parking", "NEEDS_MAINTAINER", 0.99, "", false, "NEEDS_MAINTAINER", 0.99},
+		{"rebuild annotates without routing", "REBUILD", 0.7, "", false, "REBUILD", 0.7},
+		{"an armed key rides the request", "APPROVED", 0.95, "sk-local", true, "APPROVED", 0.95},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {
-			cs := newClassifyServer(t, tc.content)
+			cs := newClassifyServer(t, tc.choice, tc.conf)
 			armVerdictRepair(t, cs, tc.key)
 			in := ReviewResult{NoVerdict: true, Comments: "looks good, but the marker line never arrived"}
 
@@ -147,10 +192,13 @@ func TestRepairReviewVerdictPromotes(t *testing.T) {
 				t.Fatalf("decision endpoint dialed %d times, want exactly one classify call", cs.count())
 			}
 			req := cs.last()
-			if req.path != "/chat/completions" {
-				t.Errorf("request path = %q, want /chat/completions (the configured url is a chat-completions base)", req.path)
+			if req.method != http.MethodPost {
+				t.Errorf("request method = %q, want POST (the systemone surface serves POST only)", req.method)
 			}
-			if req.model != "qwen2.5-coder:3b" {
+			if req.path != "/systemone" {
+				t.Errorf("request path = %q, want /systemone (the configured url is the endpoint's /v1 base)", req.path)
+			}
+			if req.model != "tev1:latest" {
 				t.Errorf("request model = %q, want the configured model name", req.model)
 			}
 			if req.contentType != "application/json" {
@@ -163,17 +211,13 @@ func TestRepairReviewVerdictPromotes(t *testing.T) {
 			if req.auth != wantAuth {
 				t.Errorf("Authorization = %q, want %q (the key is optional)", req.auth, wantAuth)
 			}
-			// The classify prompt must carry the round's marker-less output
-			// — a request that loses the review text classifies nothing —
-			// and name the choice set the answer must pick from.
-			if !strings.Contains(req.content, "looks good, but the marker line never arrived") {
-				t.Errorf("request content = %q, want the marker-less review text riding the prompt", req.content)
+			// The state carries the round's marker-less output verbatim —
+			// a request that loses the review text classifies nothing —
+			// and the verdict question offers the parser's marker set.
+			if req.state != in.Comments {
+				t.Errorf("request state = %q, want the marker-less review text carried as data", req.state)
 			}
-			for _, marker := range verdictMarkers {
-				if !strings.Contains(req.content, marker) {
-					t.Errorf("request content = %q, want it to name the marker %q", req.content, marker)
-				}
-			}
+			assertVerdictQuestion(t, req)
 			if out.LikelyVerdict != tc.wantVerdict || out.LikelyConfidence != tc.wantConf {
 				t.Errorf("annotation = %q/%v, want %q/%v", out.LikelyVerdict, out.LikelyConfidence, tc.wantVerdict, tc.wantConf)
 			}
@@ -182,6 +226,22 @@ func TestRepairReviewVerdictPromotes(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("a trailing-slash url still hits /systemone", func(t *testing.T) {
+		cs := newClassifyServer(t, "APPROVED", 0.95)
+		armVerdictRepair(t, cs, "")
+		t.Setenv(config.VerdictRepairURLEnv, cs.srv.URL+"/")
+		in := ReviewResult{NoVerdict: true, Comments: "folded"}
+
+		repairReviewVerdict(context.Background(), in)
+
+		if cs.count() != 1 {
+			t.Fatalf("decision endpoint dialed %d times, want exactly one classify call", cs.count())
+		}
+		if req := cs.last(); req.path != "/systemone" {
+			t.Errorf("request path = %q, want /systemone (the url's trailing slash is trimmed, not doubled)", req.path)
+		}
+	})
 }
 
 // TestRepairReviewVerdictFailOpen pins the layer's contract on every
@@ -189,22 +249,29 @@ func TestRepairReviewVerdictPromotes(t *testing.T) {
 // garbage-answering endpoint returns the result untouched — the
 // pre-repair behavior byte for byte (changes-requested, no annotation),
 // so the marker-less strike budget stays the layer's only retry policy.
+// On the systemone wire the answer is a scored choice, so garbage is any
+// body the answers decode cannot stomach, a missing or unknown choice
+// (the choice is exact-matched against the parser's marker set — never
+// normalized), or a confidence off the [0,1] scale.
 func TestRepairReviewVerdictFailOpen(t *testing.T) {
 	garbage := []struct {
 		label   string
-		content string
+		choice  string
+		conf    float64
+		rawBody string
 	}{
-		{"prose instead of JSON", "The review looks fine to me, approved."},
-		{"prose around the object", `Sure! {"verdict": "APPROVED", "confidence": 0.99}`},
-		{"two fenced blocks", "```json\n{\"verdict\": \"APPROVED\"}\n```\n```json\n{\"confidence\": 1}\n```"},
-		{"unknown verdict", `{"verdict": "MAYBE", "confidence": 0.99}`},
-		{"a different confidence scale", `{"verdict": "APPROVED", "confidence": 90}`},
-		{"a negative confidence", `{"verdict": "APPROVED", "confidence": -0.1}`},
-		{"an empty answer", ""},
+		{"prose instead of JSON", "", 0, "The review looks fine to me, approved."},
+		{"an unknown choice", "MAYBE", 0.99, ""},
+		{"a lowercase choice is not normalized", "approved", 0.99, ""},
+		{"a different confidence scale", "APPROVED", 90, ""},
+		{"a negative confidence", "APPROVED", -0.1, ""},
+		{"an empty answers map", "", 0, `{"answers": {}}`},
+		{"no answer for the verdict question", "", 0, `{"answers": {"sentiment": {"type": "choice", "choice": "APPROVED", "confidence": 1}}}`},
 	}
 	for _, tc := range garbage {
 		t.Run(tc.label, func(t *testing.T) {
-			cs := newClassifyServer(t, tc.content)
+			cs := newClassifyServer(t, tc.choice, tc.conf)
+			cs.rawBody = tc.rawBody
 			armVerdictRepair(t, cs, "")
 			in := ReviewResult{NoVerdict: true, Comments: "connection reset by peer"}
 
@@ -212,6 +279,9 @@ func TestRepairReviewVerdictFailOpen(t *testing.T) {
 
 			if out != in {
 				t.Errorf("result = %+v, want it untouched by the failed repair", out)
+			}
+			if cs.count() != 1 {
+				t.Fatalf("decision endpoint dialed %d times, want exactly one classify attempt", cs.count())
 			}
 		})
 	}
@@ -239,7 +309,7 @@ func TestRepairReviewVerdictFailOpen(t *testing.T) {
 		dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 		dead.Close() // the port is closed; the URL still names it
 		t.Setenv(config.VerdictRepairURLEnv, dead.URL)
-		t.Setenv(config.VerdictRepairModelEnv, "qwen2.5-coder:3b")
+		t.Setenv(config.VerdictRepairModelEnv, "tev1:latest")
 		in := ReviewResult{NoVerdict: true, Comments: "folded"}
 		if out := repairReviewVerdict(context.Background(), in); out != in {
 			t.Errorf("result = %+v, want it untouched when the endpoint is unreachable", out)
@@ -247,7 +317,7 @@ func TestRepairReviewVerdictFailOpen(t *testing.T) {
 	})
 
 	t.Run("an HTTP error status fails open", func(t *testing.T) {
-		cs := newClassifyServer(t, `{"verdict": "APPROVED", "confidence": 1}`)
+		cs := newClassifyServer(t, "APPROVED", 1)
 		cs.status = http.StatusInternalServerError
 		armVerdictRepair(t, cs, "")
 		in := ReviewResult{NoVerdict: true, Comments: "folded"}
@@ -256,23 +326,13 @@ func TestRepairReviewVerdictFailOpen(t *testing.T) {
 		}
 	})
 
-	t.Run("a malformed completion body fails open", func(t *testing.T) {
-		cs := newClassifyServer(t, "")
+	t.Run("a malformed answers body fails open", func(t *testing.T) {
+		cs := newClassifyServer(t, "", 0)
 		cs.rawBody = "<html>gateway garbage</html>"
 		armVerdictRepair(t, cs, "")
 		in := ReviewResult{NoVerdict: true, Comments: "folded"}
 		if out := repairReviewVerdict(context.Background(), in); out != in {
 			t.Errorf("result = %+v, want it untouched on an unparseable body", out)
-		}
-	})
-
-	t.Run("a completion with no choices fails open", func(t *testing.T) {
-		cs := newClassifyServer(t, "")
-		cs.rawBody = `{"choices": []}`
-		armVerdictRepair(t, cs, "")
-		in := ReviewResult{NoVerdict: true, Comments: "folded"}
-		if out := repairReviewVerdict(context.Background(), in); out != in {
-			t.Errorf("result = %+v, want it untouched with no choices", out)
 		}
 	})
 }
@@ -284,7 +344,7 @@ func TestRepairReviewVerdictFailOpen(t *testing.T) {
 // fail-closed the headroom check exists to prevent) while a round with room,
 // or no deadline at all, dials exactly once.
 func TestClassifyReviewVerdictHeadroom(t *testing.T) {
-	cs := newClassifyServer(t, `{"verdict": "CHANGES_REQUESTED", "confidence": 0.5}`)
+	cs := newClassifyServer(t, "CHANGES_REQUESTED", 0.5)
 	armVerdictRepair(t, cs, "")
 
 	t.Run("no deadline dials", func(t *testing.T) {
@@ -329,31 +389,4 @@ func TestClassifyReviewVerdictHeadroom(t *testing.T) {
 			t.Errorf("endpoint dialed %d times total, want 2", n)
 		}
 	})
-}
-
-// TestStripJSONFence pins the fence tolerance at the shapes small local
-// models actually emit — and the ones it must not pretend to fix: the strip
-// only succeeds when the content becomes a single JSON object, and any
-// shape it cannot make single fails the downstream unmarshal (the caller's
-// fail-open).
-func TestStripJSONFence(t *testing.T) {
-	cases := []struct {
-		label string
-		in    string
-		want  string
-	}{
-		{"bare JSON passes through trimmed", "  {\"a\": 1}  ", `{"a": 1}`},
-		{"a fence with an info string", "```json\n{\"a\": 1}\n```", `{"a": 1}`},
-		{"a bare fence", "```\n{\"a\": 1}\n```", `{"a": 1}`},
-		{"an unclosed fence keeps the body", "```json\n{\"a\": 1}", `{"a": 1}`},
-		{"trailing text after the closer is cut", "```json\n{\"a\": 1}\n```\nhope this helps", `{"a": 1}`},
-		{"prose around a block is not repaired", "Here you go:\n```json\n{\"a\": 1}\n```", "Here you go:\n```json\n{\"a\": 1}\n```"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.label, func(t *testing.T) {
-			if got := stripJSONFence(tc.in); got != tc.want {
-				t.Errorf("stripJSONFence(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
 }

@@ -298,11 +298,13 @@ type ReviewerConfig struct {
 // VerdictRepairConfig points the decision-model repair pass at its
 // classify-only endpoint: when a reviewer round's output carries no
 // parseable verdict marker, the review activity asks this model to read the
-// review and name the most likely verdict among the four markers. url is an
-// OpenAI-compatible chat-completions base — typically the same loopback
-// relay that serves the rounds, the request differing only in the model
-// name. key is optional (a local relay needs none). Absent (the default)
-// the repair layer is off: marker-less rounds keep the pre-repair
+// review and name the most likely verdict among the four markers. url is
+// the /v1 base of a decision-model endpoint speaking the systemone
+// contract (POST <url>/systemone — the OpenAI-compat chat paths reject
+// decision-capable models, so a chat-completions URL cannot serve here);
+// with Ollama serving tev1 that is http://localhost:11434/v1 and model
+// tev1:latest. key is optional (a local relay needs none). Absent (the
+// default) the repair layer is off: marker-less rounds keep the pre-repair
 // behavior. Under slim mode the section is required (url and model), since
 // slim's small models are the marker-less-exit generator and this layer is
 // its recovery mechanism.
