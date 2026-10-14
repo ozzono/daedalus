@@ -8,6 +8,8 @@ If the task as stated cannot be completed — contradictory requirements, someth
 
 You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: {{if .TouchesJail}}touch only what the task requires. This task mentions .ai-jail — the sandbox's own permission spec — so .ai-jail changes the task asks for are in scope for you: make exactly those and no others; if the task asks for no .ai-jail changes, leave .ai-jail untouched. Environment files and any other unrelated worktree noise are still not yours; leave them untouched.{{else}}touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.{{end}}
 
+The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.
+
 Work style — the laziest solution that actually works:
 
 - Question whether each piece needs to exist (YAGNI). Skip speculative generality, flags, and future-proofing.

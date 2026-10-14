@@ -132,6 +132,33 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 			return "", err
 		}
 	}
+	// Terminal freshness gate (approve side), slim's half of the
+	// invariant: the loop above leaves lastSuite no older than the last
+	// edit by construction — every accepted sub-task's suite runs after
+	// its last fix round — so this fires only if that loop shape ever
+	// changes. Then the close is re-grounded on a fresh execution of the
+	// already-resolved suite command instead of approving unvalidated:
+	// green finalizes; red, verdict-less (a timeout), or unexecutable
+	// parks — there is no loop left to fix any of them, and the park
+	// record says which. The parks go through parkRaw, not park: the
+	// freshness outcome is decided and written right here, and park
+	// re-checking suiteStale would re-fire the force-run a second time
+	// at this terminal transition when the first attempt never executed.
+	// Re-entering a sub-task loop is not an option either way: its first
+	// act is another implement round, a fresh edit, not a re-validation.
+	if run.suiteGate && run.suiteStale() {
+		run.logger.Info("Suite stale at approval (agent rounds ran after the last suite execution); running the suite once before finalizing")
+		result, ran := run.forceTerminalSuite("approve")
+		if !ran {
+			return "", run.parkRaw("terminal suite freshness gate: the suite state was stale at approval and the forced suite run did not execute — the final state is unvalidated")
+		}
+		if result.TimedOut {
+			return "", run.parkRaw("terminal suite freshness gate: the forced suite run timed out without a verdict — the final state is unvalidated")
+		}
+		if !result.Passed {
+			return "", run.parkRaw("terminal suite freshness gate: the forced suite run came out red — the final state never passed the suite")
+		}
+	}
 	return run.finalize()
 }
 

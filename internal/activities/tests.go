@@ -47,6 +47,13 @@ type TestResult struct {
 	// complete record, exactly as before. Inside the run's worktree, so a
 	// jailed tester or reviewer can read it.
 	DumpPath string
+	// TimedOut marks a verdict-less round: the suite executed but never
+	// finished within its ceiling, so nothing here is a verdict — Passed
+	// is the synthetic false and Logs the synthetic description. Stamped
+	// by the workflow's runSuite when it collapses the timeout (the
+	// activity itself never sets it); the terminal suite-freshness gate
+	// renders the difference instead of calling the round red.
+	TimedOut bool
 }
 
 // RunNativeTestsActivity resolves and runs the repository's own test suite
