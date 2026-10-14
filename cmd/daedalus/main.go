@@ -2,8 +2,8 @@
 // Temporal workers and starts feature-development pipelines. main is a thin
 // dispatch router: argument parsing lives in flags.go, the help screens in
 // help.go, and each command's implementation in its own file (pipeline.go,
-// worker.go, worker_run.go, worker_status.go, report.go, recapture.go,
-// tasklog.go).
+// worker.go, worker_run.go, worker_status.go, report.go, metrics.go,
+// recapture.go, tasklog.go).
 package main
 
 import (
@@ -74,9 +74,10 @@ func main() {
 	}
 
 	// Every subcommand except the no-config ones (help, version, init,
-	// report, completion, the record-driven worker commands — `worker
-	// restart all`, `worker restart <name>`, and `worker status`, which
-	// read only the recorded per-worker configs — and `log`, which reads a
+	// completion, the record-driven worker and metrics commands — `worker
+	// restart all`, `worker restart <name>`, `worker status`, `metrics
+	// status`, `metrics stop`, and `metrics list` (flag tail included),
+	// which read only the recorded daemon files — and `log`, which reads a
 	// file by name alone) loads a configuration; resolve its location once,
 	// up front, so the subcommand — and the daemon `worker start`
 	// re-executes — agree on it wherever the CLI is invoked from.
@@ -84,8 +85,8 @@ func main() {
 	switch {
 	case args[0] == "-h", args[0] == "--help", args[0] == "help",
 		args[0] == "-v", args[0] == "--version", args[0] == "version", args[0] == "init",
-		args[0] == "report", args[0] == "log", args[0] == "completion",
-		isRestartAll(args), restartNamed, isWorkerStatus(args):
+		args[0] == "log", args[0] == "completion",
+		isRestartAll(args), restartNamed, isWorkerStatus(args), isMetricsRecordRead(args):
 	default:
 		// A fresh `run <repo-path>` prefers the repo's own project-local
 		// config over the default resolution (see runLocalConfigPath);
@@ -176,15 +177,17 @@ func main() {
 			if len(args) != 3 {
 				usageFail("wakeup takes <workflow-id>")
 			}
-		} else if len(args) > 2 {
+		} else if action != "report" && len(args) > 2 {
+			// report forwards its own flags (--json, --table) to its parse.
 			usageFail("worker takes at most one action")
 		}
 		// The record-driven worker commands (`restart all`, `restart
 		// <name>`, `status`) work purely from the recorded per-worker
 		// configs and must not depend on whatever the invoking directory
-		// resolves to; every other action needs the CLI's config.
+		// resolves to; every other action needs the CLI's config (report
+		// resolves and loads it itself).
 		var cfg config.Config
-		if !(action == "restart" && (all || restartName != "")) && action != "status" {
+		if !(action == "restart" && (all || restartName != "")) && action != "status" && action != "report" {
 			cfg = loadConfig(configPath.configPath)
 		}
 		switch action {
@@ -223,6 +226,13 @@ func main() {
 			// for the Temporal connection and the owning task queue.
 			if err := wakeupPipeline(cfg, args[2]); err != nil {
 				fail("worker wakeup", err)
+			}
+		case "report":
+			// daedalus worker report — the usage report for this config's
+			// worker alone (Q7). runReport resolves and loads the config
+			// itself, so the guard above skips the pre-load.
+			if err := runReport(configPath.configPath, args[2:]); err != nil {
+				fail("worker report", err)
 			}
 		case "foreground":
 			// Run attached to this terminal — the daemon child's mode, and
@@ -367,9 +377,57 @@ func main() {
 			usageFail("completion takes bash or zsh")
 		}
 		fmt.Print(completionScript(args[1]))
-	case "report":
-		if err := runReport(configPath.configPath, args[1:]); err != nil {
-			fail("report", err)
+	case "metrics":
+		// daedalus metrics [start|stop|restart|status|list|foreground] —
+		// the host-global metrics daemon. start (the default) launches it
+		// detached; stop, status, and list are record-driven, reading the
+		// daemon's pid and status files alone.
+		action := "start"
+		if len(args) >= 2 {
+			action = args[1]
+		}
+		// list parses its own flags below; every other action takes none,
+		// and an extra word is a typo to fail on, not something to drop.
+		if action != "list" && len(args) > 2 {
+			usageFail("metrics %s takes no arguments", action)
+		}
+		var cfg config.Config
+		if action != "status" && action != "stop" && action != "list" {
+			cfg = loadConfig(configPath.configPath)
+		}
+		switch action {
+		case "start":
+			if err := metricsStart(cfg, configPath.configPath); err != nil {
+				fail("metrics start", err)
+			}
+		case "stop":
+			if err := metricsStop(); err != nil {
+				fail("metrics stop", err)
+			}
+		case "restart":
+			if err := metricsRestart(cfg, configPath.configPath); err != nil {
+				fail("metrics restart", err)
+			}
+		case "status":
+			if err := metricsStatus(); err != nil {
+				fail("metrics status", err)
+			}
+		case "list":
+			if err := runMetricsList(args[2:]); err != nil {
+				fail("metrics list", err)
+			}
+		case "foreground":
+			// Run attached to this terminal — the daemon child's mode, and
+			// the way to debug a daemon that will not start.
+			if err := runMetricsDaemon(cfg); err != nil {
+				fail("metrics", err)
+			}
+			if os.Getenv(daemonEnv) == "1" {
+				pidFile, _, _ := metricsPaths()
+				os.Remove(pidFile)
+			}
+		default:
+			usageFail("unknown metrics action %q (%s)", action, strings.Join(metricsActions, ", "))
 		}
 	default:
 		usageFail("unknown subcommand %q", args[0])

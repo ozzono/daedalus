@@ -22,9 +22,11 @@ import (
 	"github.com/ozzono/daedalus/internal/activities"
 )
 
-// TestParseReportArgs pins the flag surface: scopes are exclusive, queue
-// names go verbatim into a Temporal list query so quotes are refused, and
-// --table is the default output accepted only for explicitness.
+// TestParseReportArgs pins the flag surface: --table is the default output
+// accepted only for explicitness, --json switches to the machine form, and
+// nothing else is a flag — the Q7 rescope dropped the multi-queue selection
+// (the report is the invoking config's worker alone), so the old -q/--all
+// spellings must fail loud rather than parse into a scope nobody reads.
 func TestParseReportArgs(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -32,16 +34,17 @@ func TestParseReportArgs(t *testing.T) {
 		want    reportScope
 		wantErr string
 	}{
-		{"no flags defaults to the table and the invoking queue", nil, reportScope{}, ""},
+		{"no flags defaults to the table and the invoking worker", nil, reportScope{}, ""},
 		{"json", []string{"--json"}, reportScope{jsonOut: true}, ""},
 		{"table accepted for explicitness", []string{"--table"}, reportScope{}, ""},
-		{"queue", []string{"-q", "q7"}, reportScope{queue: "q7", queueSet: true}, ""},
-		{"queue equals form", []string{"--queue=q7"}, reportScope{queue: "q7", queueSet: true}, ""},
-		{"all queues", []string{"--all"}, reportScope{all: true}, ""},
-		{"-q without a value", []string{"-q"}, reportScope{}, "requires a value"},
-		{"--all and -q clash", []string{"--all", "-q", "q7"}, reportScope{}, "mutually exclusive"},
-		{"empty queue name", []string{"--queue="}, reportScope{}, "wants a plain queue name"},
-		{"injected query text", []string{"-q", "q7' OR TaskQueue='x"}, reportScope{}, "wants a plain queue name"},
+		{"json then table stays json", []string{"--json", "--table"}, reportScope{jsonOut: true}, ""},
+		{"removed -q is an unknown flag", []string{"-q", "q7"}, reportScope{}, "unknown report flag"},
+		{"removed --queue= is an unknown flag", []string{"--queue=q7"}, reportScope{}, "unknown report flag"},
+		{"removed --all is an unknown flag", []string{"--all"}, reportScope{}, "unknown report flag"},
+		{"-q without a value is an unknown flag", []string{"-q"}, reportScope{}, "unknown report flag"},
+		{"--all and -q together are unknown flags", []string{"--all", "-q", "q7"}, reportScope{}, "unknown report flag"},
+		{"empty queue name is an unknown flag", []string{"--queue="}, reportScope{}, "unknown report flag"},
+		{"injected query text is an unknown flag", []string{"-q", "q7' OR TaskQueue='x"}, reportScope{}, "unknown report flag"},
 		{"unknown flag", []string{"--csv"}, reportScope{}, "unknown report flag"},
 	}
 	for _, c := range cases {

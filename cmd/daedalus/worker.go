@@ -64,7 +64,7 @@ func recordedConfigPath(name string) string {
 // action diagnostic names them. It is the shared source of that diagnostic
 // (main.go's worker dispatch) and the shell completion's candidates, so a
 // new action is dispatched, diagnosed, and completed from one list.
-var workerActions = []string{"start", "stop", "status", "restart", "wakeup", "foreground"}
+var workerActions = []string{"start", "stop", "status", "restart", "wakeup", "report", "foreground"}
 
 // isRestartAll reports whether args spell out `worker restart all` (or its
 // --all spelling; -a is taken by run's --append) — one of the invocations
@@ -150,6 +150,15 @@ func workerStart(cfg config.Config, configPath, workerType string) error {
 	pidFile, logFile, confFile := daemonPaths(cfg.WorkerName())
 	if pid, ok := readLivePid(pidFile); ok {
 		return fmt.Errorf("already running (pid %d) — use 'daedalus worker restart' or 'stop'", pid)
+	}
+	// The metrics gate (Q12): with metrics enabled, this worker's rounds
+	// stage their provider calls onto the host metrics relay. A relay that
+	// is not up would fail every round at dial time instead, so fail the
+	// start with the remedy instead.
+	if cfg.Metrics.Enabled {
+		if err := metricsGateCheck(cfg); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", daemonDir, err)

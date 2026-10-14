@@ -93,6 +93,15 @@ const (
 	// enabled without an explicit dir — the .daedalus/ entrypoint
 	// convention, like the .daedalus.yaml test declaration.
 	DefaultTestOutputDir = ".daedalus/test-output"
+	// DefaultMetricsUIPort is the metrics daemon's UI listener port when
+	// metrics.port is unset — the dashboard's own decided default (htmx-ui
+	// pt1 design, Q14/Q17): the daedalus dashboard and the GoLens mount.
+	DefaultMetricsUIPort = 7777
+	// DefaultMetricsRelayPort is the metrics daemon's relay listener port
+	// when metrics.relay_port is unset: loopback-only, physically
+	// unreachable off-host (Q17), one below the UI port by the same
+	// day-one-knob precedent.
+	DefaultMetricsRelayPort = 7778
 )
 
 // Fallback wire styles accepted by the config's fallback.type.
@@ -191,6 +200,30 @@ const (
 	VerdictRepairURLEnv   = "DAEDALUS_VERDICT_REPAIR_URL"
 	VerdictRepairModelEnv = "DAEDALUS_VERDICT_REPAIR_MODEL"
 	VerdictRepairKeyEnv   = "DAEDALUS_VERDICT_REPAIR_KEY"
+	// MetricsRelayAnthropicEnv and MetricsRelayOpenAIEnv carry the staged
+	// base URLs of the metrics relay (internal/metricsrelay) for each
+	// provider wire: the relay's loopback address plus the worker-scoped
+	// path prefix (/relay/<worker-name>/<wire>) plus the upstream's own
+	// path prefix, so a CLI appending its usual suffix to the staged URL
+	// lands on the relay exactly where it would have landed on the
+	// upstream. Exported only while the metrics daemon is running and the
+	// worker verified and registered with it (metrics.enabled); absent
+	// means rounds dial the provider directly, the pre-metrics behavior.
+	// Unset symmetrically and scrubbed from the daemon spawn
+	// (ProviderEnvVars) like every other provider-derived value; the
+	// failover and reviewer endpoint overrides remove them from the round
+	// env (see provider_failover.go) so a staged URL can never route a
+	// round at an upstream it was not registered for.
+	MetricsRelayAnthropicEnv = "DAEDALUS_METRICS_RELAY_ANTHROPIC_URL"
+	MetricsRelayOpenAIEnv    = "DAEDALUS_METRICS_RELAY_OPENAI_URL"
+	// MetricsRelayTokenEnv is the registration's secret restoration token:
+	// minted by the worker, presented at registration (the relay stores it
+	// and never returns it), and exported by the worker for staging —
+	// per-round staging appends it to the synthetic attribution key, and
+	// the relay requires a match before restoring any registered key —
+	// without it any on-host process could spend a registered worker's
+	// key with a fabricated task-shaped credential.
+	MetricsRelayTokenEnv = "DAEDALUS_METRICS_RELAY_TOKEN"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -789,6 +822,36 @@ func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// MetricsConfig gates the metrics subsystem: the local LLM relay, its
+// per-request usage ledger, and the `daedalus metrics` daemon that hosts
+// them (plus the dashboard served on the same process — see the htmx-ui
+// pt1 design). Off by default: metrics never silently on, because with it
+// on every round's prompt transits the localhost relay process. When on,
+// the project requires the host-global daemon (worker start/restart
+// probes the relay listener and fails fast without it), and the worker
+// stages the relay's URL into every round's provider environment so the
+// relay reads each request's usage block — wire-shaped, not CLI-shaped:
+// an anthropic stream always carries usage, an openai-wire stream only
+// when the client asks for it (stream_options.include_usage), so a
+// streamed openai-wire round can ledger zero tokens. A CLI dialing its
+// provider directly (no staged URL override) bypasses the relay
+// invisibly: coverage is per-CLI-wiring.
+type MetricsConfig struct {
+	// Enabled turns the subsystem on for this project's rounds: the worker
+	// boot verifies the metrics daemon, registers this worker's upstream
+	// mapping with it, and stages the relay URL into jailed rounds.
+	Enabled bool `yaml:"enabled"`
+	// Port is the daemon's UI listener (the dashboard mux). Zero (unset)
+	// defaults to DefaultMetricsUIPort; equal to relay_port is a load
+	// error — one port, one listener.
+	Port int `yaml:"port"`
+	// RelayPort is the daemon's relay listener, bound to 127.0.0.1 only —
+	// the relay is unreachable off-host by construction (the UI mux may
+	// serve the LAN; the relay never does). Zero (unset) defaults to
+	// DefaultMetricsRelayPort.
+	RelayPort int `yaml:"relay_port"`
+}
+
 // Config holds the runtime configuration for a Daedalus process, loaded
 // from a YAML file (see config-example.yaml).
 type Config struct {
@@ -957,6 +1020,12 @@ type Config struct {
 	// historical default) or release onto a fallback branch (see
 	// DependencyConfig).
 	Dependency DependencyConfig `yaml:"dependency"`
+	// Metrics is the metrics-subsystem toggle; inactive unless Enabled
+	// (see MetricsConfig). Global daemon, per-project switch: the daemon
+	// is host-global (one port pair, one process), while this per-project
+	// section gates that project's relay staging and the boot-time
+	// daemon check.
+	Metrics MetricsConfig `yaml:"metrics"`
 	// Prompt points at a directory of prompt-template overrides: every .md
 	// file directly inside it whose file stem names a prompt (the
 	// internal/template Prompts — the embedded prompts/*.md stems:
@@ -1063,6 +1132,7 @@ type renderConfig struct {
 	BugFiling              BugFilingConfig     `yaml:"bug_filing"`
 	TestOutput             TestOutputConfig    `yaml:"test_output"`
 	Dependency             DependencyConfig    `yaml:"dependency"`
+	Metrics                MetricsConfig       `yaml:"metrics"`
 	Prompt                 string              `yaml:"prompt"`
 }
 
@@ -1098,6 +1168,7 @@ func (c Config) RenderYAML() (string, error) {
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
 		Dependency:             c.Dependency,
+		Metrics:                c.Metrics,
 		Prompt:                 c.Prompt,
 	})
 	return string(out), err
@@ -1387,6 +1458,9 @@ func ProviderEnvVars() []string {
 		VerdictRepairModelEnv,
 		VerdictRepairKeyEnv,
 		ToolRelayURLEnv,
+		MetricsRelayAnthropicEnv,
+		MetricsRelayOpenAIEnv,
+		MetricsRelayTokenEnv,
 		BugDirEnv,
 		BugMirrorEnv,
 		TestOutputMirrorEnv,
@@ -1569,6 +1643,18 @@ func (c Config) validate(path string) error {
 	}
 	if c.Slim.MaxInputTokens < 0 {
 		return fmt.Errorf("config %s: slim.max_input_tokens: must not be negative", path)
+	}
+	if c.Metrics.Port < 0 || c.Metrics.RelayPort < 0 {
+		return fmt.Errorf("config %s: metrics: port and relay_port must not be negative", path)
+	}
+	// validate runs after applyDefaults, so one side of this equality may
+	// be the operator's explicit port and the other the default that
+	// filled an unset field — naming only relay_port: 7777 collides with
+	// the defaulted UI port without the config ever naming the UI port.
+	// The message stays value-first for both shapes: whichever side is
+	// wrong, the fix is a distinct value.
+	if c.Metrics.Port > 0 && c.Metrics.Port == c.Metrics.RelayPort {
+		return fmt.Errorf("config %s: metrics: port and relay_port collide on %d — the daemon serves two listeners (the dashboard and the loopback relay); an unset port takes its default, so give them distinct values", path, c.Metrics.Port)
 	}
 	// A blank review_skill_list entry would resolve to a skill-review round
 	// with no instructions at all — rejected at load. Named skills are not
@@ -1876,6 +1962,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxConcurrentTests == 0 {
 		c.MaxConcurrentTests = DefaultMaxConcurrentTests
+	}
+	if c.Metrics.Port == 0 {
+		c.Metrics.Port = DefaultMetricsUIPort
+	}
+	if c.Metrics.RelayPort == 0 {
+		c.Metrics.RelayPort = DefaultMetricsRelayPort
 	}
 	if c.Fallback.Type == "" {
 		c.Fallback.Type = DefaultFallbackType

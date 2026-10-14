@@ -796,3 +796,74 @@ func TestEndpointOverridesDropToolRelayURL(t *testing.T) {
 		}
 	})
 }
+
+// TestEndpointOverridesDropMetricsRelayURL pins the metrics relay's
+// companion rule to TestEndpointOverridesDropToolRelayURL: the registry's
+// upstreams are the primary's, so any explicit endpoint override — a
+// fallback round on either wire, a reviewer round on url or the key-only
+// form — must strip the relay vars, else metricsRelayEnv would stage the
+// overridden round onto the primary's upstream (silently misrouting it, or
+// swapping its reviewer key for the primary's). A plain round with no
+// override keeps the vars: staging is exactly what it is for.
+func TestEndpointOverridesDropMetricsRelayURL(t *testing.T) {
+	anthropic := config.MetricsRelayAnthropicEnv
+	openai := config.MetricsRelayOpenAIEnv
+	check := func(t *testing.T, env []string) {
+		t.Helper()
+		for _, name := range []string{anthropic, openai} {
+			for _, kv := range env {
+				if n, _, ok := cutEnv(kv); ok && n == name {
+					t.Errorf("override env still carries %q; the relay must not route an overridden round", kv)
+				}
+			}
+		}
+	}
+
+	t.Run("fallback round on the openai wire", func(t *testing.T) {
+		t.Setenv("DAEDALUS_FALLBACK_TYPE", config.FallbackTypeOpenAI)
+		t.Setenv("DAEDALUS_FALLBACK_BASE_URL", "https://backup.example")
+		t.Setenv("DAEDALUS_FALLBACK_API_KEY", "sk-backup")
+		t.Setenv("DAEDALUS_FALLBACK_MODEL", "glm-backup")
+		t.Setenv(anthropic, "http://127.0.0.1:7778")
+		t.Setenv(openai, "http://127.0.0.1:7778")
+		check(t, fallbackEnv())
+	})
+
+	t.Run("fallback round on the anthropic wire", func(t *testing.T) {
+		t.Setenv("DAEDALUS_FALLBACK_TYPE", config.FallbackTypeAnthropic)
+		t.Setenv("DAEDALUS_FALLBACK_BASE_URL", "https://backup.example")
+		t.Setenv("DAEDALUS_FALLBACK_API_KEY", "sk-backup")
+		t.Setenv("DAEDALUS_FALLBACK_MODEL", "glm-backup")
+		t.Setenv(anthropic, "http://127.0.0.1:7778")
+		t.Setenv(openai, "http://127.0.0.1:7778")
+		check(t, fallbackEnv())
+	})
+
+	t.Run("reviewer round with url override", func(t *testing.T) {
+		t.Setenv(config.ReviewerURLEnv, "https://review.example")
+		base := reviewerRoundBaseEnv()
+		base = append(base, anthropic+"=http://127.0.0.1:7778", openai+"=http://127.0.0.1:7778")
+		for _, role := range []SessionRole{RoleDevReview, RoleTestReview} {
+			check(t, reviewerEnv(slices.Clone(base), role))
+		}
+	})
+
+	t.Run("reviewer round with the key-only override", func(t *testing.T) {
+		t.Setenv(config.ReviewerKeyEnv, "sk-review")
+		base := reviewerRoundBaseEnv()
+		base = append(base, anthropic+"=http://127.0.0.1:7778", openai+"=http://127.0.0.1:7778")
+		for _, role := range []SessionRole{RoleDevReview, RoleTestReview} {
+			check(t, reviewerEnv(slices.Clone(base), role))
+		}
+	})
+
+	t.Run("plain rounds keep the relay vars", func(t *testing.T) {
+		base := reviewerRoundBaseEnv()
+		base = append(base, anthropic+"=http://127.0.0.1:7778", openai+"=http://127.0.0.1:7778")
+		for _, role := range []SessionRole{RoleDev, RoleTest, ""} {
+			if got := reviewerEnv(slices.Clone(base), role); !slices.Equal(got, base) {
+				t.Errorf("reviewerEnv(%q) rewired a plain round: %v", role, got)
+			}
+		}
+	})
+}

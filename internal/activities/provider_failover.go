@@ -174,8 +174,13 @@ func fallbackEnv() []string {
 		// openai.url (fixed at worker boot), so it must not route a
 		// fallback round — the relay var loses to any explicit endpoint
 		// override (removed here and in reviewerEnv), putting the round
-		// back on the overridden OPENAI_BASE_URL directly.
+		// back on the overridden OPENAI_BASE_URL directly. The metrics
+		// relay vars lose the same way: the registration's upstreams are
+		// the primary's too, and metricsRelayEnv staging a fallback round
+		// would silently misroute it to the primary.
 		env = removeEnvVar(env, config.ToolRelayURLEnv)
+		env = removeEnvVar(env, config.MetricsRelayAnthropicEnv)
+		env = removeEnvVar(env, config.MetricsRelayOpenAIEnv)
 		return setEnvVar(env, "OPENAI_MODEL", os.Getenv("DAEDALUS_FALLBACK_MODEL"))
 	}
 	hb := os.Getenv("DAEDALUS_FALLBACK_HEARTBEAT_MODEL")
@@ -190,6 +195,12 @@ func fallbackEnv() []string {
 	} else {
 		env = setEnvVar(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", hb)
 	}
+	// The metrics relay vars lose here too (see the openai branch): the
+	// registry's anthropic upstream is the primary's, and staging the
+	// overridden ANTHROPIC_BASE_URL onto it would route the fallback
+	// round back to the primary.
+	env = removeEnvVar(env, config.MetricsRelayAnthropicEnv)
+	env = removeEnvVar(env, config.MetricsRelayOpenAIEnv)
 	return env
 }
 
@@ -213,17 +224,22 @@ func reviewerEnv(env []string, role SessionRole) []string {
 	if url == "" && key == "" {
 		return env
 	}
+	// The relay vars lose to any reviewer override (see fallbackEnv) — the
+	// key-only form included. The relays' upstreams are the primary's: a
+	// reviewer.key-only round left on the metrics relay would have its key
+	// swapped for the synthetic attribution key and the primary's key
+	// restored in its place (billed to the primary), and left on the slim
+	// tool relay it would forward the reviewer key to the primary-pinned
+	// openai upstream. Strip whenever the section is set at all.
+	env = removeEnvVar(env, config.ToolRelayURLEnv)
+	env = removeEnvVar(env, config.MetricsRelayAnthropicEnv)
+	env = removeEnvVar(env, config.MetricsRelayOpenAIEnv)
 	if url != "" {
 		env = setEnvVar(env, "ANTHROPIC_BASE_URL", url)
 		// OPENAI_API_BASE rides the same value as OPENAI_BASE_URL, per
 		// fallbackEnv.
 		env = setEnvVar(env, "OPENAI_BASE_URL", url)
 		env = setEnvVar(env, "OPENAI_API_BASE", url)
-		// The relay var loses to this override (see fallbackEnv): the
-		// relay's upstream is the primary's openai.url, and a
-		// reviewer.url override would silently dial it instead of the
-		// reviewer endpoint.
-		env = removeEnvVar(env, config.ToolRelayURLEnv)
 	}
 	if key != "" {
 		env = setEnvVar(env, "ANTHROPIC_API_KEY", key)

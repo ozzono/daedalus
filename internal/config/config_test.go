@@ -2889,3 +2889,113 @@ func TestAgentWireConflict(t *testing.T) {
 		}
 	})
 }
+
+// TestLoadMetricsDefaults pins the metrics subsystem's defaults: off until
+// enabled, and the daemon's two listeners default to the decided ports
+// (7777 dashboard, 7778 loopback relay) so an unset section is loadable
+// and inert.
+func TestLoadMetricsDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, ""))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Metrics.Enabled {
+		t.Errorf("Metrics.Enabled = true on an absent section, want off")
+	}
+	if cfg.Metrics.Port != DefaultMetricsUIPort {
+		t.Errorf("Metrics.Port = %d, want the default %d", cfg.Metrics.Port, DefaultMetricsUIPort)
+	}
+	if cfg.Metrics.RelayPort != DefaultMetricsRelayPort {
+		t.Errorf("Metrics.RelayPort = %d, want the default %d", cfg.Metrics.RelayPort, DefaultMetricsRelayPort)
+	}
+}
+
+// TestLoadMetricsSection pins the section's parsing: enabled and both ports
+// load through verbatim.
+func TestLoadMetricsSection(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "metrics:\n  enabled: true\n  port: 7801\n  relay_port: 7802\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Metrics.Enabled || cfg.Metrics.Port != 7801 || cfg.Metrics.RelayPort != 7802 {
+		t.Errorf("Metrics = %+v, want enabled with ports 7801/7802", cfg.Metrics)
+	}
+}
+
+// TestLoadMetricsPortCollision pins the two-listener gate: an explicit
+// port == relay_port is rejected, and so is a config naming only the
+// relay_port that equals the defaulted UI port — validate runs after the
+// defaults filled the unset side. Distinct values (explicit or defaulted)
+// load.
+func TestLoadMetricsPortCollision(t *testing.T) {
+	for _, doc := range []string{
+		"metrics:\n  port: 7801\n  relay_port: 7801\n",
+		"metrics:\n  relay_port: 7777\n", // collides with the defaulted UI port
+		"metrics:\n  port: 7778\n",       // collides with the defaulted relay port
+	} {
+		_, err := Load(writeConfig(t, doc))
+		if err == nil || !strings.Contains(err.Error(), "collide on") {
+			t.Errorf("Load(%q) error = %v, want a port-collision rejection", doc, err)
+		}
+	}
+
+	cfg, err := Load(writeConfig(t, "metrics:\n  port: 7778\n  relay_port: 7779\n"))
+	if err != nil {
+		t.Fatalf("Load(distinct ports): %v", err)
+	}
+	if cfg.Metrics.Port != 7778 || cfg.Metrics.RelayPort != 7779 {
+		t.Errorf("Metrics = %+v, want the distinct ports through", cfg.Metrics)
+	}
+}
+
+// TestLoadMetricsNegativePorts pins the negativity gate on both listeners.
+func TestLoadMetricsNegativePorts(t *testing.T) {
+	for _, doc := range []string{
+		"metrics:\n  port: -1\n",
+		"metrics:\n  relay_port: -1\n",
+	} {
+		_, err := Load(writeConfig(t, doc))
+		if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+			t.Errorf("Load(%q) error = %v, want a negative-port rejection", doc, err)
+		}
+	}
+}
+
+// TestRenderYAMLMetrics pins the render: the metrics section round-trips —
+// an explicit section re-renders with its values, and the rendered file
+// loads back to the same section.
+func TestRenderYAMLMetrics(t *testing.T) {
+	raw, err := LoadRaw(writeConfig(t, "metrics:\n  enabled: true\n  port: 7801\n  relay_port: 7802\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	for _, want := range []string{"metrics:", "enabled: true", "port: 7801", "relay_port: 7802"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderYAML output is missing %q:\n%s", want, out)
+		}
+	}
+	cfg, err := Load(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("parse rendered metrics section: %v\n%s", err, out)
+	}
+	if !cfg.Metrics.Enabled || cfg.Metrics.Port != 7801 || cfg.Metrics.RelayPort != 7802 {
+		t.Errorf("reloaded Metrics = %+v, want the rendered values", cfg.Metrics)
+	}
+}
+
+// TestProviderEnvVarsIncludesMetricsRelayEnvs pins that both relay roots
+// and the registration token are in the scrub list — a stale export must
+// not survive the daemon spawn's provider-var hygiene (a worker restarted
+// with metrics off would otherwise keep staging rounds onto a dead relay,
+// or carry a dead registration's secret into its rounds).
+func TestProviderEnvVarsIncludesMetricsRelayEnvs(t *testing.T) {
+	for _, name := range []string{MetricsRelayAnthropicEnv, MetricsRelayOpenAIEnv, MetricsRelayTokenEnv} {
+		if !slices.Contains(ProviderEnvVars(), name) {
+			t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), name)
+		}
+	}
+}

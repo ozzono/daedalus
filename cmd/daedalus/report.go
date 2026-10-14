@@ -1,15 +1,15 @@
 // Report aggregates the raw per-round provider metrics captured in
 // workflow history (activities.Usage) into per-session, per-day,
 // per-worker, and total slices, and lists this host's workers with their
-// live slot occupancy. It reads history through the same walk
-// readPriorRun uses; aggregation happens at report time, keeping history
-// lossless.
+// live slot occupancy. Scoping (Q7): the invoking config's worker — its
+// task queue — alone; there is no -q/--all. It reads history through the
+// same walk readPriorRun uses; aggregation happens at report time,
+// keeping history lossless.
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,14 +27,9 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 )
 
-// reportScope holds the parsed `daedalus report` flags.
+// reportScope holds the parsed `daedalus worker report` flags.
 type reportScope struct {
-	queue string
-	// queueSet distinguishes "no -q given" (default scope) from an
-	// explicitly empty one, and gates the queue-name check below.
-	queueSet bool
-	all      bool
-	jsonOut  bool
+	jsonOut bool
 }
 
 // parseReportArgs parses report's own flags from the positional arguments
@@ -48,82 +43,31 @@ func parseReportArgs(args []string) (reportScope, error) {
 		case a == "--json":
 			sc.jsonOut = true
 		case a == "--table":
-		case a == "--all":
-			sc.all = true
-		case a == "-q" || a == "--queue":
-			if i+1 >= len(args) {
-				return sc, fmt.Errorf("%s requires a value", a)
-			}
-			i++
-			sc.queue = args[i]
-			sc.queueSet = true
-		case strings.HasPrefix(a, "--queue="):
-			sc.queue = strings.TrimPrefix(a, "--queue=")
-			sc.queueSet = true
 		default:
-			return sc, fmt.Errorf("unknown report flag %q (--all, -q/--queue, --json, --table)", a)
+			return sc, fmt.Errorf("unknown report flag %q (--json, --table)", a)
 		}
-	}
-	if sc.all && sc.queueSet {
-		return sc, errors.New("--all and -q/--queue are mutually exclusive")
-	}
-	// The queue goes verbatim into a Temporal list query, so a quote could
-	// break (or steer) it; a plain token is all any real queue needs.
-	if sc.queueSet && (sc.queue == "" || strings.ContainsAny(sc.queue, "'\\")) {
-		return sc, fmt.Errorf("-q/--queue wants a plain queue name, got %q", sc.queue)
 	}
 	return sc, nil
 }
 
-// runReport scopes, gathers, and prints the usage report. Scoping: an
-// explicit -q queue, --all (every task queue on record), or by default the
-// invoking directory's resolved queue (configPath, honoring -c/--config).
-// The Temporal address comes from the invoking config when one can be
-// found, else the default — so -q/--all work from anywhere.
+// runReport gathers and prints the usage report for the invoking config's
+// worker — its task queue alone (Q7: single-worker scope, no -q/--all).
 func runReport(configPath string, args []string) error {
 	scope, err := parseReportArgs(args)
 	if err != nil {
 		return err
 	}
-	host := config.DefaultTemporalHost
-	var queues []string
-	path, cfgErr := resolveConfigPath(configPath)
-	var cfg config.Config
-	if cfgErr == nil {
-		cfg, cfgErr = config.Load(path)
+	path, err := resolveConfigPath(configPath)
+	if err != nil {
+		return err
 	}
-	if cfgErr == nil {
-		host = cfg.Temporal.Host
-		queues = append(queues, cfg.Temporal.TaskQueue)
-	} else if !scope.queueSet && !scope.all {
-		// The default scope is the invoking config's queue — without a
-		// loadable config there is nothing to report on.
-		return cfgErr
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
 	}
-	switch {
-	case scope.queue != "":
-		queues = []string{scope.queue}
-	case scope.all:
-		recorded, err := recordQueues()
-		if err != nil {
-			return err
-		}
-		queues = append(queues, recorded...)
-		if len(queues) == 0 {
-			return fmt.Errorf("no queues on record in %s — pass -q <queue>", daemonDir)
-		}
-	}
-	// Dedupe (the invoking config's queue may also be on record).
-	sort.Strings(queues)
-	uniq := queues[:0]
-	for i, q := range queues {
-		if i == 0 || q != queues[i-1] {
-			uniq = append(uniq, q)
-		}
-	}
-	queues = uniq
+	queues := []string{cfg.Temporal.TaskQueue}
 
-	c, err := newClient(config.Config{Temporal: config.TemporalConfig{Host: host}})
+	c, err := newClient(cfg)
 	if err != nil {
 		return err
 	}
@@ -152,35 +96,6 @@ func runReport(configPath string, args []string) error {
 	}
 	printReportTable(rep)
 	return nil
-}
-
-// recordQueues lists the distinct task queues named by the daemon-dir
-// config records — the roster `report --all` covers, on this host's
-// records alone. Unloadable records are skipped: one bad record must not
-// hide the rest.
-func recordQueues() ([]string, error) {
-	names, err := recordedWorkers()
-	if err != nil {
-		return nil, err
-	}
-	seen := make(map[string]bool, len(names))
-	var queues []string
-	for _, name := range names {
-		conf := recordedConfigPath(name)
-		if conf == "" {
-			continue
-		}
-		cfg, err := config.Load(conf)
-		if err != nil {
-			continue
-		}
-		if !seen[cfg.Temporal.TaskQueue] {
-			seen[cfg.Temporal.TaskQueue] = true
-			queues = append(queues, cfg.Temporal.TaskQueue)
-		}
-	}
-	sort.Strings(queues)
-	return queues, nil
 }
 
 // usageTotals sums raw per-round Usage figures. Only the sums are computed

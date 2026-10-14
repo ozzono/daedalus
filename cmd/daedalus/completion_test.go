@@ -78,7 +78,7 @@ func TestCompleteWorkerActions(t *testing.T) {
 	}{
 		{[]string{"worker", ""}, sorted},
 		{[]string{"-c", "cfg.yaml", "worker", ""}, sorted},
-		{[]string{"worker", "re"}, []string{"restart"}},
+		{[]string{"worker", "re"}, []string{"report", "restart"}},
 		{[]string{"worker", "sta"}, []string{"start", "status"}},
 		{[]string{"worker", "dance"}, nil},
 	} {

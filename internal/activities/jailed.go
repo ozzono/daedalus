@@ -406,7 +406,7 @@ func agentLimiter() chan struct{} {
 
 // agentWaiters counts jailed rounds currently queued for a concurrency
 // slot — the queue-depth half of the worker's published slot state
-// (SlotStats), which `daedalus report` surfaces.
+// (SlotStats), which `daedalus worker report` surfaces.
 var agentWaiters atomic.Int64
 
 // SlotStats reports this worker's jailed-round semaphore state: slots busy
@@ -642,6 +642,13 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// provider's environment untouched. Applied before anything reads the
 	// round env — pi's provider staging included.
 	env = reviewerEnv(env, role)
+	// Metrics staging: when the worker enabled metrics, route the round's
+	// provider calls through the metrics daemon's relay (staged path
+	// prefix, synthetic attribution key on keyed rounds) so the ledger
+	// sees every provider call. A no-op when the relay vars are absent —
+	// metrics disabled, or an endpoint override removed them upstream
+	// (see metricsRelayEnv).
+	env = metricsRelayEnv(ctx, env, role)
 	selected, headless, _ := jailedAgentCLI(agent)
 	// opencode and codex resumed rounds arrive with the whole post-`--`
 	// argv precomposed (agentResumeArgs — their resume tokens follow the

@@ -24,8 +24,10 @@ WORKFLOW COMMANDS
               flags: --yes
 
 WORKER COMMANDS
-  worker      Manage the Temporal worker daemon (start, stop, status, restart, foreground, wakeup)
+  worker      Manage the Temporal worker daemon (start, stop, status, restart, foreground, wakeup, report)
               flags: -c -t --all per sub-action; "worker <action> --help" is exhaustive
+  metrics     Manage the host metrics daemon — the usage relay, ledger, and dashboard
+              (start, stop, restart, status, list, foreground)
 
 UTILITY COMMANDS
   init        Generate a fully commented config-example.yaml file
@@ -33,8 +35,6 @@ UTILITY COMMANDS
               prompt-override directory (samples + README)
   config      Print the active configuration (resolved path + every field)
               flags: none
-  report      Summarize AI provider usage (cost, tokens, time) and worker slots
-              flags: -q --all --json --table
   version     Print the version and exit
               flags: none
   completion  Print the bash or zsh tab-completion script (eval into your rc)
@@ -42,7 +42,8 @@ UTILITY COMMANDS
 
 GLOBAL FLAGS
   -c, --config <path>   Path to config file (./config.yaml, ./.daedalus/config.yaml, or ~/.config/daedalus/config.yaml);
-                        rejected by log and the record-driven worker commands (worker status, worker restart <worker>|all)
+                        rejected by log and the record-driven daemon commands (worker status, worker restart <worker>|all,
+                        metrics status, metrics stop, metrics list)
   -v, --version         Print version and exit
   -h, --help            Show this help message
 
@@ -365,7 +366,7 @@ EXAMPLES
 	"worker": `daedalus worker — manage the Temporal worker daemon.
 
 USAGE
-  daedalus [-c config.yaml] worker [start|stop|status|restart|foreground|wakeup <workflow-id>]
+  daedalus [-c config.yaml] worker [start|stop|status|restart|wakeup <workflow-id>|report|foreground]
   daedalus worker restart <worker>            (from any directory)
   daedalus worker restart all | --all         (every worker on record)
 
@@ -409,6 +410,11 @@ ACTIONS
                 "continue", and the id can be checked against "daedalus
                 list". The workflow must belong to the active config's task
                 queue: a mismatched -c fails without acting.
+  report        Summarize AI provider usage (cost, tokens, time) captured in
+                workflow history for this config's worker alone (its task
+                queue — there is no -q/--all), and list this host's workers
+                with their live slot occupancy and rounds waiting. Flags:
+                --json, --table.
 
 ARGUMENTS
   <action>              One of the actions above (default: start).
@@ -417,9 +423,10 @@ ARGUMENTS
 
 FLAGS
   -c, --config <path>   Path to the config file. Accepted by start, stop, bare
-                        restart, foreground, and wakeup. Rejected by status,
-                        restart <worker>, and restart all — those act from the
-                        recorded configs alone, so -c would have no effect.
+                        restart, foreground, wakeup, and report. Rejected by
+                        status, restart <worker>, and restart all — those act
+                        from the recorded configs alone, so -c would have no
+                        effect.
   -t, --type <type>     Which pollers this daemon starts: dev (pipeline rounds
                         and reviews only — no test-queue poller) or test (test
                         suites and the repro gate only — no pipeline poller).
@@ -545,6 +552,15 @@ CONFIGURATION REFERENCE
                         "<task_queue>-test" queue, schedulable only by its
                         own workers — flip it and upgrade this
                         deployment's daemons in the same pass.
+  metrics               Host metrics participation: enabled: true gates the
+                        worker's start on the host metrics daemon ("daedalus
+                        metrics start"), stages every provider round through
+                        its loopback relay, and lands per-round token usage
+                        in its ledger. port (default 7777) is the daemon's
+                        dashboard listener (LAN-wide, no auth); relay_port
+                        (default 7778) the loopback relay. The daemon is
+                        host-global — one per machine, its ports taken from
+                        the config it was started with
   bug_filing            Out-of-scope-bug filing toggle. Off by default (the
                         section absent, or enabled: false): no bug files are
                         written and out-of-scope bugs surface in round
@@ -679,42 +695,63 @@ config is not a working one.
 EXAMPLE
   $ daedalus config
 `,
-	"report": `daedalus report — summarize AI provider usage and worker slots.
+	"metrics": `daedalus metrics — manage the host metrics daemon: the usage relay, the
+ledger, and the dashboard listener.
 
 USAGE
-  daedalus [-c config.yaml] report [--json]        (the resolved queue)
-  daedalus report -q <queue> [--json]              (one explicit queue)
-  daedalus report --all [--json]                   (every queue on record)
+  daedalus [-c config.yaml] metrics [start|stop|restart|status|list|foreground]
 
-Aggregates the raw per-round provider metrics captured in workflow history
-(cost, tokens in/out, cache tokens, duration — stamped per round by the
-jailed agent CLIs that report them) into per-session, per-day, per-worker,
-and total slices, and lists this host's workers with their live slot
-occupancy (busy/total) and rounds queued waiting for a slot.
+The daemon hosts two listeners. The relay binds 127.0.0.1:<relay_port>
+(default 7778): the reverse proxy every metrics-enabled worker's provider
+rounds stage their calls onto, where the usage ledger is written. The
+dashboard binds :<port> (default 7777) and serves the browser UI's routes
+(/, /workers, /runs, /runs/<id>, /new, /metrics). The daemon is
+host-global — one per machine, its ports read from the config of the start
+(or restart) that launched it — while per-project configs only decide
+whether their workers participate (metrics.enabled).
 
-CLIs without a structured result (opencode, codex, aider) report only the
-worker's measured wall time: their rounds count toward ROUNDS and TIME with
-zero cost and tokens. pi's --mode json events carry usage, so its rounds report
-cost and tokens like claude's and amp's. Rounds that ran before usage
-capture carry no Usage at all in history and are absent from the slices
-entirely, not zeroed.
+ACTIONS
+  start         (default) Run the daemon detached: logs append to
+                /tmp/daedalus/metrics.log, the pid lives in
+                /tmp/daedalus/metrics.pid.
+  stop          Terminate the daemon (SIGTERM) and clear its pid file. The
+                ledger is in-memory only: stopping the daemon discards every
+                recorded entry.
+  restart       Stop + start with the config the restart is invoked with
+                (the ports re-read from disk).
+  status        Print the daemon's pid, its two ports, its version, and how
+                fresh its published status file is. Record-driven: works
+                from any directory, no config.
+  list          Query the live ledger: recent provider calls, newest first,
+                with per-call token counts and round attribution.
+                Record-driven too — the endpoint is the daemon's published
+                relay port, so it works from any directory, no config.
+  foreground    Run attached to this terminal — the daemon child's mode, and
+                the way to debug a daemon that will not start.
 
-FLAGS
-  -q, --queue <queue>   Scope the usage slices to this task queue instead of
-                        the invoking directory's resolved one.
-  --all                 Scope the usage slices to every task queue on record
-                        (the daemon-dir config records).
-  --json                Emit the whole report as JSON instead of a table.
-  --table               Table output (the default; accepted for explicitness).
+LIST FLAGS
+  --worker <name>   Only this worker's entries.
+  --page <n>        The page to print (default 1; 50 entries per page).
+  --json            Emit the page as JSON instead of a table.
 
-The worker roster and slot occupancy are always this host's, whatever the
-usage scope. Without -q/--all, resolving the default queue needs a config
-(./config.yaml, ./.daedalus/config.yaml, or ~/.config/daedalus/config.yaml);
-with them, the report works from anywhere, falling back to the default
-Temporal address.
+SERVING POSTURE
+The relay binds 127.0.0.1 — its listener is unreachable off-host — while
+its forwards go wherever the registered upstreams point: a cloud provider
+receives the rounds' traffic from the daemon instead of the rounds.
+Restoring a round's real API key requires the registration's secret token
+— a loopback caller cannot spend a worker's key with a forged attribution
+key. The dashboard binds all interfaces with no authentication — any LAN
+peer can read every run's data and start runs. That is the accepted
+posture for a local tool on a trusted LAN; do not expose the port further.
 
-EXAMPLE
-  $ daedalus report --all
+Workers with metrics.enabled gate their start on the relay (an unreachable
+daemon fails the worker start, naming the port and the remedy) and
+register their provider upstreams with it, so their rounds' token usage
+lands in the ledger attributed per round. Workers without it are unaffected.
+
+EXAMPLES
+  $ daedalus metrics start
+  $ daedalus metrics list --worker my-worker --page 2
 `,
 	"wipe": `daedalus wipe — erase a session's work on disk entirely.
 
@@ -932,6 +969,32 @@ FLAGS
 
 -t/--type is rejected here: it shapes only start, bare restart, and
 foreground.
+
+"daedalus worker --help" has the full worker reference.
+`,
+	"report": `daedalus worker report — summarize AI provider usage and worker slots for
+this config's worker.
+
+USAGE
+  daedalus [-c config.yaml] worker report [--json|--table]
+
+Aggregates the raw per-round provider metrics captured in workflow history
+(cost, tokens in/out, cache tokens, duration — stamped per round by the
+jailed agent CLIs that report them) into per-session, per-day, per-worker,
+and total slices, and lists this host's workers with their live slot
+occupancy (busy/total) and rounds queued waiting for a slot. Scoped to the
+invoking config's worker — its task queue — alone; there is no -q/--all.
+
+CLIs without a structured result (opencode, codex, aider) report only the
+worker's measured wall time: their rounds count toward ROUNDS and TIME with
+zero cost and tokens. pi's --mode json events carry usage, so its rounds
+report cost and tokens like claude's and amp's. Rounds that ran before
+usage capture carry no Usage at all in history and are absent from the
+slices entirely, not zeroed.
+
+FLAGS
+  --json    Emit the whole report as JSON instead of a table.
+  --table   Table output (the default; accepted for explicitness).
 
 "daedalus worker --help" has the full worker reference.
 `,

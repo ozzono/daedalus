@@ -327,6 +327,14 @@ parse:
 		if isRestartAll(rest) || restartNamed || isWorkerStatus(rest) {
 			return f, nil, errors.New("-c/--config does not apply to worker restart all, restart <worker>, or worker status")
 		}
+		// The record-driven metrics commands (`metrics status`, `metrics
+		// stop`, `metrics list`) read the daemon's pid and status files
+		// alone — the shared message above is pinned verbatim by the
+		// worker-status tests, so these get their own wording rather than a
+		// silent no-op -c.
+		if isMetricsRecordRead(rest) {
+			return f, nil, errors.New("-c/--config does not apply to metrics status, stop, or list")
+		}
 	}
 	// -t/--type is the run-config counterpart: the record-driven worker
 	// commands act from the records alone and revive the daemon untyped, so
