@@ -310,9 +310,16 @@ const (
 	StatusWaiting RunStatus = "waiting"
 	// pending is a dependent run's live wait for its dependency (the gate
 	// in awaitDependency): no work exists yet, nothing is retrying.
-	// waiting stays the transient-retry pause — quota heartbeat, slot
-	// backoff — of a run whose rounds are already underway.
-	StatusPending  RunStatus = "pending"
+	// waiting stays the slot-backoff pause of a run whose rounds are
+	// already underway — and, on workers predating the starved stamp, the
+	// quota heartbeat's wait too.
+	StatusPending RunStatus = "pending"
+	// starved is the quota heartbeat's wait: the run's provider API is
+	// exhausted (rate limit, cap, overload) and the round retries on the
+	// hourly heartbeat — a provider-starved crawl, not a wedge, and the
+	// stamp is what lets `daedalus report` and the runs table say so
+	// instead of leaving the run looking like a stale heartbeat.
+	StatusStarved  RunStatus = "starved"
 	StatusApproved RunStatus = "approved"
 	StatusParked   RunStatus = "parked"
 	StatusFailed   RunStatus = "failed"
@@ -361,6 +368,30 @@ const preflightSkipChangeID = "preflight-baseline-validated-skip"
 
 func baselineValidatedSkipEnabled(ctx workflow.Context) bool {
 	return workflow.GetVersion(ctx, preflightSkipChangeID, workflow.DefaultVersion, 1) == 1
+}
+
+// starvedStatusChangeID gates the quota heartbeat's distinct run status
+// behind its own version marker, for the same replay reason as the
+// markers above: heartbeat upserts are recorded history events, and
+// replaying a pre-marker run with "starved" where history recorded
+// "waiting" would issue a different command and wedge the run at the
+// next worker upgrade. Pre-marker replays keep stamping waiting.
+const starvedStatusChangeID = "starved-run-status"
+
+func starvedStatusEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, starvedStatusChangeID, workflow.DefaultVersion, 1) == 1
+}
+
+// suiteFreshnessChangeID gates the terminal-state suite-freshness gate
+// behind its own version marker: the gate emits activity commands at
+// park and approve (a forced suite run, or a re-entry into the test
+// phase), and a pre-marker run replayed by an upgraded worker would be
+// wedged by commands its history lacks. Pre-marker replays reach their
+// terminal states ungated, exactly as their history recorded them.
+const suiteFreshnessChangeID = "terminal-suite-freshness-gate"
+
+func suiteFreshnessEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, suiteFreshnessChangeID, workflow.DefaultVersion, 1) == 1
 }
 
 func setRunStatus(ctx workflow.Context, s RunStatus) {
@@ -741,6 +772,19 @@ testPhase:
 						return "", err
 					}
 				}
+			}
+			// Terminal freshness gate (approve side): agent rounds ran
+			// after the last suite execution — the reviews above approved a
+			// tree no suite has seen in its final shape. Approving anyway
+			// would be the incident this gate closes (a run reaching its
+			// terminal state with the final code never validated), so the
+			// run re-enters the test phase instead: a fresh suite
+			// execution, the default reviewer first. One re-entry, no loop —
+			// the suite run at the top of the phase postdates every edit,
+			// so a coincident green-plus-approval closes the run.
+			if run.suiteGate && run.suiteStale() {
+				run.logger.Info("Suite stale at approval (agent rounds ran after the last suite execution); re-entering the test phase")
+				continue testPhase
 			}
 			return run.finalize()
 		}

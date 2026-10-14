@@ -75,6 +75,7 @@ func TestImplement(t *testing.T) {
 		"Implement the change. Do not write, modify, or delete test code; leave every existing test file untouched and pay it no attention.\n\n" +
 		"If the task as stated cannot be completed — contradictory requirements, something missing from the worktree or outside your reach — say exactly what is impossible and why in your reply, then do the best sound partial work you can. Never silently loop over an impossible goal; your reply is what lets the reviewer halt the run for maintainer input instead of requesting changes forever.\n\n" +
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
+		"The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.\n\n" +
 		"Work style — the laziest solution that actually works:\n\n" +
 		"- Question whether each piece needs to exist (YAGNI). Skip speculative generality, flags, and future-proofing.\n" +
 		"- Reuse what already exists in this codebase; prefer the standard library over new dependencies — never add one for what a few lines of stdlib can do.\n" +
@@ -96,6 +97,7 @@ func TestImplementFix(t *testing.T) {
 		"Code review feedback on your implementation:\n\nrename foo to bar\n\n" +
 		"Address the review comments. Do not write, modify, or delete test code; leave every existing test file untouched and pay it no attention.\n\n" +
 		"Git writes are forbidden in this sandbox: never stage, commit, branch, or restore — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: address only the comments about this task's changes; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail, environment files — is unrelated, leave it untouched and ignore it. A comment you cannot satisfy by editing files in this worktree is one to explain in your reply, not to force.\n\n" +
+		"The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.\n\n" +
 		"Keep it lazy and minimal: shortest working diff, reuse existing helpers, no new abstractions or dependencies unless the comments require them — and never simplify away validation, error handling, or edge cases."
 	if got != want {
 		t.Errorf("ImplementFix = %q, want %q", got, want)

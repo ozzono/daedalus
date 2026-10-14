@@ -1,10 +1,13 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -211,4 +214,122 @@ func TestMainWorkerStatusNeedsNoConfig(t *testing.T) {
 	if !strings.Contains(out, "daedalus") || !strings.Contains(out, cfg) {
 		t.Errorf("worker status output %q should list the recorded worker with its config", out)
 	}
+}
+
+// TestProbeProviderNAPaths pins the not-probeable faces: a worker with no
+// config record, one whose record no longer loads, and one whose config
+// wires no provider at all — each renders its n/a text, never a
+// fabricated probe outcome.
+func TestProbeProviderNAPaths(t *testing.T) {
+	if p := probeProvider(""); p.NA != "n/a (no config record)" || p.Main.OK {
+		t.Errorf("probeProvider(no record) = %+v, want the no-record note", p)
+	}
+	if p := probeProvider(filepath.Join(t.TempDir(), "gone.yaml")); p.NA != "config error" {
+		t.Errorf("probeProvider(unloadable) = %+v, want the config-error note", p)
+	}
+	conf := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(conf, []byte("agent: claude\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p := probeProvider(conf); p.NA != "n/a (provider not configured)" {
+		t.Errorf("probeProvider(unwired) = %+v, want the not-configured note", p)
+	}
+	if got := providerStatus(""); got != "n/a (no config record)" {
+		t.Errorf("providerStatus(no record) = %q, want the note passed through", got)
+	}
+}
+
+// TestProbeProviderLive pins the wired probes against httptest stand-ins:
+// the primary is probed in the wire style its section names (anthropic
+// /v1/messages, openai /chat/completions); a failing primary with a
+// configured fallback probes that fallback too and the row renders the
+// failover arrow — active fallback when it answers, none when it does not.
+func TestProbeProviderLive(t *testing.T) {
+	// stand serves every path with code and records what was hit.
+	stand := func(code int) (*httptest.Server, func() []string) {
+		mu := &sync.Mutex{}
+		var paths []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			paths = append(paths, r.URL.Path)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte("{}"))
+		}))
+		t.Cleanup(srv.Close)
+		return srv, func() []string { mu.Lock(); defer mu.Unlock(); return paths }
+	}
+	writeCfg := func(content string) string {
+		t.Helper()
+		conf := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(conf, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return conf
+	}
+
+	t.Run("a healthy primary probes ok in its own wire style", func(t *testing.T) {
+		srv, hits := stand(http.StatusOK)
+		conf := writeCfg("agent: claude\nanthropic:\n  url: " + srv.URL + "\n  key: k\n  model: m\n")
+		p := probeProvider(conf)
+		if !p.Main.OK || p.Main.Detail != "ok (http 200)" {
+			t.Errorf("Main = %+v, want ok (http 200)", p.Main)
+		}
+		if p.FbArmed {
+			t.Errorf("no fallback is configured, none should be probed")
+		}
+		n := 0
+		for _, path := range hits() {
+			if path == "/v1/messages" {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("the anthropic-style probe hit %v, want exactly one /v1/messages", hits())
+		}
+		if got := providerStatus(conf); got != "ok (http 200)" {
+			t.Errorf("providerStatus = %q, want the main detail alone", got)
+		}
+	})
+
+	t.Run("a down primary arms the configured openai fallback", func(t *testing.T) {
+		downSrv, downHits := stand(http.StatusInternalServerError)
+		okSrv, okHits := stand(http.StatusOK)
+		conf := writeCfg("agent: claude\nanthropic:\n  url: " + downSrv.URL + "\n  key: k\n  model: m\n" +
+			"fallback:\n  enabled: true\n  type: openai\n  url: " + okSrv.URL + "\n  key: fk\n  model: fbm\n")
+		p := probeProvider(conf)
+		if p.Main.OK {
+			t.Errorf("the 500-serving primary probed ok")
+		}
+		if !p.FbArmed || !p.Fb.OK {
+			t.Errorf("Fb armed/ok = %v/%v, want the armed fallback probed ok", p.FbArmed, p.Fb.OK)
+		}
+		if !saw(downHits(), "/v1/messages") || !saw(okHits(), "/chat/completions") {
+			t.Errorf("wire styles wrong: main hit %v, fallback hit %v", downHits(), okHits())
+		}
+		got := providerStatus(conf)
+		if !strings.Contains(got, "main: http 500") || !strings.Contains(got, "→ fallback: ok (http 200) [active: fallback]") {
+			t.Errorf("providerStatus = %q, want the failover arrow with the fallback active", got)
+		}
+	})
+
+	t.Run("primary and fallback both down render active none", func(t *testing.T) {
+		downSrv, _ := stand(http.StatusInternalServerError)
+		conf := writeCfg("agent: claude\nanthropic:\n  url: " + downSrv.URL + "\n  key: k\n  model: m\n" +
+			"fallback:\n  enabled: true\n  type: anthropic\n  url: " + downSrv.URL + "\n  key: fk\n  model: fbm\n")
+		if got := providerStatus(conf); !strings.Contains(got, "[active: none]") {
+			t.Errorf("providerStatus = %q, want [active: none]", got)
+		}
+	})
+}
+
+// saw reports whether paths contains exactly path.
+func saw(paths []string, path string) bool {
+	for _, p := range paths {
+		if p == path {
+			return true
+		}
+	}
+	return false
 }

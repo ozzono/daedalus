@@ -198,16 +198,22 @@ the help text are kept in agreement.
 | `worker restart all` | — | — | Restart every worker on record, each from its own record |
 | `worker foreground` | — | `-c -t` | Run the worker attached to this terminal |
 | `worker wakeup` | `<workflow-id>` | `-c` | Interrupt a RUNNING session's quota heartbeat so the round resumes |
+| `worker report` | — | `--json --table` | Summarize AI provider usage (cost, tokens, time) for this config's worker, plus worker slots |
+| `metrics start` | — | `-c` | Run the host metrics daemon detached (the default metrics action): usage relay, ledger, dashboard |
+| `metrics stop` / `metrics status` | — | — | Terminate the daemon / report its pid, ports, and version (record-driven, no config) |
+| `metrics restart` | — | `-c` | Stop + start the daemon with the config re-read from disk |
+| `metrics list` | — | `--worker --page --json` | Query the live usage ledger, newest first |
+| `metrics foreground` | — | `-c` | Run the metrics daemon attached to this terminal |
 | `init` | `[prompt] [slim]` | — | Generate a fully commented `config-example.yaml` |
 | `config` | — | — | Print the active configuration (resolved path + every field) |
-| `report` | — | `-q --all --json --table` | Summarize AI provider usage (cost, tokens, time) and worker slots |
 | `version` | — | — | Print the version and exit |
 | `completion` | `bash\|zsh` | — | Print the tab-completion script (eval into your shell rc) |
 
 Global flags: `-c/--config <path>`, `-v/--version`, `-h/--help`. `-c` is
-accepted by every command except `log` and the record-driven worker
-commands (`worker status`, `worker restart <worker>`, `worker restart
-all`), which act from the recorded per-worker configs alone.
+accepted by every command except `log`, the record-driven worker commands
+(`worker status`, `worker restart <worker>`, `worker restart all`), and
+the record-driven metrics commands (`metrics status`, `metrics stop`,
+`metrics list`), which act from the recorded daemon files alone.
 
 Flag reference:
 
@@ -225,10 +231,10 @@ Flag reference:
 | `-cot` | `log` | Print the run's chain-of-thought logs from Temporal history |
 | `-cot-n <N>` | `log -cot` | Tail the CoT view to the last N completed rounds (whole sections only) |
 | `-t, --type dev\|test` | `worker start`, bare `worker restart`, `worker foreground` | Which pollers the daemon starts (`dev` or `test`; omit for both). Rejected everywhere else — `run`, `worker status`, the record-driven restarts, `worker stop`/`wakeup`, and every non-worker command |
-| `--all` | `worker restart`, `report` | Restart every worker on record (same as the `all` argument) / scope the usage slices to every queue on record |
+| `--all` | `worker restart` | Restart every worker on record (same as the `all` argument) |
 | `--yes` | `wipe` | Skip the interactive confirmation (scripted use) |
-| `-q, --queue <queue>` | `report` | Scope the usage slices to one explicit queue instead of the resolved one |
-| `--json` / `--table` | `report` | JSON vs table output (table is the default; `--table` is accepted for explicitness) |
+| `--json` / `--table` | `worker report`, `metrics list` | JSON vs table output (table is the default; `--table` is accepted for explicitness) |
+| `--worker <name>` / `--page <n>` | `metrics list` | Filter the ledger page to one worker / pick the page (50 entries per page, newest first) |
 
 1. **Install** the CLI:
 

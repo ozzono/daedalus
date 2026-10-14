@@ -188,11 +188,16 @@ func TestPipelineRunLeavesRunningStatus(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
-// TestQuotaHeartbeatStampsWaiting pins the liveness story the TIME column
-// tells: the run enters its hourly sleep stamped waiting, a wakeup resumes
-// it stamped running again, and the resumed round's completion refreshes
-// LastActivityAt past the pre-sleep stamp.
-func TestQuotaHeartbeatStampsWaiting(t *testing.T) {
+// TestQuotaHeartbeatStampsStarved pins the liveness story the TIME column
+// tells: the run enters its hourly sleep stamped starved — the
+// provider-starved state `daedalus report` distinguishes from a wedge — a
+// wakeup resumes it stamped running again, and the resumed round's
+// completion refreshes LastActivityAt past the pre-sleep stamp. Fresh
+// executions record the starved-run-status marker, so the starved branch
+// is the one that runs; the pre-marker waiting stamp is replay-only
+// history (GetVersion hands back the default only on a canned history) and
+// not observable through a fresh execution here.
+func TestQuotaHeartbeatStampsStarved(t *testing.T) {
 	env := newTestEnv(t)
 	stubWorktree(t, env)
 
@@ -229,8 +234,8 @@ func TestQuotaHeartbeatStampsWaiting(t *testing.T) {
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("workflow error: %v", err)
 	}
-	if mid.Status != string(StatusWaiting) {
-		t.Errorf("mid-heartbeat DaedalusStatus = %q, want %q", mid.Status, StatusWaiting)
+	if mid.Status != string(StatusStarved) {
+		t.Errorf("mid-heartbeat DaedalusStatus = %q, want %q", mid.Status, StatusStarved)
 	}
 	if !mid.HasLast {
 		t.Error("mid-heartbeat LastActivityAt absent, want the run-start stamp")

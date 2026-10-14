@@ -9,18 +9,21 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	workflow "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/runstart"
 	"github.com/ozzono/daedalus/internal/shrink"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
@@ -37,59 +40,17 @@ import (
 const runWaitTimeout = 12 * time.Hour
 
 // sharedTestQueueInput resolves config shared_test_queue into the
-// PipelineInput field the workflow routes suite executions by: always a
-// concrete value (never nil from here), so the run records the routing its
-// starting config chose — shared or per-deployment — instead of falling
-// back at schedule time.
+// PipelineInput field the workflow routes suite executions by (the gate
+// itself lives in internal/runstart, next to the input build it feeds).
 func sharedTestQueueInput(cfg config.Config) *bool {
-	shared := cfg.SharesTestQueue()
-	return &shared
+	return runstart.SharedTestQueue(cfg)
 }
 
 // resolveRepoPath turns the operator's repo path into an absolute path and
-// verifies it is a git repository before the workflow starts. The path
-// crosses a process boundary: activities execute on the worker daemon,
-// whose working directory is wherever it was started from, so a relative
-// path arriving verbatim resolved there — against a directory that may not
-// be a repository — and failed every pipeline inside
-// CreateWorktreeActivity with an opaque git error. That is the same
-// boundary the daemon's config path was made absolute for (workerStart).
+// verifies it is a git repository before the workflow starts (the check
+// lives in internal/runstart, shared with the dashboard's form submit).
 func resolveRepoPath(repoPath string) (string, error) {
-	abs, err := filepath.Abs(repoPath)
-	if err != nil {
-		return "", fmt.Errorf("resolve repo path: %w", err)
-	}
-	if info, err := os.Stat(abs); err != nil || !info.IsDir() {
-		return "", fmt.Errorf("repo path %s is not a directory", repoPath)
-	}
-	cmd := exec.Command("git", "-C", abs, "rev-parse", "--git-dir")
-	cmd.Env = envWithoutGitRepoOverrides(os.Environ())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("repo path %s is not a git repository: %s", abs, strings.TrimSpace(string(out)))
-	}
-	return abs, nil
-}
-
-// envWithoutGitRepoOverrides strips the environment variables that override
-// git's own repository discovery. An exported GIT_DIR would have rev-parse
-// validate an unrelated repository and ship a non-repo path to the worker,
-// and GIT_CEILING_DIRECTORIES could reject a valid one; the check must
-// judge the directory on disk, not the invoking shell's git state.
-func envWithoutGitRepoOverrides(environ []string) []string {
-	scrub := map[string]bool{
-		"GIT_DIR":                 true,
-		"GIT_WORK_TREE":           true,
-		"GIT_INDEX_FILE":          true,
-		"GIT_CEILING_DIRECTORIES": true,
-	}
-	var out []string
-	for _, kv := range environ {
-		if name, _, _ := strings.Cut(kv, "="); scrub[name] {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
+	return runstart.ResolveRepoPath(repoPath)
 }
 
 // confirmCleanRepo is run's repo preflight: a dirty working tree in the
@@ -101,16 +62,14 @@ func envWithoutGitRepoOverrides(environ []string) []string {
 // workflow is dispatched: no session, branch, or worktree exists yet, so
 // the cancellation leaves nothing behind by construction.
 func confirmCleanRepo(repoPath string) error {
-	cmd := exec.Command("git", "-C", repoPath, "status", "--porcelain")
-	cmd.Env = envWithoutGitRepoOverrides(os.Environ())
-	out, err := cmd.CombinedOutput()
+	dirty, status, err := runstart.RepoStatus(repoPath)
 	if err != nil {
-		return fmt.Errorf("check %s for uncommitted changes: %v: %s", repoPath, err, strings.TrimSpace(string(out)))
+		return err
 	}
-	if strings.TrimSpace(string(out)) == "" {
+	if !dirty {
 		return nil
 	}
-	fmt.Printf("repo %s has uncommitted changes:\n%s\n", repoPath, strings.TrimRight(string(out), "\n"))
+	fmt.Printf("repo %s has uncommitted changes:\n%s\n", repoPath, status)
 	fmt.Print(`Start the pipeline anyway? Type "y" to proceed: `)
 	answer, rerr := readConfirmLine()
 	if rerr != nil {
@@ -285,25 +244,11 @@ func slimOverCapErr(n, limit int) error {
 		n, limit)
 }
 
-// issueIDGate rejects ids a workflow id cannot safely carry: the id is
-// interpolated verbatim into NotifyDependents' single-quoted Temporal
-// visibility filter (internal/activities/depends.go), whose string
-// literals have no escape — a character outside the token set (the spirit
-// of config.ValidateWorkerID) breaks that filter, so the run's completion
-// poke would fail every time and its dependents release only on the
-// fallback poll. Named and extracted like slimInputGate so the rejection
-// is unit-pinnable without a Temporal frontend, and fired at the top of
-// startPipelineFolders so bad input fails before any submit-path side
-// effect (worker preflight, daemon dial).
+// issueIDGate rejects ids a workflow id cannot safely carry (the gate
+// lives in internal/runstart, fired at the top of both submit paths so bad
+// input fails before any side effect — worker preflight, daemon dial).
 func issueIDGate(issueID string) error {
-	for _, r := range issueID {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
-		default:
-			return fmt.Errorf("issue id %q: character %q is not allowed — use only letters, digits, '.', '_' and '-' (rename the issue and rerun); the id is interpolated into the dependent-wakeup search filter, where other characters break it", issueID, string(r))
-		}
-	}
-	return nil
+	return runstart.IssueIDGate(issueID)
 }
 
 // startPipeline triggers the named workflow for the given issue on the
@@ -319,307 +264,104 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 // startPipelineFolders is startPipeline with the run's validated folder
 // grants (resolveFolderGrants) and, when set, the workflow id the run is
 // chained behind (-dep/--depends). (Split so startPipeline's existing
-// signature — and the tests pinning it — stays untouched.)
+// signature — and the tests pinning it — stays untouched.) The dispatch
+// itself is internal/runstart.Start (htmx-ui pt2's Q4=C seam, shared with
+// the dashboard's New Task form); this wrapper carries the parts only a
+// terminal can do: the interactive dirty-repo confirm — whose affirmation
+// rides to Start in Request.DirtyOK, so a confirmed dirty tree starts the
+// run instead of dead-ending on the seam's refusal — and the worker
+// daemon auto-start, in the same order the preflights always ran — repo
+// confirm before anything touches a daemon file.
 func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string, folders []string, depends string) error {
-	if err := issueIDGate(issueID); err != nil {
+	// The cheap submit gates first, exactly where they always ran: a bad
+	// issue id or wire conflict must not cost a repo prompt or spawn a
+	// worker daemon.
+	req := runstart.Request{
+		WorkflowName: workflowName,
+		RepoPath:     repoPath,
+		IssueID:      issueID,
+		Prompt:       prompt,
+		BranchPrefix: branchPrefix,
+		Agent:        agent,
+		Folders:      folders,
+		Depends:      depends,
+		Warn:         os.Stdout,
+	}
+	if err := runstart.Validate(cfg, req); err != nil {
 		return err
 	}
-	// The wire-vs-agent gate: a launch whose effective agent has no channel
-	// on this config's served wire would dial whatever the agent's own
-	// ambient/default endpoint is — fail here, before any worktree, worker
-	// ping, or round exists. Load-time validation deliberately omits this
-	// (an openai-url-only section under the default agent is a legal load:
-	// the section's env channel serves tooling and other agents), so the
-	// launch is where the conflict can be named with both the agent and the
-	// wire. The CLI's --cli override wins when set, mirroring the effective
-	// agent everywhere else.
-	effectiveAgent := agent
-	if effectiveAgent == "" {
-		effectiveAgent = cfg.Agent
-	}
-	if err := cfg.AgentWireConflict(effectiveAgent); err != nil {
-		return err
-	}
-	spec, ok := workflowRegistry[workflowName]
-	if !ok {
-		return fmt.Errorf("unknown workflow %q (available: %s)", workflowName, workflowNames())
-	}
-	repoPath, err := resolveRepoPath(repoPath)
+	abs, err := resolveRepoPath(repoPath)
 	if err != nil {
 		return err
 	}
-	if err := confirmCleanRepo(repoPath); err != nil {
+	if err := confirmCleanRepo(abs); err != nil {
 		return err
 	}
+	// The confirm was affirmed (or the tree was clean): carry that across
+	// the seam, so Start's clean-repo gate — the dashboard's refusal — does
+	// not fire after the operator already answered it.
+	req.DirtyOK = true
 	if err := ensureWorkerActive(cfg, configPath); err != nil {
 		return err
 	}
-
-	c, err := newClient(cfg)
+	run, err := runstart.Start(cfg, req)
 	if err != nil {
+		// A dependency id naming no execution is a usage error — the same
+		// screen the pre-refactor submit answered with.
+		if errors.Is(err, runstart.ErrDependencyNotFound) {
+			usageFail("%s", err)
+		}
 		return err
-	}
-	defer c.Close()
-
-	// Best-effort alert, never an error: a shared grant with another
-	// running pipeline means concurrent, uncoordinated writes to that
-	// folder.
-	warnFolderOverlap(c, cfg, folders)
-
-	// The workflow ID is scoped by task queue so different projects or flows
-	// on one Temporal server never collide on issue IDs. Flow-scoped runs
-	// carry the flow name too, and everything the run derives — worktree
-	// path, in-flight and aborted branches (workflows.FlowScope) — is
-	// scoped with it: two concurrent flows on one issue must not share a
-	// worktree, since the second create's cleanup would preserve-and-delete
-	// the first run's in-flight state. feature-dev keeps its legacy
-	// unscoped ID and names so existing history, `daedalus continue`, and
-	// recapture stay untouched. The id is opaque to every consumer (list,
-	// log, wipe, attach, continue, and the task-log filename all take it
-	// verbatim), and branch naming keys off input.IssueID directly — so
-	// runs started before the "-issue-" infix was dropped keep working
-	// alongside new ids, with no history migration.
-	workflowID := fmt.Sprintf("%s-%s", cfg.Temporal.TaskQueue, issueID)
-	if workflowName != defaultWorkflowName {
-		workflowID = fmt.Sprintf("%s-%s-%s", cfg.Temporal.TaskQueue, workflowName, issueID)
-	}
-	if depends != "" {
-		// Resolve the release-with-fallback default once, at submit: an
-		// enabled section without an explicit fallback_branch releases onto
-		// the invocation branch, and the resolved name travels in the
-		// workflow input — a config edit mid-run cannot retarget an
-		// in-flight chain, and replay re-executes the gate against the
-		// exact branch the live run saw. cfg is a value copy, so the
-		// mutation here never writes back to the caller's config. An
-		// explicitly set branch is verified to exist here — bad input
-		// failing at submit, not after the dependency has been waited out.
-		if cfg.Dependency.EnabledOrDefault() {
-			if cfg.Dependency.FallbackBranch == "" {
-				b, err := invocationBranch(repoPath)
-				if err != nil {
-					return err
-				}
-				cfg.Dependency.FallbackBranch = b
-			} else if err := verifyBranchExists(repoPath, cfg.Dependency.FallbackBranch); err != nil {
-				return err
-			}
-		}
-		if err := preflightDependency(c, cfg, workflowID, depends); err != nil {
-			return err
-		}
-	}
-	// The workflow starts by its registered type name (WorkflowTypeName) —
-	// the same name the worker registers the CompleteGreen-wrapped flow
-	// under. The registry's Fn is unwrapped and would reflect to that name
-	// by itself, but the string pins both ends to WorkflowTypeName as the
-	// single derivation, so a future wrapping of the registry's Fn cannot
-	// desynchronize start from registration.
-	run, err := c.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
-		ID:        workflowID,
-		TaskQueue: cfg.Temporal.TaskQueue,
-		// Allow re-running an issue whose previous pipeline succeeded
-		// instead of failing with an already-exists error.
-		WorkflowIDReusePolicy: enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-	}, workflows.WorkflowTypeName(spec.Fn), workflows.PipelineInput{
-		RepoPath:        repoPath,
-		TaskQueue:       cfg.Temporal.TaskQueue,
-		IssueID:         issueID,
-		Prompt:          prompt,
-		Flow:            workflowName,
-		AllowedPaths:    spec.AllowedPaths,
-		FrozenPaths:     spec.FrozenPaths,
-		BranchPrefix:    branchPrefix,
-		Agent:           agent,
-		Authorship:      cfg.Authorship,
-		TestTimeout:     cfg.TestsTimeout,
-		AgentRunTimeout: cfg.AgentRunTimeout,
-		ReviewTimeout:   cfg.ReviewTimeout,
-		CleanupTimeout:  cfg.CleanupTimeout,
-		SharedTestQueue: sharedTestQueueInput(cfg),
-		TestOutputDir:   cfg.TestOutputDir(),
-		Folders:         folders,
-		DependsOn:       depends,
-		Dependency:      cfg.Dependency,
-		ReviewSkillList: cfg.ReviewSkillList,
-	})
-	if err != nil {
-		return fmt.Errorf("start workflow: %w", err)
 	}
 	if depends != "" {
 		// The pre-round note: while the gate holds the run in pending, no
 		// round has ever written to the task log — this line is what
 		// `daedalus log` (and the idle --status brief) shows meanwhile.
 		// Best-effort: a failed write never fails the run.
-		if err := activities.AppendSubmitNote(workflowID, "waiting on dependency: "+depends); err != nil {
+		if err := activities.AppendSubmitNote(run.WorkflowID, "waiting on dependency: "+depends); err != nil {
 			fmt.Printf("warning: could not write the task-log dependency note: %v\n", err)
 		}
 	}
 
 	fmt.Printf("Started workflow:\n")
-	fmt.Printf("  Workflow ID: %s\n", run.GetID())
-	fmt.Printf("  Run ID:      %s\n", run.GetRunID())
+	fmt.Printf("  Workflow ID: %s\n", run.WorkflowID)
+	fmt.Printf("  Run ID:      %s\n", run.RunID)
 
 	if detach {
-		fmt.Printf("Detached — reattach with: daedalus attach %s\n", run.GetID())
+		fmt.Printf("Detached — reattach with: daedalus attach %s\n", run.WorkflowID)
 		return nil
 	}
-	return awaitPipeline(run)
+	c, err := newClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return awaitPipeline(c.GetWorkflow(context.Background(), run.WorkflowID, run.RunID))
 }
 
-// invocationBranch names the branch the run is submitted from — the
-// default dependency.fallback_branch: a dependent run released past a dead
-// dependency continues from where the operator stood when submitting the
-// chain. Same env hygiene as resolveRepoPath. A detached HEAD names no
-// branch and is refused: "--abbrev-ref" prints the literal "HEAD" there,
-// and falling back to a raw commit reference the operator did not name
-// would start work from a moving target's idea of a branch — setting
-// fallback_branch explicitly is the fix the error names.
+// invocationBranch and verifyBranchExists moved with the rest of the
+// dependency chain's submit half into internal/runstart (Start calls them;
+// continue has no dependency gate and never needed them here).
+
 func invocationBranch(repoPath string) (string, error) {
-	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Env = envWithoutGitRepoOverrides(os.Environ())
-	out, err := cmd.CombinedOutput()
-	branch := strings.TrimSpace(string(out))
-	if err != nil {
-		return "", fmt.Errorf("resolve the invocation branch of %s: %v: %s", repoPath, err, branch)
-	}
-	if branch == "HEAD" || branch == "" {
-		return "", fmt.Errorf("resolve the invocation branch of %s: detached HEAD names no branch — set dependency.fallback_branch in the config to release past a stopped dependency", repoPath)
-	}
-	return branch, nil
+	return runstart.InvocationBranch(repoPath)
 }
 
-// verifyBranchExists refuses a named branch that does not exist as a
-// branch in the run's repo — dependency.fallback_branch is verified at
-// submit so a typo fails the run before the dependency gate instead of
-// after it, with git's raw "invalid reference" at release time. The
-// full refname (refs/heads/<branch>) pins the check to branches: a tag or
-// a SHA would resolve --verify alone and is not a worktree base this
-// feature promises. Same env hygiene as resolveRepoPath.
 func verifyBranchExists(repoPath, branch string) error {
-	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	cmd.Env = envWithoutGitRepoOverrides(os.Environ())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("dependency.fallback_branch %q: no such branch in %s (git: %s) — create it or fix the config before chaining behind a dependency",
-			branch, repoPath, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return runstart.VerifyBranchExists(repoPath, branch)
 }
 
-// preflightDependency is the submit-time half of the dependency gate: the
-// dependency is named by workflow id verbatim (the same convention as
-// continue/attach/wipe) and must exist on this config's task queue, so a
-// typo or a foreign-queue id fails before dispatch instead of pending
-// forever. A dependency already terminal without approval (failed,
-// canceled, wiped — or completed with a park marker) means the chain is
-// already broken: the run would fail at its first probe anyway, so the
-// refusal happens here — unless the config's dependency section is in
-// release posture (cfg.Dependency, with the fallback branch already
-// resolved by startPipelineFolders), in which case the dispatch goes ahead
-// and the workflow gate applies the skip flags with the same resolved
-// section. A paused dependency passes through unconditionally: it is
-// resumable (`temporal workflow unpause`), not broken, and the gate waits
-// for it. Terminal-approved passes straight through — the workflow's first
-// probe sees the approved completion and skips the wait (idempotent
-// re-submits). Anything still in flight dispatches and lets the workflow
-// gate block.
+// preflightDependency is the submit-time half of the dependency gate (the
+// gate itself lives in internal/runstart, shared with the dashboard's form
+// submit). The CLI-side difference is the genuinely-absent dependency: a
+// usage error answered with the usage screen, exactly as the pre-extraction
+// gate answered it.
 func preflightDependency(c client.Client, cfg config.Config, workflowID, depID string) error {
-	if depID == workflowID {
-		return fmt.Errorf("dependency %s is this run's own id — a run cannot depend on itself", depID)
+	err := runstart.PreflightDependency(c, cfg, workflowID, depID)
+	if errors.Is(err, runstart.ErrDependencyNotFound) {
+		usageFail("%s", err)
 	}
-	resp, err := c.DescribeWorkflowExecution(context.Background(), depID, "")
-	if err != nil {
-		// Only a genuinely absent id is a usage error; an unreachable
-		// server or any other failure returns plainly — the "check the id
-		// against daedalus list" advice needs the server that just failed.
-		var notFound *serviceerror.NotFound
-		if errors.As(err, &notFound) {
-			usageFail("dependency %s: not found — check the id against \"daedalus list\"", depID)
-		}
-		return fmt.Errorf("describe dependency %s: %w", depID, err)
-	}
-	info := resp.GetWorkflowExecutionInfo()
-	// Same queue-ownership check as wakeup: chaining across queues would
-	// couple deployments whose workers cannot even see each other's
-	// activities coherently — the id says which queue owns the dependency.
-	if q := info.GetTaskQueue(); q != cfg.Temporal.TaskQueue {
-		return fmt.Errorf("dependency %s runs on task queue %q, not this config's %q — point -c at the config of the queue that owns it",
-			depID, q, cfg.Temporal.TaskQueue)
-	}
-	switch s := info.GetStatus(); s {
-	case enums.WORKFLOW_EXECUTION_STATUS_RUNNING, enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
-		enums.WORKFLOW_EXECUTION_STATUS_PAUSED:
-		return nil
-	case enums.WORKFLOW_EXECUTION_STATUS_COMPLETED:
-		var result string
-		if err := c.GetWorkflow(context.Background(), depID, "").Get(context.Background(), &result); err != nil {
-			return fmt.Errorf("read result of dependency %s: %w", depID, err)
-		}
-		if workflows.IsParkedResult(result) && !cfg.Dependency.ReleasePosture() {
-			return fmt.Errorf("dependency %s completed parked — the chain is already broken; resume it with `daedalus continue %s \"<prompt>\"` first",
-				depID, depID)
-		}
-		return nil
-	default:
-		if cfg.Dependency.ReleasePosture() {
-			return nil
-		}
-		return fmt.Errorf("dependency %s is %s — the chain is already broken; resolve it first (closed sessions resume with: daedalus continue %s \"<prompt>\")",
-			depID, s, depID)
-	}
-}
-
-// warnFolderOverlap prints a best-effort warning when this run's folder
-// grants overlap a currently running pipeline's on the same task queue:
-// concurrent append-one-row edits to a shared folder (a done-index) are
-// hand-fixable, so this is an alert naming the shared folder and the other
-// run — not an error, since refusing the run would turn a bookkeeping
-// convenience into a scheduling constraint. Any failure enumerating (an
-// unreachable visibility store, an unreadable history) degrades to silence,
-// never a failure. The workflow has not started yet, so the run's own grants
-// cannot match themselves.
-func warnFolderOverlap(c client.Client, cfg config.Config, folders []string) {
-	if len(folders) == 0 {
-		return
-	}
-	granted := make(map[string]bool, len(folders))
-	for _, f := range folders {
-		granted[f] = true
-	}
-	resp, err := c.ListWorkflow(context.Background(), &workflowservice.ListWorkflowExecutionsRequest{
-		Namespace: "default",
-		Query:     fmt.Sprintf("TaskQueue = '%s' AND ExecutionStatus = 'Running'", cfg.Temporal.TaskQueue),
-	})
-	if err != nil {
-		return
-	}
-	dc := converter.GetDefaultDataConverter()
-	for _, ex := range resp.GetExecutions() {
-		var prev workflows.PipelineInput
-		iter := c.GetWorkflowHistory(context.Background(),
-			ex.GetExecution().GetWorkflowId(), ex.GetExecution().GetRunId(),
-			false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
-		for iter.HasNext() {
-			ev, err := iter.Next()
-			if err != nil {
-				break
-			}
-			if att := ev.GetWorkflowExecutionStartedEventAttributes(); att != nil {
-				// Only the started event carries the input; stop walking as
-				// soon as it is seen (or undecodable).
-				if ps := att.GetInput().GetPayloads(); len(ps) > 0 {
-					if dc.FromPayload(ps[0], &prev) == nil {
-						for _, f := range prev.Folders {
-							if granted[f] {
-								fmt.Printf("warning: folder %s is also granted to running pipeline %s — writes to it are not coordinated across runs\n",
-									f, ex.GetExecution().GetWorkflowId())
-							}
-						}
-					}
-				}
-				break
-			}
-		}
-	}
+	return err
 }
 
 // writeExampleConfig writes the fully-commented example configuration —
@@ -688,16 +430,63 @@ func dur(d time.Duration) string {
 	return fmt.Sprintf("%.1fd", d.Hours()/24)
 }
 
+// runDisplayStatus renders one listed execution's status string — the one
+// derivation behind `daedalus list`'s STATUS column and the dashboard's
+// Runs view, so the two never drift. Live runs prefer the workflow's
+// upserted DaedalusStatus over the raw Temporal enum — parks and approvals
+// are both Completed there — falling back to the enum for old runs without
+// the attribute. Closed runs render by the display taxonomy: approved →
+// completed, parked and aborted (Canceled) → paused, everything else
+// unchanged; a park not carrying the stamp — pre-marker history, or a
+// live-state attribute a close the stamps don't cover left behind — hides
+// in a green (or, on the oldest workers, failed) close and is recognized
+// by probing that row's own outcome.
+func runDisplayStatus(c client.Client, info *workflow.WorkflowExecutionInfo, vis runVisibility) string {
+	status := info.GetStatus().String()
+	if closed := info.GetCloseTime(); closed.IsValid() {
+		// Closed: a terminal DaedalusStatus — CompleteGreen stamps
+		// those alone — classifies the run for display. A run closed
+		// by other means keeps a live-state attribute (a wipe cancel
+		// mid-heartbeat carries waiting, a killed worker leaves
+		// running on a TimedOut run), which must not shadow what
+		// Temporal recorded. Display taxonomy: only an approved run
+		// earns completed; parked and aborted render as paused — a
+		// park is a wait on the maintainer and an abort (the wipe
+		// cancel, Canceled here) preserved its work for `daedalus
+		// continue`, so neither is an end. A run without a terminal
+		// attribute — pre-marker history, or a live-state one a close
+		// the stamps don't cover left behind — classifies by close
+		// enum: Canceled is an abort; a park without the parked stamp
+		// hides in the outcome probe below; everything else keeps the
+		// raw enum.
+		switch workflows.RunStatus(vis.Status) {
+		case workflows.StatusApproved:
+			return "completed"
+		case workflows.StatusParked:
+			return "paused"
+		case workflows.StatusFailed:
+			return vis.Status
+		default:
+			switch info.GetStatus() {
+			case enums.WORKFLOW_EXECUTION_STATUS_CANCELED:
+				return "paused"
+			case enums.WORKFLOW_EXECUTION_STATUS_COMPLETED, enums.WORKFLOW_EXECUTION_STATUS_FAILED:
+				if closedRunParked(c, info.GetExecution().GetWorkflowId(), info.GetExecution().GetRunId()) {
+					return "paused"
+				}
+			}
+		}
+		return status
+	}
+	if vis.Status != "" {
+		return vis.Status
+	}
+	return status
+}
+
 // listPipelines prints the most recent sessions on this task queue, newest
-// first. STATUS prefers the workflow's upserted DaedalusStatus over the raw
-// Temporal enum — parks and approvals are both Completed there — falling
-// back to the enum for old runs without the attribute. Closed runs render
-// by the display taxonomy: approved → completed, parked and aborted
-// (Canceled) → paused, everything else unchanged; a park not carrying the
-// stamp — pre-marker history, or a live-state attribute a close the stamps
-// don't cover left behind — hides in a green (or, on the oldest workers,
-// failed) close and is recognized by probing that row's own outcome.
-// TIME is one merged
+// first. STATUS is runDisplayStatus's derivation — the same one the
+// dashboard's Runs view renders. TIME is one merged
 // cell, and both of its halves count runtime from DaedalusStartedAt — the
 // dependency gate's release, the run's first moment of real work — falling
 // back to the dispatch time a run without the attribute worked from (a
@@ -730,7 +519,7 @@ func listPipelines(cfg config.Config, max int) error {
 	for _, info := range resp.GetExecutions() {
 		id := info.GetExecution().GetWorkflowId()
 		vis := decodeRunVisibility(info.GetSearchAttributes(), dc)
-		status := info.GetStatus().String()
+		status := runDisplayStatus(c, info, vis)
 		dependsOn := vis.DependsOn
 		if dependsOn == "" {
 			dependsOn = "-"
@@ -741,44 +530,9 @@ func listPipelines(cfg config.Config, max int) error {
 			workedFrom = vis.StartedAt
 		}
 		if closed := info.GetCloseTime(); closed.IsValid() {
-			// Closed: a terminal DaedalusStatus — CompleteGreen stamps
-			// those alone — classifies the run for display. A run closed
-			// by other means keeps a live-state attribute (a wipe cancel
-			// mid-heartbeat carries waiting, a killed worker leaves
-			// running on a TimedOut run), which must not shadow what
-			// Temporal recorded. Display taxonomy: only an approved run
-			// earns completed; parked and aborted render as paused — a
-			// park is a wait on the maintainer and an abort (the wipe
-			// cancel, Canceled here) preserved its work for `daedalus
-			// continue`, so neither is an end. A run without a terminal
-			// attribute — pre-marker history, or a live-state one a close
-			// the stamps don't cover left behind — classifies by close
-			// enum: Canceled is an abort; a park without the parked stamp
-			// hides in the outcome probe below; everything else keeps the
-			// raw enum.
-			switch workflows.RunStatus(vis.Status) {
-			case workflows.StatusApproved:
-				status = "completed"
-			case workflows.StatusParked:
-				status = "paused"
-			case workflows.StatusFailed:
-				status = vis.Status
-			default:
-				switch info.GetStatus() {
-				case enums.WORKFLOW_EXECUTION_STATUS_CANCELED:
-					status = "paused"
-				case enums.WORKFLOW_EXECUTION_STATUS_COMPLETED, enums.WORKFLOW_EXECUTION_STATUS_FAILED:
-					if closedRunParked(c, id, info.GetExecution().GetRunId()) {
-						status = "paused"
-					}
-				}
-			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t[%s | ended %s ago]\n",
 				id, status, dependsOn, dur(closed.AsTime().Sub(workedFrom)), dur(now.Sub(closed.AsTime())))
 			continue
-		}
-		if vis.Status != "" {
-			status = vis.Status
 		}
 		if workflows.RunStatus(vis.Status) == workflows.StatusPending {
 			fmt.Fprintf(w, "%s\t%s\t%s\t[queued | submitted %s ago]\n",
@@ -795,6 +549,16 @@ func listPipelines(cfg config.Config, max int) error {
 	return w.Flush()
 }
 
+// closedParkMemo remembers closedRunParked's answer per execution. A
+// closed run's outcome is immutable, and `daedalus list` derives it per
+// ambiguous row per invocation while the dashboard re-derives every row
+// every 5s poll — without the memo the probe (a result fetch per
+// ambiguous row) would repeat forever, per viewer.
+var closedParkMemo = struct {
+	sync.Mutex
+	m map[string]bool
+}{m: map[string]bool{}}
+
 // closedRunParked probes one closed run's outcome for a park — the green
 // completion CompleteGreen gives parks on current workers, or the failure
 // message the pre-CompleteGreen workers parked with (the same two shapes
@@ -803,18 +567,39 @@ func listPipelines(cfg config.Config, max int) error {
 // would resolve the latest execution — classifying an old row from its
 // continuation's outcome, and blocking on a live one. Only runs without a
 // terminal DaedalusStatus are probed: a stamped run already says parked.
-// The timeout is far tighter than wipe's single probe — this runs once per
-// ambiguous row inside a table render — and any read failure degrades to
-// false: the row keeps the enum's rendering, the table never fails over a
-// probe.
+// The probe runs once per execution per process (closedParkMemo); a
+// transient read failure is not memoized — the answer "unknown" is not
+// immutable, so the next render retries — while the awaiting-maintainer
+// error is the park's own hold and is as definitive as a read result.
+// Any read failure degrades to false: the row keeps the enum's rendering,
+// the table never fails over a probe.
 func closedRunParked(c client.Client, workflowID, runID string) bool {
+	key := workflowID + "\x00" + runID
+	closedParkMemo.Lock()
+	parked, ok := closedParkMemo.m[key]
+	closedParkMemo.Unlock()
+	if ok {
+		return parked
+	}
 	pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var out string
-	if err := c.GetWorkflow(pctx, workflowID, runID).Get(pctx, &out); err != nil {
-		return strings.Contains(err.Error(), workflows.ErrAwaitingMaintainer.Error())
+	err := c.GetWorkflow(pctx, workflowID, runID).Get(pctx, &out)
+	switch {
+	case err == nil:
+		parked = workflows.IsParkedResult(out)
+	case strings.Contains(err.Error(), workflows.ErrAwaitingMaintainer.Error()):
+		parked = true
+	default:
+		return false
 	}
-	return workflows.IsParkedResult(out)
+	closedParkMemo.Lock()
+	if len(closedParkMemo.m) >= uiCacheCap {
+		closedParkMemo.m = map[string]bool{}
+	}
+	closedParkMemo.m[key] = parked
+	closedParkMemo.Unlock()
+	return parked
 }
 
 // continuePipeline resumes a closed pipeline (canceled, failed — including

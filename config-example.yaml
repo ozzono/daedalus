@@ -676,6 +676,45 @@ dependency:
   skip_stuck: false
   skip_canceled: false
 
+# The metrics subsystem: a local LLM relay every provider-bound round
+# dials, the per-request usage ledger it keeps (tokens in/out, cache
+# tokens, latency — parsed from the provider responses), and the
+# host-global "daedalus metrics" daemon that hosts both plus the
+# dashboard. Usage capture is wire-shaped, not CLI-shaped: an anthropic
+# stream always carries usage, but an openai-wire stream carries it only
+# when the client asks for it (stream_options.include_usage — most CLIs
+# do not), so a streamed openai-wire round can ledger zero tokens while
+# the round itself ran fine. Off by default, and never silently on: with metrics enabled
+# every round's prompt transits the localhost relay process — that is
+# acceptable for a self-hosted relay you own, and it is your call to make.
+# What enabling does: "daedalus worker start" and "restart" then require
+# the metrics daemon (the worker probes the relay listener and fails fast
+# with the "daedalus metrics start" remedy when it is down), and the
+# worker stages the relay's URL into each round's provider environment,
+# so rounds that would dial the provider dial the relay instead and their
+# usage lands in the ledger. A CLI dialing its provider directly (no
+# staged URL override) bypasses the relay invisibly — coverage is
+# per-CLI-wiring, not per-host. Fallback rounds (failover) and reviewer
+# rounds pinned to a reviewer endpoint skip the staging and stay
+# invisible to the ledger. The daemon is host-global — one process
+# serving every worker on the host — while this per-project toggle gates
+# only this project's staging; the daemon's own serving config is read
+# from the host context at "daedalus metrics start". One lifecycle note: a
+# worker restarted inside a minute of stopping fails its boot registration
+# (the dead process's registration lingers for the TTL, and a live name is
+# only ever replaced by its own secret) — wait the minute out and restart,
+# or clear it immediately with "daedalus metrics restart".
+metrics:
+  enabled: false
+  # The dashboard's port, bound on the LAN (no auth — any LAN peer can
+  # read run data and start runs; that is a decided, accepted posture for
+  # a localhost operator tool serving your own network). 0 (unset) = 7777.
+  port: 7777
+  # The relay's port, bound to 127.0.0.1 only — physically unreachable
+  # off-host. Must differ from port (one port cannot host both
+  # listeners; equality fails the load). 0 (unset) = 7778.
+  relay_port: 7778
+
 # Project-wise prompt overrides. Empty (the default): every round's prompt
 # renders byte-identically to the embedded templates in
 # internal/template/prompts. When set, this names a directory of

@@ -107,6 +107,14 @@ func complete(words []string) []string {
 			}
 			return prefixed(left, toComplete)
 		}
+	case "metrics":
+		// The action argument; the actions take no further positionals
+		// (list's flags complete no differently than worker's — not at
+		// all).
+		rest := positionalWords(typed[pos+1:])
+		if len(rest) == 0 {
+			return prefixed(metricsActions, toComplete)
+		}
 	case "completion":
 		// Exactly one shell argument — a second is a usage failure.
 		if pos+1 == len(typed) {

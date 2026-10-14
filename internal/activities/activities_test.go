@@ -2027,6 +2027,66 @@ exit 0`)
 	), "review jail")
 }
 
+// TestRunJailedReviewerActivityThinking pins the reviewer CoT capture: a
+// reviewer whose stream is structured (claude's schema) carries its native
+// thinking into ReviewResult.Thinking beside the parsed verdict — the -cot
+// view's preferred source — while a plain-text reviewer's round leaves it
+// empty rather than guessing an inline split.
+func TestRunJailedReviewerActivityThinking(t *testing.T) {
+	t.Run("a stream-json reviewer's native thinking is captured", func(t *testing.T) {
+		log := newStubLog(t)
+		stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+		stubBin(t, "ai-jail", `printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"reviewer native reasoning"}]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Looks good.\nAPPROVED"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"Looks good.\nAPPROVED","session_id":"rev-sess","total_cost_usd":0.2,"duration_ms":900}'
+exit 0`)
+
+		res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+			WorktreePath: t.TempDir(),
+			Focus:        "the implementation",
+		})
+		if err != nil {
+			t.Fatalf("RunJailedReviewerActivity: %v", err)
+		}
+		if !res.Approved || res.Comments != "Looks good." {
+			t.Errorf("verdict = (approved %v, comments %q), want the parsed APPROVED with its comments", res.Approved, res.Comments)
+		}
+		if res.Thinking != "reviewer native reasoning" {
+			t.Errorf("Thinking = %q, want the stream's thinking block", res.Thinking)
+		}
+		if res.SessionID != "rev-sess" {
+			t.Errorf("SessionID = %q, want the stream's session", res.SessionID)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 4 {
+			t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+		}
+	})
+
+	t.Run("a plain-text reviewer captures no thinking", func(t *testing.T) {
+		newStubLog(t)
+		stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+		stubBin(t, "ai-jail", `printf 'Looks good.\nAPPROVED\n'; exit 0`)
+
+		res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+			WorktreePath: t.TempDir(),
+			Focus:        "the implementation",
+		})
+		if err != nil {
+			t.Fatalf("RunJailedReviewerActivity: %v", err)
+		}
+		if !res.Approved {
+			t.Error("Approved = false, want true")
+		}
+		if res.Thinking != "" {
+			t.Errorf("Thinking = %q, want empty (plain text carries no separable CoT)", res.Thinking)
+		}
+	})
+}
+
 // TestRunJailedReviewerActivityStderrNoise pins the stdout-only verdict rule:
 // stderr written after a genuine APPROVED must not flip the verdict.
 func TestRunJailedReviewerActivityStderrNoise(t *testing.T) {

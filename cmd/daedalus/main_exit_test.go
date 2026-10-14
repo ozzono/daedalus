@@ -241,7 +241,7 @@ func TestMainUsageFail(t *testing.T) {
 		{
 			name: "unknown worker action",
 			args: []string{"worker", "dance"},
-			want: `unknown worker action "dance" (start, stop, status, restart, wakeup, foreground)`,
+			want: `unknown worker action "dance" (start, stop, status, restart, wakeup, report, foreground)`,
 		},
 		{
 			name: "worker wakeup without an id",

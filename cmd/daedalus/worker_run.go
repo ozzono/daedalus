@@ -17,6 +17,7 @@ import (
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/metricsrelay"
 	"github.com/ozzono/daedalus/internal/toolrelay"
 	"github.com/ozzono/daedalus/internal/version"
 	"github.com/ozzono/daedalus/internal/workflows"
@@ -93,6 +94,70 @@ func runWorker(cfg config.Config, workerType string) error {
 	} else if err := os.Unsetenv("DAEDALUS_SLIM"); err != nil {
 		return fmt.Errorf("unset DAEDALUS_SLIM: %w", err)
 	}
+	// The metrics relay (config metrics.enabled): the worker's rounds stage
+	// their provider calls onto the host metrics daemon's relay
+	// (internal/metricsrelay), which keeps the usage ledger the `daedalus
+	// metrics` surface reads. Two things happen here: the relay roots are
+	// exported on the env channel (per-round staging in activities reads
+	// them; symmetric unset plus the ProviderEnvVars scrub keep a stale
+	// export from staging a metrics-disabled worker), and this worker's
+	// upstream mapping — base URLs and real API keys per wire, the same
+	// values AgentEnv exported above — is registered with the daemon and
+	// refreshed on a heartbeat well inside the registration TTL. workerStart
+	// gated on the relay already; the probe here covers a bare `worker
+	// foreground` too, so a metrics-enabled start fails the same way on
+	// either path.
+	var metricsRoot, metricsToken string
+	if cfg.Metrics.Enabled {
+		if err := metricsGateCheck(cfg); err != nil {
+			return err
+		}
+		metricsRoot = fmt.Sprintf("http://127.0.0.1:%d", cfg.Metrics.RelayPort)
+		// One mint per process: boot and every heartbeat present the same
+		// secret, so a heartbeat refreshes the live registration instead of
+		// colliding with it — a fresh mint per call would be refused, the
+		// registration would lapse at the TTL, and the post-lapse re-mint
+		// would rotate the secret out from under rounds staged before it.
+		metricsToken = metricsrelay.NewToken()
+		if metricsToken == "" {
+			return fmt.Errorf("mint %s: crypto/rand failed", config.MetricsRelayTokenEnv)
+		}
+	}
+	if metricsRoot != "" {
+		if err := os.Setenv(config.MetricsRelayAnthropicEnv, metricsRoot); err != nil {
+			return fmt.Errorf("set %s: %w", config.MetricsRelayAnthropicEnv, err)
+		}
+		if err := os.Setenv(config.MetricsRelayOpenAIEnv, metricsRoot); err != nil {
+			return fmt.Errorf("set %s: %w", config.MetricsRelayOpenAIEnv, err)
+		}
+		if err := metricsRegister(cfg, metricsRoot, metricsToken); err != nil {
+			return fmt.Errorf("register with the metrics relay: %w", err)
+		}
+		stopReg := make(chan struct{})
+		defer close(stopReg)
+		go func() {
+			ticker := time.NewTicker(metricsHeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopReg:
+					return
+				case <-ticker.C:
+					// A failed refresh only ages the registration toward its
+					// TTL; the next tick retries, so log and continue.
+					if err := metricsRegister(cfg, metricsRoot, metricsToken); err != nil {
+						fmt.Printf("metrics relay: registration refresh failed: %v\n", err)
+					}
+				}
+			}
+		}()
+	} else {
+		for _, name := range []string{config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv, config.MetricsRelayTokenEnv} {
+			if err := os.Unsetenv(name); err != nil {
+				return fmt.Errorf("unset %s: %w", name, err)
+			}
+		}
+	}
 	// The slim tool-call relay: a loopback reverse proxy that lifts pi
 	// rounds' text-encoded tool calls into the native tool_calls wire pi
 	// executes (internal/toolrelay). Started only when slim is enabled
@@ -108,7 +173,17 @@ func runWorker(cfg config.Config, workerType string) error {
 	var relayURL string
 	_, open := cfg.ProviderChannels()
 	if cfg.Slim.Enabled && cfg.Slim.ParserModel != "" && open.URL != "" {
-		r, err := toolrelay.Start(open.URL, cfg.Slim.ParserModel)
+		// With metrics on, the slim relay forwards into the metrics relay's
+		// staged openai path — pi → slim relay → metrics relay → upstream —
+		// so the parser calls land in the ledger attributed to the round:
+		// the synthetic attribution key rides through both relays untouched.
+		upstream := open.URL
+		if metricsRoot != "" {
+			if staged := metricsrelay.StagedBase(metricsRoot, cfg.WorkerName(), metricsrelay.WireOpenAI, open.URL); staged != "" {
+				upstream = staged
+			}
+		}
+		r, err := toolrelay.Start(upstream, cfg.Slim.ParserModel)
 		if err != nil {
 			return fmt.Errorf("start tool relay: %w", err)
 		}
@@ -207,8 +282,8 @@ func runWorker(cfg config.Config, workerType string) error {
 		return fmt.Errorf("unset %s: %w", config.TestOutputMirrorEnv, err)
 	}
 	// The worker's name is stamped into every round's captured Usage (so
-	// `daedalus report` aggregates per worker) and keys the status file
-	// published below.
+	// `daedalus worker report` aggregates per worker) and keys the status
+	// file published below.
 	if err := os.Setenv("DAEDALUS_WORKER_NAME", cfg.WorkerName()); err != nil {
 		return fmt.Errorf("set DAEDALUS_WORKER_NAME: %w", err)
 	}
@@ -288,7 +363,7 @@ func runWorker(cfg config.Config, workerType string) error {
 		workers = append(workers, tw)
 	}
 
-	// Publish slot occupancy next to the pid file for `daedalus report`.
+	// Publish slot occupancy next to the pid file for `daedalus worker report`.
 	stopPublish := make(chan struct{})
 	defer close(stopPublish)
 	go publishWorkerStatus(cfg.WorkerName(), cfg.Temporal.TaskQueue, stopPublish)
@@ -335,7 +410,8 @@ const statusPublishInterval = 5 * time.Second
 // workerStatus is the JSON document published to worker-<name>.status: the
 // worker's live slot state (activities.SlotStats) plus its pid, update
 // time, and the version of the binary it is executing, so a reader
-// (`daedalus report`, `daedalus worker status`) can spot a stale file left
+// (`daedalus worker report`, `daedalus worker status`) can spot a stale
+// file left
 // by a crashed worker and one running a build older than the CLI.
 type workerStatus struct {
 	PID           int       `json:"pid"`

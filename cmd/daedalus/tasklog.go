@@ -88,9 +88,13 @@ func plainTailState(log string) string {
 // the last N rounds (-1 means every round); a live in-flight section,
 // when one exists, always follows — it is the newest material there is.
 // Rounds with a native thinking channel (claude, amp, pi)
-// show their captured Thinking; openai-wire rounds whose reasoning arrived
-// inline show the <think>-fenced part; rounds with no CoT at all say so
-// rather than rendering an empty section. The Temporal address comes from
+// show their captured Thinking — implementing and reviewer rounds alike;
+// openai-wire rounds whose reasoning arrived inline show the
+// <think>-fenced part; rounds with no CoT at all say so rather than
+// rendering an empty section. Every section header carries the run-id
+// attribution (the task-log blocks' 8-char-prefix convention), so a
+// continued session's identically-headed retry sections attribute to the
+// execution that produced them. The Temporal address comes from
 // the resolved config when one is found — an unloadable one fails like
 // every other client command — else the default, so the command works
 // wherever the Temporal service is reachable. When a round is in flight
@@ -190,10 +194,14 @@ func runTaskLogCot(workflowID string, cotN int) {
 				if dc.FromPayload(ps[0], &r) != nil {
 					continue
 				}
-				// The reviewer activity discards the parsed thinking at
-				// capture (see backlog/bugs/reviewer-thinking-discarded.md),
-				// so only inline, fenced CoT can surface for review rounds.
-				cot = inlineCoT(r.Comments)
+				// Native thinking first (the activity captures it since the
+				// reviewer-thinking fix), the inline fenced CoT second —
+				// rounds whose history predates the Thinking field, and
+				// plain-text reviewers, still surface what they have.
+				cot = r.Thinking
+				if cot == "" {
+					cot = inlineCoT(r.Comments)
+				}
 			default:
 				continue
 			}
@@ -201,6 +209,18 @@ func runTaskLogCot(workflowID string, cotN int) {
 			header := fmt.Sprintf("=== round %d: %s", rounds, sr.role)
 			if sr.agent != "" {
 				header += fmt.Sprintf(" (%s)", sr.agent)
+			}
+			// Run-id attribution, the task-log blocks' own convention (an
+			// 8-char prefix): a continued session's identically-headed retry
+			// sections attribute to the execution that produced them. The
+			// visibility-lag fallback walks the latest run without an id —
+			// there is nothing to stamp, and the section says so by omission.
+			if runID != "" {
+				short := runID
+				if len(short) > 8 {
+					short = short[:8]
+				}
+				header += " (run " + short + ")"
 			}
 			// The completed event's time is when this attempt's CoT
 			// became final — the honest per-round stamp.

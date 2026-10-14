@@ -42,7 +42,7 @@ func TestMainWorkerActionHelp(t *testing.T) {
 		if stdout != "" {
 			t.Errorf("daedalus worker dance %s stdout = %q, want empty", spelling, stdout)
 		}
-		if !strings.HasPrefix(stderr, `unknown worker action "dance" (start, stop, status, restart, wakeup, foreground)`+"\n\n") {
+		if !strings.HasPrefix(stderr, `unknown worker action "dance" (start, stop, status, restart, wakeup, report, foreground)`+"\n\n") {
 			t.Errorf("daedalus worker dance %s stderr should start with the unknown-action diagnostic and a blank line, got %q", spelling, stderr)
 		}
 		if !strings.HasSuffix(stderr, usage) {
@@ -142,7 +142,7 @@ func TestRootHelpDispatch(t *testing.T) {
 	}
 
 	for _, claim := range []string{
-		"rejected by log and the record-driven worker commands",
+		"rejected by log and the record-driven daemon commands",
 		`"daedalus worker <action> --help"`,
 	} {
 		if !strings.Contains(usage, claim) {
