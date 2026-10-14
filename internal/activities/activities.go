@@ -163,6 +163,15 @@ type ReviewResult struct {
 	// Comments holds everything the reviewer wrote above its verdict line,
 	// to be fed back to the implementing agent.
 	Comments string
+	// Thinking carries the reviewer's native chain of thought (the same
+	// structured capture the implementing rounds get: claude/amp result
+	// JSON, pi's json stream) — weak-model review failures (marker
+	// misses, hallucinated locations) become explicable in
+	// `daedalus log -cot` only if the thinking reaches history, so it is
+	// captured always, never flag-gated. Empty for plain-text reviewers
+	// and rounds predating the field (those fall back to the inline
+	// fenced CoT at render time).
+	Thinking string
 	// NoVerdict marks a marker-less exit: the reviewer's output carried no
 	// verdict line at all. The pipeline still treats such a round as
 	// CHANGES_REQUESTED (the standing contract for a malformed-but-real
@@ -456,7 +465,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	if res.Stderr != "" {
 		logger.Info("Reviewer stderr", "Stderr", res.Stderr)
 	}
-	_, text, session, usage := parseRoundOutput(agent, res.Stdout)
+	thinking, text, session, usage := parseRoundOutput(agent, res.Stdout)
 	if usage.Duration == 0 {
 		usage.Duration = time.Since(start).Round(time.Millisecond)
 	}
@@ -476,6 +485,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	}
 	verdict.SessionID = session
 	verdict.Usage = usage
+	verdict.Thinking = thinking
 	return verdict, nil
 }
 

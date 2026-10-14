@@ -1,10 +1,12 @@
 // Report aggregates the raw per-round provider metrics captured in
 // workflow history (activities.Usage) into per-session, per-day,
-// per-worker, and total slices, and lists this host's workers with their
-// live slot occupancy. Scoping (Q7): the invoking config's worker — its
-// task queue — alone; there is no -q/--all. It reads history through the
-// same walk readPriorRun uses; aggregation happens at report time,
-// keeping history lossless.
+// per-worker, and total slices, lists this host's workers with their live
+// slot occupancy, and gives every live run on the queue a health verdict —
+// running, provider-starved, waiting, or the stale wedge shape. Scoping
+// (Q7): the invoking config's worker — its task queue — alone; there is no
+// -q/--all. It reads history through the same multi-execution walk the
+// task-log -cot view makes (see listWorkflowRuns); aggregation happens at
+// report time, keeping history lossless.
 package main
 
 import (
@@ -19,12 +21,14 @@ import (
 	"time"
 
 	enums "go.temporal.io/api/enums/v1"
+	workflowv1 "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/workflows"
 )
 
 // reportScope holds the parsed `daedalus worker report` flags.
@@ -141,6 +145,7 @@ type usageReport struct {
 	Generated time.Time              `json:"generated"`
 	Queues    []string               `json:"queues"`
 	Workers   []workerRow            `json:"workers"`
+	Runs      []runRow               `json:"runs,omitempty"`
 	Sessions  map[string]usageTotals `json:"sessions"`
 	Days      map[string]usageTotals `json:"days"`
 	ByWorker  map[string]usageTotals `json:"by_worker"`
@@ -151,6 +156,84 @@ type usageReport struct {
 // three missed intervals mean the worker stopped writing it (crashed or
 // killed) and the file describes nothing live.
 const statusStaleAfter = 3 * statusPublishInterval
+
+// runStaleAfter is how long a live run may go without a completed round
+// before the RUNS section calls it stale: twice the default agent-round
+// ceiling, so even a round at the default maximum has completed by then
+// and "running" past it is the wedge shape. ponytail: the run's own
+// configured ceilings are not consulted (a per-run history read is not
+// report work), so a deployment with raised timeouts can show a healthy
+// slow run as stale.
+const runStaleAfter = 2 * config.DefaultAgentRunTimeout
+
+// runRow is one live run's health line in the report's RUNS section. The
+// state verdict is what makes a provider-starved run (the quota
+// heartbeat's hourly crawl under a rate-limited API) distinguishable from
+// a merely running one and from a wedged one — the distinction a stale
+// heartbeat used to hide. Starved arrives as the workflow's own
+// DaedalusStatus stamp (workflows.StatusStarved); a stale-or-older worker
+// leaves the heartbeat stamped "waiting", which renders as the (less
+// specific) slot-backoff line.
+type runRow struct {
+	WorkflowID string `json:"workflow_id"`
+	// State is the health verdict: "provider-starved (quota heartbeat)",
+	// "waiting (slot backoff)", "pending (dependency gate)", "running",
+	// the stale wedge shape, or the run's raw status for anything the
+	// verdicts above don't cover.
+	State string `json:"state"`
+	// LastRound is the run's last completed-round stamp
+	// (LastActivityAt), RFC3339, "unknown" for runs predating the
+	// attribute.
+	LastRound string `json:"last_round,omitempty"`
+}
+
+// runRowFor derives one run's health row from a listed execution and the
+// same visibility decode the runs table makes. ok is false for closed
+// runs — the RUNS section is live health only; closed outcomes already
+// have `daedalus list`.
+func runRowFor(info *workflowv1.WorkflowExecutionInfo, now time.Time) (row runRow, ok bool) {
+	if info.GetCloseTime().IsValid() {
+		return runRow{}, false
+	}
+	vis := decodeRunVisibility(info.GetSearchAttributes(), converter.GetDefaultDataConverter())
+	row = runRow{WorkflowID: info.GetExecution().GetWorkflowId()}
+	if vis.LastAt.IsZero() {
+		row.LastRound = "unknown"
+	} else {
+		row.LastRound = vis.LastAt.UTC().Format(time.RFC3339)
+	}
+	runningVerdict := func() {
+		if vis.LastAt.IsZero() {
+			row.State = "running (no completed round recorded)"
+		} else if age := now.Sub(vis.LastAt); age > runStaleAfter {
+			row.State = fmt.Sprintf("stale — no completed round in %s; possible wedge", dur(age))
+		} else {
+			row.State = "running"
+		}
+	}
+	switch {
+	case workflows.RunStatus(vis.Status) == workflows.StatusStarved:
+		row.State = "provider-starved (quota heartbeat)"
+	case workflows.RunStatus(vis.Status) == workflows.StatusWaiting:
+		row.State = "waiting (slot backoff)"
+	case workflows.RunStatus(vis.Status) == workflows.StatusPending:
+		row.State = "pending (dependency gate)"
+	case workflows.RunStatus(vis.Status) == workflows.StatusRunning:
+		runningVerdict()
+	case vis.Status == "":
+		// A run predating the visibility attributes: the raw enum is all
+		// there is — running verdicts only for an actually-running enum
+		// (a live continued-as-new execution keeps its own label).
+		if info.GetStatus() == enums.WORKFLOW_EXECUTION_STATUS_RUNNING {
+			runningVerdict()
+		} else {
+			row.State = info.GetStatus().String()
+		}
+	default:
+		row.State = vis.Status
+	}
+	return row, true
+}
 
 // collectWorkerRows lists this host's workers — every config record plus
 // any live stray — with slot occupancy from each worker's published status
@@ -216,8 +299,24 @@ func aggregateQueueUsage(c client.Client, queue string, rep *usageReport) error 
 	}
 	// ponytail: first page only (the 100 most recent sessions per queue) —
 	// paging through whole histories waits for a whole-history need.
+	// The list carries one row per execution, and a continued or
+	// restarted session owns several under one id — the RUNS section
+	// wants every row, but the session walk (aggregateSessionUsage)
+	// already reads every execution of the id itself, so each id is
+	// aggregated exactly once.
+	seen := make(map[string]bool, len(resp.GetExecutions()))
 	for _, info := range resp.GetExecutions() {
-		if err := aggregateSessionUsage(c, info.GetExecution().GetWorkflowId(), rep); err != nil {
+		// The live-health section rides the same list call the usage
+		// aggregation makes — no second query.
+		if row, ok := runRowFor(info, time.Now()); ok {
+			rep.Runs = append(rep.Runs, row)
+		}
+		id := info.GetExecution().GetWorkflowId()
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if err := aggregateSessionUsage(c, id, rep); err != nil {
 			return err
 		}
 	}
@@ -225,13 +324,43 @@ func aggregateQueueUsage(c client.Client, queue string, rep *usageReport) error 
 }
 
 // aggregateSessionUsage walks one workflow's history and adds each jailed
-// round's Usage to the session, day, worker, and total slices. Rounds whose
-// history carries no Usage (workers predating capture) contribute nothing —
-// absent from the slices, not zeroed.
+// round's Usage to the session, day, worker, and total slices. Every
+// execution of the workflow id is walked, oldest first — `daedalus
+// continue` and restart create new executions under the same id, and an
+// empty-run-id walk reads only the latest one, so a restarted session's
+// earlier rounds used to vanish from the report (the same walk the -cot
+// view makes; see listWorkflowRuns). Rounds whose history carries no Usage
+// (workers predating capture) contribute nothing — absent from the slices,
+// not zeroed.
 func aggregateSessionUsage(c client.Client, workflowID string, rep *usageReport) error {
 	dc := converter.GetDefaultDataConverter()
+	// listWorkflowRuns exits on a quoted id (its filter cannot carry one) —
+	// right for the -cot command, fatal for a report over every id on the
+	// queue: a pre-gate workflow id carrying a metachar would kill the
+	// whole report. Such an id degrades to the latest-run walk instead.
+	runs := []string{""}
+	if !strings.ContainsAny(workflowID, "'\\") {
+		runs = listWorkflowRuns(c, workflowID)
+	}
+	if len(runs) == 0 {
+		// Visibility saw no executions (a very fresh run, or a visibility
+		// backend lagging behind): fall back to the latest run's history,
+		// the pre-fix walk.
+		runs = []string{""}
+	}
+	for _, runID := range runs {
+		if err := aggregateRunUsage(c, workflowID, runID, dc, rep); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// aggregateRunUsage folds one execution's jailed rounds into the report —
+// the per-run body of aggregateSessionUsage.
+func aggregateRunUsage(c client.Client, workflowID, runID string, dc converter.DataConverter, rep *usageReport) error {
 	scheduled := map[int64]string{}
-	iter := c.GetWorkflowHistory(context.Background(), workflowID, "",
+	iter := c.GetWorkflowHistory(context.Background(), workflowID, runID,
 		false, enums.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
 	for iter.HasNext() {
 		ev, err := iter.Next()
@@ -310,6 +439,15 @@ func printReportTable(rep *usageReport) {
 		}
 		fmt.Fprintf(w, "%s\t%s\t%d/%d\t%d\t%s\t%s\n",
 			wr.Name, state, wr.SlotsBusy, wr.SlotsTotal, wr.RoundsWaiting, wr.TaskQueue, wr.StatusAge)
+	}
+	fmt.Fprintln(w, "")
+
+	// Live runs and their health verdicts — the section that tells a
+	// provider-starved crawl apart from a wedge (see runRow).
+	fmt.Fprintln(w, "RUNS ON THIS QUEUE")
+	fmt.Fprintln(w, "WORKFLOW ID\tSTATE\tLAST ROUND")
+	for _, row := range rep.Runs {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", row.WorkflowID, row.State, row.LastRound)
 	}
 	fmt.Fprintln(w, "")
 

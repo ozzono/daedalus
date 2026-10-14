@@ -10,7 +10,7 @@ This sub-task — the only work in scope:
 - acceptance criteria:
 {{range .Subtask.AcceptanceCriteria}}  - {{.}}
 {{end}}
-Implement exactly this, touching only its target files (plus a companion file a criterion demands). No later sub-task work; no reworking earlier sub-tasks unless this sub-task's criteria force it. Minimal diff.
+Implement exactly this, touching only its target files (plus a companion file a criterion demands). No later sub-task work; no reworking earlier sub-tasks unless this sub-task's criteria force it. Minimal diff. The diff is the deliverable — no temp, backup, or paste-buffer files left in the worktree; no session logs, changelogs, or progress commentary as source comments.
 
 Terminal ground truth: code that looks correct proves nothing. Verify every acceptance criterion against actual CLI output — build the affected packages, run the repository's test suite; compiler errors and test failures are the verdict, not your confidence. Failing criterion: fix before replying.
 

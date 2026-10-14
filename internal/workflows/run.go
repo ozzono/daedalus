@@ -104,6 +104,28 @@ type pipelineRun struct {
 	// lacks.
 	vis bool
 
+	// starvedStatus records whether this execution recorded the
+	// starved-run-status version marker: heartbeat stamps StatusStarved
+	// with it, StatusWaiting without, matching whatever history recorded.
+	starvedStatus bool
+
+	// suiteGate records whether this execution recorded the terminal
+	// suite-freshness version marker; the gate emits activity commands at
+	// park and approve and must stay off pre-marker replays (see vis).
+	suiteGate bool
+
+	// lastEdit is the completion time of this run's last jailed agent
+	// round — any round may have edited the worktree. lastSuite is the
+	// completion time of the last suite execution. The terminal gate
+	// (suiteStale) compares them: no automatic park or approval may land
+	// while the suite predates the last edit. suiteCommand is the last
+	// resolved suite command, the one the gate's force-run executes —
+	// never a fresh discovery, which could spend agent rounds (and quota
+	// heartbeats) at the terminal transition itself.
+	lastEdit     time.Time
+	lastSuite    time.Time
+	suiteCommand string
+
 	quotaHeartbeats     int
 	consecutiveTimeouts int
 	reviewTimeouts      int
@@ -268,6 +290,8 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func(), 
 		// edit `git add -A` gives for free.
 	}
 	r.vis = visibilityEnabled(ctx)
+	r.starvedStatus = starvedStatusEnabled(ctx)
+	r.suiteGate = suiteFreshnessEnabled(ctx)
 	if input.DependsOn != "" {
 		if err := r.awaitDependency(); err != nil {
 			return nil, nil, err
@@ -307,8 +331,84 @@ func (r *pipelineRun) createWorktree() error {
 // result carries the reason (see ErrAwaitingMaintainer); the deferred
 // cleanup has already preserved the attempt's work on its aborted/ branch,
 // so `daedalus continue` restarts from it.
+//
+// A park is an automatic terminal state, so the terminal freshness gate
+// applies: when agent rounds ran after the last suite execution, the
+// suite runs once first, whatever the park's cause — the final state
+// reaches a suite verdict and the park record says which (a maintainer
+// restarting the run knows whether the preserved tree is green). A human
+// cancel or abort never routes through here and stays ungated. The
+// force-run is best-effort: the park decision is already made, so a
+// failure is appended to the reason, never a replacement for it.
 func (r *pipelineRun) park(reason string) error {
+	if r.suiteGate && r.suiteStale() {
+		r.logger.Info("Suite stale at park (agent rounds ran after the last suite execution); running the suite once before parking")
+		result, ran := r.forceTerminalSuite("park")
+		switch {
+		case !ran:
+			reason += "\n\n(suite freshness run at park did not execute — the final state is unvalidated)"
+		case result.TimedOut:
+			reason += "\n\n(suite freshness run at park timed out — it produced no verdict on the final state)"
+		case result.Passed:
+			reason += "\n\n(suite freshness run at park: green)"
+		default:
+			reason += "\n\n(suite freshness run at park: RED — the final state never passed the suite)"
+		}
+	}
+	return r.parkRaw(reason)
+}
+
+// parkRaw records the park decision itself — ErrAwaitingMaintainer with
+// the reason — without park's freshness force-run. For callers that have
+// already decided and recorded the freshness outcome in their reason
+// (the slim approve gate's failure branches): routing them through park
+// would re-check suiteStale, and on a not-ran outcome re-fire the
+// force-run a second time at the terminal transition — a second suite
+// execution, and a record whose "did not execute" line could be followed
+// by a fresh attempt's "green".
+func (r *pipelineRun) parkRaw(reason string) error {
 	return fmt.Errorf("%w: %s", ErrAwaitingMaintainer, reason)
+}
+
+// suiteStale reports whether the run's last suite execution predates its
+// last agent round — the terminal freshness gate's condition. No edits
+// (zero lastEdit) is never stale: nothing needs validating. A run whose
+// last suite predates its first edit — a continued run whose baseline
+// skip recorded no suite of its own, or any run whose dev rounds
+// postdate the test phase's last look — is stale.
+func (r *pipelineRun) suiteStale() bool {
+	return r.lastEdit.After(r.lastSuite)
+}
+
+// forceTerminalSuite runs the suite once for a terminal transition whose
+// suite state is stale: one execution of the already-resolved suite
+// command, on the same context and queue the test phase uses, the
+// outcome absorbed — an execution failure is logged and reported in ran,
+// never failed onward, because the caller's transition decision is
+// already made and the gate's whole job is to buy the record a validated
+// final state. A run that never resolved a suite command (a no-suite
+// repository, or a flow that died before the gate) has nothing to
+// execute — discovering one at the terminal transition would spend an
+// agent round there — so it reports not-ran. When ran, result is the
+// suite's outcome and result.TimedOut distinguishes a verdict-less round
+// (the suite burned its whole ceiling without finishing) from a red one —
+// callers must render the difference: a suite that never finished did
+// not come out red.
+func (r *pipelineRun) forceTerminalSuite(transition string) (result activities.TestResult, ran bool) {
+	if r.suiteCommand == "" {
+		r.logger.Warn("Terminal suite freshness gate has no resolved suite command to run; the transition proceeds unvalidated",
+			"Transition", transition)
+		return activities.TestResult{}, false
+	}
+	result, err := r.runSuite(r.suiteCommand)
+	if err != nil {
+		r.logger.Warn("Terminal suite freshness run failed; the transition proceeds unvalidated",
+			"Transition", transition, "Error", err)
+		return activities.TestResult{}, false
+	}
+	r.logger.Info("Terminal suite freshness run complete",
+		"Transition", transition, "Passed", result.Passed, "TimedOut", result.TimedOut)
+	return result, true
 }
 
 // setStatus upserts the DaedalusStatus visibility attribute; a no-op
@@ -365,7 +465,14 @@ func (r *pipelineRun) heartbeat(err error, stage string) error {
 	}
 	r.logger.Warn("Agent API exhausted; sleeping one hour before retrying the round",
 		"Stage", stage, "Heartbeat", r.quotaHeartbeats, "Of", maxQuotaHeartbeats)
-	r.setStatus(StatusWaiting)
+	// Starved, not merely waiting: the quota heartbeat's crawl is the
+	// provider-starved state `daedalus report` distinguishes from a wedge.
+	// Pre-marker replays keep the waiting stamp their history recorded.
+	if r.starvedStatus {
+		r.setStatus(StatusStarved)
+	} else {
+		r.setStatus(StatusWaiting)
+	}
 	// The sleep races the "wakeup" signal (`daedalus worker wakeup`): the
 	// timer branch resumes the round when the hour is out, the signal branch
 	// the moment the operator — who has verified the provider recovered —
@@ -412,6 +519,9 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			r.consecutiveTimeouts = 0
 			r.quotaHeartbeats = 0
 			r.touch()
+			// Any agent round may have edited the worktree — this is the
+			// terminal freshness gate's edit timestamp (suiteStale).
+			r.lastEdit = workflow.Now(r.ctx)
 			*session = result.SessionID
 			r.logger.Info("Agent run completed", "Stage", stage,
 				"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
@@ -674,6 +784,10 @@ func (r *pipelineRun) resolveTestCommand() (string, error) {
 			// quota absorption), so its completion refreshes activity like
 			// any other.
 			r.touch()
+			// Remembered for the terminal freshness gate's force-run —
+			// resolving again at a terminal transition would spend a
+			// discovery round there.
+			r.suiteCommand = command
 			return command, nil
 		}
 		if isSlotWait(err) {
@@ -718,6 +832,9 @@ func (r *pipelineRun) runSuite(command string) (activities.TestResult, error) {
 		// provider was reachable for it.
 		r.quotaHeartbeats = 0
 		r.touch()
+		// The terminal freshness gate's suite timestamp (suiteStale): an
+		// execution happened and produced a verdict, red or green.
+		r.lastSuite = workflow.Now(r.ctx)
 		// The dump relay: wherever Logs already travels — every fix
 		// prompt and reviewer round — a successful dump adds one line
 		// naming the file (worktree-relative, so a jailed agent can open
@@ -731,11 +848,18 @@ func (r *pipelineRun) runSuite(command string) (activities.TestResult, error) {
 	if !temporal.IsTimeoutError(err) {
 		return activities.TestResult{}, fmt.Errorf("run tests: %w", err)
 	}
+	// The suite executed even here — it burned its whole window — so the
+	// terminal freshness gate's suite timestamp (suiteStale) lands on the
+	// timeout path too: a verdict-less round is not a stale one, and
+	// re-running it at a terminal transition would wait out a second full
+	// ceiling back-to-back.
+	r.lastSuite = workflow.Now(r.ctx)
 	r.logger.Warn("Native test suite hit the timeout ceiling; treating as a failing round",
 		"TestsTimeout", r.testTimeout)
 	return activities.TestResult{
-		Passed: false,
-		Logs:   fmt.Sprintf("NATIVE TEST SUITE TIMED OUT: the suite did not finish within %s. Cut runtime (parallelism, caching, narrower scope) or raise config tests_timeout.", r.testTimeout),
+		Passed:   false,
+		TimedOut: true,
+		Logs:     fmt.Sprintf("NATIVE TEST SUITE TIMED OUT: the suite did not finish within %s. Cut runtime (parallelism, caching, narrower scope) or raise config tests_timeout.", r.testTimeout),
 	}, nil
 }
 
