@@ -2999,3 +2999,30 @@ func TestProviderEnvVarsIncludesMetricsRelayEnvs(t *testing.T) {
 		}
 	}
 }
+
+// TestAgentsAdmitsItsOwnList pins the agent dropdown's source: every name
+// Agents() returns is admitted by ValidateAgent, and the returned slice is
+// a clone — mutating it must not corrupt the package's list or a
+// subsequent validation.
+func TestAgentsAdmitsItsOwnList(t *testing.T) {
+	list := Agents()
+	if len(list) == 0 {
+		t.Fatal("Agents() is empty")
+	}
+	for _, name := range list {
+		if err := ValidateAgent(name); err != nil {
+			t.Errorf("ValidateAgent(%q) = %v, want admitted", name, err)
+		}
+	}
+	list[0] = "mutated"
+	if err := ValidateAgent("mutated"); err == nil {
+		t.Error("mutating the returned slice leaked into the package's list")
+	}
+	again := Agents()
+	if again[0] == "mutated" {
+		t.Errorf("Agents() = %v, the clone did not hold", again)
+	}
+	if err := ValidateAgent(again[0]); err != nil {
+		t.Errorf("ValidateAgent(%q) = %v after the caller-side mutation", again[0], err)
+	}
+}

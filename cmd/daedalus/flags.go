@@ -11,9 +11,8 @@ import (
 
 	"go.temporal.io/sdk/client"
 
-	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
-	"github.com/ozzono/daedalus/internal/workflows"
+	"github.com/ozzono/daedalus/internal/runstart"
 )
 
 // defaultConfigPath is used when -c/--config is not given: looked up in the
@@ -26,38 +25,17 @@ const defaultConfigPath = "config.yaml"
 // work wherever they are invoked.
 const homeConfigDir = ".config/daedalus"
 
-// defaultWorkflowName is used when -w/--workflow is not given.
-const defaultWorkflowName = "feature-dev"
+// defaultWorkflowName is used when -w/--workflow is not given — the
+// runstart seam's own constant, so the ID scoping and slim reroute can
+// never drift from the workflow-ID derivation in runstart.Start.
+const defaultWorkflowName = runstart.DefaultWorkflow
 
 // workflowRegistry maps the names accepted by -w/--workflow to their
-// flows: the workflow function plus the per-flow write-scope policy
-// startPipeline carries in the run's input (verified structurally before
-// finalize — see workflows.Flow). Adding a flow later means adding an
-// entry here (plus its workflow function and files) — no CLI changes.
-var workflowRegistry = map[string]workflows.Flow{
-	"feature-dev": {Fn: workflows.FeatureDevWorkflow},
-	// dev-only is feature-dev's phase 1 alone: implementation ↔ code
-	// review, landing without any test-phase execution (and without the
-	// preflight suite gate — see DevOnlyWorkflow). Selection is CLI-only;
-	// no config key picks a flow.
-	"dev-only": {Fn: workflows.DevOnlyWorkflow},
-	// slim is the micro-stepped atomic loop for context-limited
-	// self-hosted models (target agent: pi): a planner round writes the
-	// plan in prose and a parse round transcribes it into an ordered
-	// queue of 1–2-file sub-tasks, then each
-	// sub-task runs its own implement ↔ review loop — fresh reviewer
-	// session per round, native suite as terminal ground truth. Also
-	// config-gated: with slim: true, a run without an explicit -w starts
-	// this flow (see the run path in main.go).
-	"slim": {Fn: workflows.SlimWorkflow},
-	"investigate": {Fn: workflows.InvestigateWorkflow,
-		AllowedPaths: []string{"*.md", "docs/"}},
-	"test-only": {Fn: workflows.TestOnlyWorkflow,
-		AllowedPaths: activities.TestPathPatterns},
-	"refactor": {Fn: workflows.RefactorWorkflow,
-		FrozenPaths: activities.TestPathPatterns},
-	"bug-fix": {Fn: workflows.BugFixWorkflow},
-}
+// flows. The registry is shared with the dashboard's form submit — both
+// paths validate against this one map (internal/runstart), so a flow
+// added there is selectable from the CLI and the UI alike with no second
+// list to drift.
+var workflowRegistry = runstart.Registry
 
 // Worker-type values for -t/--type on the worker command: a run config
 // choosing which pollers one daemon process starts. Absence (the empty
@@ -551,13 +529,8 @@ func workflowNames() string {
 	return strings.Join(names, ", ")
 }
 
-// newClient connects to the Temporal frontend described by cfg.
+// newClient connects to the Temporal frontend described by cfg (shared
+// implementation in internal/runstart).
 func newClient(cfg config.Config) (client.Client, error) {
-	c, err := client.Dial(client.Options{
-		HostPort: cfg.Temporal.Host,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("connect to temporal at %s: %w", cfg.Temporal.Host, err)
-	}
-	return c, nil
+	return runstart.NewClient(cfg)
 }
