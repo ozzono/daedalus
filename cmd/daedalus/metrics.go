@@ -7,10 +7,11 @@
 // bound to 127.0.0.1 on metrics.relay_port — physically unreachable
 // off-host — and the UI mux on metrics.port bound to the LAN with no auth
 // (an accepted posture: any LAN peer can read all run data and start
-// runs). The pt2 views (/, /workers,
-// /runs, /runs/{id}, /new) are 501 placeholders in pt1, as is the GoLens
-// dashboard mount at /metrics — the golens-metrics embed needs the
-// golens-metrics module, which this environment does not carry.
+// runs). The dashboard views (ui.go — htmx-ui pt2) serve the decided
+// route map (Q14) off that mux; /metrics is GoLens's mount, unbuilt here
+// (the golens-metrics module is absent from this build), so it renders
+// the daemon's own aggregates — the relay ledger's counters and the live
+// session counts — where the embed's charts would, and says so.
 package main
 
 import (
@@ -250,14 +251,14 @@ func runMetricsDaemon(cfg config.Config) error {
 	defer relay.Close()
 
 	// The UI mux binds all interfaces — the LAN serving Q17 decided (no
-	// auth; the relay stays loopback-only).
+	// auth; the relay stays loopback-only). The dashboard (ui.go, htmx-ui
+	// pt2) owns the route map; every walk it renders reads the serving
+	// config below.
 	ui, err := net.Listen("tcp", ":"+strconv.Itoa(cfg.Metrics.Port))
 	if err != nil {
 		return fmt.Errorf("listen on :%d: %w (the metrics.port knob names this port)", cfg.Metrics.Port, err)
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", metricsUIRoutes)
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second}
+	srv := &http.Server{Handler: newUIServer(cfg, ledger).routes(), ReadHeaderTimeout: 30 * time.Second}
 	go func() {
 		if err := srv.Serve(ui); err != http.ErrServerClosed {
 			fmt.Printf("metrics: dashboard serve: %v\n", err)
@@ -275,23 +276,6 @@ func runMetricsDaemon(cfg config.Config) error {
 	<-sig
 	srv.Close()
 	return nil
-}
-
-// metricsUIRoutes serves the decided route map (Q14). pt2 owns the
-// dashboard views; pt1 serves them as 501 placeholders so the routes and
-// the port already answer. /metrics is GoLens's mount — its embed is not
-// available in this build (the golens-metrics module is absent), so the
-// mount answers with what a viewer needs to know instead of a silent 404.
-func metricsUIRoutes(w http.ResponseWriter, req *http.Request) {
-	switch {
-	case req.URL.Path == "/" || req.URL.Path == "/workers" || req.URL.Path == "/new" ||
-		req.URL.Path == "/runs" || strings.HasPrefix(req.URL.Path, "/runs/"):
-		http.Error(w, "dashboard route "+req.URL.Path+" is served by htmx-ui pt2 (not implemented yet)", http.StatusNotImplemented)
-	case req.URL.Path == "/metrics" || strings.HasPrefix(req.URL.Path, "/metrics/"):
-		http.Error(w, "golens dashboard mount (built without the golens-metrics embed — the ledger read path is `daedalus metrics list`)", http.StatusNotImplemented)
-	default:
-		http.NotFound(w, req)
-	}
 }
 
 // publishMetricsStatus rewrites the daemon's status file on the worker's

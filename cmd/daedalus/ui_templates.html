@@ -1,0 +1,411 @@
+{{define "head"}}<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{if .}}{{.}}{{else}}daedalus{{end}}</title>
+<script>try{if(localStorage.getItem('dd-theme')==='light')document.documentElement.classList.remove('dark')}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Inter','system-ui','sans-serif'],mono:['JetBrains Mono','ui-monospace','monospace']}}}}</script>
+<style type="text/tailwindcss">
+@layer components{
+ .card{@apply rounded-lg border border-slate-200 bg-white dark:border-slate-700/60 dark:bg-slate-900;}
+ .mono{@apply font-mono text-[13px];}
+ .badge{@apply inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium font-mono;}
+ .b-run{@apply bg-emerald-500/10 text-emerald-700 dark:text-emerald-400;}
+ .b-wait{@apply bg-amber-500/10 text-amber-700 dark:text-amber-400;}
+ .b-fail{@apply bg-red-500/10 text-red-700 dark:text-red-400;}
+ .b-idle{@apply bg-slate-500/10 text-slate-500 dark:text-slate-400;}
+ .lbl{@apply block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1;}
+ .inp{@apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/60;}
+ .btn{@apply rounded-lg px-3 py-1.5 text-sm font-medium border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition;}
+ .btn-p{@apply rounded-lg px-4 py-2 text-sm font-semibold bg-emerald-500 text-slate-950 hover:bg-emerald-400 transition;}
+ .tab{@apply px-3 py-1.5 rounded-lg text-sm font-medium text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100 cursor-pointer;}
+ .tab.on{@apply text-emerald-700 bg-emerald-500/10 dark:text-emerald-400;}
+}
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{background:#f8fafc;color:#0f172a}
+html.dark body{background:#020617;color:#e2e8f0}
+*{scrollbar-width:thin;scrollbar-color:#334155 transparent}
+</style>
+</head>
+<body hx-boost="true" class="font-sans antialiased min-h-screen">
+{{end}}
+
+{{define "header"}}
+<header class="sticky top-0 z-10 border-b border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/70 backdrop-blur" style="top:env(safe-area-inset-top,0px)">
+ <div class="mx-auto max-w-6xl px-4 py-2.5 flex items-center gap-3 flex-wrap">
+  <a class="font-semibold tracking-tight mr-2 flex items-center gap-2" href="/"><span class="h-2 w-2 rounded-full bg-emerald-500"></span>daedalus</a>
+  <nav class="flex gap-1 flex-wrap">
+   <a class="tab {{if eq .Nav "workers"}}on{{end}}" href="/workers">Workers</a>
+   <a class="tab {{if eq .Nav "runs"}}on{{end}}" href="/runs">Runs</a>
+   <a class="tab {{if eq .Nav "new"}}on{{end}}" href="/new">New Task</a>
+   <a class="tab {{if eq .Nav "metrics"}}on{{end}}" href="/metrics">Metrics</a>
+  </nav>
+  <div class="ml-auto flex items-center gap-3 text-xs">
+   <div class="flex items-center gap-1.5" title="auto-refresh every 5s">
+    <svg class="h-4 w-4 text-emerald-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+    <span id="cd" class="mono font-medium text-emerald-500">5</span>
+    <span class="text-slate-500 hidden sm:inline">last polled <span id="lp" class="mono">--:--:--</span></span>
+   </div>
+   <button id="theme" class="btn !p-1.5" aria-label="toggle theme">
+    <svg class="h-4 w-4 hidden dark:block" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    <svg class="h-4 w-4 dark:hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+   </button>
+  </div>
+ </div>
+</header>
+{{end}}
+
+{{define "foot"}}
+</main>
+<script src="https://unpkg.com/htmx.org@2.0.4"></script>
+<script>
+/* theme: dark default, persisted; /metrics flips in lockstep via the root class */
+document.getElementById('theme').onclick=function(){
+ var d=document.documentElement.classList.toggle('dark');
+ try{localStorage.setItem('dd-theme',d?'dark':'light')}catch(e){}
+};
+/* 5s poll countdown: ticks 5→1 and resets on each successful poll; a feed
+   that stops answering leaves it clamped at 0 — the honest stall signal.
+   The interval is guarded because hx-boost swaps re-run this script. */
+if(window.__ddTick)clearInterval(window.__ddTick);
+var n=5;
+window.__ddTick=setInterval(function(){if(n>0)n--;var el=document.getElementById('cd');if(el)el.textContent=n},1000);
+document.body.addEventListener('htmx:afterRequest',function(ev){
+ if(ev.detail.successful){
+  n=5;
+  var lp=document.getElementById('lp');
+  if(lp)lp.textContent=new Date().toTimeString().slice(0,8);
+ }
+});
+/* the New-Task mode toggle: Direct Text and File Path are one mode — the
+   radio marks the active tab and shows exactly one of the two fields */
+document.querySelectorAll('input[name=mode]').forEach(function(r){
+ r.addEventListener('change',function(){
+  var file=document.querySelector('input[name=mode]:checked').value==='file';
+  var p=document.querySelector('textarea[name=prompt]'),f=document.querySelector('input[name=file]');
+  if(p)p.classList.toggle('hidden',file);
+  if(f)f.classList.toggle('hidden',!file);
+  document.querySelectorAll('label.tab input[name=mode]').forEach(function(x){
+   x.closest('label').classList.toggle('on',x.checked);
+  });
+ });
+});
+</script>
+</body>
+</html>
+{{end}}
+
+{{define "page_workers"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
+<main class="mx-auto max-w-6xl px-4 py-6">
+ <h1 class="text-lg font-semibold mb-1">Workers on this host</h1>
+ <p class="text-sm text-slate-500 mb-4">Per-host scope · polled every 5s</p>
+<div id="wlist" hx-get="/workers/rows" hx-trigger="every 5s" hx-swap="innerHTML">
+{{template "frag_workers" .Snap}}
+</div>
+<p class="text-xs text-slate-500 mt-3">Host-scoped view · Workflow controls remain in the CLI</p>
+</main>
+{{template "foot"}}
+{{end}}
+
+{{define "frag_workers"}}
+{{range .Workers}}
+<div class="card p-4 mb-3 grid gap-3 md:grid-cols-[1fr_auto] md:items-center">
+ <div class="grid gap-2">
+  <div class="flex items-center gap-2 flex-wrap">
+   <span class="mono font-medium text-[15px]">{{.Name}}</span>
+   {{if .Running}}<span class="badge b-run">running · pid {{.PID}}</span>{{else}}<span class="badge b-idle">not running</span>{{end}}
+   {{if .Running}}
+    {{if .ProbeNA}}<span class="badge b-idle">{{.ProbeNA}}</span>
+    {{else}}
+     <span class="badge {{if .ProbeMainOK}}b-run{{else}}b-fail{{end}}">primary {{if .ProbeMainOK}}✓{{else}}✗{{end}}</span>
+     {{if .ProbeFBArmed}}<span class="badge {{if .ProbeFBOK}}b-run{{else}}b-fail{{end}}">fallback {{if .ProbeFBOK}}✓{{else}}✗{{end}}</span>{{end}}
+    {{end}}
+   {{end}}
+  </div>
+  <div class="flex gap-4 flex-wrap text-xs text-slate-500">
+   <span>slots <span class="mono text-slate-900 dark:text-slate-100">{{.SlotsBusy}}/{{.SlotsFull}}</span></span>
+   <span>queue depth <span class="mono text-slate-900 dark:text-slate-100">{{.Depth}}</span></span>
+   <span>waiting for slot <span class="mono text-slate-900 dark:text-slate-100">{{.Waiting}}</span></span>
+   {{if .Queue}}<span class="mono">{{.Queue}}</span>{{end}}
+   {{if .StatusAge}}<span>status {{.StatusAge}}</span>{{end}}
+  </div>
+  {{if .SlotsFull}}
+  <div class="h-1 w-40 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+   <div class="h-full bg-emerald-500" style="width:{{div100 .SlotsBusy .SlotsFull}}%"></div>
+  </div>
+  {{end}}
+  <div class="text-sm">
+   {{if .Work}}
+    {{range $i, $w := .Work}}{{if $i}} · {{end}}<span class="mono">{{$w.Repo}}</span> · <span class="mono">#{{$w.Issue}}</span> → <span class="mono text-emerald-600 dark:text-emerald-400">{{$w.Stage}} (round {{$w.Round}})</span>{{end}}
+   {{else}}<span class="text-slate-500">idle</span>{{end}}
+  </div>
+ </div>
+ <div class="flex gap-2">
+  <a class="btn" href="/new?worker={{.Name}}">＋ New task</a>
+  <a class="btn" href="/runs?queue={{.Queue}}">View runs</a>
+ </div>
+</div>
+{{else}}
+<div class="card p-6 text-center text-sm text-slate-500">No workers on record — start one with <span class="mono">daedalus worker start</span>.</div>
+{{end}}
+{{end}}
+
+{{define "page_runs"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
+<main class="mx-auto max-w-6xl px-4 py-6">
+ <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
+  <h1 class="text-lg font-semibold">Runs</h1>
+  <div class="flex gap-2">
+   <div><label class="lbl">Queue</label>
+    <select id="fq" name="queue" class="inp !py-1.5 mono">
+     <option value="">all</option>
+     {{range .Filters.Queues}}<option value="{{.}}" {{if eq . $.Filters.Queue}}selected{{end}}>{{.}}</option>{{end}}
+    </select></div>
+   <div><label class="lbl">Status</label>
+    <select id="fs" name="status" class="inp !py-1.5 mono">
+     <option value="">all</option>
+     {{range .Filters.Statuses}}<option value="{{.}}" {{if eq . $.Filters.Status}}selected{{end}}>{{.}}</option>{{end}}
+    </select></div>
+  </div>
+ </div>
+<div hx-get="/runs/rows" hx-trigger="every 5s" hx-include="#fq,#fs" hx-target="#rtbody" hx-swap="innerHTML">
+<table class="card w-full text-sm min-w-[820px]">
+ <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+  <tr><th class="p-3">Workflow id</th><th>Status</th><th>Issue</th><th>Repo</th><th>Queue</th><th>Started</th><th>Last interaction</th></tr>
+ </thead>
+ <tbody id="rtbody">
+{{template "frag_runs" .}}
+ </tbody>
+</table>
+</div>
+<p class="text-xs text-slate-500 mt-3">Run detail is read-only in v1 · deep history lives in the Temporal UI (:8233).</p>
+</main>
+{{template "foot"}}
+{{end}}
+
+{{define "frag_runs"}}
+{{range .Rows}}
+ <tr class="border-b last:border-0 border-slate-100 dark:border-slate-800/70 hover:bg-slate-50 dark:hover:bg-slate-800/40">
+  <td class="p-3"><a class="mono text-emerald-600 dark:text-emerald-400 hover:underline" href="/runs/{{.WorkflowID}}">{{.WorkflowID}}</a></td>
+  <td><span class="badge {{.Badge}}">{{.Status}}</span></td>
+  <td class="mono">{{if .Issue}}#{{.Issue}}{{else}}-{{end}}</td>
+  <td class="mono">{{if .Repo}}{{.Repo}}{{else}}-{{end}}</td>
+  <td class="mono">{{.Queue}}</td>
+  <td class="text-slate-500 mono">{{.Started}}</td>
+  <td class="text-slate-500">{{.LastAt}}</td>
+ </tr>
+{{else}}
+ <tr><td colspan="7" class="p-6 text-center text-slate-500">{{if .WalkErr}}Run feed unavailable: {{.WalkErr}}{{else}}No runs match.{{end}}</td></tr>
+{{end}}
+{{end}}
+
+{{define "page_run"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
+<main class="mx-auto max-w-6xl px-4 py-6">
+<div hx-get="/runs/{{.D.WorkflowID}}/body" hx-trigger="every 5s" hx-swap="innerHTML">
+{{template "frag_run" .D}}
+</div>
+</main>
+{{template "foot"}}
+{{end}}
+
+{{define "frag_run"}}
+<div class="flex items-center gap-3 flex-wrap mb-4">
+ <a class="btn" href="/runs">← Runs</a>
+ <h1 class="text-lg font-semibold mono">{{.WorkflowID}}</h1>
+ <span class="badge {{.Badge}}">{{.Status}}</span>
+ {{if .TemporalURL}}<a class="btn text-xs" href="{{.TemporalURL}}" target="_blank" rel="noopener">Temporal UI ↗</a>{{end}}
+</div>
+
+<div class="card p-4 mb-4 grid gap-2 text-sm sm:grid-cols-3">
+ <div><span class="lbl">Issue</span>{{if .Issue}}#{{.Issue}}{{else}}-{{end}}</div>
+ <div><span class="lbl">Repo</span><span class="mono">{{if .Repo}}{{.Repo}}{{else}}-{{end}}</span></div>
+ <div><span class="lbl">Branch</span><span class="mono">{{.Branch}}</span></div>
+ <div><span class="lbl">Queue</span><span class="mono">{{.Queue}}</span></div>
+ <div><span class="lbl">Flow</span><span class="mono">{{if .Flow}}{{.Flow}}{{else}}feature-dev{{end}}</span></div>
+ <div><span class="lbl">Depends on</span><span class="mono">{{if .DependsOn}}{{.DependsOn}}{{else}}-{{end}}</span></div>
+ <div><span class="lbl">Started</span><span class="mono">{{.Started}}</span></div>
+ <div><span class="lbl">Last activity</span><span class="mono">{{.LastAt}}</span></div>
+ <div><span class="lbl">Run</span><span class="mono">{{if .RunID}}{{.RunID}}{{else}}-{{end}}</span></div>
+</div>
+
+<div class="card p-4 mb-4">
+ <div class="lbl">Rounds</div>
+ {{if .Nodes}}
+ <div class="border-l-2 border-slate-200 dark:border-slate-700 ml-2">
+  {{range .Nodes}}
+  <div class="pl-4 py-1.5 -ml-[2px] border-l-2 border-transparent">
+   <span class="badge {{.Badge}}">{{.Outcome}}</span>
+   <span class="text-sm">{{.Role}}{{if .Agent}} · <span class="mono">{{.Agent}}</span>{{end}}</span>
+   <span class="text-xs text-slate-500 mono ml-2">{{.Duration}}</span>
+  </div>
+  {{end}}
+ </div>
+ {{else}}<div class="text-sm text-slate-500">No rounds in history yet.</div>{{end}}
+</div>
+
+<div class="card overflow-x-auto mb-4">
+ <table class="w-full text-sm min-w-[640px]">
+  <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+   <tr><th class="p-3">Round</th><th>Role</th><th>Agent</th><th>Tokens in</th><th>Tokens out</th><th>Duration</th><th>Cost USD</th></tr>
+  </thead>
+  <tbody>
+  {{range .Usage}}
+   <tr class="border-b last:border-0 border-slate-100 dark:border-slate-800/70">
+    <td class="p-3 mono">{{.Round}}</td>
+    <td>{{.Role}}</td>
+    <td class="mono">{{if .Agent}}{{.Agent}}{{else}}-{{end}}</td>
+    {{if .NA}}
+     <td colspan="4" class="text-slate-500">n/a</td>
+    {{else}}
+     <td class="mono">{{.In}}</td><td class="mono">{{.Out}}</td><td class="mono">{{.Duration}}</td><td class="mono">{{.Cost}}</td>
+    {{end}}
+   </tr>
+  {{else}}
+   <tr><td colspan="7" class="p-4 text-center text-slate-500">No captured usage for this run's agents.</td></tr>
+  {{end}}
+  </tbody>
+  <tfoot class="border-t border-slate-200 dark:border-slate-800 font-semibold">
+   <tr><td class="p-3" colspan="6">Total cost</td><td class="mono">{{.TotalCost}}</td></tr>
+  </tfoot>
+ </table>
+</div>
+
+{{if .TestFound}}
+<div class="card p-4 mb-4">
+ <div class="flex items-center gap-2 mb-2">
+  <span class="badge {{if .TestPassed}}b-run{{else}}b-fail{{end}}">{{if .TestPassed}}suite green{{else}}suite red{{end}}</span>
+  {{if .TestCommand}}<span class="mono text-xs text-slate-500">{{.TestCommand}}</span>{{end}}
+ </div>
+ <pre class="mono text-xs whitespace-pre-wrap break-words max-h-96 overflow-y-auto text-slate-700 dark:text-slate-300">{{.TestExcerpt}}</pre>
+</div>
+{{end}}
+
+{{if .ReviewFound}}
+<div class="card p-4 mb-4">
+ <div class="mb-2"><span class="badge {{.ReviewBadge}}">{{.ReviewVd}}</span></div>
+ <pre class="mono text-xs whitespace-pre-wrap break-words text-slate-700 dark:text-slate-300">{{.ReviewBody}}</pre>
+</div>
+{{end}}
+{{end}}
+
+{{define "frag_error"}}
+<div class="card p-4 text-sm text-red-600 dark:text-red-400">{{.}}</div>
+{{end}}
+
+{{define "page_metrics"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
+<main class="mx-auto max-w-6xl px-4 py-6">
+ <h1 class="text-lg font-semibold mb-4">Metrics</h1>
+ <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+  <div class="card p-4"><div class="lbl">Relay calls</div><div class="text-2xl font-semibold mono">{{.Relay.Calls}}</div><div class="text-xs text-slate-500 mt-1">{{.Relay.Window}} · {{.Relay.Hour}} in the last hour</div></div>
+  <div class="card p-4"><div class="lbl">Tokens in</div><div class="text-2xl font-semibold mono">{{.Relay.In}}</div><div class="text-xs text-slate-500 mt-1">relay-served rounds only</div></div>
+  <div class="card p-4"><div class="lbl">Tokens out</div><div class="text-2xl font-semibold mono">{{.Relay.Out}}</div><div class="text-xs text-slate-500 mt-1">relay-served rounds only</div></div>
+  <div class="card p-4"><div class="lbl">Failed calls</div><div class="text-2xl font-semibold mono {{if gt .Relay.Errors 0}}text-red-600 dark:text-red-400{{end}}">{{.Relay.Errors}}</div><div class="text-xs text-slate-500 mt-1">non-2xx upstream status</div></div>
+ </div>
+ <div class="grid lg:grid-cols-2 gap-4">
+  <div class="card p-4">
+   <div class="font-medium mb-2">Sessions by queue</div>
+   <table class="w-full text-sm">
+    <thead><tr class="text-left text-slate-500"><th class="font-medium pb-2">Queue</th><th class="font-medium pb-2">Running</th><th class="font-medium pb-2">Waiting</th><th class="font-medium pb-2">Listed</th></tr></thead>
+    <tbody>
+    {{range .Sessions}}<tr class="border-t border-slate-200 dark:border-slate-800">
+      <td class="py-1 mono">{{.Queue}}</td><td>{{.Running}}</td><td>{{.Waiting}}</td><td>{{.Total}}</td>
+    </tr>{{end}}
+    </tbody>
+   </table>
+   {{if .WalkErr}}<p class="text-xs text-red-600 dark:text-red-400 mt-2">Run feed unavailable: {{.WalkErr}}</p>{{end}}
+   <p class="text-xs text-slate-500 mt-2">Live counts from the same Temporal walk the Runs feed renders.</p>
+  </div>
+  <div class="card p-4">
+   <div class="font-medium mb-2">Relay-served calls by worker</div>
+   {{if .Relay.Worker}}
+   <table class="w-full text-sm">
+    <thead><tr class="text-left text-slate-500"><th class="font-medium pb-2">Worker</th><th class="font-medium pb-2">Calls</th><th class="font-medium pb-2">In</th><th class="font-medium pb-2">Out</th><th class="font-medium pb-2">Errors</th><th class="font-medium pb-2">Last</th></tr></thead>
+    <tbody>
+    {{range .Relay.Worker}}<tr class="border-t border-slate-200 dark:border-slate-800">
+      <td class="py-1 mono">{{.Worker}}</td><td>{{.Calls}}</td><td>{{.In}}</td><td>{{.Out}}</td><td>{{.Errors}}</td><td>{{.Last}}</td>
+    </tr>{{end}}
+    </tbody>
+   </table>
+   {{else}}<p class="text-sm text-slate-500">No relayed calls recorded yet.</p>{{end}}
+   <p class="text-xs text-slate-500 mt-2">Only relay-served rounds appear here — a round dialing its CLI-default upstream directly never passes the relay. Per-round rows: <span class="mono">daedalus metrics list</span>.</p>
+  </div>
+ </div>
+ <div class="card p-4 mt-4 text-sm text-slate-500">
+  The GoLens embed is not built into this binary (the golens-metrics module is absent from this build), so this mount has no charts — the aggregates above are the daemon's own.
+ </div>
+</main>
+{{template "foot"}}
+{{end}}
+
+{{define "page_new"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
+<main class="mx-auto max-w-6xl px-4 py-6">
+ <h1 class="text-lg font-semibold mb-4">New Task</h1>
+ <div class="card p-5 max-w-2xl">
+  <form hx-post="/new" hx-target="#res" hx-swap="innerHTML">
+   <div class="grid sm:grid-cols-2 gap-4">
+    <div><label class="lbl">Worker / queue</label>
+     <select id="nq" name="worker" class="inp mono" hx-get="/new/agents" hx-target="#agent-slot" hx-swap="innerHTML">
+      {{range .Form.Workers}}<option value="{{.Name}}" {{if .Selected}}selected{{end}} {{if not .Available}}disabled{{end}}>{{.Name}} ({{.State}}){{if not .Available}} — no config record{{end}}</option>{{end}}
+     </select></div>
+    <div><label class="lbl">Workflow</label>
+     <select name="workflow" class="inp mono">
+      <option value="" {{if not .Form.Workflow}}selected{{end}}>default</option>
+      {{range .Form.Flows}}<option value="{{.}}" {{if eq . $.Form.Workflow}}selected{{end}}>{{.}}</option>{{end}}
+     </select></div>
+    <div class="sm:col-span-2"><label class="lbl">Repo path</label>
+     <input name="repo" class="inp mono" placeholder="~/src/billing-api" value="{{.Form.Repo}}"></div>
+    <div><label class="lbl">Issue id</label>
+     <input name="issue" class="inp mono" placeholder="ISS-501" value="{{.Form.Issue}}"></div>
+    <div id="agent-slot">{{template "frag_agents" .Agents}}</div>
+    <div class="sm:col-span-2"><label class="lbl">Task instructions</label>
+     <div class="flex gap-2 mb-2 text-sm">
+      <label class="tab {{if ne .Form.Mode "file"}}on{{end}}"><input type="radio" name="mode" value="text" class="hidden" {{if ne .Form.Mode "file"}}checked{{end}}>Direct Text</label>
+      <label class="tab {{if eq .Form.Mode "file"}}on{{end}}"><input type="radio" name="mode" value="file" class="hidden" {{if eq .Form.Mode "file"}}checked{{end}}>File Path</label>
+     </div>
+     <textarea name="prompt" rows="4" class="inp {{if eq .Form.Mode "file"}}hidden{{end}}" placeholder="Describe the task…">{{.Form.Prompt}}</textarea>
+     <input name="file" class="inp mono {{if ne .Form.Mode "file"}}hidden{{end}}" placeholder="~/tasks/ISS-501.md" value="{{.Form.File}}">
+     <p class="text-xs text-slate-500 mt-1">Direct Text and File Path are one mode: exactly one of the two carries the task.</p>
+    </div>
+    <div><label class="lbl">Branch prefix <span class="font-normal">(optional)</span></label>
+     <input name="prefix" class="inp mono" placeholder="{{.Form.Prefix}}" value="{{.Form.Prefix}}"></div>
+   </div>
+   <div class="mt-5 flex items-center gap-3">
+    <button type="submit" class="btn-p">Submit task</button>
+    <span class="text-xs text-slate-500">Mirrors <span class="mono">run</span> inputs one-to-one — a dirty repo is refused, not asked about.</span>
+   </div>
+  </form>
+  <div id="res" class="mt-4"></div>
+ </div>
+</main>
+{{template "foot"}}
+{{end}}
+
+{{define "frag_agents"}}
+{{if .Note}}
+<select class="inp mono" disabled><option>{{.Note}}</option></select>
+{{else}}
+<label class="lbl">Agent</label>
+<select name="agent" class="inp mono">
+ {{range .Options}}<option value="{{.}}" {{if eq . $.Selected}}selected{{end}}>{{.}}</option>{{end}}
+</select>
+{{end}}
+{{end}}
+
+{{define "frag_new_result"}}
+{{if .Error}}
+<div class="rounded-lg border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-600 dark:text-red-400">{{.Error}} <span class="text-slate-500">Form state preserved.</span></div>
+{{else if .OK}}
+<div class="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-sm">
+ <div>Task submitted to <span class="mono">{{.Queue}}</span>. Workflow <a class="mono text-emerald-600 dark:text-emerald-400 hover:underline" href="/runs/{{.Workflow}}">{{.Workflow}}</a></div>
+ {{if .Warning}}<div class="mt-1 text-amber-700 dark:text-amber-400 text-xs">{{.Warning}}</div>{{end}}
+ <div class="mt-2 flex gap-2">
+  <a class="btn text-xs" href="/runs?queue={{.Queue}}">View in Runs Feed</a>
+  <a class="btn text-xs" href="/new">Submit Another Task</a>
+ </div>
+</div>
+{{end}}
+{{end}}

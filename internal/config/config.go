@@ -1202,6 +1202,11 @@ func (c Config) RenderYAML() (string, error) {
 // model, not by daedalus — see FallbackTypeOpenAI.
 var agents = []string{"claude", "opencode", "amp", "pi", "aider", "codex"}
 
+// Agents lists the agent names ValidateAgent accepts — the single source
+// the dashboard's New-Task dropdown renders from, so its options can never
+// drift from what the -cli flag and the config loader admit.
+func Agents() []string { return slices.Clone(agents) }
+
 // ValidateAgent rejects Agent values Load would refuse. The CLI's
 // -cli/--cli flag overrides the config's agent and must fail up front,
 // with the same error, rather than at worker startup.

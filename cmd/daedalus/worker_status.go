@@ -132,23 +132,35 @@ func workerCodePath(confPath string) string {
 	return strings.Join(paths, ", ")
 }
 
-// providerStatus live-probes the provider a worker's recorded config
+// providerProbes is the structured outcome of probing one worker's
+// provider wiring: what `daedalus worker status` renders as text and the
+// dashboard renders as badges, without either parsing the other's output.
+// NA non-empty means nothing was probed — the same reason text the CLI
+// row shows; FbArmed means the fallback was probed after a missed main.
+type providerProbes struct {
+	Main    provider.Result
+	Fb      provider.Result
+	FbArmed bool
+	NA      string
+}
+
+// probeProvider live-probes the provider a worker's recorded config
 // names, so a row answers "will this worker's next round reach the API?"
 // The main provider is probed — the provider: section's endpoint in the
 // wire style its type names when set, the legacy anthropic: section, or
 // the legacy openai: section when the anthropic side is unset (the served
 // channel of an openai-only config); when it is not ok and the config arms
-// a fallback, the fallback is probed too and reported as the active one —
-// mirroring the worker's own failover choice. Values that cannot be
-// determined (no record, unloadable config, provider not fully configured)
-// are reported as such rather than as failures.
-func providerStatus(confPath string) string {
+// a fallback, the fallback is probed too — mirroring the worker's own
+// failover choice. Values that cannot be determined (no record, unloadable
+// config, provider not fully configured) come back as NA text rather than
+// as failures.
+func probeProvider(confPath string) providerProbes {
 	if confPath == "" {
-		return "n/a (no config record)"
+		return providerProbes{NA: "n/a (no config record)"}
 	}
 	cfg, err := config.Load(confPath)
 	if err != nil {
-		return "config error"
+		return providerProbes{NA: "config error"}
 	}
 	anth, open := cfg.ProviderChannels()
 	url, key, model := anth.URL, anth.Key, heartbeatOrDefault(anth.HeartbeatModel, anth.Model)
@@ -166,17 +178,16 @@ func providerStatus(confPath string) string {
 		url, key, model, style = open.URL, open.Key, open.Model, provider.StyleOpenAI
 	}
 	if url == "" || key == "" {
-		return "n/a (provider not configured)"
+		return providerProbes{NA: "n/a (provider not configured)"}
 	}
-	spec := provider.Spec{
+	p := providerProbes{Main: provider.Probe(context.Background(), provider.Spec{
 		URL:   url,
 		Key:   key,
 		Model: model,
 		Style: style,
-	}
-	main := provider.Probe(context.Background(), spec)
-	if !cfg.Fallback.Active() || main.OK {
-		return main.Detail
+	})}
+	if !cfg.Fallback.Active() || p.Main.OK {
+		return p
 	}
 	// The fallback's type picks its probe's wire style, matching what
 	// failover rounds speak; anthropic is the default (also for a Type
@@ -185,17 +196,32 @@ func providerStatus(confPath string) string {
 	if cfg.Fallback.Type == config.FallbackTypeOpenAI {
 		fbStyle = provider.StyleOpenAI
 	}
-	fb := provider.Probe(context.Background(), provider.Spec{
+	p.Fb = provider.Probe(context.Background(), provider.Spec{
 		URL:   cfg.Fallback.URL,
 		Key:   cfg.Fallback.Key,
 		Model: heartbeatOrDefault(cfg.Fallback.HeartbeatModel, cfg.Fallback.Model),
 		Style: fbStyle,
 	})
+	p.FbArmed = true
+	return p
+}
+
+// providerStatus renders the probes as the roster row's text: the main
+// provider's detail alone, or the failover arrow when a fallback was
+// probed — mirroring the worker's own failover choice.
+func providerStatus(confPath string) string {
+	p := probeProvider(confPath)
+	if p.NA != "" {
+		return p.NA
+	}
+	if !p.FbArmed {
+		return p.Main.Detail
+	}
 	active := "fallback"
-	if !fb.OK {
+	if !p.Fb.OK {
 		active = "none"
 	}
-	return fmt.Sprintf("main: %s → fallback: %s [active: %s]", main.Detail, fb.Detail, active)
+	return fmt.Sprintf("main: %s → fallback: %s [active: %s]", p.Main.Detail, p.Fb.Detail, active)
 }
 
 // heartbeatOrDefault picks the model a cheap request should name: the
