@@ -129,6 +129,19 @@ cleanup_timeout: 30m
 # or rate knob of its own (source-verified 2026-09-26), and the slot-wait
 # behavior is identical to aider/claude rounds.
 max_concurrent_agent_runs: 2
+# Cap on provider requests per minute for this deployment: jailed pi
+# rounds' chat-completions calls — agent and reviewer alike — are paced
+# through the worker's loopback relay to at most this many per sliding
+# one-minute window, a request beyond the cap waiting inside the relay
+# until the window frees. For a provider whose API tier rate-limits by
+# request count (a free 15 req/min tier, say): staying under the cap
+# avoids the 429 quota-heartbeat crawl entirely instead of absorbing it.
+# Enforcement rides the relay's staging, so it covers exactly the rounds
+# the relay serves — requires agent: pi and an openai.url (the relay
+# forwards that channel); any other shape is rejected at load, and a
+# reviewer.url or openai-fallback override bypasses it. 0 (the default)
+# means unthrottled.
+max_requests_per_minute: 0
 `
 
 // exampleSlimBlock is the slim: section (the mode toggle and the tool-call
@@ -290,10 +303,11 @@ temporal:
 # provider entry daedalus stages into the host's ~/.pi/agent/models.json
 # for rounds served by the openai section (model contextWindow/maxTokens
 # and samplingParams; see the openai section below), plus — for timeout_ms
-# only — retry.provider.timeoutMs merged into the host's
-# ~/.pi/agent/settings.json: pi reads no timeout env var and its provider
-# entries carry no timeout it plumbs, so settings.json is its only
-# request-timeout channel and pi's own 5-minute default folds a slow
+# only — both of pi's request-timeout keys merged into the host's
+# ~/.pi/agent/settings.json (retry.provider.timeoutMs and top-level
+# httpIdleTimeoutMs): pi reads no timeout env var and its provider
+# entries carry no timeout it plumbs, so settings.json is its only route
+# for them, and pi's own 5-minute defaults fold a slow
 # round (reviewer turns at self-hosted pace legitimately run longer)
 # before it delivers a verdict. Outside those staged rounds pi has no
 # route for these knobs and ignores them. pi's samplers ride
@@ -403,12 +417,17 @@ openai:
   # timeout value, so a ceiling always applies; set it explicitly for
   # self-hosted endpoints whose litellm would otherwise apply only ~600s
   # on its own. pi ignores the exported var; its pi staging bridge merges
-  # this value into the host's ~/.pi/agent/settings.json as
-  # retry.provider.timeoutMs (pi's own request-timeout channel — pi's
-  # 5-minute default otherwise), so this one field bounds pi rounds too.
-  # Note that merge overwrites whatever timeout the host user had set for
-  # their own interactive pi on this key — inherent: settings.json is
-  # pi's only channel for it. Keep the value at least as long as one
+  # this value into the host's ~/.pi/agent/settings.json as both
+  # retry.provider.timeoutMs (the SDK's time-to-headers ceiling) and the
+  # top-level httpIdleTimeoutMs (the undici dispatcher header/body-idle
+  # ceiling that actually kills a buffered upstream — pi's 5-minute
+  # defaults otherwise), so this one field bounds pi rounds too.
+  # Note that merge overwrites whatever values the host user had set for
+  # their own interactive pi on these keys — inherent: settings.json is
+  # pi's only channel for them — and httpIdleTimeoutMs is pi's global
+  # dispatcher ceiling, scoping every HTTP request pi makes (interactive
+  # rounds included), not just staged-round provider calls. Keep the
+  # value at least as long as one
   # honest reviewer turn at the served model's pace: pi folding first
   # makes rounds exit verdict-less, the run parks after three such rounds
   # in a row, and review_timeout never fires because pi gives up before

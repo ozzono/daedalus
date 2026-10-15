@@ -211,16 +211,25 @@ func stagePiProvider(env []string) ([]string, func() error, error) {
 	// cleanup — including the timeout-merge failure below — or the entry
 	// would outlive the round that can never launch.
 	drop := func() error { return removePiProviderEntry(id) }
-	// pi folds a provider request at its own 5-minute default
-	// (retry.provider.timeoutMs, which defaults to httpIdleTimeoutMs) and
-	// reads no timeout env var, so API_TIMEOUT_MS alone never reaches it —
-	// at slow-model pace a legitimate reviewer turn outlives the default,
-	// pi's agent-level retries burn, and the round exits verdict-less. The
-	// bridge stages the same ceiling other agents get from the export into
-	// pi's own channel, so one config value bounds every CLI. Derived from
-	// the exported var (the serving section's timeout, per the AgentEnv
-	// invariant that a ceiling is always exported), so an absent or
-	// unparseable value leaves pi's default standing.
+	// pi kills a slow provider request through two independent channels and
+	// reads no timeout env var, so API_TIMEOUT_MS alone never reaches either:
+	// retry.provider.timeoutMs bounds the openai SDK's time-to-headers abort
+	// (fetchWithTimeout clears its timer the moment response headers
+	// arrive), while the top-level httpIdleTimeoutMs feeds undici's
+	// dispatcher headersTimeout/bodyTimeout — the pair that actually fires
+	// on a buffering upstream, where the wire is silent for the whole
+	// generation and the 5-minute default kills each attempt no matter the
+	// staged SDK ceiling (wa-termo 01a13d10: four 300.9 s "Request timed
+	// out." attempts against a ~2.9 tok/s buffered model under a staged
+	// 50-minute retry.provider.timeoutMs). At slow-model pace a legitimate
+	// reviewer turn outlives either default, pi's agent-level retries burn,
+	// and the round exits verdict-less. The bridge stages the same ceiling
+	// other agents get from the export into both channels, so one config
+	// value bounds every CLI. Derived from the exported var (the serving
+	// section's timeout, per the AgentEnv invariant that a ceiling is always
+	// exported), so an absent or unparseable value stages nothing: pi's
+	// defaults stand on a never-staged host, and a prior round's staged
+	// values stand on one daedalus already bridged.
 	if n, err := strconv.Atoi(envLookup(env, "API_TIMEOUT_MS")); err == nil && n > 0 {
 		if err := mergePiRetryTimeout(n); err != nil {
 			return nil, drop, fmt.Errorf("stage pi provider timeout: %w", err)
@@ -422,22 +431,27 @@ func lockPiAgentConfig() (func(), error) {
 	}, nil
 }
 
-// mergePiRetryTimeout upserts retry.provider.timeoutMs into the host's
-// ~/.pi/agent/settings.json — pi's only request-timeout channel (pi reads
-// no timeout env var, and its models.json provider entries carry no
-// timeoutMs it plumbs — source-verified 2026-09-27, references exist only
-// in interactive-TUI code). daedalus owns exactly that one key, derived
-// from the same config timeout other agents get as API_TIMEOUT_MS; the
-// merge is idempotent and preserves every other setting, including the
-// rest of any user retry block. The read-modify-write holds
-// lockPiAgentConfig like the models.json merge. If pi later plumbs
-// timeoutMs on provider entries, stage it there and retire this settings
-// write.
-// ponytail: the lock closes the torn-write/lost-update class, but the key
-// itself is one shared setting — pi has no per-round timeout channel — so
-// a round can still observe a concurrent round's timeoutMs value at its
-// startup read (both operator-configured; the provider entry, which IS
-// per-round, never collides).
+// mergePiRetryTimeout upserts both of pi's request-timeout keys into the
+// host's ~/.pi/agent/settings.json: retry.provider.timeoutMs — the openai
+// SDK's time-to-headers abort (fetchWithTimeout clears its timer the moment
+// response headers arrive, so it never bounds a slow body) — and the
+// top-level httpIdleTimeoutMs, which configureHttpDispatcher applies to
+// undici's dispatcher headersTimeout and bodyTimeout, the pair that
+// actually kills a buffering upstream whose wire stays silent for the whole
+// generation (pi reads no timeout env var, and its models.json provider
+// entries carry no timeoutMs it plumbs — source-verified 2026-09-27,
+// references exist only in interactive-TUI code). daedalus owns exactly
+// those two keys, derived from the same config timeout other agents get as
+// API_TIMEOUT_MS; the merge is idempotent and preserves every other
+// setting, including the rest of any user retry block. The
+// read-modify-write holds lockPiAgentConfig like the models.json merge. If
+// pi later plumbs timeoutMs on provider entries, stage it there and retire
+// this settings write.
+// ponytail: the lock closes the torn-write/lost-update class, but the keys
+// themselves are shared settings — pi has no per-round timeout channel — so
+// a round can still observe a concurrent round's values at its startup read
+// (both operator-configured; the provider entry, which IS per-round, never
+// collides).
 func mergePiRetryTimeout(timeoutMS int) error {
 	unlock, err := lockPiAgentConfig()
 	if err != nil {
@@ -489,6 +503,15 @@ func mergePiRetryTimeout(timeoutMS int) error {
 		}
 	}
 	provider["timeoutMs"], err = json.Marshal(timeoutMS)
+	if err != nil {
+		return err
+	}
+	// The dispatcher ceiling is a top-level settings key — pi's
+	// configureHttpDispatcher reads it straight off settings, not out of the
+	// retry block — and it must ride at the same value: a buffered upstream
+	// never delivers headers, so this pair, not the SDK's abort above, is
+	// what fires on slow rounds.
+	top["httpIdleTimeoutMs"], err = json.Marshal(timeoutMS)
 	if err != nil {
 		return err
 	}

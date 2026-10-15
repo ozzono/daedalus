@@ -3026,3 +3026,26 @@ func TestAgentsAdmitsItsOwnList(t *testing.T) {
 		t.Errorf("ValidateAgent(%q) = %v after the caller-side mutation", again[0], err)
 	}
 }
+
+// TestLoadMaxRequestsPerMinuteValidation pins the rate cap's
+// enforceability gate: the cap loads with the one shape the worker's
+// relay can serve (agent: pi plus an openai url) and fails at load —
+// naming the key — on every silently-inert shape: a negative value, no
+// openai url to resolve the relay's upstream against, and an agent whose
+// rounds never read the relay's staged URL.
+func TestLoadMaxRequestsPerMinuteValidation(t *testing.T) {
+	ok := "agent: pi\nmax_requests_per_minute: 15\nopenai:\n  url: http://127.0.0.1:11434/v1\n  model: m\n"
+	if _, err := Load(writeConfig(t, ok)); err != nil {
+		t.Fatalf("Load (pi + openai url): %v", err)
+	}
+	for _, yc := range []struct{ name, yaml, want string }{
+		{"negative", "agent: pi\nmax_requests_per_minute: -1\n", "must not be negative"},
+		{"no openai url", "agent: pi\nmax_requests_per_minute: 15\n", "no openai url"},
+		{"non-pi agent", "max_requests_per_minute: 15\nopenai:\n  url: http://127.0.0.1:11434/v1\n  model: m\n", "only pi rounds"},
+	} {
+		_, err := Load(writeConfig(t, yc.yaml))
+		if err == nil || !strings.Contains(err.Error(), "max_requests_per_minute") || !strings.Contains(err.Error(), yc.want) {
+			t.Errorf("Load (%s) error = %v, want a max_requests_per_minute rejection naming %q", yc.name, err, yc.want)
+		}
+	}
+}

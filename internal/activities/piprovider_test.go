@@ -1208,9 +1208,13 @@ exit 0`, seed))
 
 // TestStagePiProviderStagesRetryTimeout pins the timeout bridge: a positive
 // API_TIMEOUT_MS export — the same ceiling every other agent gets as the
-// exported var — lands as retry.provider.timeoutMs in the host's
-// settings.json (pi's only request-timeout channel), and models.json is
-// still staged alongside it.
+// exported var — lands as BOTH of pi's request-timeout channels in the
+// host's settings.json at the same value: retry.provider.timeoutMs (the
+// openai SDK's time-to-headers abort) and the top-level httpIdleTimeoutMs
+// (the undici dispatcher ceiling that actually kills a buffering upstream —
+// the SDK timer clears the moment headers arrive, so staging only the retry
+// key leaves pi's 5-minute dispatcher default folding slow rounds). The
+// models.json bridge is still staged alongside them.
 func TestStagePiProviderStagesRetryTimeout(t *testing.T) {
 	home := piTestHome(t)
 	if _, _, err := stagePiProvider(piEnv(
@@ -1224,18 +1228,27 @@ func TestStagePiProviderStagesRetryTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read staged settings.json: %v", err)
 	}
-	var top struct {
-		Retry struct {
-			Provider struct {
-				TimeoutMS int `json:"timeoutMs"`
-			} `json:"provider"`
-		} `json:"retry"`
-	}
+	var top map[string]json.RawMessage
 	if err := json.Unmarshal(data, &top); err != nil {
 		t.Fatalf("parse staged settings.json: %v", err)
 	}
-	if top.Retry.Provider.TimeoutMS != 900000 {
-		t.Errorf("retry.provider.timeoutMs = %d, want 900000", top.Retry.Provider.TimeoutMS)
+	var retry struct {
+		Provider struct {
+			TimeoutMS int `json:"timeoutMs"`
+		} `json:"provider"`
+	}
+	if err := json.Unmarshal(top["retry"], &retry); err != nil {
+		t.Fatalf("parse staged retry block: %v", err)
+	}
+	if retry.Provider.TimeoutMS != 900000 {
+		t.Errorf("retry.provider.timeoutMs = %d, want 900000", retry.Provider.TimeoutMS)
+	}
+	// The dispatcher ceiling rides at the same value, at the top level where
+	// pi's configureHttpDispatcher reads it. Pinned through the raw bytes:
+	// this fails on a string-typed value, a nested placement, or an
+	// unstaged key alike, where a typed decode would blur them together.
+	if string(top["httpIdleTimeoutMs"]) != "900000" {
+		t.Errorf("httpIdleTimeoutMs = %s, want the same ceiling staged top-level as a JSON number", top["httpIdleTimeoutMs"])
 	}
 	if _, entry := stagedDaedalusEntry(t, home); entry.BaseURL != "http://localhost:11434/v1" {
 		t.Errorf("staged baseUrl = %q, want the models.json bridge unaffected", entry.BaseURL)
@@ -1326,17 +1339,21 @@ func TestStagePiProviderCleanupRidesTimeoutFailure(t *testing.T) {
 }
 
 // TestMergePiRetryTimeoutPreservesUserSettings pins the merge contract:
-// daedalus owns exactly retry.provider.timeoutMs — the host user's other
-// top-level settings, the rest of their retry block, and the rest of their
-// provider block survive verbatim, and a re-stage upserts the one key
-// instead of accumulating duplicates.
+// daedalus owns exactly retry.provider.timeoutMs and the top-level
+// httpIdleTimeoutMs — the host user's other top-level settings, the rest of
+// their retry block, and the rest of their provider block survive verbatim.
+// The user's own httpIdleTimeoutMs is overwritten (inherent: settings.json
+// is pi's only channel for the knob, and a stale smaller value would fold
+// the round it stages), the dispatcher key stays at the top level — never
+// nested into the retry block pi does not read it from — and a re-stage
+// upserts both keys instead of accumulating duplicates.
 func TestMergePiRetryTimeoutPreservesUserSettings(t *testing.T) {
 	home := piTestHome(t)
 	path := piSettingsPath(home)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(path, []byte(`{"theme":"dark","retry":{"attempts":5,"provider":{"apiKey":"sk-user","timeoutMs":300000}}}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"theme":"dark","httpIdleTimeoutMs":120000,"retry":{"attempts":5,"provider":{"apiKey":"sk-user","timeoutMs":300000}}}`), 0o644); err != nil {
 		t.Fatalf("seed settings.json: %v", err)
 	}
 	if err := mergePiRetryTimeout(900000); err != nil {
@@ -1353,12 +1370,19 @@ func TestMergePiRetryTimeoutPreservesUserSettings(t *testing.T) {
 	if string(top["theme"]) != `"dark"` {
 		t.Errorf("theme = %s, want it preserved", top["theme"])
 	}
+	if string(top["httpIdleTimeoutMs"]) != `900000` {
+		t.Errorf("httpIdleTimeoutMs = %s, want the daedalus value to win over the user's own", top["httpIdleTimeoutMs"])
+	}
 	var retry map[string]json.RawMessage
 	if err := json.Unmarshal(top["retry"], &retry); err != nil {
 		t.Fatalf("parse retry: %v", err)
 	}
 	if string(retry["attempts"]) != `5` {
 		t.Errorf("retry.attempts = %s, want it preserved", retry["attempts"])
+	}
+	// The dispatcher ceiling rides top-level, not inside the retry block.
+	if _, ok := retry["httpIdleTimeoutMs"]; ok {
+		t.Errorf("retry block = %s, want no dispatcher key nested there", top["retry"])
 	}
 	var provider map[string]json.RawMessage
 	if err := json.Unmarshal(retry["provider"], &provider); err != nil {
@@ -1371,7 +1395,7 @@ func TestMergePiRetryTimeoutPreservesUserSettings(t *testing.T) {
 		t.Errorf("retry.provider.timeoutMs = %s, want the daedalus value to win", provider["timeoutMs"])
 	}
 
-	// A re-stage replaces the one owned key in place.
+	// A re-stage replaces both owned keys in place.
 	if err := mergePiRetryTimeout(600000); err != nil {
 		t.Fatalf("re-mergePiRetryTimeout: %v", err)
 	}
@@ -1379,7 +1403,7 @@ func TestMergePiRetryTimeoutPreservesUserSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reread merged settings.json: %v", err)
 	}
-	for _, key := range []string{`"apiKey"`, `"attempts"`, `"theme"`} {
+	for _, key := range []string{`"apiKey"`, `"attempts"`, `"theme"`, `"httpIdleTimeoutMs"`} {
 		if n := strings.Count(string(data), key); n != 1 {
 			t.Errorf("merged settings.json carries %q %d times, want exactly 1", key, n)
 		}
@@ -1390,6 +1414,7 @@ func TestMergePiRetryTimeoutPreservesUserSettings(t *testing.T) {
 				TimeoutMS int `json:"timeoutMs"`
 			} `json:"provider"`
 		} `json:"retry"`
+		HTTPIdleTimeoutMS int `json:"httpIdleTimeoutMs"`
 	}
 	if err := json.Unmarshal(data, &recheck); err != nil {
 		t.Fatalf("parse re-merged settings.json: %v", err)
@@ -1397,10 +1422,13 @@ func TestMergePiRetryTimeoutPreservesUserSettings(t *testing.T) {
 	if recheck.Retry.Provider.TimeoutMS != 600000 {
 		t.Errorf("retry.provider.timeoutMs = %d, want the re-stage value", recheck.Retry.Provider.TimeoutMS)
 	}
+	if recheck.HTTPIdleTimeoutMS != 600000 {
+		t.Errorf("httpIdleTimeoutMs = %d, want the re-stage value", recheck.HTTPIdleTimeoutMS)
+	}
 }
 
 // TestMergePiRetryTimeoutFreshHost pins the no-file case: a host with no
-// settings.json at all gets one created carrying just the staged timeout —
+// settings.json at all gets one created carrying both staged timeout keys —
 // the merge must not depend on a pre-existing file.
 func TestMergePiRetryTimeoutFreshHost(t *testing.T) {
 	home := piTestHome(t)
@@ -1411,8 +1439,14 @@ func TestMergePiRetryTimeoutFreshHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read staged settings.json: %v", err)
 	}
+	// The leading quote makes these two checks disjoint: the dispatcher
+	// key's bytes ("httpIdleTimeoutMs") contain "TimeoutMs" but never the
+	// retry key's quoted form, so each presence proves its own key.
 	if !strings.Contains(string(data), `"timeoutMs": 900000`) {
-		t.Errorf("staged settings.json = %s, want the timeout key", data)
+		t.Errorf("staged settings.json = %s, want the retry timeout key", data)
+	}
+	if !strings.Contains(string(data), `"httpIdleTimeoutMs": 900000`) {
+		t.Errorf("staged settings.json = %s, want the dispatcher timeout key", data)
 	}
 }
 
@@ -1457,8 +1491,14 @@ func TestMergePiNullShapes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read staged settings.json: %v", err)
 		}
+		// Both request-timeout keys must survive every null shape; the
+		// leading quotes keep the two contains-checks disjoint (the
+		// dispatcher key's bytes never contain the retry key's quoted form).
 		if !strings.Contains(string(data), `"timeoutMs": 900000`) {
-			t.Errorf("staged settings.json = %s, want the timeout key", data)
+			t.Errorf("staged settings.json = %s, want the retry timeout key", data)
+		}
+		if !strings.Contains(string(data), `"httpIdleTimeoutMs": 900000`) {
+			t.Errorf("staged settings.json = %s, want the dispatcher timeout key", data)
 		}
 	}
 
