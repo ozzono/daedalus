@@ -3,6 +3,7 @@ package toolrelay
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -48,7 +49,7 @@ func (rec *recorder) all() []recordedRequest {
 // prefix the openai section carries, closed at test cleanup.
 func startStubRelay(t *testing.T, srv *httptest.Server, parserModel string) *Relay {
 	t.Helper()
-	r, err := Start(srv.URL+"/v1", parserModel)
+	r, err := Start(srv.URL+"/v1", parserModel, 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -229,7 +230,7 @@ type decodedSynthetic struct {
 func TestCloseIsQuiet(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer up.Close()
-	r, err := Start(up.URL+"/v1", "parser")
+	r, err := Start(up.URL+"/v1", "parser", 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -361,7 +362,7 @@ func TestPinsAcceptEncodingIdentity(t *testing.T) {
 // instead of serving a relay that 502s every request.
 func TestStartRejectsUnusableUpstream(t *testing.T) {
 	for _, upstream := range []string{"127.0.0.1:11434", "http:///v1", "://bad"} {
-		r, err := Start(upstream, "parser")
+		r, err := Start(upstream, "parser", 0)
 		if err == nil {
 			r.Close()
 			t.Errorf("Start(%q) = nil error, want rejection", upstream)
@@ -373,7 +374,7 @@ func TestStartRejectsUnusableUpstream(t *testing.T) {
 // own loopback address plus the upstream's path prefix, so pi's request
 // paths land on the relay exactly as they would land on the upstream.
 func TestRelayURLCarriesUpstreamPath(t *testing.T) {
-	r, err := Start("http://upstream.example:11434/v1", "parser")
+	r, err := Start("http://upstream.example:11434/v1", "parser", 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -690,7 +691,7 @@ func TestUpstreamUnreachableServes502(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	up.Close() // take the port away: the relay's upstream is dead
 
-	relay, err := Start(up.URL+"/v1", "parser")
+	relay, err := Start(up.URL+"/v1", "parser", 0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -783,5 +784,81 @@ func TestStripFence(t *testing.T) {
 		if got != c.want {
 			t.Errorf("stripFence(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestRateLimiterPacesUpstream pins the sliding-window contract: the
+// first max acquisitions of a window pass immediately, the next waits
+// until the oldest expires and frees a slot.
+func TestRateLimiterPacesUpstream(t *testing.T) {
+	l := &rateLimiter{window: 150 * time.Millisecond, max: 2}
+	start := time.Now()
+	for i := 0; i < 2; i++ {
+		if err := l.wait(context.Background()); err != nil {
+			t.Fatalf("wait %d: %v", i, err)
+		}
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("first 2 waits took %v, want effectively immediate", d)
+	}
+	if err := l.wait(context.Background()); err != nil {
+		t.Fatalf("third wait: %v", err)
+	}
+	if d := time.Since(start); d < 140*time.Millisecond {
+		t.Errorf("third wait returned after %v, want a ~%v stall for a window slot", d, l.window)
+	}
+}
+
+// TestStartRateLimitedPacesCompletions pins the rate cap end to end: a
+// relay started with a cap and no parser model is a pure forwarder whose
+// completions POSTs are admitted at most maxPerMinute per window, while
+// non-completions traffic streams through unthrottled.
+func TestStartRateLimitedPacesCompletions(t *testing.T) {
+	var rec recorder
+	var mu sync.Mutex
+	var at []time.Time
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		rec.add(r, body)
+		mu.Lock()
+		at = append(at, time.Now())
+		mu.Unlock()
+		w.Write([]byte(`{}`))
+	}))
+	r, err := Start(up.URL+"/v1", "", 2)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { r.Close() })
+	// Production fixes the window at a minute; shrink it so the test's
+	// pacing stall is milliseconds, not tens of seconds.
+	r.rate.window = 150 * time.Millisecond
+	post := func(path string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, r.URL()+path, strings.NewReader(`{"model":"m"}`))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("POST %s status = %d, want 200", path, resp.StatusCode)
+		}
+	}
+	start := time.Now()
+	post("/v1/chat/completions")
+	post("/v1/chat/completions")
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("first 2 completions took %v, want effectively immediate", d)
+	}
+	post("/v1/chat/completions")
+	if d := time.Since(start); d < 140*time.Millisecond {
+		t.Errorf("third completion arrived after %v, want a ~%v rate stall", d, r.rate.window)
+	}
+	if got := len(rec.all()); got != 3 {
+		t.Errorf("upstream saw %d requests, want all 3 forwarded after pacing", got)
 	}
 }

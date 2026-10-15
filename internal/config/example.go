@@ -129,6 +129,19 @@ cleanup_timeout: 30m
 # or rate knob of its own (source-verified 2026-09-26), and the slot-wait
 # behavior is identical to aider/claude rounds.
 max_concurrent_agent_runs: 2
+# Cap on provider requests per minute for this deployment: jailed pi
+# rounds' chat-completions calls — agent and reviewer alike — are paced
+# through the worker's loopback relay to at most this many per sliding
+# one-minute window, a request beyond the cap waiting inside the relay
+# until the window frees. For a provider whose API tier rate-limits by
+# request count (a free 15 req/min tier, say): staying under the cap
+# avoids the 429 quota-heartbeat crawl entirely instead of absorbing it.
+# Enforcement rides the relay's staging, so it covers exactly the rounds
+# the relay serves — requires agent: pi and an openai.url (the relay
+# forwards that channel); any other shape is rejected at load, and a
+# reviewer.url or openai-fallback override bypasses it. 0 (the default)
+# means unthrottled.
+max_requests_per_minute: 0
 `
 
 // exampleSlimBlock is the slim: section (the mode toggle and the tool-call

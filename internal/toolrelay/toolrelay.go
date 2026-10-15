@@ -15,7 +15,10 @@
 // lift failure degrades to that passthrough — fail-open, no new workflow
 // failure path. The relay is stateless: no metrics store, no persistence;
 // one structured log line per inspected response (tool name only, never
-// argument bodies).
+// argument bodies). When started with a positive per-minute cap the relay
+// also paces its upstream-bound completions traffic through a sliding
+// one-minute window — the worker-managed guard for a provider whose API
+// tier rate-limits by request count.
 package toolrelay
 
 import (
@@ -30,6 +33,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,23 +41,75 @@ import (
 // lift and the response passes through as inert text.
 const parserTimeout = 60 * time.Second
 
+// rateLimiter bounds upstream requests to max per sliding window. One
+// Relay owns one limiter, so the window is shared by every round the
+// worker stages through it — agent and reviewer alike — which is the
+// accounting a per-account API tier actually enforces. wait blocks until
+// a slot frees or ctx is done.
+type rateLimiter struct {
+	window time.Duration
+	max    int
+	mu     sync.Mutex
+	// at holds the admitted request times in ascending order; trim-from-
+	// front keeps the oldest at index 0.
+	at []time.Time
+}
+
+func (l *rateLimiter) wait(ctx context.Context) error {
+	for {
+		l.mu.Lock()
+		now := time.Now()
+		cutoff := now.Add(-l.window)
+		i := 0
+		for ; i < len(l.at) && l.at[i].Before(cutoff); i++ {
+		}
+		l.at = l.at[i:]
+		if len(l.at) < l.max {
+			l.at = append(l.at, now)
+			l.mu.Unlock()
+			return nil
+		}
+		d := l.window - now.Sub(l.at[0])
+		l.mu.Unlock()
+		if d <= 0 {
+			continue
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // Relay is the loopback proxy for one worker. Start it with Start; it
 // serves until Close or process exit.
 type Relay struct {
 	upstream *url.URL
 	// parserModel is slim.parser_model — the model asked to normalize
-	// lifted arguments, resolved against the same upstream pi dials.
+	// lifted arguments, resolved against the same upstream pi dials. Empty
+	// disables the lift entirely: the relay is then a pure forwarder (the
+	// rate-cap case) and a text-encoded tool call passes through as
+	// content, never reaching a parser call with no model to ask.
 	parserModel string
-	transport   http.RoundTripper
-	proxy       *httputil.ReverseProxy
-	srv         *http.Server
-	listener    net.Listener
+	// rate, when non-nil, paces every upstream-bound completions request —
+	// the forwarded leg and the parser call alike, both spending the same
+	// upstream's request budget.
+	rate      *rateLimiter
+	transport http.RoundTripper
+	proxy     *httputil.ReverseProxy
+	srv       *http.Server
+	listener  net.Listener
 }
 
 // Start parses the upstream URL (the openai section's url — scheme and
 // host are what the relay forwards to; the path prefix is preserved
 // end-to-end, see URL) and serves the relay on a fresh 127.0.0.1 port.
-func Start(upstreamURL, parserModel string) (*Relay, error) {
+// maxPerMinute, when positive, paces upstream-bound completions requests
+// through a sliding one-minute window; zero means unthrottled.
+func Start(upstreamURL, parserModel string, maxPerMinute int) (*Relay, error) {
 	u, err := url.Parse(upstreamURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse upstream url: %w", err)
@@ -78,6 +134,9 @@ func Start(upstreamURL, parserModel string) (*Relay, error) {
 			pr.Out.URL.Path = pr.In.URL.Path
 			pr.Out.URL.RawPath = pr.In.URL.RawPath
 		}},
+	}
+	if maxPerMinute > 0 {
+		r.rate = &rateLimiter{window: time.Minute, max: maxPerMinute}
 	}
 	// The server lives on the Relay so Close goes through it — closing the
 	// listener alone would exit Serve with a raw accept error instead of
@@ -109,9 +168,25 @@ func (r *Relay) URL() string {
 }
 
 func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// Only chat-completions POSTs can be tool-bearing; everything else —
-	// other methods, model pulls, /api routes — streams through verbatim.
+	// Only chat-completions POSTs can be tool-bearing (and only they
+	// dominate a request-counted API tier); everything else — other
+	// methods, model pulls, /api routes — streams through verbatim,
+	// unthrottled.
 	if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/chat/completions") {
+		if r.rate != nil {
+			if err := r.rate.wait(req.Context()); err != nil {
+				log.Printf("toolrelay: rate wait canceled: %v", err)
+				http.Error(w, "toolrelay: rate-limit wait canceled", http.StatusBadGateway)
+				return
+			}
+		}
+		// Without a parser model the lift path has nothing to call, so the
+		// relay stays a pure forwarder: streamed through unbuffered, paced
+		// only by the window above.
+		if r.parserModel == "" {
+			r.proxy.ServeHTTP(w, req)
+			return
+		}
 		r.serveCompletions(w, req)
 		return
 	}
@@ -368,6 +443,15 @@ func (r *Relay) parserCall(req *http.Request, completionsPath string, tool toolS
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), parserTimeout)
 	defer cancel()
+	// The parser dial spends the same upstream's request budget as the
+	// forwarded leg, so it takes a window slot of its own; a window wait
+	// that outlives the parser timeout fails the lift into passthrough,
+	// never the round.
+	if r.rate != nil {
+		if err := r.rate.wait(ctx); err != nil {
+			return nil, err
+		}
+	}
 	up, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		r.upstream.Scheme+"://"+r.upstream.Host+completionsPath, bytes.NewReader(reqBody))
 	if err != nil {

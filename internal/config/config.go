@@ -907,6 +907,20 @@ type Config struct {
 	// parallelism (many workflows on one task queue) slows every run.
 	// DefaultMaxConcurrentAgentRuns when unset.
 	MaxConcurrentAgentRuns int `yaml:"max_concurrent_agent_runs"`
+	// MaxRequestsPerMinute, when positive, paces this deployment's
+	// provider traffic through the worker's loopback relay
+	// (internal/toolrelay): jailed pi rounds' chat-completions requests —
+	// agent and reviewer alike — are forwarded only up to this many per
+	// sliding one-minute window, a request beyond the cap waiting inside
+	// the relay until the window frees. The point is a provider whose API
+	// tier rate-limits by request count: staying under the cap avoids the
+	// 429 quota-heartbeat crawl instead of absorbing it. Enforcement rides
+	// the relay's staging, so it covers exactly the rounds the relay
+	// serves (pi on the openai channel; a reviewer.url or openai-fallback
+	// override bypasses it) — Load rejects the key with any other agent or
+	// without an openai url, where it would be silently inert. Zero
+	// (unset) means unthrottled.
+	MaxRequestsPerMinute int `yaml:"max_requests_per_minute"`
 	// Slim targets small self-hosted models (small context window, low max
 	// output tokens) on the aider and pi agents: when enabled, the worker
 	// runs a single jailed-agent round at a time (MaxConcurrentAgentRuns is
@@ -1117,6 +1131,7 @@ type renderConfig struct {
 	ReviewTimeout          durationValue       `yaml:"review_timeout"`
 	CleanupTimeout         durationValue       `yaml:"cleanup_timeout"`
 	MaxConcurrentAgentRuns int                 `yaml:"max_concurrent_agent_runs"`
+	MaxRequestsPerMinute   int                 `yaml:"max_requests_per_minute"`
 	MaxConcurrentTests     int                 `yaml:"max_concurrent_tests"`
 	SharedTestQueue        *bool               `yaml:"shared_test_queue"`
 	Slim                   SlimConfig          `yaml:"slim"`
@@ -1153,6 +1168,7 @@ func (c Config) RenderYAML() (string, error) {
 		ReviewTimeout:          durationValue(c.ReviewTimeout),
 		CleanupTimeout:         durationValue(c.CleanupTimeout),
 		MaxConcurrentAgentRuns: c.MaxConcurrentAgentRuns,
+		MaxRequestsPerMinute:   c.MaxRequestsPerMinute,
 		MaxConcurrentTests:     c.MaxConcurrentTests,
 		SharedTestQueue:        c.SharedTestQueue,
 		Slim:                   c.Slim,
@@ -1642,6 +1658,24 @@ func (c Config) validate(path string) error {
 	}
 	if c.MaxConcurrentAgentRuns < 0 {
 		return fmt.Errorf("config %s: max_concurrent_agent_runs: must not be negative", path)
+	}
+	if c.MaxRequestsPerMinute < 0 {
+		return fmt.Errorf("config %s: max_requests_per_minute: must not be negative", path)
+	}
+	// A set cap must be enforceable, never silently inert: the pacing lives
+	// in the worker's loopback relay (internal/toolrelay), which forwards
+	// the openai channel and is staged only into pi rounds. Any other
+	// shape — no openai url to resolve the relay's upstream against, or an
+	// agent whose rounds never read the relay's staged URL — would load a
+	// knob that throttles nothing, so it fails at load naming the key.
+	if c.MaxRequestsPerMinute > 0 {
+		_, open := c.ProviderChannels()
+		if open.URL == "" {
+			return fmt.Errorf("config %s: max_requests_per_minute: no openai url to relay — the cap is enforced by the worker's loopback provider relay, which forwards the openai channel; set openai.url or remove the key", path)
+		}
+		if c.Agent != "pi" {
+			return fmt.Errorf("config %s: max_requests_per_minute: only pi rounds are staged through the worker's provider relay — set agent: pi or remove the key", path)
+		}
 	}
 	if c.MaxConcurrentTests < 0 {
 		return fmt.Errorf("config %s: max_concurrent_tests: must not be negative", path)

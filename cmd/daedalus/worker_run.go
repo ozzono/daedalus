@@ -158,32 +158,38 @@ func runWorker(cfg config.Config, workerType string) error {
 			}
 		}
 	}
-	// The slim tool-call relay: a loopback reverse proxy that lifts pi
-	// rounds' text-encoded tool calls into the native tool_calls wire pi
-	// executes (internal/toolrelay). Started only when slim is enabled
-	// with a parser model AND the openai channel provides an upstream —
-	// the provider section's url when its type is openai, else the legacy
-	// openai section's. Absent any of the three, the relay never starts
-	// and the env var below stays unset, byte-identical to the pre-relay
-	// behavior. The staged URL (relay address plus the upstream's path
-	// prefix) travels the env channel like every other knob; unset
+	// The worker's provider relay: a loopback reverse proxy between jailed
+	// pi rounds and the openai channel's upstream (internal/toolrelay). It
+	// starts for either of two jobs — never both required at once: lifting
+	// pi's text-encoded tool calls into the native tool_calls wire (slim
+	// enabled with a parser model), or pacing the upstream's completions
+	// traffic to max_requests_per_minute (a request-counted API tier; the
+	// window is shared by agent and reviewer rounds alike, the accounting
+	// the tier actually enforces). Both gate on an openai-channel upstream
+	// — the provider section's url when its type is openai, else the
+	// legacy openai section's — and absent every trigger the relay never
+	// starts and the env var below stays unset, byte-identical to the
+	// pre-relay behavior. The staged URL (relay address plus the upstream's
+	// path prefix) travels the env channel like every other knob; unset
 	// symmetrically, and scrubbed from the daemon spawn via
 	// ProviderEnvVars, so a stale export can never point a new worker's
 	// rounds at a dead relay.
 	var relayURL string
 	_, open := cfg.ProviderChannels()
-	if cfg.Slim.Enabled && cfg.Slim.ParserModel != "" && open.URL != "" {
-		// With metrics on, the slim relay forwards into the metrics relay's
-		// staged openai path — pi → slim relay → metrics relay → upstream —
-		// so the parser calls land in the ledger attributed to the round:
-		// the synthetic attribution key rides through both relays untouched.
+	relayParser := cfg.Slim.Enabled && cfg.Slim.ParserModel != ""
+	if open.URL != "" && (relayParser || cfg.MaxRequestsPerMinute > 0) {
+		// With metrics on, the relay forwards into the metrics relay's
+		// staged openai path — pi → relay → metrics relay → upstream —
+		// so the round's calls land in the ledger attributed to the
+		// round: the synthetic attribution key rides through both relays
+		// untouched.
 		upstream := open.URL
 		if metricsRoot != "" {
 			if staged := metricsrelay.StagedBase(metricsRoot, cfg.WorkerName(), metricsrelay.WireOpenAI, open.URL); staged != "" {
 				upstream = staged
 			}
 		}
-		r, err := toolrelay.Start(upstream, cfg.Slim.ParserModel)
+		r, err := toolrelay.Start(upstream, cfg.Slim.ParserModel, cfg.MaxRequestsPerMinute)
 		if err != nil {
 			return fmt.Errorf("start tool relay: %w", err)
 		}
