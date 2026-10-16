@@ -51,6 +51,7 @@ html.dark body{@apply bg-slate-950 text-slate-200;}
    <a class="tab {{if eq .Nav "workers"}}on{{end}}" href="/workers">Workers</a>
    <a class="tab {{if eq .Nav "runs"}}on{{end}}" href="/runs">Runs</a>
    <a class="tab {{if eq .Nav "new"}}on{{end}}" href="/new">New Task</a>
+   <a class="tab {{if eq .Nav "models"}}on{{end}}" href="/models">Models</a>
    <a class="tab {{if eq .Nav "metrics"}}on{{end}}" href="/metrics">Metrics</a>
   </nav>
   <div class="ml-auto flex items-center gap-3 text-xs">
@@ -361,6 +362,28 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  </table>
 </div>
 
+<div class="card p-4 mb-4">
+ <div class="lbl">Ledger cost (priced models only)</div>
+ {{if .LedgerCost}}
+ <table class="w-full text-sm">
+  <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+   <tr><th scope="col" class="font-medium pb-2">Model</th><th scope="col" class="font-medium pb-2">Calls</th><th scope="col" class="font-medium pb-2">Cost USD</th></tr>
+  </thead>
+  <tbody>
+  {{range .LedgerCost}}
+   <tr class="border-t border-slate-200 dark:border-slate-800"><td class="py-1 mono">{{.Model}}</td><td>{{.Calls}}</td><td class="mono">{{.Cost}}</td></tr>
+  {{end}}
+  </tbody>
+  <tfoot class="border-t border-slate-200 dark:border-slate-800 font-semibold">
+   <tr><td class="py-1" colspan="2">Total</td><td class="mono">{{.LedgerTotal}}</td></tr>
+  </tfoot>
+ </table>
+ {{else}}
+ <div class="text-sm text-slate-500">—</div>
+ {{end}}
+ <p class="text-xs text-slate-500 mt-2">Rendered from the relay ledger and the Models tab's price table — a price edit reprices this section on the next render.</p>
+</div>
+
 {{if .TestFound}}
 <div class="card p-4 mb-4">
  <div class="flex items-center gap-2 mb-2">
@@ -381,6 +404,115 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 
 {{define "frag_error"}}
 <div class="card p-4 text-sm text-red-600 dark:text-red-400">{{.}}</div>
+{{end}}
+
+{{define "usage_table"}}{{/* the replicated column set both usage tables render; .Head names the key column */}}
+<div class="card overflow-x-auto mb-4">
+ <table class="w-full text-sm min-w-[1180px]">
+  <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+   <tr><th scope="col" class="p-3">{{.Head}}</th><th scope="col">Calls</th><th scope="col">In</th><th scope="col">Out</th><th scope="col">Cache R</th><th scope="col">Cache W</th><th scope="col">Runs</th><th scope="col">Dev</th><th scope="col">Test</th><th scope="col">Review</th><th scope="col">Hit %</th><th scope="col">2xx</th><th scope="col">429</th><th scope="col">4xx</th><th scope="col">5xx</th><th scope="col">p50</th><th scope="col">p95</th><th scope="col">req/min</th><th scope="col">Last</th><th scope="col">Cost USD</th></tr>
+  </thead>
+  <tbody>
+  {{range .Rows}}
+   <tr class="border-b last:border-0 border-slate-100 dark:border-slate-800/70">
+    <td class="p-3 mono">{{.Key}}</td>
+    <td>{{.Calls}}</td>
+    <td class="mono">{{tok .In}}</td>
+    <td class="mono">{{tok .Out}}</td>
+    <td class="mono">{{tok .CacheRead}}</td>
+    <td class="mono">{{tok .CacheWrite}}</td>
+    <td>{{.Runs}}</td>
+    <td>{{.Dev}}</td><td>{{.Test}}</td><td>{{.Review}}</td>
+    <td class="mono">{{.HitPct}}</td>
+    <td>{{.OK2xx}}</td><td>{{.R429}}</td><td>{{.R4xx}}</td><td{{if gt .R5xx 0}} class="text-red-600 dark:text-red-400"{{end}}>{{.R5xx}}</td>
+    <td class="mono">{{.P50}}</td><td class="mono">{{.P95}}</td>
+    <td class="mono">{{.RPM}}</td>
+    <td class="text-slate-500">{{.Last}}</td>
+    <td class="mono">{{if .Priced}}{{usd .Cost}}{{else}}—{{end}}</td>
+   </tr>
+  {{else}}
+   <tr><td colspan="20" class="p-4 text-center text-slate-500">Nothing relayed yet.</td></tr>
+  {{end}}
+  </tbody>
+ </table>
+</div>
+{{end}}
+
+{{define "page_models"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
+<main class="mx-auto max-w-6xl px-4 py-6">
+ <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
+  <h1 class="text-lg font-semibold">Models</h1>
+  <span class="text-xs text-slate-500">{{.V.Window}}</span>
+ </div>
+
+ {{if .V.FormRows}}
+ <div class="card p-4 mb-4 overflow-x-auto">
+  <form method="post" action="/models">
+   <table class="w-full text-sm min-w-[680px]">
+    <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+     <tr><th scope="col" class="p-3">Model</th><th scope="col">Calls</th><th scope="col">Last seen</th><th scope="col">In $/1M</th><th scope="col">Out $/1M</th><th scope="col">Cached $/1M</th></tr>
+    </thead>
+    <tbody>
+    {{range .V.FormRows}}
+     <tr class="border-b last:border-0 border-slate-100 dark:border-slate-800/70">
+      <td class="p-3 mono">{{.Model}}</td>
+      <td>{{.Calls}}</td>
+      <td class="text-slate-500">{{.Last}}</td>
+      {{if .Unknown}}
+       <td><input class="inp !py-1.5 mono" disabled value="" title="failed calls carry no model name — a rate on this mixed bucket would be a fabricated signal"></td>
+       <td><input class="inp !py-1.5 mono" disabled value="" title="failed calls carry no model name — a rate on this mixed bucket would be a fabricated signal"></td>
+       <td><input class="inp !py-1.5 mono" disabled value="" title="failed calls carry no model name — a rate on this mixed bucket would be a fabricated signal"></td>
+      {{else}}
+       <td><input class="inp !py-1.5 mono" name="in[{{.Model}}]" value="{{.In}}" inputmode="decimal"></td>
+       <td><input class="inp !py-1.5 mono" name="out[{{.Model}}]" value="{{.Out}}" inputmode="decimal"></td>
+       <td><input class="inp !py-1.5 mono" name="cached[{{.Model}}]" value="{{.Cached}}" inputmode="decimal"></td>
+      {{end}}
+     </tr>
+    {{end}}
+    </tbody>
+   </table>
+   <div class="mt-3 flex items-center gap-3 flex-wrap">
+    <button type="submit" class="btn-p">Save rates</button>
+    <span class="text-xs text-slate-500">USD per 1M tokens · saving upserts — no entry is ever deleted · cache writes bill at the in rate</span>
+   </div>
+  </form>
+ </div>
+ {{end}}
+
+ <div class="grid sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
+  <div class="card p-4"><div class="lbl">Tokens / run</div><div class="text-2xl font-semibold mono">{{.V.Tiles.TokensPerRun}}</div><div class="text-xs text-slate-500 mt-1">in + out over keyed runs</div></div>
+  <div class="card p-4"><div class="lbl">Tokens / worker</div><div class="text-2xl font-semibold mono">{{.V.Tiles.TokensPerWorker}}</div><div class="text-xs text-slate-500 mt-1">in + out over relayed workers</div></div>
+  <div class="card p-4"><div class="lbl">Dev → review</div><div class="text-2xl font-semibold mono">{{.V.Tiles.DevLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last dev call → first review</div></div>
+  <div class="card p-4"><div class="lbl">Test → review</div><div class="text-2xl font-semibold mono">{{.V.Tiles.TestLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last test call → first review</div></div>
+  <div class="card p-4"><div class="lbl">Round drift</div><div class="text-2xl font-semibold mono">{{.V.Tiles.Drift}}</div><div class="text-xs text-slate-500 mt-1">avg input growth within a round</div></div>
+ </div>
+
+ <div class="mb-2 font-medium">Usage by model</div>
+ {{template "usage_table" .V.ModelTable}}
+
+ <div class="mb-2 font-medium">Usage by worker</div>
+ {{template "usage_table" .V.WorkerTable}}
+
+ {{if .V.TokenChart}}<div class="card p-4 mb-4">{{.V.TokenChart}}</div>{{end}}
+ {{if .V.WorkerCharts}}
+ <div class="grid lg:grid-cols-2 gap-4 mb-4">
+  {{range .V.WorkerCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
+ </div>
+ {{end}}
+
+ {{if .V.CostChart}}<div class="card p-4 mb-4">{{.V.CostChart}}</div>{{end}}
+ {{if or .V.WorkerCostCharts .V.ModelCostCharts}}
+ <div class="grid lg:grid-cols-2 gap-4 mb-4">
+  {{range .V.WorkerCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
+  {{range .V.ModelCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
+ </div>
+ {{end}}
+
+ <div class="card p-4 text-sm text-slate-500">
+  Coverage: only relay-served rounds appear — unkeyed rounds attribute at worker level only, and a round dialing its CLI-default upstream bypasses the relay entirely. Loop averages span to the first review only and include non-provider time. Per-round rows: <span class="mono">daedalus metrics list</span>.
+ </div>
+</main>
+{{template "foot"}}
 {{end}}
 
 {{define "page_metrics"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
