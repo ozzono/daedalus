@@ -285,18 +285,26 @@ func TestSlimWorkflowHappyPath(t *testing.T) {
 
 	// Reviews: one fresh session per round, judged against exactly the
 	// current sub-task's criteria; red logs travel, green logs stay out.
+	// Role: every sub-task but the last reviews as the plain reviewer;
+	// the last sub-task's reviews are the run's terminal review (its
+	// worktree diff carries the whole plan's accepted work) and resolve
+	// as the final-review role.
 	if len(reviews.inputs) != 4 {
 		t.Fatalf("reviewer ran %d times, want 4 (three rounds for sub-task 1, one for sub-task 2)", len(reviews.inputs))
 	}
 	for i, in := range reviews.inputs {
+		wantRole := activities.RoleDevReview
+		if i == 3 {
+			wantRole = activities.RoleFinalReview
+		}
 		if !in.FreshReview {
 			t.Errorf("review %d FreshReview = false, want true (no review resumes another's conversation)", i)
 		}
 		if in.SessionID != "" {
 			t.Errorf("review %d SessionID = %q, want empty (fresh review mode never resumes)", i, in.SessionID)
 		}
-		if in.Role != activities.RoleDevReview {
-			t.Errorf("review %d Role = %v, want RoleDevReview", i, in.Role)
+		if in.Role != wantRole {
+			t.Errorf("review %d Role = %v, want %v", i, in.Role, wantRole)
 		}
 	}
 	for i, want := range []string{

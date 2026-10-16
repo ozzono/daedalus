@@ -556,6 +556,21 @@ fallback:
   model: ""
   heartbeat_model: ""
 
+# The dev rounds' own provider overrides — the implementing agent's
+# rounds: the slim flow's plan, parse, step, and fix rounds among them.
+# Every field is optional and independently settable; unset (the default)
+# means dev rounds authenticate and request the serving provider's values
+# exactly like before. The fields work like the reviewer section's below
+# (same env channel, same override rules); the thinking knob's unset case
+# falls back to the openai section's disable_thinking, which is what dev
+# rounds keyed on before this section existed.
+dev:
+  url: ""
+  key: ""
+  model: ""
+  context_tokens: 0
+  disable_thinking: false
+
 # Reviewer rounds' own provider endpoint and model. Absent (the default):
 # the reviewer rounds (code reviewer, test reviewer, docs reviewer)
 # authenticate exactly like the implementing agent's rounds — the serving
@@ -575,6 +590,11 @@ reviewer:
   url: ""
   key: ""
   model: ""
+  # Reviewer rounds' own context window in tokens, staged like the serving
+  # anthropic.context_tokens (pi's ContextWindow, aider's staged metadata,
+  # opencode's limit.context, claude's own var): only the review rounds'
+  # budget arithmetic changes. 0/unset keeps the serving window.
+  context_tokens: 0
   # Stage the disable-thinking encoding onto reviewer rounds' wire
   # requests — chat_template_kwargs {"enable_thinking": false}, the
   # Qwen3-template convention, so a hybrid-thinking reviewer brain (a
@@ -584,6 +604,22 @@ reviewer:
   # backend's own thinking default stands. This keys on the reviewer
   # section alone: openai's disable_thinking below never reaches reviewer
   # rounds, and vice versa.
+  disable_thinking: false
+
+# The terminal review's own provider overrides — the slim flow's last
+# sub-task's review loop, the rounds that see the cumulative diff of the
+# whole run (every earlier sub-task's accepted work is in the tree by
+# then): the motivating case is a bigger window or a different brain for
+# exactly that review. Every field falls back, per field: final_reviewer
+# unset → reviewer's value → the serving provider's — so setting only
+# model gives the terminal review a different brain on the reviewer's
+# endpoint, and an all-unset section stages byte-identically to the
+# reviewer chain.
+final_reviewer:
+  url: ""
+  key: ""
+  model: ""
+  context_tokens: 0
   disable_thinking: false
 
 # Extra skill reviews appended to each review-gated phase of the

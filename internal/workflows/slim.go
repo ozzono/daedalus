@@ -165,7 +165,13 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 // slimStep runs one sub-task's atomic loop: an implement round in the
 // chained dev conversation, then fix rounds until the suite is green AND
 // a fresh reviewer approves against the sub-task's acceptance criteria.
-// index/total are 1-based, for the prompts and the log.
+// index/total are 1-based, for the prompts and the log. The last
+// sub-task's reviews are the run's terminal review — its worktree diff
+// carries every earlier sub-task's accepted work, so it alone sees the
+// cumulative diff of the whole plan — and they resolve as RoleFinalReview:
+// the final_reviewer provider group when configured, falling back to the
+// reviewer chain (see activities.reviewerEnv). Every earlier sub-task's
+// reviews resolve as the plain reviewer.
 func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, command string) error {
 	r.logger.Info("Slim subtask starting", "ID", st.ID, "Index", index, "Of", total, "Description", st.Description)
 	prompt, err := template.SlimStep(index, total, st)
@@ -179,6 +185,10 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 	r.reviewCriteria = st.AcceptanceCriteria
 	defer func() { r.reviewCriteria = nil }()
 	focus := fmt.Sprintf("subtask %d (%s)", st.ID, st.Description)
+	reviewRole := activities.RoleDevReview
+	if index == total {
+		reviewRole = activities.RoleFinalReview
+	}
 	for round := 0; ; round++ {
 		if round >= maxSlimStepRounds {
 			return r.park(fmt.Sprintf("slim subtask %d failed to converge — %d ground-truth rounds without a green suite and an approving review; last fix prompt scope: %s",
@@ -198,7 +208,7 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 			testLogs = result.Logs
 		}
 		var session string // freshReviews: never read, never written
-		verdict, err := r.review(focus, testLogs, false, false, "", activities.RoleDevReview, &session, false)
+		verdict, err := r.review(focus, testLogs, false, false, "", reviewRole, &session, false)
 		if err != nil {
 			return fmt.Errorf("slim subtask review: %w", err)
 		}

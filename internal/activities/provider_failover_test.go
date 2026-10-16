@@ -606,11 +606,14 @@ func countEnv(env []string, name string) int {
 }
 
 // TestReviewerEnvOverridesReviewerRoundsOnly pins the reviewer override's
-// role gate: the two reviewer roles get every provider base-url/key var
+// role gate: the review roles get every provider base-url/key var
 // pointed at the config's reviewer endpoint (both wire families, replaced
 // in place) while dev and test rounds — and role-less one-shot rounds —
 // keep the serving provider's environment untouched, and model vars travel
-// through everywhere.
+// through everywhere. RoleFinalReview resolves the same chain — with only
+// reviewer vars set, its final_reviewer fields are unset and every pick
+// falls back to the reviewer section's, so its staging is byte-identical
+// here; the chain's own precedence is TestReviewerEnvFinalReviewFallbackChain's.
 func TestReviewerEnvOverridesReviewerRoundsOnly(t *testing.T) {
 	t.Setenv(config.ReviewerURLEnv, "https://review.example")
 	t.Setenv(config.ReviewerKeyEnv, "sk-review")
@@ -622,7 +625,7 @@ func TestReviewerEnvOverridesReviewerRoundsOnly(t *testing.T) {
 		}
 	}
 
-	for _, role := range []SessionRole{RoleDevReview, RoleTestReview} {
+	for _, role := range []SessionRole{RoleDevReview, RoleTestReview, RoleFinalReview} {
 		got := reviewerEnv(reviewerRoundBaseEnv(), role)
 		for name, want := range map[string]string{
 			"ANTHROPIC_BASE_URL": "https://review.example",
@@ -762,6 +765,145 @@ func TestReviewerEnvModelOverride(t *testing.T) {
 	})
 }
 
+// TestReviewerEnvFinalReviewFallbackChain pins the terminal review's
+// per-field precedence: a final_reviewer field set wins over the reviewer
+// section's for that field alone, an unset field falls back to the
+// reviewer section's, and an unset reviewer field leaves the serving
+// value — so a final url composes with a reviewer key, the window
+// dimension resolves along the same chain onto ContextTokensEnv, and an
+// all-unset chain passes a final-review round through byte-identical.
+func TestReviewerEnvFinalReviewFallbackChain(t *testing.T) {
+	t.Run("final fields win per field, unset ones fall back to the reviewer's", func(t *testing.T) {
+		t.Setenv(config.ReviewerURLEnv, "https://review.example")
+		t.Setenv(config.ReviewerKeyEnv, "sk-review")
+		t.Setenv(config.ReviewerModelEnv, "qwen3-review")
+		t.Setenv(config.FinalReviewerURLEnv, "https://final.example")
+		t.Setenv(config.FinalReviewerModelEnv, "qwen3-final")
+		got := reviewerEnv(reviewerRoundBaseEnv(), RoleFinalReview)
+		for name, want := range map[string]string{
+			"ANTHROPIC_BASE_URL": "https://final.example", // final wins
+			"OPENAI_BASE_URL":    "https://final.example",
+			"ANTHROPIC_API_KEY":  "sk-review", // final unset → the reviewer's
+			"OPENAI_API_KEY":     "sk-review",
+			"ANTHROPIC_MODEL":    "qwen3-final", // final wins
+			"OPENAI_MODEL":       "qwen3-final",
+		} {
+			if v := envValue(got, name); v != want {
+				t.Errorf("final review %s = %q, want %q", name, v, want)
+			}
+		}
+	})
+
+	t.Run("window resolves along the chain", func(t *testing.T) {
+		t.Setenv(config.FinalReviewerContextTokensEnv, "262144")
+		got := reviewerEnv(reviewerRoundBaseEnv(), RoleFinalReview)
+		if v := envValue(got, config.ContextTokensEnv); v != "262144" {
+			t.Errorf("final review %s = %q, want 262144 (the final_reviewer window)", config.ContextTokensEnv, v)
+		}
+
+		t.Setenv(config.FinalReviewerContextTokensEnv, "")
+		t.Setenv(config.ReviewerContextTokensEnv, "65536")
+		got = reviewerEnv(reviewerRoundBaseEnv(), RoleFinalReview)
+		if v := envValue(got, config.ContextTokensEnv); v != "65536" {
+			t.Errorf("final review %s = %q, want 65536 (final unset → the reviewer window)", config.ContextTokensEnv, v)
+		}
+	})
+
+	t.Run("all-unset chain passes through untouched", func(t *testing.T) {
+		base := reviewerRoundBaseEnv()
+		if got := reviewerEnv(slices.Clone(base), RoleFinalReview); !slices.Equal(got, base) {
+			t.Errorf("reviewerEnv(RoleFinalReview) rewired an all-unset chain: %v", got)
+		}
+	})
+}
+
+// TestDevEnvOverridesDevRoundsOnly pins the dev override's role gate and
+// dimensions: the implementing agent's rounds (RoleDev) get both wire
+// families pointed at the dev section's endpoint and the dev window staged
+// onto ContextTokensEnv, while every other role — the review roles
+// included: the final review resolves the reviewer chain, never the dev
+// section — and role-less one-shots keep the serving environment. The
+// relay contract matches the reviewer side: an endpoint or key override
+// strips the relay vars, a window-only or model-only override keeps them
+// (the relays' upstream is exactly the endpoint such a round still dials),
+// and an all-unset section passes through byte-identical.
+func TestDevEnvOverridesDevRoundsOnly(t *testing.T) {
+	relayVars := []string{config.ToolRelayURLEnv, config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv}
+	relayBase := append(reviewerRoundBaseEnv(),
+		config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1",
+		config.MetricsRelayAnthropicEnv+"=http://127.0.0.1:7778",
+		config.MetricsRelayOpenAIEnv+"=http://127.0.0.1:7778",
+	)
+
+	t.Run("url and key rewire both families and drop the relays", func(t *testing.T) {
+		t.Setenv(config.DevURLEnv, "https://dev.example")
+		t.Setenv(config.DevKeyEnv, "sk-dev")
+		got := devEnv(slices.Clone(relayBase), RoleDev)
+		for name, want := range map[string]string{
+			"ANTHROPIC_BASE_URL": "https://dev.example",
+			"ANTHROPIC_API_KEY":  "sk-dev",
+			"OPENAI_BASE_URL":    "https://dev.example",
+			"OPENAI_API_BASE":    "https://dev.example",
+			"OPENAI_API_KEY":     "sk-dev",
+			"ANTHROPIC_MODEL":    "claude-opus-5",
+		} {
+			if v := envValue(got, name); v != want {
+				t.Errorf("dev round %s = %q, want %q", name, v, want)
+			}
+			if n := countEnv(got, name); n != 1 {
+				t.Errorf("dev round left %d entries for %s, want exactly one", n, name)
+			}
+		}
+		for _, name := range relayVars {
+			for _, kv := range got {
+				if n, _, ok := cutEnv(kv); ok && n == name {
+					t.Errorf("dev override env still carries %q; the relay must not route an overridden round", kv)
+				}
+			}
+		}
+	})
+
+	t.Run("model and window apply with the relays kept", func(t *testing.T) {
+		t.Setenv(config.DevModelEnv, "qwen3-dev")
+		t.Setenv(config.DevContextTokensEnv, "131072")
+		got := devEnv(slices.Clone(relayBase), RoleDev)
+		for name, want := range map[string]string{
+			"ANTHROPIC_MODEL":       "qwen3-dev",
+			"OPENAI_MODEL":          "qwen3-dev",
+			config.ContextTokensEnv: "131072",
+			"ANTHROPIC_BASE_URL":    "https://primary.example",
+			"ANTHROPIC_API_KEY":     "sk-primary",
+		} {
+			if v := envValue(got, name); v != want {
+				t.Errorf("dev round %s = %q, want %q", name, v, want)
+			}
+		}
+		for _, name := range relayVars {
+			if n := countEnv(got, name); n != 1 {
+				t.Errorf("dev round left %d entries for %s, want exactly one (model/window overrides keep the relay)", n, name)
+			}
+		}
+	})
+
+	t.Run("every other role stays untouched", func(t *testing.T) {
+		t.Setenv(config.DevURLEnv, "https://dev.example")
+		t.Setenv(config.DevKeyEnv, "sk-dev")
+		t.Setenv(config.DevModelEnv, "qwen3-dev")
+		t.Setenv(config.DevContextTokensEnv, "131072")
+		for _, role := range []SessionRole{RoleTest, RoleDevReview, RoleTestReview, RoleFinalReview, ""} {
+			if got := devEnv(slices.Clone(relayBase), role); !slices.Equal(got, relayBase) {
+				t.Errorf("devEnv(%q) rewired a non-dev round: %v", role, got)
+			}
+		}
+	})
+
+	t.Run("all-unset dev section passes through", func(t *testing.T) {
+		if got := devEnv(slices.Clone(relayBase), RoleDev); !slices.Equal(got, relayBase) {
+			t.Errorf("devEnv(RoleDev) rewired an unconfigured dev section: %v", got)
+		}
+	})
+}
+
 // TestWireThinkingEnv pins the wire-level thinking knob's role resolution:
 // reviewer rounds key on the reviewer section's export alone and every
 // other role (dev, test, role-less one-shots) on the openai section's —
@@ -770,23 +912,34 @@ func TestReviewerEnvModelOverride(t *testing.T) {
 // explicit disable_thinking: true) resolves to a signal; an ambient garbage
 // value is never read as an off. The resolution is set-or-removed every
 // round, so a stale round-env value cannot outlive a knob that says
-// nothing.
+// nothing. The two newer roles carry one fallback hop each along their
+// provider chain: the final review falls from its own knob to the
+// reviewer's, and the dev role falls from its own knob to the openai
+// section's (its pre-role behavior).
 func TestWireThinkingEnv(t *testing.T) {
 	for _, c := range []struct {
-		name             string
-		role             SessionRole
-		openai, reviewer string // worker-export values; "" leaves the var unset
-		wantSet          bool
+		name                         string
+		role                         SessionRole
+		openai, reviewer, dev, final string // worker-export values; "" leaves the var unset
+		wantSet                      bool
 	}{
-		{"dev round reads the openai knob", RoleDev, "off", "", true},
-		{"test round reads the openai knob", RoleTest, "off", "", true},
-		{"role-less round reads the openai knob", "", "off", "", true},
-		{"dev-review round reads the reviewer knob", RoleDevReview, "", "off", true},
-		{"test-review round reads the reviewer knob", RoleTestReview, "", "off", true},
-		{"reviewer round ignores the openai knob", RoleDevReview, "off", "", false},
-		{"dev round ignores the reviewer knob", RoleDev, "", "off", false},
-		{"garbage is never an off", RoleDev, "maybe", "", false},
-		{"unset on both sides sends nothing", RoleTestReview, "", "", false},
+		{"dev round reads the openai knob", RoleDev, "off", "", "", "", true},
+		{"test round reads the openai knob", RoleTest, "off", "", "", "", true},
+		{"role-less round reads the openai knob", "", "off", "", "", "", true},
+		{"dev-review round reads the reviewer knob", RoleDevReview, "", "off", "", "", true},
+		{"test-review round reads the reviewer knob", RoleTestReview, "", "off", "", "", true},
+		{"reviewer round ignores the openai knob", RoleDevReview, "off", "", "", "", false},
+		{"dev round ignores the reviewer knob", RoleDev, "", "off", "", "", false},
+		{"garbage is never an off", RoleDev, "maybe", "", "", "", false},
+		{"unset on both sides sends nothing", RoleTestReview, "", "", "", "", false},
+		{"dev round reads the dev knob", RoleDev, "", "", "off", "", true},
+		{"dev garbage knob falls back to the openai knob", RoleDev, "off", "", "maybe", "", true},
+		{"dev round ignores the final knob", RoleDev, "", "", "", "off", false},
+		{"dev-review round ignores the dev knob", RoleDevReview, "", "", "off", "", false},
+		{"final-review round reads the final knob", RoleFinalReview, "", "", "", "off", true},
+		{"final-review round falls back to the reviewer knob", RoleFinalReview, "", "off", "", "", true},
+		{"final-review garbage knob falls back to the reviewer knob", RoleFinalReview, "", "off", "", "maybe", true},
+		{"final-review round ignores the openai knob", RoleFinalReview, "off", "", "", "", false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if c.openai != "" {
@@ -794,6 +947,12 @@ func TestWireThinkingEnv(t *testing.T) {
 			}
 			if c.reviewer != "" {
 				t.Setenv(config.ReviewerThinkingEnv, c.reviewer)
+			}
+			if c.dev != "" {
+				t.Setenv(config.DevThinkingEnv, c.dev)
+			}
+			if c.final != "" {
+				t.Setenv(config.FinalReviewerThinkingEnv, c.final)
 			}
 			// A stale round-env value seeds the removal branch; the set
 			// branch must replace it in place, not append a second entry.
@@ -912,6 +1071,74 @@ func TestReviewerRoundDialsReviewerEndpoint(t *testing.T) {
 			t.Errorf("dev round %s = %q, want %q", name, got, want)
 		}
 	}
+}
+
+// TestRoundRoleStagingDevAndFinalReview pins the two new role resolutions
+// at the round boundary — the composition unit tests on reviewerEnv/devEnv
+// cannot see: runJailedRound actually applies the dev override for a dev
+// round (a dropped call site would silently return dev rounds to the
+// serving endpoint), and the final-review round resolves the reviewer
+// chain while skipping pi's edit-discipline guardrail (review roles do not
+// edit — the guardrail must never leak into the terminal reviewer's
+// prompt).
+func TestRoundRoleStagingDevAndFinalReview(t *testing.T) {
+	t.Run("dev round dials the dev endpoint", func(t *testing.T) {
+		t.Setenv(config.DevURLEnv, "https://dev.example")
+		t.Setenv(config.DevKeyEnv, "sk-dev")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0\n")
+		base := append(reviewerRoundBaseEnv(), "PATH="+os.Getenv("PATH"))
+		if _, err := runJailedRound(context.Background(), slices.Clone(base), RoleDev, "claude", t.TempDir(), "dev prompt"); err != nil {
+			t.Fatalf("runJailedRound: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		for name, want := range map[string]string{
+			"ANTHROPIC_BASE_URL": "https://dev.example",
+			"ANTHROPIC_API_KEY":  "sk-dev",
+			"OPENAI_BASE_URL":    "https://dev.example",
+			"OPENAI_API_KEY":     "sk-dev",
+		} {
+			if got := calls[0].Env[name]; got != want {
+				t.Errorf("dev round %s = %q, want %q", name, got, want)
+			}
+		}
+	})
+
+	t.Run("final-review round dials the reviewer chain and skips the pi edit guardrail", func(t *testing.T) {
+		piTestHome(t)
+		t.Setenv(config.ReviewerURLEnv, "https://review.example")
+		t.Setenv(config.ReviewerKeyEnv, "sk-review")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0\n")
+		// The round env carries the serving model (pi cannot bridge an
+		// openai section without one); the reviewer chain overrides only
+		// the endpoint, so the staged model id stays the serving one.
+		base := append(reviewerRoundBaseEnv(),
+			"OPENAI_MODEL=qwen2.5-coder:3b",
+			"PATH="+os.Getenv("PATH"),
+		)
+		if _, err := runJailedRound(context.Background(), slices.Clone(base), RoleFinalReview, "pi", t.TempDir(), "review prompt"); err != nil {
+			t.Fatalf("runJailedRound: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		for name, want := range map[string]string{
+			"ANTHROPIC_BASE_URL": "https://review.example",
+			"ANTHROPIC_API_KEY":  "sk-review",
+		} {
+			if got := calls[0].Env[name]; got != want {
+				t.Errorf("final-review round %s = %q, want %q (the reviewer chain)", name, got, want)
+			}
+		}
+		if calls[0].Stdin != "review prompt" {
+			t.Errorf("final-review round stdin = %q, want the bare prompt (review roles never carry the edit guardrail)", calls[0].Stdin)
+		}
+	})
 }
 
 // TestEndpointOverridesDropToolRelayURL pins the relay var's precedence
