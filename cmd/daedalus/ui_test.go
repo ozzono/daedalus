@@ -354,6 +354,23 @@ func (h *uiHarness) get(t *testing.T, path string) string {
 	return string(body)
 }
 
+// poll is get for the polled fragments: renderFrag answers 204 No Content
+// when a fragment's bytes are unchanged, so the caller sees the status code
+// and body instead of get's 200-only contract.
+func (h *uiHarness) poll(t *testing.T, path string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(h.srv.URL + path)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read GET %s: %v", path, err)
+	}
+	return resp.StatusCode, string(body)
+}
+
 func (h *uiHarness) postForm(t *testing.T, path string, form url.Values) string {
 	t.Helper()
 	resp, err := http.PostForm(h.srv.URL+path, form)
@@ -604,6 +621,64 @@ func TestUIRunsViewFilters(t *testing.T) {
 	}
 }
 
+// TestUIWorkerProbeTooltips pins the probe badges' hover faces: the title
+// carries the probe's own detail plus the TTL-cached caveat, and differs on
+// whether the probe reached the provider — the roster's "will the next
+// round reach the API?" answer, readable without re-running a probe. The
+// fallback badge only exists when the config arms one, and carries the
+// fallback probe's own face.
+func TestUIWorkerProbeTooltips(t *testing.T) {
+	rec := func(t *testing.T, h *uiHarness, name, providerYAML string) {
+		t.Helper()
+		writeWorkerUIRecord(t, name, uiWorkerConfig(h.cfg.Temporal.Host, "listq")+providerYAML)
+		writeLivePidFile(t, name)
+	}
+
+	t.Run("a reached primary explains itself", func(t *testing.T) {
+		h := newUIHarness(t)
+		prov := providerServer(t, http.StatusOK, "{}")
+		rec(t, h, "w-ok", "provider:\n  type: anthropic\n  url: "+prov+"\n  key: k\n  model: m\n")
+		out := h.get(t, "/workers/rows")
+		if !strings.Contains(out, `title="last probe reached the primary provider (ok (http 200)); TTL-cached, may be stale"`) {
+			t.Errorf("rows lack the reached-primary tooltip:\n%s", out)
+		}
+		if !strings.Contains(out, ">primary ✓</span>") {
+			t.Errorf("rows lack the primary ✓ badge:\n%s", out)
+		}
+	})
+
+	t.Run("a failed primary warns of stall or failover", func(t *testing.T) {
+		h := newUIHarness(t)
+		prov := providerServer(t, http.StatusUnauthorized, "no")
+		rec(t, h, "w-bad", "provider:\n  type: anthropic\n  url: "+prov+"\n  key: k\n  model: m\n")
+		out := h.get(t, "/workers/rows")
+		if !strings.Contains(out, `title="last probe failed (401 auth rejected) — next rounds may stall or fail over to the fallback; TTL-cached, may be stale"`) {
+			t.Errorf("rows lack the failed-primary tooltip:\n%s", out)
+		}
+		if !strings.Contains(out, ">primary ✗</span>") {
+			t.Errorf("rows lack the primary ✗ badge:\n%s", out)
+		}
+	})
+
+	t.Run("an armed fallback carries its own face", func(t *testing.T) {
+		h := newUIHarness(t)
+		main := providerServer(t, http.StatusUnauthorized, "no")
+		fb := providerServer(t, http.StatusOK, "{}")
+		rec(t, h, "w-fb", "provider:\n  type: anthropic\n  url: "+main+"\n  key: k\n  model: m\n"+
+			"fallback:\n  enabled: true\n  url: "+fb+"\n  key: fk\n  model: fm\n")
+		out := h.get(t, "/workers/rows")
+		for _, want := range []string{
+			`title="last probe reached the fallback provider (ok (http 200)); TTL-cached, may be stale"`,
+			">fallback ✓</span>",
+			">primary ✗</span>",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("rows lack %q:\n%s", want, out)
+			}
+		}
+	})
+}
+
 // TestUIRunsFeedDownNotesTheWalk pins the degraded face: a failing
 // visibility walk renders the feed-down note (and empties the table)
 // without failing the request, and the workers view keeps its roster.
@@ -618,6 +693,164 @@ func TestUIRunsFeedDownNotesTheWalk(t *testing.T) {
 	}
 	if workers := h.get(t, "/workers/rows"); !strings.Contains(workers, "w1") {
 		t.Errorf("workers rows = %q, want the roster regardless of the walk", workers)
+	}
+}
+
+// TestUIPolledFragmentsAnswer204WhenUnchanged pins renderFrag through all
+// three polled endpoints: a fragment whose fresh bytes equal the last bytes
+// sent for that URI answers 204 No Content — htmx counts 204 a successful
+// poll but never swaps it, so stable content leaves the DOM (and a click
+// mid-poll) alone. Changed data re-sends, the cache keys on the full
+// request URI (the runs feed's filter state rides it), and the page shells
+// keep answering 200 whole on every poll.
+func TestUIPolledFragmentsAnswer204WhenUnchanged(t *testing.T) {
+	h := newUIHarness(t)
+	started := time.Now().Add(-2 * time.Hour)
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+		uiRow(t, "listq-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started, nil),
+	}
+	h.fake.wfHistory["listq-live"] = []*historypb.HistoryEvent{
+		uiStartedEvent(t, workflows.PipelineInput{IssueID: "42", RepoPath: "", Flow: "feature-dev"}),
+	}
+	h.fake.describes["listq-live"] = &workflowservice.DescribeWorkflowExecutionResponse{
+		WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+			Execution: &commonpb.WorkflowExecution{WorkflowId: "listq-live", RunId: "run-live"},
+			TaskQueue: "listq",
+			Status:    enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			StartTime: timestamppb.New(started),
+		},
+	}
+
+	// The workers fragment: first sight sends, the unchanged repeat does
+	// not.
+	if code, out := h.poll(t, "/workers/rows"); code != http.StatusOK || !strings.Contains(out, "No workers on record") {
+		t.Fatalf("first /workers/rows poll = %d, want 200 with the roster", code)
+	}
+	if code, out := h.poll(t, "/workers/rows"); code != http.StatusNoContent || out != "" {
+		t.Errorf("unchanged /workers/rows poll = %d, %q; want 204 with no body", code, out)
+	}
+
+	// The runs fragment: the dedupe holds until the feed's bytes change,
+	// then the fresh rows ride a 200 again.
+	if code, out := h.poll(t, "/runs/rows"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
+		t.Fatalf("first /runs/rows poll = %d, want 200 with the feed", code)
+	}
+	if code, _ := h.poll(t, "/runs/rows"); code != http.StatusNoContent {
+		t.Errorf("unchanged /runs/rows poll = %d, want 204", code)
+	}
+	h.fake.rows = append(h.fake.rows,
+		uiRow(t, "listq-two", "run-two", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusWaiting, started.Add(time.Hour), nil))
+	if code, out := h.poll(t, "/runs/rows"); code != http.StatusOK || !strings.Contains(out, "listq-two") {
+		t.Errorf("changed /runs/rows poll = %d, want 200 re-sending the new row", code)
+	}
+
+	// The key is the request URI: a filter's URI was never sent, so it
+	// answers 200 even though the unfiltered feed just deduped — and
+	// dedupes on its own repeat.
+	if code, out := h.poll(t, "/runs/rows?status=running"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
+		t.Errorf("first filtered poll = %d, want 200 (a new URI, not the unfiltered one)", code)
+	}
+	if code, _ := h.poll(t, "/runs/rows?status=running"); code != http.StatusNoContent {
+		t.Errorf("unchanged filtered poll = %d, want 204", code)
+	}
+
+	// The run-detail fragment dedupes the same way.
+	if code, out := h.poll(t, "/runs/listq-live/body"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
+		t.Fatalf("first /runs/listq-live/body poll = %d, want 200 with the detail", code)
+	}
+	if code, _ := h.poll(t, "/runs/listq-live/body"); code != http.StatusNoContent {
+		t.Errorf("unchanged detail poll = %d, want 204", code)
+	}
+
+	// Pages are not fragments: they render 200 whole on every request, so
+	// the shell's own markup never depends on poll history.
+	for i := 0; i < 2; i++ {
+		if code, out := h.poll(t, "/"); code != http.StatusOK || !strings.Contains(out, "Workers on this host") {
+			t.Errorf("page / poll %d = %d, want 200 with the shell every time", i+1, code)
+		}
+		if code, out := h.poll(t, "/runs"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
+			t.Errorf("page /runs poll %d = %d, want 200 with the shell every time", i+1, code)
+		}
+	}
+}
+
+// TestUIRunDetailErrorFaceHeals pins the polled error face's cache
+// membership: runBody routes a failed detail walk through renderFrag under
+// the poll's URI, so identical errors dedupe into 204 (the DOM already
+// holds the card) and a recovery re-sends 200 — the cached bytes are the
+// error, so the restored healthy render can never dedupe against them.
+// An uncached error render is exactly the regression this fails on: the
+// cache would keep holding the stale healthy bytes from step one, the
+// recovery poll would 204, and the error card would stay pinned in the
+// DOM. Steps 2-4 cross a dropClient and re-dial.
+func TestUIRunDetailErrorFaceHeals(t *testing.T) {
+	h := newUIHarness(t)
+	started := time.Now().Add(-time.Hour)
+	h.fake.wfHistory["listq-live"] = []*historypb.HistoryEvent{
+		uiStartedEvent(t, workflows.PipelineInput{IssueID: "42", RepoPath: "", Flow: "feature-dev"}),
+	}
+	describe := &workflowservice.DescribeWorkflowExecutionResponse{
+		WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+			Execution: &commonpb.WorkflowExecution{WorkflowId: "listq-live", RunId: "run-live"},
+			TaskQueue: "listq",
+			Status:    enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			StartTime: timestamppb.New(started),
+		},
+	}
+	h.fake.describes["listq-live"] = describe
+
+	// Healthy: the detail fragment sends.
+	if code, out := h.poll(t, "/runs/listq-live/body"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
+		t.Fatalf("healthy poll = %d, want 200 with the detail", code)
+	}
+
+	// The walk fails: the error face rides a 200 too — it must swap in.
+	delete(h.fake.describes, "listq-live")
+	if code, out := h.poll(t, "/runs/listq-live/body"); code != http.StatusOK || !strings.Contains(out, "workflow not found: listq-live") {
+		t.Fatalf("erroring poll = %d, want 200 with the describe diagnostic", code)
+	}
+	// The identical error dedupes — harmless, the DOM already holds it.
+	if code, out := h.poll(t, "/runs/listq-live/body"); code != http.StatusNoContent || out != "" {
+		t.Errorf("same-error poll = %d, %q; want 204 with no body", code, out)
+	}
+
+	// Recovery: the healthy bytes differ from the cached error, so the
+	// fragment re-sends — never 204 while the DOM holds the error face.
+	h.fake.describes["listq-live"] = describe
+	if code, out := h.poll(t, "/runs/listq-live/body"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
+		t.Fatalf("recovery poll = %d, want 200 re-sending the detail", code)
+	}
+	if code, _ := h.poll(t, "/runs/listq-live/body"); code != http.StatusNoContent {
+		t.Errorf("stable poll = %d, want 204", code)
+	}
+}
+
+// TestUIFragmentCacheCapDropsWholesale pins the fragment cache's bound:
+// past uiCacheCap entries the map drops wholesale, so a URI last seen
+// before the drop answers 200 again — a reset costs a re-send, never
+// staleness. Exercised at the renderFrag seam: filling the cap through the
+// server would re-walk the host once per poll to test a map reset.
+func TestUIFragmentCacheCapDropsWholesale(t *testing.T) {
+	s := newUIServer(config.Config{}, nil)
+	poll := func(uri string) int {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.renderFrag(w, httptest.NewRequest("GET", uri, nil), "frag_workers", uiSnapshot{})
+		return w.Code
+	}
+	if code := poll("/workers/rows?only"); code != http.StatusOK {
+		t.Fatalf("first poll = %d, want 200", code)
+	}
+	if code := poll("/workers/rows?only"); code != http.StatusNoContent {
+		t.Fatalf("unchanged poll = %d, want 204", code)
+	}
+	for i := 0; i < uiCacheCap; i++ {
+		if code := poll("/workers/rows?f=" + strconv.Itoa(i)); code != http.StatusOK {
+			t.Fatalf("fill poll %d = %d, want 200", i, code)
+		}
+	}
+	if code := poll("/workers/rows?only"); code != http.StatusOK {
+		t.Errorf("pre-drop URI answered %d past the cap, want a re-sending 200 (the drop is wholesale)", code)
 	}
 }
 
