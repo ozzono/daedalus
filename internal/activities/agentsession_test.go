@@ -939,9 +939,6 @@ exit 0`)
 func TestRunJailedReviewerActivityJailSpecRelay(t *testing.T) {
 	scrubBugFilingEnv(t)
 	fakeHome(t)
-	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
-exit 0`)
-	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-1"}'; exit 0`)
 
 	for _, tc := range []struct {
 		name        string
@@ -973,6 +970,9 @@ exit 0`)
 		t.Run(tc.name, func(t *testing.T) {
 			wt := t.TempDir()
 			log := newStubLog(t)
+			stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+			stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-1"}'; exit 0`)
 			if err := os.WriteFile(filepath.Join(wt, ".ai-jail"), []byte(tc.spec), 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -1014,9 +1014,6 @@ exit 0`)
 func TestRunJailedReviewerActivitySlimCriteria(t *testing.T) {
 	scrubBugFilingEnv(t)
 	fakeHome(t)
-	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M adder.go\n'; fi
-exit 0`)
-	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-1"}'; exit 0`)
 
 	for _, tc := range []struct {
 		name       string
@@ -1037,6 +1034,9 @@ exit 0`)
 		t.Run(tc.name, func(t *testing.T) {
 			wt := t.TempDir()
 			log := newStubLog(t)
+			stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M adder.go\n'; fi
+exit 0`)
+			stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-1"}'; exit 0`)
 
 			if _, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
 				WorktreePath:       wt,

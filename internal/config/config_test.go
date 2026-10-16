@@ -1,7 +1,11 @@
 package config
 
 import (
+	_ "embed"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +15,14 @@ import (
 	"testing"
 	"time"
 )
+
+// configSource is this package's own production source, embedded at
+// build: the AgentEnv scan anchors on it, immune to both the process
+// cwd and -trimpath (a runtime.Caller path is module-relative under
+// trimpath and a cwd-relative read breaks outside the package dir).
+//
+//go:embed config.go
+var configSource string
 
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
@@ -651,6 +663,71 @@ func TestProviderEnvVarsIncludesOpenAIAPIBase(t *testing.T) {
 	}
 }
 
+// TestRoundEnvVarsExcludesWorkerConsumedVars pins the sandbox-door
+// exclusion half of the round-env allow-list: the ProviderEnvVars subset
+// the worker consumes before the jail spawn (roundEnvWorkerSideVars — the
+// fallback section, the reviewer and verdict-repair endpoints, the metrics
+// trio, the bug/mirror paths; every one credential-carrying) and the
+// worker's own control exports never appear in RoundEnvVars, and the list
+// carries no duplicates. OPENCODE_CONFIG is the one WorkerEnvVars member
+// allowed through: the daemon scrub removes it, but the opencode bridge
+// stages it round-scoped and the jailed CLI reads it there.
+func TestRoundEnvVarsExcludesWorkerConsumedVars(t *testing.T) {
+	round := RoundEnvVars()
+	seen := make(map[string]bool, len(round))
+	for _, name := range round {
+		if seen[name] {
+			t.Errorf("RoundEnvVars() lists %q twice", name)
+		}
+		seen[name] = true
+	}
+	for name := range roundEnvWorkerSideVars {
+		if seen[name] {
+			t.Errorf("RoundEnvVars() carries %q; worker-consumed vars must stop at the spawn gate", name)
+		}
+	}
+	for _, name := range WorkerEnvVars() {
+		if name == "OPENCODE_CONFIG" {
+			continue
+		}
+		if seen[name] {
+			t.Errorf("RoundEnvVars() carries worker control knob %q", name)
+		}
+	}
+}
+
+// TestRoundEnvVarsCoversServedAndStagedVars pins the admission half: every
+// provider-derived var the jailed CLI serves from directly (ProviderEnvVars
+// minus roundEnvWorkerSideVars) is allow-listed, so a var added to a
+// provider section reaches the round env without a second edit, and the
+// named entries the round builder stages or a jailed tool cannot run
+// without are listed.
+func TestRoundEnvVarsCoversServedAndStagedVars(t *testing.T) {
+	round := RoundEnvVars()
+	for _, name := range ProviderEnvVars() {
+		if roundEnvWorkerSideVars[name] {
+			continue
+		}
+		if !slices.Contains(round, name) {
+			t.Errorf("RoundEnvVars() drops %q; a provider var the jail serves from must stay allow-listed", name)
+		}
+	}
+	for _, name := range []string{
+		"OPENCODE_CONFIG",                                       // opencode bridge staging
+		"MAX_THINKING_TOKENS",                                   // claude thinking pin
+		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",                         // claude output budget
+		"AIDER_MODEL", "AIDER_WEAK_MODEL", "AIDER_EDITOR_MODEL", // slim pins + operator exports
+		"AMP_API_KEY", "CODEX_HOME", "XDG_DATA_HOME", // named agents' in-jail exports
+		"PATH", "HOME", "TMPDIR", // exec, identity, scratch
+		"HTTPS_PROXY", "SSL_CERT_FILE", // egress trust shape
+		"GOPROXY", // a jailed `go test`'s module fetch
+	} {
+		if !slices.Contains(round, name) {
+			t.Errorf("RoundEnvVars() drops %q; the round builder or an in-jail tool needs it", name)
+		}
+	}
+}
+
 // TestLoadContextTokens pins the context_tokens knob end to end: a set
 // value loads through and exports as ContextTokensEnv (the var jailed
 // claude reads and the aider staging consumes), zero/unset exports
@@ -1072,8 +1149,15 @@ func TestExampleYAML(t *testing.T) {
 		cfg.Provider.HeartbeatModel != "" || cfg.Provider.TimeoutMS != DefaultAnthropicTimeoutMS ||
 		cfg.Provider.ContextTokens != 0 || cfg.Provider.MaxOutputTokens != 0 ||
 		cfg.Provider.TopP != 0 || cfg.Provider.Temperature != 0 || cfg.Provider.PresencePenalty != 0 ||
-		cfg.Provider.TopK != 0 || cfg.Provider.MinP != 0 || cfg.Provider.RepetitionPenalty != 0 {
+		cfg.Provider.TopK != 0 || cfg.Provider.MinP != 0 || cfg.Provider.RepetitionPenalty != 0 ||
+		cfg.Provider.DisableThinking {
 		t.Errorf("ExampleYAML provider section = %+v, want the typed-but-inert defaults", cfg.Provider)
+	}
+	// The reviewer section documents every field but ships inert: an
+	// example-file deployment shares the serving endpoint, model, and
+	// thinking default exactly as an unconfigured one would.
+	if cfg.Reviewer != (ReviewerConfig{}) {
+		t.Errorf("ExampleYAML reviewer section = %+v, want the documented-but-inert defaults", cfg.Reviewer)
 	}
 }
 
@@ -1583,6 +1667,192 @@ func TestProviderEnvVarsIncludesKnobExports(t *testing.T) {
 	}
 }
 
+// TestWorkerEnvVarsExactMembership pins WorkerEnvVars' exact membership,
+// both directions: a member dropped from the list stops being scrubbed
+// and the ambient value rides the jailed passthrough back into the test
+// pins, while a spurious addition is worse — it is dropped from the
+// detached daemon's inherited env at spawn forever (AllWorkerEnvVars →
+// envWithoutWorkerVars) although runWorker never re-exports it, silently
+// changing daemon behavior with every suite green. The list must equal
+// exactly these nine names (set equality + length); OPENCODE_CONFIG is
+// the one deliberate non-re-exported member (the opencode bridge stages
+// it round-scoped), DAEDALUS_WORKER_DAEMON the daemon marker carried on
+// the spawned daemon's env (worker.go's daemonEnv). An intentional
+// addition requires touching this pin, which is the point. The add
+// direction against runWorker's actual export set is guarded by
+// TestRunWorkerExportsAreScrubbed in cmd/daedalus.
+func TestWorkerEnvVarsExactMembership(t *testing.T) {
+	want := []string{
+		"DAEDALUS_WORKER_NAME",
+		"DAEDALUS_MAX_CONCURRENT_AGENT_RUNS",
+		"DAEDALUS_MAX_CONCURRENT_TESTS",
+		"DAEDALUS_SLIM",
+		"DAEDALUS_THINKING",
+		"DAEDALUS_STREAM",
+		"DAEDALUS_AGENT",
+		"OPENCODE_CONFIG",
+		"DAEDALUS_WORKER_DAEMON",
+	}
+	have := WorkerEnvVars()
+	if len(have) != len(want) {
+		t.Errorf("WorkerEnvVars() carries %d names, want exactly %d — a spurious member would be scrubbed from the daemon at spawn but never re-exported", len(have), len(want))
+	}
+	haveSet := map[string]bool{}
+	for _, name := range have {
+		haveSet[name] = true
+		if !slices.Contains(want, name) {
+			t.Errorf("WorkerEnvVars() lists %s, want only the pinned runWorker exports plus the OPENCODE_CONFIG carve-out", name)
+		}
+	}
+	for _, name := range want {
+		if !haveSet[name] {
+			t.Errorf("WorkerEnvVars() = %v, want %s listed", have, name)
+		}
+	}
+}
+
+// TestAgentEnvKeysAreProviderEnvVars closes the dynamic export loop
+// site by construction: runWorker's only variable-argument os.Setenv
+// applies exactly the AgentEnv pairs, so every key AgentEnv can emit
+// must be in ProviderEnvVars — a new add() family missing from the list
+// would ride the jailed os.Environ() passthrough into every jailed
+// suite on a serving worker while every suite stays green on dev hosts.
+// The scan is a total go/ast walk of the AgentEnv FuncDecl in this
+// package's source, not a text regex: a call wrapped across lines and
+// a comment mentioning add() cannot be misread, and the FuncDecl anchor
+// survives code motion above the function. The walk is total, not
+// filtered: every CallExpr callee must be on the explicit allowlist
+// (the add/addFloat key helpers and the strconv formatters they call),
+// any direct assignment to or append onto the env slice fails, and the
+// two helper closures are the only skipped subtrees — their internal
+// env appends are the sanctioned mechanism itself. A third helper, a
+// direct append, or a new call shape therefore breaks this test loudly
+// and forces an intentional pin update instead of riding silently. Key
+// sites are counted against wantSites exactly: a renamed closure, a
+// helper extraction, or any silent under-count fails.
+func TestAgentEnvKeysAreProviderEnvVars(t *testing.T) {
+	agentEnvConsts := map[string]string{
+		"ContextTokensEnv":      ContextTokensEnv,
+		"MaxOutputTokensEnv":    MaxOutputTokensEnv,
+		"TopPEnv":               TopPEnv,
+		"TemperatureEnv":        TemperatureEnv,
+		"PresencePenaltyEnv":    PresencePenaltyEnv,
+		"TopKEnv":               TopKEnv,
+		"MinPEnv":               MinPEnv,
+		"RepetitionPenaltyEnv":  RepetitionPenaltyEnv,
+		"ReviewerURLEnv":        ReviewerURLEnv,
+		"ReviewerKeyEnv":        ReviewerKeyEnv,
+		"VerdictRepairURLEnv":   VerdictRepairURLEnv,
+		"VerdictRepairModelEnv": VerdictRepairModelEnv,
+		"VerdictRepairKeyEnv":   VerdictRepairKeyEnv,
+	}
+	const (
+		wantSites  = 27
+		envVarName = "env"
+	)
+	// This scan and TestRunWorkerExportsAreScrubbed (cmd/daedalus) are
+	// deliberate twins — the same go/ast machinery twice rather than a
+	// shared internal package at this size; change both or fold later.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "config.go", configSource, 0)
+	if err != nil {
+		t.Fatalf("parse config.go: %v", err)
+	}
+	var agentEnv *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "AgentEnv" && fn.Recv != nil {
+			agentEnv = fn
+			break
+		}
+	}
+	if agentEnv == nil {
+		t.Fatal("AgentEnv not found in config.go — re-anchor the scan")
+	}
+	sites := 0
+	closures := map[string]bool{}
+	ast.Inspect(agentEnv.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range node.Lhs {
+				id, ok := lhs.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				if id.Name == envVarName {
+					t.Fatalf("AgentEnv: direct assignment to the %s slice — new families must go through the add/addFloat closures or update this pin", envVarName)
+				}
+				// the sanctioned helper closures: record and skip their
+				// bodies (their internal env appends are the mechanism
+				// itself, not additional export families)
+				if (id.Name == "add" || id.Name == "addFloat") && len(node.Lhs) == 1 && len(node.Rhs) == 1 {
+					if _, isLit := node.Rhs[0].(*ast.FuncLit); isLit {
+						closures[id.Name] = true
+						return false
+					}
+				}
+			}
+		case *ast.CallExpr:
+			switch fn := node.Fun.(type) {
+			case *ast.Ident:
+				if fn.Name == "append" && len(node.Args) > 0 {
+					if arg0, ok := node.Args[0].(*ast.Ident); ok && arg0.Name == envVarName {
+						t.Fatalf("AgentEnv: direct append onto the %s slice — new families must go through the add/addFloat closures or update this pin", envVarName)
+					}
+				}
+				if fn.Name != "add" && fn.Name != "addFloat" {
+					t.Fatalf("AgentEnv: call to %s — not on the scan's allowlist; extend the allowlist consciously if this is a new key family", fn.Name)
+				}
+			case *ast.SelectorExpr:
+				// method/package-func calls cannot put a key into the
+				// local env slice except through an assignment, and
+				// assignments to env are fatal above — no allowlist needed
+			default:
+				t.Fatalf("AgentEnv: unresolved call expression — extend the scan")
+			}
+			id, ok := node.Fun.(*ast.Ident)
+			if !ok || (id.Name != "add" && id.Name != "addFloat") {
+				return true
+			}
+			if len(node.Args) == 0 {
+				t.Fatalf("AgentEnv: %s call without arguments", id.Name)
+			}
+			sites++
+			switch arg := node.Args[0].(type) {
+			case *ast.BasicLit:
+				if arg.Kind != token.STRING {
+					t.Fatalf("AgentEnv: %s first argument is a %s literal, not a string — resolve by hand", id.Name, arg.Kind)
+				}
+				lit, err := strconv.Unquote(arg.Value)
+				if err != nil {
+					t.Fatalf("AgentEnv: string literal %s does not unquote: %v", arg.Value, err)
+				}
+				if !slices.Contains(ProviderEnvVars(), lit) {
+					t.Errorf("AgentEnv adds %s, want it listed in ProviderEnvVars() so runWorker's export loop stays inside the scrub set", lit)
+				}
+			case *ast.Ident:
+				resolved, ok := agentEnvConsts[arg.Name]
+				if !ok {
+					t.Fatalf("AgentEnv adds %s — an env constant the scan does not resolve; extend agentEnvConsts (and ProviderEnvVars, if new)", arg.Name)
+				}
+				if !slices.Contains(ProviderEnvVars(), resolved) {
+					t.Errorf("AgentEnv adds %s, want it listed in ProviderEnvVars() so runWorker's export loop stays inside the scrub set", resolved)
+				}
+			default:
+				t.Fatalf("AgentEnv: %s first argument is an expression the scan does not resolve — extend the scan or the scrub list", id.Name)
+			}
+		}
+		return true
+	})
+	for _, name := range []string{"add", "addFloat"} {
+		if !closures[name] {
+			t.Errorf("AgentEnv carries no %s closure definition — the scan's sanctioned mechanism changed; re-anchor the pin", name)
+		}
+	}
+	if sites != wantSites {
+		t.Errorf("AgentEnv carries %d add/addFloat key sites, want exactly %d — a silent under-count must fail; adjust wantSites consciously when the family list changes", sites, wantSites)
+	}
+}
+
 // TestBugFilingDir pins the effective-dir resolution: off (the section
 // absent, or enabled: false) returns "" — the off signal the env export
 // and the prompt render sites key on; enabled without a dir keeps the
@@ -2084,10 +2354,72 @@ func TestAgentEnvReviewerEndpoint(t *testing.T) {
 // exports, or a stale inherited value would arm (or mis-arm) the reviewer
 // override next to the config it is supposed to mirror.
 func TestProviderEnvVarsIncludesReviewerEnvs(t *testing.T) {
-	for _, name := range []string{ReviewerURLEnv, ReviewerKeyEnv} {
+	for _, name := range []string{ReviewerURLEnv, ReviewerKeyEnv, ReviewerModelEnv} {
 		if !slices.Contains(ProviderEnvVars(), name) {
 			t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), name)
 		}
+	}
+}
+
+// TestProviderEnvVarsIncludesThinkingEnvs pins the wire-level thinking
+// channel's three names in the scrub/restore list: the two per-role worker
+// exports (DAEDALUS_OPENAI_THINKING / DAEDALUS_REVIEWER_THINKING, from the
+// openai and reviewer sections' disable_thinking) must be cleared from a
+// daemon's inherited env or a stale export would arm a config that says
+// nothing, and the round-env var (DAEDALUS_WIRE_THINKING) rides the same
+// list for the jailed passthrough.
+func TestProviderEnvVarsIncludesThinkingEnvs(t *testing.T) {
+	for _, name := range []string{OpenAIThinkingEnv, ReviewerThinkingEnv, WireThinkingEnv} {
+		if !slices.Contains(ProviderEnvVars(), name) {
+			t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), name)
+		}
+	}
+}
+
+// TestLoadReviewerModelAndThinking pins the reviewer section's model and
+// disable_thinking fields plus the openai wire's disable_thinking knob:
+// the values load into the struct, absent keys stay at their zero values
+// (no signal anywhere), the provider section's knob projects onto the
+// openai channel exactly like its sampler knobs (so a provider-typed
+// section's setting governs the openai side), and an anthropic-typed
+// provider carrying it is a load error — a chat-completions request param
+// has no anthropic-wire consumer.
+func TestLoadReviewerModelAndThinking(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "reviewer:\n  url: https://review.example\n  model: qwen3-review\n  disable_thinking: true\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Reviewer.Model != "qwen3-review" || !cfg.Reviewer.DisableThinking {
+		t.Errorf("Reviewer = %+v, want model qwen3-review with disable_thinking set", cfg.Reviewer)
+	}
+
+	if cfg, err = Load(writeConfig(t, "")); err != nil || (cfg.Reviewer != ReviewerConfig{}) {
+		t.Errorf("absent reviewer section = %+v (err %v), want the zero value", cfg.Reviewer, err)
+	}
+
+	cfg, err = Load(writeConfig(t, "openai:\n  disable_thinking: true\n"))
+	if err != nil {
+		t.Fatalf("Load(openai.disable_thinking): %v", err)
+	}
+	if !cfg.OpenAI.DisableThinking {
+		t.Errorf("OpenAI = %+v, want disable_thinking set", cfg.OpenAI)
+	}
+
+	cfg, err = Load(writeConfig(t, "provider:\n  type: openai\n  url: https://selfhost.example/v1\n  key: sk\n  disable_thinking: true\n"))
+	if err != nil {
+		t.Fatalf("Load(provider.disable_thinking): %v", err)
+	}
+	if !cfg.Provider.DisableThinking {
+		t.Errorf("Provider = %+v, want disable_thinking set", cfg.Provider)
+	}
+	if _, open := cfg.ProviderChannels(); !open.DisableThinking {
+		t.Errorf("ProviderChannels() openai channel = %+v, want the provider section's disable_thinking projected", open)
+	}
+
+	if _, err = Load(writeConfig(t, "provider:\n  type: anthropic\n  url: https://selfhost.example\n  key: sk\n  disable_thinking: true\n")); err == nil ||
+		!strings.Contains(err.Error(), "provider") ||
+		!strings.Contains(err.Error(), "disable_thinking") {
+		t.Errorf("Load(anthropic-typed provider with disable_thinking) err = %v, want a provider.disable_thinking rejection", err)
 	}
 }
 

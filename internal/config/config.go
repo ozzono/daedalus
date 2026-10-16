@@ -172,14 +172,29 @@ const (
 	// suite on a foreign deployment's worker, and each deployment
 	// mirrors onto its own host.
 	TestOutputMirrorEnv = "DAEDALUS_TEST_OUTPUT_MIRROR"
-	// ReviewerURLEnv and ReviewerKeyEnv carry the reviewer section's
-	// endpoint (reviewer.url / reviewer.key) into the jailed-round
-	// builder, which pins reviewer rounds' provider endpoint to them while
-	// implementing and test rounds keep the serving provider's. Exported
-	// only when set — absent means reviewers share the implementing
-	// agent's endpoint exactly as before.
-	ReviewerURLEnv = "DAEDALUS_REVIEWER_BASE_URL"
-	ReviewerKeyEnv = "DAEDALUS_REVIEWER_API_KEY"
+	// ReviewerURLEnv, ReviewerKeyEnv, and ReviewerModelEnv carry the
+	// reviewer section's endpoint (reviewer.url / reviewer.key /
+	// reviewer.model) into the jailed-round builder, which pins reviewer
+	// rounds' provider endpoint and model to them while implementing and
+	// test rounds keep the serving provider's. Exported only when set —
+	// absent means reviewers share the implementing agent's endpoint and
+	// model exactly as before.
+	ReviewerURLEnv   = "DAEDALUS_REVIEWER_BASE_URL"
+	ReviewerKeyEnv   = "DAEDALUS_REVIEWER_API_KEY"
+	ReviewerModelEnv = "DAEDALUS_REVIEWER_MODEL"
+	// OpenAIThinkingEnv and ReviewerThinkingEnv carry the openai and
+	// reviewer sections' disable_thinking knobs to the jailed-round
+	// builder, which resolves them per role into WireThinkingEnv — the
+	// round-env var the provider stagings read (pi's staged samplingParams,
+	// aider's extra_body) to stage the disable-thinking encoding onto the
+	// wire request. Exported only when set ("off"; an explicit
+	// disable_thinking: true) — absent means that role's rounds send no
+	// thinking signal and the backend's own default stands. All three are
+	// scrubbed from the daemon spawn (ProviderEnvVars) like every other
+	// provider-derived value.
+	OpenAIThinkingEnv   = "DAEDALUS_OPENAI_THINKING"
+	ReviewerThinkingEnv = "DAEDALUS_REVIEWER_THINKING"
+	WireThinkingEnv     = "DAEDALUS_WIRE_THINKING"
 	// ToolRelayURLEnv carries the staged base URL of the worker's slim
 	// tool-call relay (internal/toolrelay) — the relay's loopback address
 	// plus the openai upstream's path prefix, so pi's request paths land
@@ -317,15 +332,31 @@ type FallbackConfig struct {
 
 // ReviewerConfig optionally points the reviewer rounds (code reviewer in
 // the dev loop, test reviewer, docs reviewer) at their own provider
-// endpoint, independently of the implementing agent's anthropic/openai
-// sections. Setting url and/or key overrides just those values for
-// reviewer rounds; absent (the default) means reviewers authenticate
-// exactly like every other round. Values travel the env-only channel
-// (ReviewerURLEnv / ReviewerKeyEnv — never workflow history, activity
-// inputs, or argv); see activities.reviewerEnv for the override rules.
+// endpoint and model, independently of the implementing agent's
+// anthropic/openai sections. Setting url and/or key overrides just those
+// values for reviewer rounds; model overrides the model id alone — legal
+// with the section's other fields unset (same endpoint, different brain).
+// Absent values (the default) mean reviewers authenticate and request the
+// serving section's model exactly like every other round. Values travel
+// the env-only channel (ReviewerURLEnv / ReviewerKeyEnv /
+// ReviewerModelEnv — never workflow history, activity inputs, or argv);
+// see activities.reviewerEnv for the override rules.
 type ReviewerConfig struct {
 	URL string `yaml:"url"`
 	Key string `yaml:"key"`
+	// Model, when set, is the model id reviewer rounds request from the
+	// reviewer endpoint — or from the serving endpoint when url is unset —
+	// while implementing and test rounds keep the serving section's model.
+	// It overrides both wire families' model vars, so every staging path
+	// (claude's env, aider's --model, the pi/codex/opencode staged model
+	// entries) picks it up from the round env.
+	Model string `yaml:"model"`
+	// DisableThinking, when true, stages the disable-thinking encoding onto
+	// reviewer rounds' wire requests (see OpenAIConfig.DisableThinking).
+	// It keys on the reviewer section alone — reviewer rounds send nothing
+	// when it is unset, even if the serving section toggles — each role
+	// controls its own brain.
+	DisableThinking bool `yaml:"disable_thinking"`
 }
 
 // VerdictRepairConfig points the decision-model repair pass at its
@@ -428,6 +459,20 @@ type OpenAIConfig struct {
 	// output-loop bug the constants fixed — so it joins the decided list
 	// as a fifth knob rather than being silently omitted.
 	RepetitionPenalty float64 `yaml:"repetition_penalty"`
+	// DisableThinking, when true, stages the disable-thinking encoding onto
+	// this section's rounds' wire requests — chat_template_kwargs
+	// {"enable_thinking": false}, the Qwen3-template convention, the
+	// toggle's target brain family. It rides the same channel as the
+	// sampler knobs (OpenAIThinkingEnv, consumed by the pi and aider
+	// stagings; agents without a wire staging ignore it), and only true
+	// ever sends a signal: false and unset both leave the backend's own
+	// thinking default standing (never-send-a-default).
+	// ponytail: the encoding is probe-owed — the serving endpoint is
+	// unreachable from the round sandbox, and omlx-class backends silently
+	// drop unknown fields, so a backend that cannot honor the key behaves
+	// exactly as before; a probe pinning a different shape edits the one
+	// staging spot per consuming agent.
+	DisableThinking bool `yaml:"disable_thinking"`
 }
 
 // configured reports whether the section carries any operator-set value —
@@ -533,6 +578,13 @@ type ProviderConfig struct {
 	TopK              float64 `yaml:"top_k"`
 	MinP              float64 `yaml:"min_p"`
 	RepetitionPenalty float64 `yaml:"repetition_penalty"`
+	// DisableThinking is OpenAIConfig.DisableThinking's provider-section
+	// counterpart: same encoding, same env channel and staging consumers
+	// (OpenAIThinkingEnv, the pi and aider stagings), same
+	// never-send-a-default discipline — only true sends a signal. An
+	// openai-wire property like the sampler knobs above, so an
+	// anthropic-typed provider carrying it is a load error.
+	DisableThinking bool `yaml:"disable_thinking"`
 }
 
 // anthropicChannel projects the section onto the ANTHROPIC_* channel —
@@ -565,6 +617,7 @@ func (p ProviderConfig) openaiChannel() OpenAIConfig {
 		TopK:              p.TopK,
 		MinP:              p.MinP,
 		RepetitionPenalty: p.RepetitionPenalty,
+		DisableThinking:   p.DisableThinking,
 	}
 }
 
@@ -619,6 +672,9 @@ func (p ProviderConfig) validate() error {
 		(p.TopP != 0 || p.Temperature != 0 || p.PresencePenalty != 0 ||
 			p.TopK != 0 || p.MinP != 0 || p.RepetitionPenalty != 0) {
 		return fmt.Errorf("sampler knobs apply only to the openai wire (chat-completions request params; no anthropic-wire staging consumes them) — remove them from an anthropic-typed provider")
+	}
+	if p.Type == FallbackTypeAnthropic && p.DisableThinking {
+		return fmt.Errorf("disable_thinking applies only to the openai wire (a chat-completions request param; no anthropic-wire staging consumes it) — remove it from an anthropic-typed provider")
 	}
 	return nil
 }
@@ -1443,12 +1499,13 @@ func (c Config) AgentEnv() []string {
 }
 
 // ProviderEnvVars lists every environment variable daedalus derives from
-// the config's provider sections — the single source of truth for what a
-// spawned worker daemon must NOT inherit from the invoking shell. worker
-// start scrubs these from the daemon's inherited environment so the
-// recorded config file is the only way provider values reach the daemon:
-// a stale export in the operator's terminal can never win over a rotated
-// config. Foreground runs keep the inherit semantics (see AgentEnv).
+// the config's provider sections — the provider-derived half of the
+// union in AllWorkerEnvVars, which is the actual spawn-scrub source
+// (envWithoutWorkerVars in cmd/daedalus scrubs it at daemon spawn), so
+// the recorded config file is the only way provider values reach the
+// daemon: a stale export in the operator's terminal can never win over
+// a rotated config. Foreground runs keep the inherit semantics (see
+// AgentEnv).
 func ProviderEnvVars() []string {
 	return []string{
 		"ANTHROPIC_BASE_URL",
@@ -1475,6 +1532,10 @@ func ProviderEnvVars() []string {
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
 		ReviewerURLEnv,
 		ReviewerKeyEnv,
+		ReviewerModelEnv,
+		OpenAIThinkingEnv,
+		ReviewerThinkingEnv,
+		WireThinkingEnv,
 		VerdictRepairURLEnv,
 		VerdictRepairModelEnv,
 		VerdictRepairKeyEnv,
@@ -1486,6 +1547,116 @@ func ProviderEnvVars() []string {
 		BugMirrorEnv,
 		TestOutputMirrorEnv,
 	}
+}
+
+// WorkerEnvVars lists the worker-ecosystem variables that must never
+// inherit ambiently, beyond the config-derived set in ProviderEnvVars:
+// the worker name, its concurrency clamps, the mode/agent switches its
+// jailed rounds inherit through the os.Environ() passthrough, and the
+// daemon marker (worker.go's daemonEnv, carried on the spawned daemon's
+// env — never a shell's). runWorker re-exports every member from the
+// recorded config EXCEPT OPENCODE_CONFIG: the opencode bridge stages it
+// round-scoped into the round env, runWorker never sets it, and an
+// operator's own export would ride the same passthrough into the pins
+// that read the var back off the ai-jail call — so it scrubs with the
+// rest and must never return ambient.
+func WorkerEnvVars() []string {
+	return []string{
+		"DAEDALUS_WORKER_NAME",
+		"DAEDALUS_MAX_CONCURRENT_AGENT_RUNS",
+		"DAEDALUS_MAX_CONCURRENT_TESTS",
+		"DAEDALUS_SLIM",
+		"DAEDALUS_THINKING",
+		"DAEDALUS_STREAM",
+		"DAEDALUS_AGENT",
+		"OPENCODE_CONFIG",
+		"DAEDALUS_WORKER_DAEMON",
+	}
+}
+
+// AllWorkerEnvVars is the full scrub set: ProviderEnvVars plus the
+// worker's own exports. The single composition point — the daemon-spawn
+// scrub (envWithoutWorkerVars in cmd/daedalus: the primary production
+// consumer) and the test suites' TestMain scrubs and the export
+// reconciliation scan consume this, never the two lists separately —
+// so a future third list or a per-site filter cannot leave one package
+// non-hermetic while the others stay clean.
+func AllWorkerEnvVars() []string {
+	return append(ProviderEnvVars(), WorkerEnvVars()...)
+}
+
+// roundEnvWorkerSideVars is the ProviderEnvVars subset the worker process
+// consumes before the jail spawn, so it never needs to reach the round
+// env (RoundEnvVars): the fallback section (provider_failover.go reads it
+// to build failover envs and bench dry providers), the reviewer and
+// verdict-repair endpoints (reviewerEnv and the repair pass read them
+// worker-side; both carry credentials), the metrics-staging inputs
+// (metricsRelayEnv reads them pre-spawn and stages their output onto the
+// provider vars themselves), and the bug/mirror host paths (the prompt
+// render and the post-round mirror copies consume them worker-side). A
+// ProviderEnvVars member not listed here serves the jailed CLI directly
+// and reaches the round env by default.
+var roundEnvWorkerSideVars = map[string]bool{
+	"DAEDALUS_FALLBACK_TYPE":            true,
+	"DAEDALUS_FALLBACK_BASE_URL":        true,
+	"DAEDALUS_FALLBACK_API_KEY":         true,
+	"DAEDALUS_FALLBACK_MODEL":           true,
+	"DAEDALUS_FALLBACK_HEARTBEAT_MODEL": true,
+	ReviewerURLEnv:                      true,
+	ReviewerKeyEnv:                      true,
+	VerdictRepairURLEnv:                 true,
+	VerdictRepairModelEnv:               true,
+	VerdictRepairKeyEnv:                 true,
+	MetricsRelayAnthropicEnv:            true,
+	MetricsRelayOpenAIEnv:               true,
+	MetricsRelayTokenEnv:                true,
+	BugDirEnv:                           true,
+	BugMirrorEnv:                        true,
+	TestOutputMirrorEnv:                 true,
+}
+
+// RoundEnvVars is the jailed round env's allow-list: the only variables
+// the sandbox may receive (roundEnvAllowlist in internal/activities
+// strips everything else from the assembled round env right before the
+// ai-jail spawn, so no other family's key, worker control knob, or
+// ambient value rides in). Beyond the provider-derived set —
+// ProviderEnvVars minus roundEnvWorkerSideVars — it carries the names the
+// round builder itself stages (OPENCODE_CONFIG; claude's
+// MAX_THINKING_TOKENS and CLAUDE_CODE_MAX_OUTPUT_TOKENS; the slim aider
+// pins), the operator exports named agents consume in-jail (AIDER_MODEL,
+// and AMP_API_KEY / CODEX_HOME / XDG_DATA_HOME, which the builder's
+// --env passthrough copies from this same round env), and the ambient
+// base every round needs: shell identity and locale, the proxy and TLS
+// trust shape, and the go module-fetch knobs a jailed `go test` inherits.
+// The base is the whole vouch list — an agent knob it does not name (the
+// wider AIDER_*/CLAUDE_CODE_* families, NODE_EXTRA_CA_CERTS, …) stops at
+// the sandbox door and joins this list only as a conscious addition.
+// ponytail: the base's sufficiency on a deployment is proven only by
+// rounds running there; a missing entry surfaces as a round-level tool
+// failure, never silently.
+func RoundEnvVars() []string {
+	vars := make([]string, 0, len(ProviderEnvVars())+33)
+	for _, name := range ProviderEnvVars() {
+		if !roundEnvWorkerSideVars[name] {
+			vars = append(vars, name)
+		}
+	}
+	return append(vars,
+		"OPENCODE_CONFIG",
+		"MAX_THINKING_TOKENS",
+		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+		"AIDER_MODEL",
+		"AIDER_WEAK_MODEL",
+		"AIDER_EDITOR_MODEL",
+		"AMP_API_KEY",
+		"CODEX_HOME",
+		"XDG_DATA_HOME",
+		"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "no_proxy",
+		"SSL_CERT_FILE", "SSL_CERT_DIR",
+		"GOPROXY", "GONOPROXY", "GOPRIVATE", "GOINSECURE", "GOSUMDB", "GOFLAGS", "GOTOOLCHAIN",
+	)
 }
 
 // Load reads the YAML configuration at path and applies defaults for every

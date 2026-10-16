@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/version"
 )
 
@@ -31,6 +32,14 @@ const reexecEnv = "DAEDALUS_TEST_REEXEC_ARGS"
 // the arguments it was actually given; the child's stdout is redirected into
 // the daemon log, which is where the test reads the line back.
 const reexecDumpArgsEnv = "DAEDALUS_TEST_DUMP_OSARGS"
+
+// reexecDumpEnvVarsEnv makes the test binary print the named environment
+// variables (unit-separated names, each as a NAME=value line) and exit,
+// instead of running anything. Tests set it when a spawned daemon must
+// report the environment it actually inherited; the child's stdout is
+// redirected into the daemon log, which is where the test reads the lines
+// back.
+const reexecDumpEnvVarsEnv = "DAEDALUS_TEST_DUMP_ENV_VARS"
 
 // reexecSweepSleepEnv turns a re-exec'd test binary into a stand-in worker:
 // it writes the env value's path as a ready marker and sleeps until
@@ -55,6 +64,12 @@ func TestMain(m *testing.M) {
 		fmt.Println(strings.Join(os.Args[1:], "\x1f"))
 		os.Exit(0)
 	}
+	if names := os.Getenv(reexecDumpEnvVarsEnv); names != "" {
+		for _, name := range strings.Split(names, "\x1f") {
+			fmt.Printf("%s=%s\n", name, os.Getenv(name))
+		}
+		os.Exit(0)
+	}
 	if args := os.Getenv(reexecEnv); args != "" {
 		os.Args = append([]string{"daedalus"}, strings.Split(args, "\x1f")...)
 		main()
@@ -63,6 +78,19 @@ func TestMain(m *testing.M) {
 		// by a test's child. A child returning from main() would surface as
 		// an exit-0 mismatch in that test, not a silently passing one.
 		os.Exit(0)
+	}
+	// Scrub the ambient worker environment before the suite runs: a
+	// metrics-enabled worker serving a jailed `go test` exports its relay
+	// roots, registration token, and DAEDALUS_WORKER_NAME into its own
+	// process env, and every var on config.AllWorkerEnvVars (the
+	// config-derived provider set plus the worker's own exports) rides
+	// the same shell when the config carries one — the metrics staging
+	// would rewrite pinned endpoints and an ambient token would defeat
+	// the "unset after a refused registration" assertions. The scrub
+	// sits after the re-exec branches so re-exec'd children (runMainIn,
+	// the argv dumps) keep the env their parent handed them.
+	for _, name := range config.AllWorkerEnvVars() {
+		os.Unsetenv(name)
 	}
 	os.Exit(m.Run())
 }
@@ -620,5 +648,94 @@ func TestVersionHelpMatchesDispatch(t *testing.T) {
 	}
 	if want := "print the CLI version"; !strings.Contains(commandHelp["version"], want) {
 		t.Errorf("version help %q should describe the one-token contract (%q)", commandHelp["version"], want)
+	}
+}
+
+// TestSpawnDaemonScrubsWorkerEnv pins the daemon-spawn contract at the one
+// helper both spawn sites share: the child re-executes this binary in its
+// own session on an environment scrubbed of every config.AllWorkerEnvVars
+// member — a stale provider export or a leftover bridge config in the
+// invoking shell must never win over the recorded config — with the daemon
+// marker re-appended and every non-worker var untouched, stdout captured
+// into the daemon log, and the recorded pid matching the returned one.
+func TestSpawnDaemonScrubsWorkerEnv(t *testing.T) {
+	// daemonDir is global; point it at a throwaway dir rather than the
+	// real task-log dir (spawnDaemon mkdirs it and prunes old logs there).
+	reset := daemonDir
+	daemonDir = t.TempDir()
+	t.Cleanup(func() { daemonDir = reset })
+
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "spawn.pid")
+	logFile := filepath.Join(dir, "spawn.log")
+
+	t.Setenv("DAEDALUS_WORKER_NAME", "spawn-fixture")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-stale")
+	t.Setenv("OPENCODE_CONFIG", "/leftover/project.yaml")
+	t.Setenv("DAEDALUS_TEST_SPAWN_KEEPVAR", "kept")
+	t.Setenv(reexecDumpEnvVarsEnv, strings.Join([]string{
+		"DAEDALUS_WORKER_DAEMON",
+		"DAEDALUS_WORKER_NAME",
+		"ANTHROPIC_API_KEY",
+		"OPENCODE_CONFIG",
+		"DAEDALUS_TEST_SPAWN_KEEPVAR",
+	}, "\x1f"))
+
+	pid, err := spawnDaemon(pidFile, logFile)
+	if err != nil {
+		t.Fatalf("spawnDaemon: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+
+	// The daemon is detached; its stdout lands in the log file, so the
+	// dump's arrival is the liveness and log-capture proof in one.
+	want := map[string]string{
+		"DAEDALUS_WORKER_DAEMON":      "1",    // re-appended after the scrub
+		"DAEDALUS_WORKER_NAME":        "",     // worker export → scrubbed
+		"ANTHROPIC_API_KEY":           "",     // stale provider export → scrubbed
+		"OPENCODE_CONFIG":             "",     // leftover bridge config → scrubbed
+		"DAEDALUS_TEST_SPAWN_KEEPVAR": "kept", // the scrub is surgical, not a wipe
+	}
+	var last string
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if data, err := os.ReadFile(logFile); err == nil {
+			last = string(data)
+			for _, line := range strings.Split(strings.TrimRight(last, "\n"), "\n") {
+				name, value, ok := strings.Cut(line, "=")
+				if !ok {
+					continue
+				}
+				wantValue, probed := want[name]
+				if !probed {
+					continue
+				}
+				// Report a mismatched var once: deleting on the first
+				// sighting keeps the poll loop from re-erroring the same
+				// line every tick until the deadline.
+				delete(want, name)
+				if value != wantValue {
+					t.Errorf("daemon env %s = %q, want %q", name, value, wantValue)
+				}
+			}
+			if len(want) == 0 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			for name := range want {
+				t.Errorf("daemon env dump never reported %s (log tail %q)", name, last)
+			}
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	recorded, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read pid file: %v", err)
+	}
+	if got, err := strconv.Atoi(strings.TrimSpace(string(recorded))); err != nil || got != pid {
+		t.Errorf("pid file = %q, want %d", recorded, pid)
 	}
 }

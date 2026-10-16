@@ -31,9 +31,10 @@ import (
 )
 
 // metricsRelayEnv stages a round's provider environment onto the metrics
-// relay. Called from runJailedRoundFolders right after reviewerEnv,
-// before any provider staging reads the env; a no-op when the relay vars
-// are absent (metrics disabled, or an override removed them upstream).
+// relay. Called from runJailedRoundFolders right after reviewerEnv and
+// wireThinkingEnv, before any provider staging reads the env; a no-op
+// when the relay vars are absent (metrics disabled, or an override
+// removed them upstream).
 func metricsRelayEnv(ctx context.Context, env []string, role SessionRole) []string {
 	// One relay root serves both wires; either var's presence means the
 	// worker staged metrics on.

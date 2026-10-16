@@ -204,36 +204,46 @@ func fallbackEnv() []string {
 	return env
 }
 
-// reviewerEnv pins a reviewer round's endpoint to the config's reviewer
-// section (ReviewerURLEnv / ReviewerKeyEnv, exported by runWorker when
-// reviewer.url/key are set): reviewers dial their own url/key while dev
-// and test rounds keep the serving provider's. Applied to the round's
-// assembled environment — primary or fallback side alike — in
-// runJailedRound, the one invoker every jailed round goes through. Both
-// wire families are overridden so the section serves regardless of which
-// provider is up; model vars travel untouched, so a reviewer endpoint must
-// serve the already-configured model names. Both vars absent (the default)
-// leaves the environment untouched — reviewers share the implementing
-// agent's endpoint exactly as before.
+// reviewerEnv pins a reviewer round's endpoint and model to the config's
+// reviewer section (ReviewerURLEnv / ReviewerKeyEnv / ReviewerModelEnv,
+// exported by runWorker when reviewer.url/key/model are set): reviewers
+// dial their own url/key and request their own model while dev and test
+// rounds keep the serving provider's. Applied to the round's assembled
+// environment — primary or fallback side alike — in runJailedRound, the
+// one invoker every jailed round goes through. Both wire families are
+// overridden so the section serves regardless of which provider is up;
+// the model override covers both families' model vars, so every staging
+// path (claude's env, aider's --model, the pi/codex/opencode staged model
+// entries) picks the reviewer model up from the round env. Model is
+// independently settable — a model-only section retargets just the model
+// id (same endpoint, different brain), so the endpoint relays stay staged
+// in that shape: their upstreams are the primary's, which is exactly the
+// endpoint a model-only round still dials. All three vars absent (the
+// default) leaves the environment untouched — reviewers share the
+// implementing agent's endpoint and model exactly as before.
 func reviewerEnv(env []string, role SessionRole) []string {
 	if role != RoleDevReview && role != RoleTestReview {
 		return env
 	}
 	url := os.Getenv(config.ReviewerURLEnv)
 	key := os.Getenv(config.ReviewerKeyEnv)
-	if url == "" && key == "" {
+	model := os.Getenv(config.ReviewerModelEnv)
+	if url == "" && key == "" && model == "" {
 		return env
 	}
-	// The relay vars lose to any reviewer override (see fallbackEnv) — the
-	// key-only form included. The relays' upstreams are the primary's: a
-	// reviewer.key-only round left on the metrics relay would have its key
+	// The relay vars lose to any endpoint or key override (see fallbackEnv)
+	// — the key-only form included. The relays' upstreams are the primary's:
+	// a reviewer.key-only round left on the metrics relay would have its key
 	// swapped for the synthetic attribution key and the primary's key
 	// restored in its place (billed to the primary), and left on the slim
 	// tool relay it would forward the reviewer key to the primary-pinned
-	// openai upstream. Strip whenever the section is set at all.
-	env = removeEnvVar(env, config.ToolRelayURLEnv)
-	env = removeEnvVar(env, config.MetricsRelayAnthropicEnv)
-	env = removeEnvVar(env, config.MetricsRelayOpenAIEnv)
+	// openai upstream. Strip whenever url or key is set; a model-only
+	// section keeps them (see above).
+	if url != "" || key != "" {
+		env = removeEnvVar(env, config.ToolRelayURLEnv)
+		env = removeEnvVar(env, config.MetricsRelayAnthropicEnv)
+		env = removeEnvVar(env, config.MetricsRelayOpenAIEnv)
+	}
 	if url != "" {
 		env = setEnvVar(env, "ANTHROPIC_BASE_URL", url)
 		// OPENAI_API_BASE rides the same value as OPENAI_BASE_URL, per
@@ -245,7 +255,33 @@ func reviewerEnv(env []string, role SessionRole) []string {
 		env = setEnvVar(env, "ANTHROPIC_API_KEY", key)
 		env = setEnvVar(env, "OPENAI_API_KEY", key)
 	}
+	if model != "" {
+		env = setEnvVar(env, "ANTHROPIC_MODEL", model)
+		env = setEnvVar(env, "OPENAI_MODEL", model)
+	}
 	return env
+}
+
+// wireThinkingEnv resolves the round's wire-level thinking knob into the
+// round env (WireThinkingEnv) — the one channel the provider stagings read
+// for it, since their signatures take the env alone. Reviewer rounds key
+// on the reviewer section's disable_thinking alone and every other role on
+// the openai section's: each role controls its own brain, and an unset
+// knob sends nothing even when the other section toggles
+// (never-send-a-default). The exports carry only the off value
+// ("off"; runWorker's disable_thinking export), matched strictly like
+// DAEDALUS_THINKING — an ambient garbage value is never read as an off.
+// Set-or-removed every round, so a stale foreground export can never
+// leak into a round whose config says nothing.
+func wireThinkingEnv(env []string, role SessionRole) []string {
+	name := config.OpenAIThinkingEnv
+	if role == RoleDevReview || role == RoleTestReview {
+		name = config.ReviewerThinkingEnv
+	}
+	if os.Getenv(name) == "off" {
+		return setEnvVar(env, config.WireThinkingEnv, "off")
+	}
+	return removeEnvVar(env, config.WireThinkingEnv)
 }
 
 // lookupEnv returns the value of name in env, "" when absent.
@@ -283,6 +319,27 @@ func slimAiderEnv(env []string) []string {
 		env = setEnvVar(env, "AIDER_EDITOR_MODEL", model)
 	}
 	return env
+}
+
+// roundEnvAllowlist filters an assembled round environment down to
+// config.RoundEnvVars — the spawn gate in runJailedRoundFolders, run
+// after every staging step has read its inputs from the inherited
+// environment. Unlisted entries stop at the sandbox door: the jailed CLI
+// sees the provider wires it dials, the overlay the builder staged, and
+// the ambient base, and nothing else — no unselected family's key, no
+// worker control knob, no ambient value.
+func roundEnvAllowlist(env []string) []string {
+	allow := make(map[string]bool)
+	for _, name := range config.RoundEnvVars() {
+		allow[name] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if n, _, ok := cutEnv(kv); ok && allow[n] {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // setEnvVar returns env with name set to value (appended when absent).

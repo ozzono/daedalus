@@ -60,10 +60,19 @@ func scrubBugFilingEnv(t *testing.T) {
 // prompts survive the line-based log), one "STDIN:<data>" line (same
 // escaping), and one "ENV:<key>=<value>" line per interesting variable to
 // $STUB_LOG, then runs the extra shell body.
+//
+// The log path travels inside the script text, not the environment: the
+// round-env allow-list gate strips STUB_LOG at the sandbox door (a test
+// transport must never widen the production allow-list), so the script
+// stages its own copy at startup and every $STUB_LOG reference — preamble
+// and body alike — resolves without any ambient passthrough. The bake
+// happens at creation time, so stubBin must be called after newStubLog.
 func stubBin(t *testing.T, name, body string) {
 	t.Helper()
 	dir := t.TempDir()
 	script := `#!/bin/sh
+STUB_LOG=` + strconv.Quote(os.Getenv("STUB_LOG")) + `
+export STUB_LOG
 echo "=== CALL ===" >> "$STUB_LOG"
 echo "CWD=$(pwd)" >> "$STUB_LOG"
 for a in "$@"; do
@@ -2484,8 +2493,7 @@ func TestNativeTestsMakefileTargets(t *testing.T) {
 // TestNativeTestsMakefileTestRuleWins pins the static-detection precedence:
 // a Makefile declaring a plain `test:` rule wins over the single-language
 // defaults — a repo that composes its own suite means to run the
-// composition, not the bare default its primary language would suggest
-// (daedalus run 01a125e2 resolved `go test ./...` for exactly such a repo) —
+// composition, not the bare default its primary language would suggest —
 // and over the split test-ui/test-api fallback too.
 func TestNativeTestsMakefileTestRuleWins(t *testing.T) {
 	log := newStubLog(t)

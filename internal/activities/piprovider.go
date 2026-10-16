@@ -203,6 +203,18 @@ func stagePiProvider(env []string) ([]string, func() error, error) {
 		}
 		modelEntry.SamplingParams = params
 	}
+	// The resolved wire-level thinking off signal (the openai and reviewer
+	// sections' disable_thinking, per role — see wireThinkingEnv):
+	// staged as chat_template_kwargs {"enable_thinking": false}, the
+	// Qwen3-template convention (see OpenAIConfig.DisableThinking for the
+	// probe-owed caveat). Merged as a top-level request param like every
+	// samplingParams entry.
+	if envLookup(env, config.WireThinkingEnv) == "off" {
+		if modelEntry.SamplingParams == nil {
+			modelEntry.SamplingParams = map[string]any{}
+		}
+		modelEntry.SamplingParams["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+	}
 	entry.Models = []piModelConfig{modelEntry}
 	if err := mergePiModelsEntry(id, entry); err != nil {
 		return nil, nil, fmt.Errorf("stage pi provider entry: %w", err)
@@ -219,8 +231,8 @@ func stagePiProvider(env []string) ([]string, func() error, error) {
 	// dispatcher headersTimeout/bodyTimeout — the pair that actually fires
 	// on a buffering upstream, where the wire is silent for the whole
 	// generation and the 5-minute default kills each attempt no matter the
-	// staged SDK ceiling (wa-termo 01a13d10: four 300.9 s "Request timed
-	// out." attempts against a ~2.9 tok/s buffered model under a staged
+	// staged SDK ceiling (four 300.9 s "Request timed out." attempts
+	// against a ~2.9 tok/s buffered model under a staged
 	// 50-minute retry.provider.timeoutMs). At slow-model pace a legitimate
 	// reviewer turn outlives either default, pi's agent-level retries burn,
 	// and the round exits verdict-less. The bridge stages the same ceiling

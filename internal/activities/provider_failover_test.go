@@ -12,70 +12,51 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 )
 
-// TestMain scrubs the ambient provider environment once for the whole
-// package. A real worker shell exports DAEDALUS_FALLBACK_* (runWorker
-// sets them from config.yaml's fallback section), which arms failover for
-// every jailed-round test — and combined with the dry holds the
-// exhaustion tests leave in the package-global providerState, fails
-// unrelated tests with "both providers in dry holds". Three more ambient
-// hazards ride the same os.Environ() passthrough into runJailedRound:
-// DAEDALUS_SLIM/DAEDALUS_THINKING (runWorker exports both from
-// config.yaml) — an ambient DAEDALUS_SLIM=1 would silently arm aider
-// pinning and an ambient DAEDALUS_THINKING=off would inject a thinking
-// flag in every round test — DAEDALUS_STREAM (runWorker exports it from
-// config.yaml's stream field) would inject --stream/--no-stream into every
-// aider round test — and CLAUDE_CODE_MAX_CONTEXT_TOKENS /
-// DAEDALUS_MAX_OUTPUT_TOKENS, which replace the staged metadata's input
-// and output sides, so an ambient export — agent harnesses set the claude
-// one — would silently rewrite every pinned budget. The DAEDALUS_* sampler
-// exports (runWorker exports them from config.yaml's openai section) would
-// stage sampler params into every pinned settings file.
-// DAEDALUS_AGENT is exported at worker startup from config.yaml's agent
-// field, and jailedAgentCLI("") reads it: an ambient value (aider on an
-// aider-serving worker) silently switches every unpinned round test to
-// that agent's argv/env/scratch-dir wiring, failing them on shapes the
-// claude default never produces. The openai exports (OPENAI_BASE_URL,
-// OPENAI_API_KEY, OPENAI_MODEL, OPENAI_API_BASE — runWorker exports the
-// openai section for tooling) ride the passthrough into every round's
-// child env, so an ambient value breaks the tests that pin the no-openai
-// wiring exactly. With the vars unset, fallbackConfigured() is false
-// package-wide, poisoned holds are inert, staged metadata uses the
-// constants, and unpinned rounds resolve the claude default; tests that
-// need a fallback, a slim profile, a context window, or a non-claude
-// agent arm one explicitly (armFallback or t.Setenv).
+// TestMain scrubs the ambient worker environment once for the whole
+// package: runWorker exports config.ProviderEnvVars plus its own vars
+// (config.WorkerEnvVars — all but OPENCODE_CONFIG, which runWorker
+// deliberately never re-exports: the opencode bridge stages it
+// round-scoped) into the worker's process env. A suite running under a
+// serving worker inherits all of them, and this package reads them
+// in-process — DAEDALUS_FALLBACK_* arms failover through fallbackConfigured,
+// the reviewer vars arm reviewerEnv, DAEDALUS_AGENT steers jailedAgentCLI,
+// the metrics trio feeds metricsRelayEnv — so an ambient value would arm
+// all of that in every test. The hazards behind that list: DAEDALUS_FALLBACK_* arms
+// failover for every jailed-round test — and combined with the dry holds
+// the exhaustion tests leave in the package-global providerState, fails
+// unrelated tests with "both providers in dry holds"; the reviewer vars
+// would silently arm the reviewer override in every test;
+// DAEDALUS_SLIM=1 would silently arm aider pinning and
+// DAEDALUS_THINKING=off would inject a thinking flag in every round
+// test; DAEDALUS_STREAM would inject --stream/--no-stream into every
+// aider round test; CLAUDE_CODE_MAX_CONTEXT_TOKENS /
+// DAEDALUS_MAX_OUTPUT_TOKENS replace the staged metadata's input and
+// output sides, so an ambient export — agent harnesses set the claude
+// one — would silently rewrite every pinned budget; the DAEDALUS_*
+// sampler exports would stage sampler params into every pinned settings
+// file. DAEDALUS_AGENT is read by jailedAgentCLI(""): an ambient value
+// (aider on an aider-serving worker) silently switches every unpinned
+// round test to that agent's argv/env/scratch-dir wiring, failing them
+// on shapes the claude default never produces. The openai exports
+// (runWorker exports the openai section for tooling) ride the
+// passthrough into every round's child env, so an ambient value breaks
+// the tests that pin the no-openai wiring exactly. The metrics relay
+// roots plus DAEDALUS_WORKER_NAME stage every round onto the serving
+// worker's relay, rewriting every pinned endpoint. With the vars unset,
+// fallbackConfigured() is false package-wide, poisoned holds are inert,
+// staged metadata uses the constants, and unpinned rounds resolve the
+// claude default; tests that need a fallback, a slim profile, a context
+// window, or a non-claude agent arm one explicitly (armFallback or
+// t.Setenv).
+//
+// The jail-side half of the old hazard — the same values riding the
+// round-env passthrough into a jailed child — is now the round-env
+// allow-list gate's job (roundEnvAllowlist at the spawn; see
+// roundenv_test.go), which also covers target-repo suites served by a
+// worker that carry no TestMain of their own. This scrub stays for the
+// in-process readers above; it is belt-and-suspenders for the spawn.
 func TestMain(m *testing.M) {
-	for _, name := range []string{
-		"DAEDALUS_FALLBACK_TYPE",
-		"DAEDALUS_FALLBACK_BASE_URL",
-		"DAEDALUS_FALLBACK_API_KEY",
-		"DAEDALUS_FALLBACK_MODEL",
-		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
-		"DAEDALUS_SLIM",
-		"DAEDALUS_THINKING",
-		"DAEDALUS_STREAM",
-		"DAEDALUS_AGENT",
-		"OPENAI_BASE_URL",
-		"OPENAI_API_KEY",
-		"OPENAI_MODEL",
-		"OPENAI_API_BASE",
-		// OPENCODE_CONFIG (the opencode bridge stages the round-scoped
-		// config path into the round env) would leak an operator's own
-		// pointer into the pins that read the var back off the ai-jail
-		// call.
-		"OPENCODE_CONFIG",
-		// reviewerEnv reads these from the process env: a live worker host
-		// exporting them (runWorker sets them from config.yaml's reviewer
-		// section) would silently arm the reviewer override in every test.
-		config.ReviewerURLEnv,
-		config.ReviewerKeyEnv,
-		config.ContextTokensEnv,
-		config.MaxOutputTokensEnv,
-		config.TopPEnv,
-		config.PresencePenaltyEnv,
-		config.TopKEnv,
-		config.MinPEnv,
-		config.RepetitionPenaltyEnv,
-	} {
+	for _, name := range config.AllWorkerEnvVars() {
 		os.Unsetenv(name)
 	}
 	os.Exit(m.Run())
@@ -699,6 +680,185 @@ func TestReviewerEnvPartialOverride(t *testing.T) {
 	}
 }
 
+// TestReviewerEnvModelOverride pins the model dimension of the reviewer
+// override: a model-only section retargets just the model id on both wire
+// families — replaced in place where the serving env already carries one,
+// so the staged claude/aider/pi/codex/opencode model wiring all pick it up
+// — while url, key, and the relay vars stay untouched: a model-only round
+// dials the serving endpoint, which is exactly what the relays' upstreams
+// already are. url and model compose (both applied, relays stripped), and
+// non-reviewer roles pass through byte-identical with the model set.
+func TestReviewerEnvModelOverride(t *testing.T) {
+	const model = "qwen3-review"
+
+	t.Run("model-only keeps endpoint, key, and relays", func(t *testing.T) {
+		t.Setenv(config.ReviewerModelEnv, model)
+		base := append(reviewerRoundBaseEnv(),
+			config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1",
+			config.MetricsRelayAnthropicEnv+"=http://127.0.0.1:7778",
+			config.MetricsRelayOpenAIEnv+"=http://127.0.0.1:7778",
+		)
+		for _, role := range []SessionRole{RoleDevReview, RoleTestReview} {
+			got := reviewerEnv(slices.Clone(base), role)
+			for name, want := range map[string]string{
+				"ANTHROPIC_MODEL":    model,
+				"OPENAI_MODEL":       model,
+				"ANTHROPIC_BASE_URL": "https://primary.example",
+				"ANTHROPIC_API_KEY":  "sk-primary",
+				"OPENAI_BASE_URL":    "https://oai.example",
+				"OPENAI_API_KEY":     "sk-oai",
+			} {
+				if v := envValue(got, name); v != want {
+					t.Errorf("reviewerEnv(%q) %s = %q, want %q", role, name, v, want)
+				}
+			}
+			for _, name := range []string{
+				"ANTHROPIC_MODEL", "OPENAI_MODEL",
+				config.ToolRelayURLEnv, config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv,
+			} {
+				if n := countEnv(got, name); n != 1 {
+					t.Errorf("reviewerEnv(%q) left %d entries for %s, want exactly one", role, n, name)
+				}
+			}
+		}
+	})
+
+	t.Run("url and model compose, relays drop", func(t *testing.T) {
+		t.Setenv(config.ReviewerURLEnv, "https://review.example")
+		t.Setenv(config.ReviewerModelEnv, model)
+		base := append(reviewerRoundBaseEnv(),
+			config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1",
+			config.MetricsRelayAnthropicEnv+"=http://127.0.0.1:7778",
+			config.MetricsRelayOpenAIEnv+"=http://127.0.0.1:7778",
+		)
+		got := reviewerEnv(base, RoleDevReview)
+		for name, want := range map[string]string{
+			"ANTHROPIC_BASE_URL": "https://review.example",
+			"OPENAI_BASE_URL":    "https://review.example",
+			"ANTHROPIC_MODEL":    model,
+			"OPENAI_MODEL":       model,
+		} {
+			if v := envValue(got, name); v != want {
+				t.Errorf("%s = %q, want %q", name, v, want)
+			}
+		}
+		for _, name := range []string{config.ToolRelayURLEnv, config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv} {
+			for _, kv := range got {
+				if n, _, ok := cutEnv(kv); ok && n == name {
+					t.Errorf("url+model override env still carries %q; the relay must not route an overridden round", kv)
+				}
+			}
+		}
+	})
+
+	t.Run("non-reviewer roles untouched with the model set", func(t *testing.T) {
+		t.Setenv(config.ReviewerModelEnv, model)
+		untouched := reviewerRoundBaseEnv()
+		for _, role := range []SessionRole{RoleDev, RoleTest, ""} {
+			if got := reviewerEnv(slices.Clone(untouched), role); !slices.Equal(got, untouched) {
+				t.Errorf("reviewerEnv(%q) rewired a non-reviewer round: %v", role, got)
+			}
+		}
+	})
+}
+
+// TestWireThinkingEnv pins the wire-level thinking knob's role resolution:
+// reviewer rounds key on the reviewer section's export alone and every
+// other role (dev, test, role-less one-shots) on the openai section's —
+// each role controls its own brain, so neither section's knob ever crosses
+// to the other. Only the strict "off" value (what runWorker exports for an
+// explicit disable_thinking: true) resolves to a signal; an ambient garbage
+// value is never read as an off. The resolution is set-or-removed every
+// round, so a stale round-env value cannot outlive a knob that says
+// nothing.
+func TestWireThinkingEnv(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		role             SessionRole
+		openai, reviewer string // worker-export values; "" leaves the var unset
+		wantSet          bool
+	}{
+		{"dev round reads the openai knob", RoleDev, "off", "", true},
+		{"test round reads the openai knob", RoleTest, "off", "", true},
+		{"role-less round reads the openai knob", "", "off", "", true},
+		{"dev-review round reads the reviewer knob", RoleDevReview, "", "off", true},
+		{"test-review round reads the reviewer knob", RoleTestReview, "", "off", true},
+		{"reviewer round ignores the openai knob", RoleDevReview, "off", "", false},
+		{"dev round ignores the reviewer knob", RoleDev, "", "off", false},
+		{"garbage is never an off", RoleDev, "maybe", "", false},
+		{"unset on both sides sends nothing", RoleTestReview, "", "", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.openai != "" {
+				t.Setenv(config.OpenAIThinkingEnv, c.openai)
+			}
+			if c.reviewer != "" {
+				t.Setenv(config.ReviewerThinkingEnv, c.reviewer)
+			}
+			// A stale round-env value seeds the removal branch; the set
+			// branch must replace it in place, not append a second entry.
+			env := []string{"PATH=/usr/bin", config.WireThinkingEnv + "=off"}
+			got := wireThinkingEnv(env, c.role)
+			if !c.wantSet {
+				if _, ok := lookupTestEnv(got, config.WireThinkingEnv); ok {
+					t.Errorf("wireThinkingEnv(%q) kept %q with the knob unset/garbage: %v", c.role, config.WireThinkingEnv, got)
+				}
+				return
+			}
+			if v := envValue(got, config.WireThinkingEnv); v != "off" {
+				t.Errorf("wireThinkingEnv(%q) %s = %q, want off", c.role, config.WireThinkingEnv, v)
+			}
+			if n := countEnv(got, config.WireThinkingEnv); n != 1 {
+				t.Errorf("wireThinkingEnv(%q) left %d entries for %s, want exactly one", c.role, n, config.WireThinkingEnv)
+			}
+		})
+	}
+}
+
+// lookupTestEnv reports whether env carries name, the removal probe.
+func lookupTestEnv(env []string, name string) (string, bool) {
+	for _, kv := range env {
+		if n, v, ok := cutEnv(kv); ok && n == name {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// TestRoundResolvesWireThinking pins the knob's resolution at the round
+// boundary: runJailedRoundFolders resolves the per-role worker export into
+// the round env the jailed CLI actually sees — a reviewer round keys on the
+// reviewer section's export, a dev round on the openai section's, and
+// neither crosses — the same one-invoker composition reviewerEnv's
+// round-level pin covers for the endpoint override.
+func TestRoundResolvesWireThinking(t *testing.T) {
+	t.Setenv(config.ReviewerThinkingEnv, "off")
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", `echo "ENV:DAEDALUS_WIRE_THINKING=$DAEDALUS_WIRE_THINKING" >> "$STUB_LOG"
+exit 0`)
+	// A fixed env, not os.Environ()+overrides: production round envs never
+	// carry a name twice (see TestReviewerRoundDialsReviewerEndpoint).
+	base := append(reviewerRoundBaseEnv(),
+		"PATH="+os.Getenv("PATH"),
+		"STUB_LOG="+log,
+	)
+	for _, role := range []SessionRole{RoleDevReview, RoleDev} {
+		if _, err := runJailedRound(context.Background(), slices.Clone(base), role, "claude", t.TempDir(), "round prompt"); err != nil {
+			t.Fatalf("%s: runJailedRound: %v", role, err)
+		}
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 2 {
+		t.Fatalf("got %d jailed calls, want 2 (reviewer then dev)", len(calls))
+	}
+	if got := calls[0].Env[config.WireThinkingEnv]; got != "off" {
+		t.Errorf("reviewer round %s = %q, want off (the reviewer section's knob)", config.WireThinkingEnv, got)
+	}
+	if got := calls[1].Env[config.WireThinkingEnv]; got != "" {
+		t.Errorf("dev round %s = %q, want absent (the openai knob was never set)", config.WireThinkingEnv, got)
+	}
+}
+
 // TestReviewerRoundDialsReviewerEndpoint pins the override at the round
 // boundary: runJailedRound composes reviewerEnv into the child environment
 // for a reviewer role — the url/key the jailed CLI actually sees are the
@@ -713,10 +873,12 @@ func TestReviewerRoundDialsReviewerEndpoint(t *testing.T) {
 	// A fixed env, not os.Environ()+overrides: production round envs never
 	// carry a name twice (os.Environ() is unique, fallbackEnv starts from
 	// it), and a duplicate would let the appended primary shadow the
-	// first-occurrence replacement setEnvVar performs.
+	// first-occurrence replacement setEnvVar performs. PATH is staged so
+	// the stubbed ai-jail resolves; STUB_LOG needs no staging — the stub
+	// script carries its own log path (see stubBin), and the allow-list
+	// gate would strip the name anyway.
 	base := append(reviewerRoundBaseEnv(),
 		"PATH="+os.Getenv("PATH"),
-		"STUB_LOG="+log,
 	)
 	for _, role := range []SessionRole{RoleDevReview, RoleDev} {
 		if _, err := runJailedRound(context.Background(), slices.Clone(base), role, "claude", t.TempDir(), "round prompt"); err != nil {

@@ -14,7 +14,7 @@ import (
 // re-reading the file, then abandons the tool channel and prints the
 // tool-call JSON as fenced assistant text — which pi records as plain
 // prose, so the degenerate pattern sits in the resumed transcript as an
-// example the model imitates (wa-termo-bootstrap 01a0ecd2, 2026-09-29).
+// example the model imitates.
 // Two daedalus-side counters, both best-effort and both gated to pi: a
 // resumed session whose transcript already embeds tool-call JSON is not
 // resumed at all (the transcript is the infection vector), and a resumed

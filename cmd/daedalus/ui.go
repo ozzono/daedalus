@@ -51,10 +51,11 @@ import (
 var uiTemplateFS embed.FS
 
 // uiCacheCap bounds the server's caches — the started-event input cache,
-// the provider-probe cache, and the CLI's closed-run park memo; past it a
-// map drops wholesale. Inputs are history (immutable), probes are
-// TTL-bound, and parks are immutable once closed, so a reset only costs
-// re-reads, never staleness.
+// the provider-probe cache, the polled fragments' last-sent cache, and
+// the CLI's closed-run park memo; past it a map drops wholesale. Inputs
+// are history (immutable), probes are TTL-bound, fragments re-render from
+// the same walks, and parks are immutable once closed, so a reset only
+// costs re-reads, never staleness.
 const uiCacheCap = 4096
 
 // uiTestExcerptMax caps the test-log excerpt the detail page renders. The
@@ -66,9 +67,10 @@ const uiTestExcerptMax = 64 << 10
 // uiServer is the dashboard's state: the serving config, the parsed
 // templates, one reusable Temporal client (reset on error — the daemon
 // outlives server restarts), the started-event input cache shared by the
-// Workers and Runs renderers, the TTL-cached provider probes, and the
-// relay ledger — the same in-process ledger the relay appends to, read
-// here for the metrics view's aggregates.
+// Workers and Runs renderers, the TTL-cached provider probes, the relay
+// ledger — the same in-process ledger the relay appends to, read
+// here for the metrics view's aggregates — and the last-sent fragment
+// cache behind the polled views' unchanged-poll 204s.
 type uiServer struct {
 	cfg    config.Config
 	tpl    *template.Template
@@ -78,6 +80,7 @@ type uiServer struct {
 	cl     client.Client
 	inputs map[string]workflows.PipelineInput
 	probes map[string]uiProbe
+	frags  map[string][]byte
 }
 
 func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger) *uiServer {
@@ -93,7 +96,7 @@ func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger) *uiServer {
 	}).ParseFS(uiTemplateFS, "ui_templates.html"))
 	return &uiServer{cfg: cfg, tpl: tpl, ledger: ledger,
 		inputs: map[string]workflows.PipelineInput{},
-		probes: map[string]uiProbe{}}
+		probes: map[string]uiProbe{}, frags: map[string][]byte{}}
 }
 
 // temporal returns the cached client, dialing on first use and after any
@@ -208,6 +211,42 @@ func (s *uiServer) render(w http.ResponseWriter, status int, name string, data a
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write(b.Bytes())
+}
+
+// renderFrag is render for the three polled fragments, with the polled
+// views' click race folded in: a poll whose fresh bytes equal the last
+// bytes sent for that URI answers 204 No Content — htmx counts 204 a
+// successful poll but never swaps it, so stable content means stable DOM
+// nodes and a click can no longer land on a card the poll just replaced.
+// The cache is keyed by request URI (the fragments' filter and run-id
+// state ride in it) and is per-process, so a second browser tab sharing a
+// URI shares entries; that is only visible when content changed between
+// this tab's last own swap and another tab's latest poll — one further
+// content change and the tab resyncs. ponytail: a single-operator LAN
+// tool, so that window is left as is; per-tab byte tracking is the fix
+// if it ever matters.
+func (s *uiServer) renderFrag(w http.ResponseWriter, req *http.Request, name string, data any) {
+	var b bytes.Buffer
+	if err := s.tpl.ExecuteTemplate(&b, name, data); err != nil {
+		http.Error(w, "render "+name+": "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	key := req.URL.RequestURI()
+	fresh := b.Bytes()
+	s.mu.Lock()
+	if len(s.frags) >= uiCacheCap {
+		s.frags = map[string][]byte{}
+	}
+	unchanged := bytes.Equal(s.frags[key], fresh)
+	s.frags[key] = fresh
+	s.mu.Unlock()
+	if unchanged {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(fresh)
 }
 
 // uiChrome is the shell data every page carries: the active nav tab and
@@ -545,7 +584,7 @@ func (s *uiServer) pageWorkers(w http.ResponseWriter, req *http.Request) {
 // fragWorkers is the workers view's polled region: the cards alone.
 func (s *uiServer) fragWorkers(w http.ResponseWriter, req *http.Request) {
 	snap := s.snapshot()
-	s.render(w, http.StatusOK, "frag_workers", snap)
+	s.renderFrag(w, req, "frag_workers", snap)
 }
 
 // uiFilters carries the runs feed's filter state; the selects re-render
@@ -600,12 +639,17 @@ func (s *uiServer) runsView(w http.ResponseWriter, req *http.Request, tpl string
 		}
 		rows = kept
 	}
-	s.render(w, http.StatusOK, tpl, struct {
+	data := struct {
 		Chrome  uiChrome
 		Filters uiFilters
 		Rows    []uiRunRow
 		WalkErr string
-	}{uiChrome{Nav: "runs", Title: "daedalus — runs"}, f, rows, snap.WalkErr})
+	}{uiChrome{Nav: "runs", Title: "daedalus — runs"}, f, rows, snap.WalkErr}
+	if tpl == "frag_runs" {
+		s.renderFrag(w, req, tpl, data)
+		return
+	}
+	s.render(w, http.StatusOK, tpl, data)
 }
 
 // uiUsage is one usage-table row — the per-round figures `daedalus worker
@@ -651,10 +695,17 @@ type uiNode struct {
 // unchanged run renders byte-identical across polls, so the htmx swap is
 // visually silent (the decided behavior).
 type uiRunDetail struct {
-	WorkflowID  string
-	RunID       string
-	Status      string
-	Badge       string
+	WorkflowID string
+	RunID      string
+	Status     string
+	Badge      string
+	// ParkCause carries a parked run's own reason (the PARKED: result's
+	// text, or the awaiting-maintainer hold on older workers) and
+	// FailCause the last failed activity's failure message — the two
+	// closed faces whose cause the badge alone drops; both empty when the
+	// walk found none.
+	ParkCause   string
+	FailCause   string
 	Issue       string
 	Repo        string
 	Flow        string
@@ -796,6 +847,14 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 	vis := decodeRunVisibility(info.GetSearchAttributes(), dc)
 	d.Status = runDisplayStatus(c, info, vis)
 	d.Badge = badgeClass(d.Status)
+	// The paused face covers park and abort; the park reason is what
+	// tells them apart, and it rides the probe runDisplayStatus may have
+	// just made (memoized — a stamped park probes once here).
+	if d.Status == "paused" {
+		if _, reason := closedRunParkReason(c, d.WorkflowID, d.RunID); reason != "" {
+			d.ParkCause = reason
+		}
+	}
 	d.DependsOn = vis.DependsOn
 	d.Started = clockOrDate(info.GetStartTime().AsTime())
 	if closed := info.GetCloseTime(); closed.IsValid() {
@@ -895,6 +954,10 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 			}
 		case ev.GetActivityTaskFailedEventAttributes() != nil:
 			a := ev.GetActivityTaskFailedEventAttributes()
+			// The failure message is the cause the failed badge drops;
+			// the walk is chronological, so the last failure is the
+			// proximate one.
+			d.FailCause = a.GetFailure().GetMessage()
 			sc := scheduled[a.GetScheduledEventId()]
 			span := ev.GetEventTime().AsTime().Sub(at[a.GetScheduledEventId()])
 			switch sc.name {
@@ -966,6 +1029,18 @@ func (s *uiServer) fragRun(w http.ResponseWriter, req *http.Request) {
 func (s *uiServer) runBody(w http.ResponseWriter, req *http.Request, tpl string) {
 	d, err := s.detail(req.PathValue("id"))
 	if err != nil {
+		// The polled error face joins the fragment cache under the poll's
+		// URI — identical errors dedupe harmlessly (the DOM already holds
+		// the card), and a recovery whose bytes differ from the cached
+		// error re-sends 200. An uncached error render would leave the
+		// cache holding the stale healthy bytes, so the recovery poll
+		// would dedupe into a 204 and pin the error card in the DOM. The
+		// page shell stays on render: a 204 on a navigation renders
+		// nothing.
+		if tpl == "frag_run" {
+			s.renderFrag(w, req, "frag_error", err.Error())
+			return
+		}
 		s.render(w, http.StatusOK, "frag_error", err.Error())
 		return
 	}
@@ -973,7 +1048,7 @@ func (s *uiServer) runBody(w http.ResponseWriter, req *http.Request, tpl string)
 	// with .D — so it must never be handed the wrapper; only the page
 	// shell takes the chrome.
 	if tpl == "frag_run" {
-		s.render(w, http.StatusOK, tpl, d)
+		s.renderFrag(w, req, tpl, d)
 		return
 	}
 	s.render(w, http.StatusOK, tpl, struct {

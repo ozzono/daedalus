@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -118,41 +117,17 @@ func metricsGateCheck(cfg config.Config) error {
 }
 
 // metricsStart launches the metrics daemon as a detached process — the
-// worker daemon's start shape: re-exec `metrics foreground`, redirect into
-// the metrics log, write the pid file.
+// worker daemon's start shape (spawnDaemon): re-exec `metrics foreground`,
+// redirected into the metrics log, write the pid file.
 func metricsStart(cfg config.Config, configPath string) error {
 	pidFile, logFile, _ := metricsPaths()
 	if pid, ok := readLivePid(pidFile); ok {
 		return fmt.Errorf("already running (pid %d) — use 'daedalus metrics restart' or 'stop'", pid)
 	}
-	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", daemonDir, err)
-	}
-	pruneOldLogs()
-
-	log, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	pid, err := spawnDaemon(pidFile, logFile, "metrics", "foreground", "-c", configPath)
 	if err != nil {
-		return fmt.Errorf("open log %s: %w", logFile, err)
+		return err
 	}
-	defer log.Close()
-
-	self, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve executable: %w", err)
-	}
-	cmd := exec.Command(self, "metrics", "foreground", "-c", configPath)
-	cmd.Env = append(envWithoutProviderVars(os.Environ()), daemonEnv+"=1")
-	cmd.Stdout = log
-	cmd.Stderr = log
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from the terminal
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start daemon: %w", err)
-	}
-	pid := cmd.Process.Pid
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		return fmt.Errorf("write pid file %s: %w", pidFile, err)
-	}
-	cmd.Process.Release() // the daemon outlives this process
 
 	fmt.Printf("metrics daemon started (pid %d)\n", pid)
 	fmt.Printf("  relay:     127.0.0.1:%d\n", cfg.Metrics.RelayPort)

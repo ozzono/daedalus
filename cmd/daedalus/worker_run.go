@@ -65,6 +65,18 @@ func runWorker(cfg config.Config, workerType string) error {
 			}
 		}
 	}
+	// The reviewer section's model override rides the same channel as the
+	// endpoint override above, but as literal Setenv sites here rather
+	// than an AgentEnv key family: AgentEnv's key-site scan is a pinned
+	// exact count, so a new family would fail it. Set only when configured
+	// — absent means reviewers request the serving section's model — and
+	// scrubbed from the daemon spawn (config.ProviderEnvVars), so a stale
+	// shell export can never retarget a config that says nothing.
+	if m := cfg.Reviewer.Model; m != "" {
+		if err := os.Setenv("DAEDALUS_REVIEWER_MODEL", m); err != nil {
+			return fmt.Errorf("set DAEDALUS_REVIEWER_MODEL: %w", err)
+		}
+	}
 	// The jailed agent selection travels the same channel: activities read
 	// DAEDALUS_AGENT when building the ai-jail command line.
 	if err := os.Setenv("DAEDALUS_AGENT", cfg.Agent); err != nil {
@@ -83,10 +95,12 @@ func runWorker(cfg config.Config, workerType string) error {
 	// Slim mode travels the same env channel: activities read DAEDALUS_SLIM
 	// when building a jailed aider round's environment (weak/editor model
 	// pinning). Like the concurrency var it is set here from the recorded
-	// config; the unset branch matters as much as the set one — neither var
-	// is in the daemon spawn scrub, so a stale export in the invoking shell
-	// would otherwise survive into the daemon and silently beat a config
-	// that says off.
+	// config; the unset branch matters as much as the set one — both vars
+	// are in the daemon spawn scrub (config.AllWorkerEnvVars), so a stale
+	// export in the invoking shell is dropped at spawn and the re-export
+	// here (or the unset below) is the only channel a value returns on:
+	// the daemon's own behavior stays config-driven. Foreground runs keep
+	// the inherit semantics by design.
 	if cfg.Slim.Enabled {
 		if err := os.Setenv("DAEDALUS_SLIM", "1"); err != nil {
 			return fmt.Errorf("set DAEDALUS_SLIM: %w", err)
@@ -99,8 +113,9 @@ func runWorker(cfg config.Config, workerType string) error {
 	// (internal/metricsrelay), which keeps the usage ledger the `daedalus
 	// metrics` surface reads. Two things happen here: the relay roots are
 	// exported on the env channel (per-round staging in activities reads
-	// them; symmetric unset plus the ProviderEnvVars scrub keep a stale
-	// export from staging a metrics-disabled worker), and this worker's
+	// them; symmetric unset plus the daemon-spawn scrub
+	// (config.AllWorkerEnvVars) keep a stale export from staging a
+	// metrics-disabled worker), and this worker's
 	// upstream mapping — base URLs and real API keys per wire, the same
 	// values AgentEnv exported above — is registered with the daemon and
 	// refreshed on a heartbeat well inside the registration TTL. workerStart
@@ -172,7 +187,7 @@ func runWorker(cfg config.Config, workerType string) error {
 	// pre-relay behavior. The staged URL (relay address plus the upstream's
 	// path prefix) travels the env channel like every other knob; unset
 	// symmetrically, and scrubbed from the daemon spawn via
-	// ProviderEnvVars, so a stale export can never point a new worker's
+	// config.AllWorkerEnvVars, so a stale export can never point a new worker's
 	// rounds at a dead relay.
 	var relayURL string
 	_, open := cfg.ProviderChannels()
@@ -204,11 +219,13 @@ func runWorker(cfg config.Config, workerType string) error {
 		return fmt.Errorf("unset %s: %w", config.ToolRelayURLEnv, err)
 	}
 	// The thinking toggle: only an explicit thinking: false is exported
-	// (as DAEDALUS_THINKING=off, the sole thinking signal daedalus ever
-	// sends); unset or true means no agent gets any thinking signal and
-	// each follows its own default. The jailed-round builder translates
-	// the signal per agent (pi --thinking off, aider --thinking-tokens 0,
-	// claude MAX_THINKING_TOKENS=0). Unset symmetrically, for the same
+	// (as DAEDALUS_THINKING=off, the agent-lever thinking signal —
+	// translated per agent to pi/aider/claude's own off lever); unset or
+	// true means no agent gets any thinking signal and each follows its
+	// own default. The wire-level per-role signals below
+	// (DAEDALUS_OPENAI_THINKING / DAEDALUS_REVIEWER_THINKING, from the
+	// openai and reviewer sections' disable_thinking) are the staged-onto-
+	// the-request counterpart. Unset symmetrically, for the same
 	// stale-export reason as DAEDALUS_SLIM above.
 	if cfg.ThinkingDisabled() {
 		if err := os.Setenv("DAEDALUS_THINKING", "off"); err != nil {
@@ -216,6 +233,30 @@ func runWorker(cfg config.Config, workerType string) error {
 		}
 	} else if err := os.Unsetenv("DAEDALUS_THINKING"); err != nil {
 		return fmt.Errorf("unset DAEDALUS_THINKING: %w", err)
+	}
+	// The wire-level thinking toggles, one per role (literal Setenv sites
+	// for the same pinned-scan reason as DAEDALUS_REVIEWER_MODEL above):
+	// only an explicit disable_thinking: true is exported, as "off" —
+	// unset means that role's rounds send no thinking signal and the
+	// backend's own default stands. The openai-side value reads the
+	// projected openai channel (ProviderChannels), not cfg.OpenAI, so a
+	// provider-typed section's knob governs. The jailed-round builder
+	// resolves the per-role value into the round env
+	// (DAEDALUS_WIRE_THINKING), the var the pi and aider stagings read.
+	// Unset symmetrically like DAEDALUS_THINKING above.
+	if open.DisableThinking {
+		if err := os.Setenv("DAEDALUS_OPENAI_THINKING", "off"); err != nil {
+			return fmt.Errorf("set DAEDALUS_OPENAI_THINKING: %w", err)
+		}
+	} else if err := os.Unsetenv("DAEDALUS_OPENAI_THINKING"); err != nil {
+		return fmt.Errorf("unset DAEDALUS_OPENAI_THINKING: %w", err)
+	}
+	if cfg.Reviewer.DisableThinking {
+		if err := os.Setenv("DAEDALUS_REVIEWER_THINKING", "off"); err != nil {
+			return fmt.Errorf("set DAEDALUS_REVIEWER_THINKING: %w", err)
+		}
+	} else if err := os.Unsetenv("DAEDALUS_REVIEWER_THINKING"); err != nil {
+		return fmt.Errorf("unset DAEDALUS_REVIEWER_THINKING: %w", err)
 	}
 	// The streaming toggle: exported (as DAEDALUS_STREAM=on/off) only when
 	// explicitly set — absent means every agent follows its own streaming
@@ -233,7 +274,7 @@ func runWorker(cfg config.Config, workerType string) error {
 	// bug_filing.dir, default applied) is exported only when filing is
 	// enabled — absent means off, and the absence is load-bearing, like
 	// DAEDALUS_THINKING's only-off export above. Unset symmetrically (and
-	// scrubbed from the daemon spawn via ProviderEnvVars) so a stale export
+	// scrubbed from the daemon spawn via config.AllWorkerEnvVars) so a stale export
 	// in the invoking shell can never re-enable filing for a config that
 	// says off. The prompt-render sites read it in the worker process. Like
 	// DAEDALUS_SLIM and DAEDALUS_WORKER_NAME it passes through to jailed
@@ -253,7 +294,7 @@ func runWorker(cfg config.Config, workerType string) error {
 	// its filed files there after the round that wrote them. Exported only
 	// when the section is enabled and a mirror configured — absent means
 	// off, the same load-bearing absence as DAEDALUS_BUG_DIR, with the
-	// same symmetric unset and daemon-spawn scrub (ProviderEnvVars). They
+	// same symmetric unset and daemon-spawn scrub (config.AllWorkerEnvVars). They
 	// travel worker env, not pipeline input, because a mirror is a host
 	// path: a shared test queue may run a suite on a foreign deployment's
 	// worker, and each deployment mirrors onto its own host.
