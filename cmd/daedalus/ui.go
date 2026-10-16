@@ -695,10 +695,17 @@ type uiNode struct {
 // unchanged run renders byte-identical across polls, so the htmx swap is
 // visually silent (the decided behavior).
 type uiRunDetail struct {
-	WorkflowID  string
-	RunID       string
-	Status      string
-	Badge       string
+	WorkflowID string
+	RunID      string
+	Status     string
+	Badge      string
+	// ParkCause carries a parked run's own reason (the PARKED: result's
+	// text, or the awaiting-maintainer hold on older workers) and
+	// FailCause the last failed activity's failure message — the two
+	// closed faces whose cause the badge alone drops; both empty when the
+	// walk found none.
+	ParkCause   string
+	FailCause   string
 	Issue       string
 	Repo        string
 	Flow        string
@@ -840,6 +847,14 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 	vis := decodeRunVisibility(info.GetSearchAttributes(), dc)
 	d.Status = runDisplayStatus(c, info, vis)
 	d.Badge = badgeClass(d.Status)
+	// The paused face covers park and abort; the park reason is what
+	// tells them apart, and it rides the probe runDisplayStatus may have
+	// just made (memoized — a stamped park probes once here).
+	if d.Status == "paused" {
+		if _, reason := closedRunParkReason(c, d.WorkflowID, d.RunID); reason != "" {
+			d.ParkCause = reason
+		}
+	}
 	d.DependsOn = vis.DependsOn
 	d.Started = clockOrDate(info.GetStartTime().AsTime())
 	if closed := info.GetCloseTime(); closed.IsValid() {
@@ -939,6 +954,10 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 			}
 		case ev.GetActivityTaskFailedEventAttributes() != nil:
 			a := ev.GetActivityTaskFailedEventAttributes()
+			// The failure message is the cause the failed badge drops;
+			// the walk is chronological, so the last failure is the
+			// proximate one.
+			d.FailCause = a.GetFailure().GetMessage()
 			sc := scheduled[a.GetScheduledEventId()]
 			span := ev.GetEventTime().AsTime().Sub(at[a.GetScheduledEventId()])
 			switch sc.name {

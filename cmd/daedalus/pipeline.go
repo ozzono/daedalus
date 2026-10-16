@@ -549,37 +549,52 @@ func listPipelines(cfg config.Config, max int) error {
 	return w.Flush()
 }
 
-// closedParkMemo remembers closedRunParked's answer per execution. A
+// closedPark is closedRunParkReason's memoized answer: whether the run
+// parked and, when it did, the reason the park carries.
+type closedPark struct {
+	parked bool
+	reason string
+}
+
+// closedParkMemo remembers closedRunParkReason's answer per execution. A
 // closed run's outcome is immutable, and `daedalus list` derives it per
 // ambiguous row per invocation while the dashboard re-derives every row
 // every 5s poll — without the memo the probe (a result fetch per
 // ambiguous row) would repeat forever, per viewer.
 var closedParkMemo = struct {
 	sync.Mutex
-	m map[string]bool
-}{m: map[string]bool{}}
+	m map[string]closedPark
+}{m: map[string]closedPark{}}
 
-// closedRunParked probes one closed run's outcome for a park — the green
-// completion CompleteGreen gives parks on current workers, or the failure
-// message the pre-CompleteGreen workers parked with (the same two shapes
-// wipe recognizes). The run ID is the row's own execution, never empty:
-// `continue` restarts under the same workflow ID, and an empty run ID
-// would resolve the latest execution — classifying an old row from its
-// continuation's outcome, and blocking on a live one. Only runs without a
-// terminal DaedalusStatus are probed: a stamped run already says parked.
-// The probe runs once per execution per process (closedParkMemo); a
-// transient read failure is not memoized — the answer "unknown" is not
-// immutable, so the next render retries — while the awaiting-maintainer
-// error is the park's own hold and is as definitive as a read result.
-// Any read failure degrades to false: the row keeps the enum's rendering,
-// the table never fails over a probe.
+// closedRunParked reports whether one closed run parked — the bool face
+// of closedRunParkReason.
 func closedRunParked(c client.Client, workflowID, runID string) bool {
+	parked, _ := closedRunParkReason(c, workflowID, runID)
+	return parked
+}
+
+// closedRunParkReason probes one closed run's outcome for a park and,
+// when it finds one, the reason the park carries — the green completion
+// CompleteGreen gives parks on current workers ("PARKED: <reason>"), or
+// the awaiting-maintainer failure message the pre-CompleteGreen workers
+// parked with (the same two shapes wipe recognizes). The run ID is the
+// row's own execution, never empty: `continue` restarts under the same
+// workflow ID, and an empty run ID would resolve the latest execution —
+// classifying an old row from its continuation's outcome, and blocking
+// on a live one. Only runs without a terminal DaedalusStatus are probed:
+// a stamped run already says parked. The probe runs once per execution
+// per process (closedParkMemo); a transient read failure is not memoized
+// — the answer "unknown" is not immutable, so the next render retries —
+// while the awaiting-maintainer error is the park's own hold and is as
+// definitive as a read result. Any read failure degrades to false: the
+// row keeps the enum's rendering, the table never fails over a probe.
+func closedRunParkReason(c client.Client, workflowID, runID string) (bool, string) {
 	key := workflowID + "\x00" + runID
 	closedParkMemo.Lock()
-	parked, ok := closedParkMemo.m[key]
+	p, ok := closedParkMemo.m[key]
 	closedParkMemo.Unlock()
 	if ok {
-		return parked
+		return p.parked, p.reason
 	}
 	pctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -587,19 +602,23 @@ func closedRunParked(c client.Client, workflowID, runID string) bool {
 	err := c.GetWorkflow(pctx, workflowID, runID).Get(pctx, &out)
 	switch {
 	case err == nil:
-		parked = workflows.IsParkedResult(out)
+		p.parked = workflows.IsParkedResult(out)
+		if p.parked {
+			p.reason = strings.TrimPrefix(out, workflows.ParkedResultPrefix)
+		}
 	case strings.Contains(err.Error(), workflows.ErrAwaitingMaintainer.Error()):
-		parked = true
+		p.parked = true
+		p.reason = workflows.ErrAwaitingMaintainer.Error()
 	default:
-		return false
+		return false, ""
 	}
 	closedParkMemo.Lock()
 	if len(closedParkMemo.m) >= uiCacheCap {
-		closedParkMemo.m = map[string]bool{}
+		closedParkMemo.m = map[string]closedPark{}
 	}
-	closedParkMemo.m[key] = parked
+	closedParkMemo.m[key] = p
 	closedParkMemo.Unlock()
-	return parked
+	return p.parked, p.reason
 }
 
 // continuePipeline resumes a closed pipeline (canceled, failed — including

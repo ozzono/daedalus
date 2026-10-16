@@ -19,6 +19,7 @@ import (
 
 	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
@@ -472,6 +473,22 @@ func uiScheduled(t *testing.T, id int64, when time.Time, typ string, input any) 
 	}
 }
 
+// uiFailedEvent builds an activity-failed event for the scheduled event id,
+// carrying message — the failure the detail rail renders as a failed round
+// and the cause card quotes verbatim.
+func uiFailedEvent(scheduledID int64, when time.Time, message string) *historypb.HistoryEvent {
+	return &historypb.HistoryEvent{
+		EventId:   scheduledID + 1,
+		EventTime: timestamppb.New(when),
+		Attributes: &historypb.HistoryEvent_ActivityTaskFailedEventAttributes{
+			ActivityTaskFailedEventAttributes: &historypb.ActivityTaskFailedEventAttributes{
+				ScheduledEventId: scheduledID,
+				Failure:          &failurepb.Failure{Message: message},
+			},
+		},
+	}
+}
+
 // TestUIWorkersPage pins the roster view: an empty host says how to start
 // one; a recorded stopped worker renders its name, its not-running face,
 // and the queue its config names; the page shell embeds the polled rows;
@@ -495,7 +512,7 @@ func TestUIWorkersPage(t *testing.T) {
 		}
 
 		out := h.get(t, "/workers/rows")
-		for _, want := range []string{"w1", "not running", "listq", "New task"} {
+		for _, want := range []string{"w1", "not running", "listq", "New Task"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("rows output lacks %q:\n%s", want, out)
 			}
@@ -934,6 +951,264 @@ func TestUIRunDetailUnknownRun(t *testing.T) {
 	}
 }
 
+// TestUIRunDetailCauseCard pins the closed-run cause card: a parked run's
+// page quotes the park's own reason (the probe's trimmed PARKED result), a
+// failed run's quotes the last activity failure's message (the walk is
+// chronological, so the proximate failure wins), an aborted run carries
+// the resumable hint without a park reason (the reason is what tells park
+// and abort apart), and a running run renders no card at all — nothing is
+// closed to resume.
+func TestUIRunDetailCauseCard(t *testing.T) {
+	h := newUIHarness(t)
+	started := time.Now().Add(-time.Hour)
+	closed := time.Now().Add(-30 * time.Minute)
+	build := func(t *testing.T, id, runID string, st enums.WorkflowExecutionStatus, stamp workflows.RunStatus, closedRun bool, hist []*historypb.HistoryEvent) {
+		t.Helper()
+		info := &workflowpb.WorkflowExecutionInfo{
+			Execution: &commonpb.WorkflowExecution{WorkflowId: id, RunId: runID},
+			TaskQueue: "listq",
+			Status:    st,
+			StartTime: timestamppb.New(started),
+		}
+		if closedRun {
+			info.CloseTime = timestamppb.New(closed)
+		}
+		if stamp != "" {
+			payload, err := converter.GetDefaultDataConverter().ToPayload(stamp)
+			if err != nil {
+				t.Fatalf("encode DaedalusStatus %q: %v", stamp, err)
+			}
+			info.SearchAttributes = &commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
+				workflows.DaedalusStatusAttr: payload,
+			}}
+		}
+		h.fake.describes[id] = &workflowservice.DescribeWorkflowExecutionResponse{WorkflowExecutionInfo: info}
+		h.fake.wfHistory[id] = hist
+	}
+	labels := workflows.PipelineInput{IssueID: "42", RepoPath: "/repo/alpha", Flow: "feature-dev"}
+	agentRound := func(id int64, at time.Time) []*historypb.HistoryEvent {
+		return []*historypb.HistoryEvent{
+			uiScheduled(t, id, at, "RunJailedClaudeActivity", activities.AgentRunInput{Agent: "pi", Role: activities.RoleDev}),
+		}
+	}
+
+	t.Run("a parked run quotes the park's own reason", func(t *testing.T) {
+		build(t, "listq-hold", "run-hold", enums.WORKFLOW_EXECUTION_STATUS_COMPLETED, workflows.StatusParked, true,
+			[]*historypb.HistoryEvent{uiStartedEvent(t, labels)})
+		h.fake.history["run-hold"] = greenClose(t, workflows.ParkedResult("reviewer halted the run"))
+
+		out := h.get(t, "/runs/listq-hold")
+		for _, want := range []string{
+			"park reason: reviewer halted the run",
+			"daedalus continue listq-hold",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("parked detail lacks %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "failure: ") {
+			t.Errorf("parked detail fabricates a failure cause:\n%s", out)
+		}
+	})
+
+	t.Run("a failed run quotes the last activity failure", func(t *testing.T) {
+		at := time.Now().Add(-45 * time.Minute)
+		hist := agentRound(4, at.Add(-5*time.Minute))
+		hist = append(hist, uiFailedEvent(4, at, "the provider refused the key"))
+		hist = append(hist,
+			uiScheduled(t, 6, at.Add(time.Minute), "RunJailedClaudeActivity", activities.AgentRunInput{Agent: "pi", Role: activities.RoleDev}))
+		hist = append(hist, uiFailedEvent(6, at.Add(2*time.Minute), "the suite fell over after round 2"))
+		build(t, "listq-fell", "run-fell", enums.WORKFLOW_EXECUTION_STATUS_FAILED, workflows.StatusFailed, true, hist)
+
+		out := h.get(t, "/runs/listq-fell")
+		for _, want := range []string{
+			"failure: the suite fell over after round 2",
+			"daedalus continue listq-fell",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("failed detail lacks %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "the provider refused the key") {
+			t.Errorf("failed detail quotes an earlier failure over the proximate one:\n%s", out)
+		}
+		if strings.Contains(out, "park reason: ") {
+			t.Errorf("failed detail fabricates a park reason:\n%s", out)
+		}
+	})
+
+	t.Run("an aborted run is resumable without a park reason", func(t *testing.T) {
+		build(t, "listq-abort", "run-abort", enums.WORKFLOW_EXECUTION_STATUS_CANCELED, "", true,
+			[]*historypb.HistoryEvent{uiStartedEvent(t, labels)})
+
+		out := h.get(t, "/runs/listq-abort")
+		if !strings.Contains(out, "daedalus continue listq-abort") {
+			t.Errorf("aborted detail lacks the resumable hint:\n%s", out)
+		}
+		if strings.Contains(out, "park reason: ") {
+			t.Errorf("an aborted run must not borrow a park reason (the probe cannot read one):\n%s", out)
+		}
+	})
+
+	t.Run("a running run renders no card", func(t *testing.T) {
+		build(t, "listq-open", "run-open", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, "", false,
+			[]*historypb.HistoryEvent{uiStartedEvent(t, labels)})
+
+		out := h.get(t, "/runs/listq-open")
+		for _, want := range []string{"daedalus continue", "park reason: ", "failure: "} {
+			if strings.Contains(out, want) {
+				t.Errorf("running detail carries the closed-run face %q:\n%s", want, out)
+			}
+		}
+	})
+}
+
+// TestUIPolledPageFaces pins the polling client's decisions as the page
+// shells ship them: every polled region gates its poll on a visible tab,
+// the runs region re-renders the moment a filter changes, an active
+// selection vetoes the swap that would destroy it, the excerpt's scroll
+// offset rides the swap both ways, a failed poll announces itself in the
+// header, and the every-trigger probe is what hides the countdown ring on
+// a page with nothing polling instead of leaving it clamped at zero. The
+// scripts ship inside the shells; these pins hold their decision lines so
+// a template refactor cannot silently drop them.
+func TestUIPolledPageFaces(t *testing.T) {
+	h := newUIHarness(t)
+	started := time.Now().Add(-time.Hour)
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+		uiRow(t, "listq-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started, nil),
+	}
+	h.fake.wfHistory["listq-live"] = []*historypb.HistoryEvent{
+		uiStartedEvent(t, workflows.PipelineInput{IssueID: "42", RepoPath: "", Flow: "feature-dev"}),
+	}
+	h.fake.describes["listq-live"] = &workflowservice.DescribeWorkflowExecutionResponse{
+		WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+			Execution: &commonpb.WorkflowExecution{WorkflowId: "listq-live", RunId: "run-live"},
+			TaskQueue: "listq",
+			Status:    enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			StartTime: timestamppb.New(started),
+		},
+	}
+	index := h.get(t, "/")
+	runs := h.get(t, "/runs")
+	detail := h.get(t, "/runs/listq-live")
+
+	t.Run("background tabs stop polling", func(t *testing.T) {
+		if i := strings.Index(index, `id="wlist" hx-get="/workers/rows" hx-trigger="every 5s [!document.hidden]"`); i < 0 {
+			t.Errorf("the workers region lost its hidden gate:\n%s", index)
+		}
+		if !strings.Contains(detail, `hx-trigger="every 5s [!document.hidden]"`) {
+			t.Errorf("the run-detail region lost its hidden gate:\n%s", detail)
+		}
+		if !strings.Contains(runs, `hx-trigger="every 5s [!document.hidden], change from:#fq, change from:#fs"`) {
+			t.Errorf("the runs region lost its hidden gate or its filter change triggers:\n%s", runs)
+		}
+	})
+
+	t.Run("an active selection vetoes the swap it would destroy", func(t *testing.T) {
+		for _, want := range []string{
+			`if(sel.rangeCount&&!sel.isCollapsed&&t.contains(sel.getRangeAt(0).commonAncestorContainer)){`,
+			`ev.detail.shouldSwap=false;`,
+		} {
+			if !strings.Contains(index, want) {
+				t.Errorf("the page shell lacks the selection veto's %q:\n%s", want, index)
+			}
+		}
+	})
+
+	t.Run("the excerpt scroll rides the swap", func(t *testing.T) {
+		for _, want := range []string{
+			`if(pre)ddScroll=pre.scrollTop;`,
+			`if(pre)pre.scrollTop=ddScroll;`,
+		} {
+			if !strings.Contains(index, want) {
+				t.Errorf("the page shell lacks the scroll carry's %q:\n%s", want, index)
+			}
+		}
+	})
+
+	t.Run("a failed poll announces itself", func(t *testing.T) {
+		if !strings.Contains(index, `lp.textContent='poll failed';`) {
+			t.Errorf("the page shell lacks the poll-failed face:\n%s", index)
+		}
+	})
+
+	t.Run("the ring hides where nothing polls", func(t *testing.T) {
+		for _, want := range []string{
+			`var ddLive=!!document.querySelector('[hx-trigger*="every"]');`,
+			`if(cdEl)cdEl.closest('div').classList.add('hidden');`,
+		} {
+			if !strings.Contains(index, want) {
+				t.Errorf("the page shell lacks the ring's every-trigger probe or its hide branch:\n%s", want)
+			}
+		}
+	})
+}
+
+// TestUIPageA11yFaces pins the accessibility faces: the theme toggle
+// exposes its pressed state and the script keeps it honest across toggles,
+// the mode radios are sr-only (tab-reachable, focus ring on their label),
+// every form label names its control, and the tables declare column
+// headers.
+func TestUIPageA11yFaces(t *testing.T) {
+	h := newUIHarness(t)
+	writeWorkerUIRecord(t, "w1", uiWorkerConfig(h.cfg.Temporal.Host, "listq"))
+
+	t.Run("the theme toggle exposes its pressed state", func(t *testing.T) {
+		page := h.get(t, "/")
+		for _, want := range []string{
+			`aria-label="toggle theme" aria-pressed="true"`,
+			`ddTheme.setAttribute('aria-pressed',document.documentElement.classList.contains('dark'));`,
+			`ddTheme.setAttribute('aria-pressed',d);`,
+		} {
+			if !strings.Contains(page, want) {
+				t.Errorf("the theme toggle lacks %q:\n%s", want, page)
+			}
+		}
+	})
+
+	t.Run("the mode radios keep tab order and show their focus", func(t *testing.T) {
+		page := h.get(t, "/new")
+		for _, want := range []string{
+			`<input type="radio" name="mode" value="text" class="sr-only"`,
+			`<input type="radio" name="mode" value="file" class="sr-only"`,
+			`.tab:has(input:focus-visible){@apply ring-2 ring-emerald-500/60;}`,
+		} {
+			if !strings.Contains(page, want) {
+				t.Errorf("the mode toggle lacks %q:\n%s", want, page)
+			}
+		}
+	})
+
+	t.Run("every form label names its control", func(t *testing.T) {
+		page := h.get(t, "/new")
+		for _, id := range []string{"nq", "nwf", "nrepo", "nissue", "nprompt", "nprefix"} {
+			for _, want := range []string{`for="` + id + `"`, `id="` + id + `"`} {
+				if !strings.Contains(page, want) {
+					t.Errorf("the form lacks the %q wiring:\n%s", want, page)
+				}
+			}
+		}
+		// The agent label ships in its fragment, which only a chosen
+		// worker's page embeds.
+		pre := h.get(t, "/new?worker=w1")
+		if !strings.Contains(pre, `for="nagent"`) || !strings.Contains(pre, `id="nagent"`) {
+			t.Errorf("the agent fragment lacks its label wiring:\n%s", pre)
+		}
+	})
+
+	t.Run("tables declare column headers", func(t *testing.T) {
+		runs := h.get(t, "/runs")
+		if n := strings.Count(runs, `<th scope="col"`); n != 7 {
+			t.Errorf("the runs table declares %d column headers, want 7:\n%s", n, runs)
+		}
+		metrics := h.get(t, "/metrics")
+		if !strings.Contains(metrics, `<th scope="col" class="font-medium pb-2">Queue</th>`) {
+			t.Errorf("the sessions table declares no column headers:\n%s", metrics)
+		}
+	})
+}
+
 // TestUIMetricsPage pins the metrics view: the relay ledger's aggregates
 // (calls, the last-hour slice, token sums, the non-2xx count, per-worker
 // rows ordered by call count), and the live session gauges computed from
@@ -1242,5 +1517,48 @@ func TestClosedRunParkedMemoizes(t *testing.T) {
 	}
 	if n := probesFor("run-memo-a"); n != 1 {
 		t.Errorf("run-memo-a probed %d times, want 1 (the definitive answer memoizes)", n)
+	}
+}
+
+// TestClosedRunParkReasonFaces pins the park probe's reason face: a green
+// park yields the PARKED result's own text (prefix trimmed), the old
+// workers' awaiting-maintainer failure yields the sentinel alone (the
+// wrapped detail is the old workers' own), a plain close yields no reason,
+// and the memo serves the reason with the parked answer — a repeat probes
+// nothing and answers identically.
+func TestClosedRunParkReasonFaces(t *testing.T) {
+	fake := &fakeListServer{history: map[string]*historypb.HistoryEvent{}}
+	cfg := startListServer(t, fake)
+	c, err := newClient(cfg)
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	defer c.Close()
+
+	fake.history["run-reason-park"] = greenClose(t, workflows.ParkedResult("reviewer halted the run"))
+	fake.history["run-reason-old"] = redClose(workflows.ErrAwaitingMaintainer.Error() + ": reviewer halted the run")
+	fake.history["run-reason-green"] = greenClose(t, "aborted/issue-42")
+
+	if parked, reason := closedRunParkReason(c, "wf-reason-park", "run-reason-park"); !parked || reason != "reviewer halted the run" {
+		t.Errorf("a parked close probed (%v, %q), want the trimmed park reason", parked, reason)
+	}
+	if parked, reason := closedRunParkReason(c, "wf-reason-old", "run-reason-old"); !parked || reason != workflows.ErrAwaitingMaintainer.Error() {
+		t.Errorf("an awaiting-maintainer close probed (%v, %q), want (%v, %q)", parked, reason, true, workflows.ErrAwaitingMaintainer.Error())
+	}
+	if parked, reason := closedRunParkReason(c, "wf-reason-green", "run-reason-green"); parked || reason != "" {
+		t.Errorf("a plain green close probed (%v, %q), want no park and no reason", parked, reason)
+	}
+
+	if parked, reason := closedRunParkReason(c, "wf-reason-park", "run-reason-park"); !parked || reason != "reviewer halted the run" {
+		t.Errorf("the memoized repeat probed (%v, %q), want the identical parked answer", parked, reason)
+	}
+	n := 0
+	for _, p := range fake.probes {
+		if p.runID == "run-reason-park" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("run-reason-park probed %d times, want 1 (the memo serves the reason too)", n)
 	}
 }
