@@ -509,6 +509,74 @@ func TestStagePiProviderSamplingParams(t *testing.T) {
 	})
 }
 
+// TestStagePiProviderWireThinking pins the wire-level disable-thinking
+// staging: a resolved DAEDALUS_WIRE_THINKING=off (wireThinkingEnv's
+// per-role output) stages chat_template_kwargs {"enable_thinking": false}
+// into the model entry's samplingParams — the Qwen3-template convention,
+// merged as a top-level request param like every sampler knob — while an
+// absent or non-"off" value stages nothing (never-send-a-default, exactly
+// like a nil sampler field).
+func TestStagePiProviderWireThinking(t *testing.T) {
+	t.Run("off stages the disable-thinking encoding", func(t *testing.T) {
+		home := piTestHome(t)
+		if _, _, err := stagePiProvider(piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1",
+			"OPENAI_MODEL=qwen",
+			config.WireThinkingEnv+"=off",
+		)); err != nil {
+			t.Fatalf("stagePiProvider: %v", err)
+		}
+		_, entry := stagedDaedalusEntry(t, home)
+		kwargs, ok := entry.Models[0].SamplingParams["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("samplingParams chat_template_kwargs = %v, want the disable-thinking map staged", entry.Models[0].SamplingParams["chat_template_kwargs"])
+		}
+		if v, ok := kwargs["enable_thinking"].(bool); !ok || v {
+			t.Errorf("chat_template_kwargs enable_thinking = %v, want the bool false", kwargs["enable_thinking"])
+		}
+	})
+
+	t.Run("merges into sampler-staged params", func(t *testing.T) {
+		home := piTestHome(t)
+		if _, _, err := stagePiProvider(piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1",
+			"OPENAI_MODEL=qwen",
+			config.TopKEnv+"=40",
+			config.WireThinkingEnv+"=off",
+		)); err != nil {
+			t.Fatalf("stagePiProvider: %v", err)
+		}
+		_, entry := stagedDaedalusEntry(t, home)
+		params := entry.Models[0].SamplingParams
+		if got, ok := params["top_k"].(float64); !ok || got != 40 {
+			t.Errorf("samplingParams top_k = %v, want 40 kept beside the thinking staging", params["top_k"])
+		}
+		if _, ok := params["chat_template_kwargs"].(map[string]any); !ok {
+			t.Errorf("samplingParams chat_template_kwargs = %v, want the disable-thinking map staged", params["chat_template_kwargs"])
+		}
+	})
+
+	t.Run("absent and garbage stage nothing", func(t *testing.T) {
+		for _, wire := range []string{"", "maybe"} {
+			home := piTestHome(t)
+			kv := []string{
+				"OPENAI_BASE_URL=http://localhost:11434/v1",
+				"OPENAI_MODEL=qwen",
+			}
+			if wire != "" {
+				kv = append(kv, config.WireThinkingEnv+"="+wire)
+			}
+			if _, _, err := stagePiProvider(piEnv(kv...)); err != nil {
+				t.Fatalf("stagePiProvider: %v", err)
+			}
+			_, entry := stagedDaedalusEntry(t, home)
+			if _, ok := entry.Models[0].SamplingParams["chat_template_kwargs"]; ok {
+				t.Errorf("samplingParams staged chat_template_kwargs with %s=%q, want nothing sent", config.WireThinkingEnv, wire)
+			}
+		}
+	})
+}
+
 // TestStagePiProviderSlashModel pins the --model reference shape: the id is
 // appended whole after the provider prefix, because pi splits
 // provider/model on the FIRST slash — a huggingface-style model ref must

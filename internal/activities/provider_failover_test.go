@@ -670,6 +670,185 @@ func TestReviewerEnvPartialOverride(t *testing.T) {
 	}
 }
 
+// TestReviewerEnvModelOverride pins the model dimension of the reviewer
+// override: a model-only section retargets just the model id on both wire
+// families — replaced in place where the serving env already carries one,
+// so the staged claude/aider/pi/codex/opencode model wiring all pick it up
+// — while url, key, and the relay vars stay untouched: a model-only round
+// dials the serving endpoint, which is exactly what the relays' upstreams
+// already are. url and model compose (both applied, relays stripped), and
+// non-reviewer roles pass through byte-identical with the model set.
+func TestReviewerEnvModelOverride(t *testing.T) {
+	const model = "qwen3-review"
+
+	t.Run("model-only keeps endpoint, key, and relays", func(t *testing.T) {
+		t.Setenv(config.ReviewerModelEnv, model)
+		base := append(reviewerRoundBaseEnv(),
+			config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1",
+			config.MetricsRelayAnthropicEnv+"=http://127.0.0.1:7778",
+			config.MetricsRelayOpenAIEnv+"=http://127.0.0.1:7778",
+		)
+		for _, role := range []SessionRole{RoleDevReview, RoleTestReview} {
+			got := reviewerEnv(slices.Clone(base), role)
+			for name, want := range map[string]string{
+				"ANTHROPIC_MODEL":    model,
+				"OPENAI_MODEL":       model,
+				"ANTHROPIC_BASE_URL": "https://primary.example",
+				"ANTHROPIC_API_KEY":  "sk-primary",
+				"OPENAI_BASE_URL":    "https://oai.example",
+				"OPENAI_API_KEY":     "sk-oai",
+			} {
+				if v := envValue(got, name); v != want {
+					t.Errorf("reviewerEnv(%q) %s = %q, want %q", role, name, v, want)
+				}
+			}
+			for _, name := range []string{
+				"ANTHROPIC_MODEL", "OPENAI_MODEL",
+				config.ToolRelayURLEnv, config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv,
+			} {
+				if n := countEnv(got, name); n != 1 {
+					t.Errorf("reviewerEnv(%q) left %d entries for %s, want exactly one", role, n, name)
+				}
+			}
+		}
+	})
+
+	t.Run("url and model compose, relays drop", func(t *testing.T) {
+		t.Setenv(config.ReviewerURLEnv, "https://review.example")
+		t.Setenv(config.ReviewerModelEnv, model)
+		base := append(reviewerRoundBaseEnv(),
+			config.ToolRelayURLEnv+"=http://127.0.0.1:41238/v1",
+			config.MetricsRelayAnthropicEnv+"=http://127.0.0.1:7778",
+			config.MetricsRelayOpenAIEnv+"=http://127.0.0.1:7778",
+		)
+		got := reviewerEnv(base, RoleDevReview)
+		for name, want := range map[string]string{
+			"ANTHROPIC_BASE_URL": "https://review.example",
+			"OPENAI_BASE_URL":    "https://review.example",
+			"ANTHROPIC_MODEL":    model,
+			"OPENAI_MODEL":       model,
+		} {
+			if v := envValue(got, name); v != want {
+				t.Errorf("%s = %q, want %q", name, v, want)
+			}
+		}
+		for _, name := range []string{config.ToolRelayURLEnv, config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv} {
+			for _, kv := range got {
+				if n, _, ok := cutEnv(kv); ok && n == name {
+					t.Errorf("url+model override env still carries %q; the relay must not route an overridden round", kv)
+				}
+			}
+		}
+	})
+
+	t.Run("non-reviewer roles untouched with the model set", func(t *testing.T) {
+		t.Setenv(config.ReviewerModelEnv, model)
+		untouched := reviewerRoundBaseEnv()
+		for _, role := range []SessionRole{RoleDev, RoleTest, ""} {
+			if got := reviewerEnv(slices.Clone(untouched), role); !slices.Equal(got, untouched) {
+				t.Errorf("reviewerEnv(%q) rewired a non-reviewer round: %v", role, got)
+			}
+		}
+	})
+}
+
+// TestWireThinkingEnv pins the wire-level thinking knob's role resolution:
+// reviewer rounds key on the reviewer section's export alone and every
+// other role (dev, test, role-less one-shots) on the openai section's —
+// each role controls its own brain, so neither section's knob ever crosses
+// to the other. Only the strict "off" value (what runWorker exports for an
+// explicit disable_thinking: true) resolves to a signal; an ambient garbage
+// value is never read as an off. The resolution is set-or-removed every
+// round, so a stale round-env value cannot outlive a knob that says
+// nothing.
+func TestWireThinkingEnv(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		role             SessionRole
+		openai, reviewer string // worker-export values; "" leaves the var unset
+		wantSet          bool
+	}{
+		{"dev round reads the openai knob", RoleDev, "off", "", true},
+		{"test round reads the openai knob", RoleTest, "off", "", true},
+		{"role-less round reads the openai knob", "", "off", "", true},
+		{"dev-review round reads the reviewer knob", RoleDevReview, "", "off", true},
+		{"test-review round reads the reviewer knob", RoleTestReview, "", "off", true},
+		{"reviewer round ignores the openai knob", RoleDevReview, "off", "", false},
+		{"dev round ignores the reviewer knob", RoleDev, "", "off", false},
+		{"garbage is never an off", RoleDev, "maybe", "", false},
+		{"unset on both sides sends nothing", RoleTestReview, "", "", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.openai != "" {
+				t.Setenv(config.OpenAIThinkingEnv, c.openai)
+			}
+			if c.reviewer != "" {
+				t.Setenv(config.ReviewerThinkingEnv, c.reviewer)
+			}
+			// A stale round-env value seeds the removal branch; the set
+			// branch must replace it in place, not append a second entry.
+			env := []string{"PATH=/usr/bin", config.WireThinkingEnv + "=off"}
+			got := wireThinkingEnv(env, c.role)
+			if !c.wantSet {
+				if _, ok := lookupTestEnv(got, config.WireThinkingEnv); ok {
+					t.Errorf("wireThinkingEnv(%q) kept %q with the knob unset/garbage: %v", c.role, config.WireThinkingEnv, got)
+				}
+				return
+			}
+			if v := envValue(got, config.WireThinkingEnv); v != "off" {
+				t.Errorf("wireThinkingEnv(%q) %s = %q, want off", c.role, config.WireThinkingEnv, v)
+			}
+			if n := countEnv(got, config.WireThinkingEnv); n != 1 {
+				t.Errorf("wireThinkingEnv(%q) left %d entries for %s, want exactly one", c.role, n, config.WireThinkingEnv)
+			}
+		})
+	}
+}
+
+// lookupTestEnv reports whether env carries name, the removal probe.
+func lookupTestEnv(env []string, name string) (string, bool) {
+	for _, kv := range env {
+		if n, v, ok := cutEnv(kv); ok && n == name {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// TestRoundResolvesWireThinking pins the knob's resolution at the round
+// boundary: runJailedRoundFolders resolves the per-role worker export into
+// the round env the jailed CLI actually sees — a reviewer round keys on the
+// reviewer section's export, a dev round on the openai section's, and
+// neither crosses — the same one-invoker composition reviewerEnv's
+// round-level pin covers for the endpoint override.
+func TestRoundResolvesWireThinking(t *testing.T) {
+	t.Setenv(config.ReviewerThinkingEnv, "off")
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", `echo "ENV:DAEDALUS_WIRE_THINKING=$DAEDALUS_WIRE_THINKING" >> "$STUB_LOG"
+exit 0`)
+	// A fixed env, not os.Environ()+overrides: production round envs never
+	// carry a name twice (see TestReviewerRoundDialsReviewerEndpoint).
+	base := append(reviewerRoundBaseEnv(),
+		"PATH="+os.Getenv("PATH"),
+		"STUB_LOG="+log,
+	)
+	for _, role := range []SessionRole{RoleDevReview, RoleDev} {
+		if _, err := runJailedRound(context.Background(), slices.Clone(base), role, "claude", t.TempDir(), "round prompt"); err != nil {
+			t.Fatalf("%s: runJailedRound: %v", role, err)
+		}
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 2 {
+		t.Fatalf("got %d jailed calls, want 2 (reviewer then dev)", len(calls))
+	}
+	if got := calls[0].Env[config.WireThinkingEnv]; got != "off" {
+		t.Errorf("reviewer round %s = %q, want off (the reviewer section's knob)", config.WireThinkingEnv, got)
+	}
+	if got := calls[1].Env[config.WireThinkingEnv]; got != "" {
+		t.Errorf("dev round %s = %q, want absent (the openai knob was never set)", config.WireThinkingEnv, got)
+	}
+}
+
 // TestReviewerRoundDialsReviewerEndpoint pins the override at the round
 // boundary: runJailedRound composes reviewerEnv into the child environment
 // for a reviewer role — the url/key the jailed CLI actually sees are the

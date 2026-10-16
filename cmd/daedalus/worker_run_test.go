@@ -201,6 +201,83 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	}
 }
 
+// TestRunWorkerReviewerSplitEnvExports pins the reviewer-split env channel
+// at worker startup: a reviewer.model export travels as
+// DAEDALUS_REVIEWER_MODEL (exported only when set, per the task spec —
+// scrubbed from the daemon spawn via config.ProviderEnvVars; the
+// stale-foreground-export clear is deliberately not asserted, see
+// backlog/bugs/reviewer-model-env-foreground-stale-export.md), and the two
+// wire-level thinking knobs export as DAEDALUS_OPENAI_THINKING=off /
+// DAEDALUS_REVIEWER_THINKING=off — only an explicit disable_thinking: true
+// sends a signal (never-send-a-default), and like the toggle family they
+// mirror (DAEDALUS_SLIM/THINKING/STREAM) they unset symmetrically. The
+// openai-side value reads the projected openai channel (ProviderChannels),
+// so a provider-typed section's knob governs exactly like the legacy
+// openai section's. runWorker is driven to its first failure (an empty
+// task queue fails worktree preflight before any Temporal dial) purely to
+// observe the exports.
+func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
+	restoreProcessEnv(t, config.ReviewerModelEnv, config.OpenAIThinkingEnv, config.ReviewerThinkingEnv,
+		"DAEDALUS_AGENT", "DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", "DAEDALUS_MAX_CONCURRENT_TESTS", "DAEDALUS_WORKER_NAME")
+
+	// Stale thinking exports must not outlive a config that says nothing —
+	// the toggles' set-or-unset symmetry.
+	t.Setenv(config.OpenAIThinkingEnv, "off")
+	t.Setenv(config.ReviewerThinkingEnv, "off")
+	if err := runWorker(config.Config{}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv(config.OpenAIThinkingEnv); got != "" {
+		t.Errorf("%s = %q after an unconfigured config, want the stale export cleared", config.OpenAIThinkingEnv, got)
+	}
+	if got := os.Getenv(config.ReviewerThinkingEnv); got != "" {
+		t.Errorf("%s = %q after an unconfigured config, want the stale export cleared", config.ReviewerThinkingEnv, got)
+	}
+
+	// The set branches: a reviewer model rides its own var, each knob arms
+	// only its own role's signal, and the two never merge.
+	if err := runWorker(config.Config{
+		Reviewer: config.ReviewerConfig{Model: "qwen3-review", DisableThinking: true},
+		OpenAI:   config.OpenAIConfig{DisableThinking: true},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv(config.ReviewerModelEnv); got != "qwen3-review" {
+		t.Errorf("%s = %q after a reviewer.model config, want qwen3-review", config.ReviewerModelEnv, got)
+	}
+	if got := os.Getenv(config.OpenAIThinkingEnv); got != "off" {
+		t.Errorf("%s = %q after an openai disable_thinking config, want off", config.OpenAIThinkingEnv, got)
+	}
+	if got := os.Getenv(config.ReviewerThinkingEnv); got != "off" {
+		t.Errorf("%s = %q after a reviewer disable_thinking config, want off", config.ReviewerThinkingEnv, got)
+	}
+
+	// A provider-typed openai section governs the openai-side knob through
+	// the projected channel; the reviewer side stays silent on its own.
+	if err := runWorker(config.Config{
+		Provider: &config.ProviderConfig{Type: config.FallbackTypeOpenAI, URL: "http://127.0.0.1:11434/v1", DisableThinking: true},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv(config.OpenAIThinkingEnv); got != "off" {
+		t.Errorf("%s = %q after a provider-typed disable_thinking config, want off (the projected channel governs)", config.OpenAIThinkingEnv, got)
+	}
+	if got := os.Getenv(config.ReviewerThinkingEnv); got != "" {
+		t.Errorf("%s = %q with no reviewer disable_thinking, want it unset", config.ReviewerThinkingEnv, got)
+	}
+
+	// The reviewer knob alone arms only the reviewer signal.
+	if err := runWorker(config.Config{Reviewer: config.ReviewerConfig{DisableThinking: true}}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv(config.ReviewerThinkingEnv); got != "off" {
+		t.Errorf("%s = %q after a reviewer-only disable_thinking config, want off", config.ReviewerThinkingEnv, got)
+	}
+	if got := os.Getenv(config.OpenAIThinkingEnv); got != "" {
+		t.Errorf("%s = %q with no openai disable_thinking, want it unset", config.OpenAIThinkingEnv, got)
+	}
+}
+
 // TestRunWorkerRelayProviderUpstream pins the relay's upstream resolution
 // through the provider channels: an openai-typed provider section serves as
 // the relay's upstream exactly as the legacy openai section does (the

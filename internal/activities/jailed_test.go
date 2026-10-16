@@ -625,6 +625,140 @@ exit 0`)
 	}
 }
 
+// TestRunJailedAiderWireThinking pins the aider staging of the wire-level
+// disable-thinking signal end to end: a DAEDALUS_OPENAI_THINKING=off
+// export (runWorker's openai disable_thinking export, resolved per role by
+// wireThinkingEnv into the round env) lands in the staged model settings as
+// extra_body chat_template_kwargs {enable_thinking: false} — the Qwen3-
+// template convention, under litellm's extra_body like top_k/min_p — with
+// the file typed-parsed so the value rides as a real YAML bool. Only the
+// strict "off" stages; the reviewer section's knob never arms a dev round
+// (the never-cross pin, through the full chain); and the encoding composes
+// with the sampler knobs in one extra_body.
+func TestRunJailedAiderWireThinking(t *testing.T) {
+	parseSettings := func(t *testing.T, wt string) map[string]any {
+		t.Helper()
+		settings, err := os.ReadFile(filepath.Join(wt, ".daedalus-aider", "model.settings.yml"))
+		if err != nil {
+			t.Fatalf("read staged settings: %v", err)
+		}
+		var parsed []struct {
+			ExtraParams map[string]any `yaml:"extra_params"`
+		}
+		if err := yaml.Unmarshal(settings, &parsed); err != nil {
+			t.Fatalf("staged settings are not valid YAML: %v\n%s", err, settings)
+		}
+		if len(parsed) != 1 {
+			t.Fatalf("staged settings parse to %d entries, want 1:\n%s", len(settings), settings)
+		}
+		return parsed[0].ExtraParams
+	}
+	checkNoStaging := func(t *testing.T, extra map[string]any) {
+		t.Helper()
+		if body, ok := extra["extra_body"].(map[string]any); ok {
+			if _, ok := body["chat_template_kwargs"]; ok {
+				t.Errorf("staged extra_body carried chat_template_kwargs: %v", body)
+			}
+		}
+	}
+
+	t.Run("off stages the disable-thinking encoding", func(t *testing.T) {
+		t.Setenv("DAEDALUS_AGENT", "aider")
+		t.Setenv(config.OpenAIThinkingEnv, "off")
+		fakeAiderInstall(t, "tree")
+		newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		wt := gitRepo(t)
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+
+		body, ok := parseSettings(t, wt)["extra_body"].(map[string]any)
+		if !ok {
+			t.Fatal("staged extra_params carry no extra_body map")
+		}
+		kwargs, ok := body["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("staged extra_body chat_template_kwargs = %v, want the disable-thinking map", body["chat_template_kwargs"])
+		}
+		if v, ok := kwargs["enable_thinking"].(bool); !ok || v {
+			t.Errorf("staged enable_thinking = %v, want the bool false", kwargs["enable_thinking"])
+		}
+	})
+
+	for _, c := range []struct {
+		name    string
+		envName string
+		envVal  string
+	}{
+		{"garbage value stages nothing", config.OpenAIThinkingEnv, "nope"},
+		{"the reviewer knob never arms a dev round", config.ReviewerThinkingEnv, "off"},
+		{"unset stages nothing", "", ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.envName != "" {
+				t.Setenv(c.envName, c.envVal)
+			}
+			t.Setenv("DAEDALUS_AGENT", "aider")
+			fakeAiderInstall(t, "tree")
+			newStubLog(t)
+			stubBin(t, "ai-jail", "exit 0")
+			t.Setenv("OPENAI_MODEL", "glm-selfhost")
+			t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+			wt := gitRepo(t)
+
+			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+				WorktreePath: wt,
+				Prompt:       "fix the bug",
+			}); err != nil {
+				t.Fatalf("RunJailedClaudeActivity: %v", err)
+			}
+
+			checkNoStaging(t, parseSettings(t, wt))
+		})
+	}
+
+	t.Run("composes with top_k in one extra_body", func(t *testing.T) {
+		t.Setenv("DAEDALUS_AGENT", "aider")
+		t.Setenv(config.OpenAIThinkingEnv, "off")
+		t.Setenv(config.TopKEnv, "40")
+		fakeAiderInstall(t, "tree")
+		newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		wt := gitRepo(t)
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+
+		body, ok := parseSettings(t, wt)["extra_body"].(map[string]any)
+		if !ok {
+			t.Fatal("staged extra_params carry no extra_body map")
+		}
+		if got, ok := body["top_k"].(float64); !ok || got != 40.0 {
+			t.Errorf("staged extra_body top_k = %#v, want the float 40", body["top_k"])
+		}
+		kwargs, ok := body["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("staged extra_body chat_template_kwargs = %v, want the disable-thinking map beside top_k", body["chat_template_kwargs"])
+		}
+		if v, ok := kwargs["enable_thinking"].(bool); !ok || v {
+			t.Errorf("staged enable_thinking = %v, want the bool false", kwargs["enable_thinking"])
+		}
+	})
+}
+
 // TestRunJailedClaudeMaxOutputEnv pins claude's completion-cap lever: a
 // MaxOutputTokensEnv export (anthropic.max_output_tokens riding the round
 // env) is re-exported to the jailed claude as CLAUDE_CODE_MAX_OUTPUT_TOKENS,

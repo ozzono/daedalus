@@ -203,6 +203,18 @@ func stagePiProvider(env []string) ([]string, func() error, error) {
 		}
 		modelEntry.SamplingParams = params
 	}
+	// The resolved wire-level thinking off signal (the openai and reviewer
+	// sections' disable_thinking, per role — see wireThinkingEnv):
+	// staged as chat_template_kwargs {"enable_thinking": false}, the
+	// Qwen3-template convention (see OpenAIConfig.DisableThinking for the
+	// probe-owed caveat). Merged as a top-level request param like every
+	// samplingParams entry.
+	if envLookup(env, config.WireThinkingEnv) == "off" {
+		if modelEntry.SamplingParams == nil {
+			modelEntry.SamplingParams = map[string]any{}
+		}
+		modelEntry.SamplingParams["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+	}
 	entry.Models = []piModelConfig{modelEntry}
 	if err := mergePiModelsEntry(id, entry); err != nil {
 		return nil, nil, fmt.Errorf("stage pi provider entry: %w", err)

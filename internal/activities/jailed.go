@@ -642,6 +642,9 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// provider's environment untouched. Applied before anything reads the
 	// round env — pi's provider staging included.
 	env = reviewerEnv(env, role)
+	// The wire-level thinking knob resolves per role into the round env
+	// (see wireThinkingEnv), before any staging reads it.
+	env = wireThinkingEnv(env, role)
 	// Metrics staging: when the worker enabled metrics, route the round's
 	// provider calls through the metrics daemon's relay (staged path
 	// prefix, synthetic attribution key on keyed rounds) so the ledger
@@ -1291,9 +1294,12 @@ const (
 // round env. A nil field is omitted from the staged settings — absent from
 // the wire request, never sent as null/0, so the backend's own sampler
 // defaults stand (a sent default overriding them was the exact bug class
-// that motivated these knobs).
+// that motivated these knobs). ThinkingOff is the resolved wire-level
+// disable-thinking signal (WireThinkingEnv, see wireThinkingEnv); false
+// stages nothing, exactly like a nil sampler field.
 type aiderSampler struct {
 	TopP, Temperature, PresencePenalty, TopK, MinP, RepetitionPenalty *float64
+	ThinkingOff                                                       bool
 }
 
 // samplerFromEnv parses the DAEDALUS_* sampler exports out of the round
@@ -1318,6 +1324,7 @@ func samplerFromEnv(env []string) aiderSampler {
 		TopK:              parse(config.TopKEnv),
 		MinP:              parse(config.MinPEnv),
 		RepetitionPenalty: parse(config.RepetitionPenaltyEnv),
+		ThinkingOff:       envLookup(env, config.WireThinkingEnv) == "off",
 	}
 }
 
@@ -1374,13 +1381,18 @@ func stageAiderModelFiles(worktreePath, prefixedModel string, maxInputTokens, ma
 	if sampler.RepetitionPenalty != nil {
 		fmt.Fprintf(&settings, "    repetition_penalty: %s\n", yamlFloat(*sampler.RepetitionPenalty))
 	}
-	if sampler.TopK != nil || sampler.MinP != nil {
+	if sampler.TopK != nil || sampler.MinP != nil || sampler.ThinkingOff {
 		settings.WriteString("    extra_body:\n")
 		if sampler.TopK != nil {
 			fmt.Fprintf(&settings, "      top_k: %s\n", yamlFloat(*sampler.TopK))
 		}
 		if sampler.MinP != nil {
 			fmt.Fprintf(&settings, "      min_p: %s\n", yamlFloat(*sampler.MinP))
+		}
+		if sampler.ThinkingOff {
+			// The disable-thinking encoding, Qwen3-template convention (see
+			// OpenAIConfig.DisableThinking for the probe-owed caveat).
+			settings.WriteString("      chat_template_kwargs:\n        enable_thinking: false\n")
 		}
 	}
 	dir := filepath.Join(worktreePath, ".daedalus-aider")

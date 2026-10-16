@@ -1084,8 +1084,15 @@ func TestExampleYAML(t *testing.T) {
 		cfg.Provider.HeartbeatModel != "" || cfg.Provider.TimeoutMS != DefaultAnthropicTimeoutMS ||
 		cfg.Provider.ContextTokens != 0 || cfg.Provider.MaxOutputTokens != 0 ||
 		cfg.Provider.TopP != 0 || cfg.Provider.Temperature != 0 || cfg.Provider.PresencePenalty != 0 ||
-		cfg.Provider.TopK != 0 || cfg.Provider.MinP != 0 || cfg.Provider.RepetitionPenalty != 0 {
+		cfg.Provider.TopK != 0 || cfg.Provider.MinP != 0 || cfg.Provider.RepetitionPenalty != 0 ||
+		cfg.Provider.DisableThinking {
 		t.Errorf("ExampleYAML provider section = %+v, want the typed-but-inert defaults", cfg.Provider)
+	}
+	// The reviewer section documents every field but ships inert: an
+	// example-file deployment shares the serving endpoint, model, and
+	// thinking default exactly as an unconfigured one would.
+	if cfg.Reviewer != (ReviewerConfig{}) {
+		t.Errorf("ExampleYAML reviewer section = %+v, want the documented-but-inert defaults", cfg.Reviewer)
 	}
 }
 
@@ -2282,10 +2289,72 @@ func TestAgentEnvReviewerEndpoint(t *testing.T) {
 // exports, or a stale inherited value would arm (or mis-arm) the reviewer
 // override next to the config it is supposed to mirror.
 func TestProviderEnvVarsIncludesReviewerEnvs(t *testing.T) {
-	for _, name := range []string{ReviewerURLEnv, ReviewerKeyEnv} {
+	for _, name := range []string{ReviewerURLEnv, ReviewerKeyEnv, ReviewerModelEnv} {
 		if !slices.Contains(ProviderEnvVars(), name) {
 			t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), name)
 		}
+	}
+}
+
+// TestProviderEnvVarsIncludesThinkingEnvs pins the wire-level thinking
+// channel's three names in the scrub/restore list: the two per-role worker
+// exports (DAEDALUS_OPENAI_THINKING / DAEDALUS_REVIEWER_THINKING, from the
+// openai and reviewer sections' disable_thinking) must be cleared from a
+// daemon's inherited env or a stale export would arm a config that says
+// nothing, and the round-env var (DAEDALUS_WIRE_THINKING) rides the same
+// list for the jailed passthrough.
+func TestProviderEnvVarsIncludesThinkingEnvs(t *testing.T) {
+	for _, name := range []string{OpenAIThinkingEnv, ReviewerThinkingEnv, WireThinkingEnv} {
+		if !slices.Contains(ProviderEnvVars(), name) {
+			t.Errorf("ProviderEnvVars() = %v, want %s listed", ProviderEnvVars(), name)
+		}
+	}
+}
+
+// TestLoadReviewerModelAndThinking pins the reviewer section's model and
+// disable_thinking fields plus the openai wire's disable_thinking knob:
+// the values load into the struct, absent keys stay at their zero values
+// (no signal anywhere), the provider section's knob projects onto the
+// openai channel exactly like its sampler knobs (so a provider-typed
+// section's setting governs the openai side), and an anthropic-typed
+// provider carrying it is a load error — a chat-completions request param
+// has no anthropic-wire consumer.
+func TestLoadReviewerModelAndThinking(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "reviewer:\n  url: https://review.example\n  model: qwen3-review\n  disable_thinking: true\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Reviewer.Model != "qwen3-review" || !cfg.Reviewer.DisableThinking {
+		t.Errorf("Reviewer = %+v, want model qwen3-review with disable_thinking set", cfg.Reviewer)
+	}
+
+	if cfg, err = Load(writeConfig(t, "")); err != nil || (cfg.Reviewer != ReviewerConfig{}) {
+		t.Errorf("absent reviewer section = %+v (err %v), want the zero value", cfg.Reviewer, err)
+	}
+
+	cfg, err = Load(writeConfig(t, "openai:\n  disable_thinking: true\n"))
+	if err != nil {
+		t.Fatalf("Load(openai.disable_thinking): %v", err)
+	}
+	if !cfg.OpenAI.DisableThinking {
+		t.Errorf("OpenAI = %+v, want disable_thinking set", cfg.OpenAI)
+	}
+
+	cfg, err = Load(writeConfig(t, "provider:\n  type: openai\n  url: https://selfhost.example/v1\n  key: sk\n  disable_thinking: true\n"))
+	if err != nil {
+		t.Fatalf("Load(provider.disable_thinking): %v", err)
+	}
+	if !cfg.Provider.DisableThinking {
+		t.Errorf("Provider = %+v, want disable_thinking set", cfg.Provider)
+	}
+	if _, open := cfg.ProviderChannels(); !open.DisableThinking {
+		t.Errorf("ProviderChannels() openai channel = %+v, want the provider section's disable_thinking projected", open)
+	}
+
+	if _, err = Load(writeConfig(t, "provider:\n  type: anthropic\n  url: https://selfhost.example\n  key: sk\n  disable_thinking: true\n")); err == nil ||
+		!strings.Contains(err.Error(), "provider") ||
+		!strings.Contains(err.Error(), "disable_thinking") {
+		t.Errorf("Load(anthropic-typed provider with disable_thinking) err = %v, want a provider.disable_thinking rejection", err)
 	}
 }
 
