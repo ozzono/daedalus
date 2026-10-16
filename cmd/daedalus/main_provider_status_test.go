@@ -12,11 +12,12 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 )
 
-// TestEnvWithoutProviderVars pins the daemon spawn scrub: every
-// config-derived provider variable is dropped from the inherited
-// environment — so a stale shell export can never win over a rotated
-// config — while everything else passes through untouched.
-func TestEnvWithoutProviderVars(t *testing.T) {
+// TestEnvWithoutWorkerVars pins the daemon spawn scrub: every variable
+// the config can derive or the worker can export (config.AllWorkerEnvVars)
+// is dropped from the inherited environment — so a stale shell export can
+// never win over a rotated config — while everything else passes through
+// untouched.
+func TestEnvWithoutWorkerVars(t *testing.T) {
 	in := []string{
 		"PATH=/usr/bin:/bin",
 		"ANTHROPIC_BASE_URL=https://stale.example",
@@ -31,22 +32,26 @@ func TestEnvWithoutProviderVars(t *testing.T) {
 		"DAEDALUS_FALLBACK_API_KEY=stale-backup",
 		"DAEDALUS_FALLBACK_MODEL=stale-backup-model",
 		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL=stale-backup-air",
+		"DAEDALUS_AGENT=aider",
+		"OPENCODE_CONFIG=/home/test/opencode.json",
+		"DAEDALUS_WORKER_DAEMON=1",
 		"HOME=/Users/test",
 	}
-	out := envWithoutProviderVars(in)
+	out := envWithoutWorkerVars(in)
 	if len(out) != 2 || out[0] != "PATH=/usr/bin:/bin" || out[1] != "HOME=/Users/test" {
 		t.Errorf("scrubbed env = %v, want only PATH and HOME", out)
 	}
-	// Every name the config can set must be scrubbed — a var added to
-	// AgentEnv/ProviderEnvVars but not to the scrub list would leak again.
+	// Every name the config can set or the worker can export must be
+	// scrubbed — a var added to AgentEnv/ProviderEnvVars/WorkerEnvVars
+	// but not to the scrub list would leak again.
 	scrubbed := map[string]bool{}
 	for _, kv := range out {
 		name, _, _ := strings.Cut(kv, "=")
 		scrubbed[name] = true
 	}
-	for _, name := range config.ProviderEnvVars() {
+	for _, name := range config.AllWorkerEnvVars() {
 		if scrubbed[name] {
-			t.Errorf("provider var %s survived the scrub", name)
+			t.Errorf("worker-ecosystem var %s survived envWithoutWorkerVars' daemon spawn scrub", name)
 		}
 	}
 }

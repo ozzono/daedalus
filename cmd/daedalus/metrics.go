@@ -141,7 +141,7 @@ func metricsStart(cfg config.Config, configPath string) error {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
 	cmd := exec.Command(self, "metrics", "foreground", "-c", configPath)
-	cmd.Env = append(envWithoutProviderVars(os.Environ()), daemonEnv+"=1")
+	cmd.Env = append(envWithoutWorkerVars(os.Environ()), daemonEnv+"=1")
 	cmd.Stdout = log
 	cmd.Stderr = log
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from the terminal

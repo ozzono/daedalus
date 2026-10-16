@@ -1443,12 +1443,13 @@ func (c Config) AgentEnv() []string {
 }
 
 // ProviderEnvVars lists every environment variable daedalus derives from
-// the config's provider sections — the single source of truth for what a
-// spawned worker daemon must NOT inherit from the invoking shell. worker
-// start scrubs these from the daemon's inherited environment so the
-// recorded config file is the only way provider values reach the daemon:
-// a stale export in the operator's terminal can never win over a rotated
-// config. Foreground runs keep the inherit semantics (see AgentEnv).
+// the config's provider sections — the provider-derived half of the
+// union in AllWorkerEnvVars, which is the actual spawn-scrub source
+// (envWithoutWorkerVars in cmd/daedalus scrubs it at daemon spawn), so
+// the recorded config file is the only way provider values reach the
+// daemon: a stale export in the operator's terminal can never win over
+// a rotated config. Foreground runs keep the inherit semantics (see
+// AgentEnv).
 func ProviderEnvVars() []string {
 	return []string{
 		"ANTHROPIC_BASE_URL",
@@ -1486,6 +1487,42 @@ func ProviderEnvVars() []string {
 		BugMirrorEnv,
 		TestOutputMirrorEnv,
 	}
+}
+
+// WorkerEnvVars lists the worker-ecosystem variables that must never
+// inherit ambiently, beyond the config-derived set in ProviderEnvVars:
+// the worker name, its concurrency clamps, the mode/agent switches its
+// jailed rounds inherit through the os.Environ() passthrough, and the
+// daemon marker (worker.go's daemonEnv, carried on the spawned daemon's
+// env — never a shell's). runWorker re-exports every member from the
+// recorded config EXCEPT OPENCODE_CONFIG: the opencode bridge stages it
+// round-scoped into the round env, runWorker never sets it, and an
+// operator's own export would ride the same passthrough into the pins
+// that read the var back off the ai-jail call — so it scrubs with the
+// rest and must never return ambient.
+func WorkerEnvVars() []string {
+	return []string{
+		"DAEDALUS_WORKER_NAME",
+		"DAEDALUS_MAX_CONCURRENT_AGENT_RUNS",
+		"DAEDALUS_MAX_CONCURRENT_TESTS",
+		"DAEDALUS_SLIM",
+		"DAEDALUS_THINKING",
+		"DAEDALUS_STREAM",
+		"DAEDALUS_AGENT",
+		"OPENCODE_CONFIG",
+		"DAEDALUS_WORKER_DAEMON",
+	}
+}
+
+// AllWorkerEnvVars is the full scrub set: ProviderEnvVars plus the
+// worker's own exports. The single composition point — the daemon-spawn
+// scrub (envWithoutWorkerVars in cmd/daedalus: the primary production
+// consumer) and the test suites' TestMain scrubs and the export
+// reconciliation scan consume this, never the two lists separately —
+// so a future third list or a per-site filter cannot leave one package
+// non-hermetic while the others stay clean.
+func AllWorkerEnvVars() []string {
+	return append(ProviderEnvVars(), WorkerEnvVars()...)
 }
 
 // Load reads the YAML configuration at path and applies defaults for every

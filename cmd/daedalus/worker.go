@@ -117,15 +117,21 @@ func recordedWorkers() ([]string, error) {
 	return names, nil
 }
 
-// envWithoutProviderVars drops every config-derived provider variable (see
-// config.ProviderEnvVars) from an inherited environment. The spawned daemon
-// gets provider values only from the config file it loads — runWorker
-// re-exports them — so a stale export in the invoking shell (e.g. an old
-// ANTHROPIC_API_KEY) can never win over a rotated config. Manual
-// `worker foreground` runs keep the inherit semantics: this scrub applies
-// only to the detached daemon.
-func envWithoutProviderVars(environ []string) []string {
-	names := config.ProviderEnvVars()
+// envWithoutWorkerVars drops every environment variable the worker
+// ecosystem derives from config or exports itself (config.AllWorkerEnvVars:
+// the provider sections and the fallback/reviewer/verdict-repair/tool-relay/
+// metrics channels, plus the worker's own exports — DAEDALUS_AGENT, the
+// concurrency clamps, the mode switches, the worker name, OPENCODE_CONFIG).
+// The spawned daemon gets provider values only from the config file it
+// loads — runWorker re-exports every member of that set EXCEPT
+// OPENCODE_CONFIG, which must never return ambient (its only legitimate
+// channel is the opencode bridge's round-scoped staging) — so a stale export
+// in the invoking shell (e.g. an old ANTHROPIC_API_KEY, or an
+// OPENCODE_CONFIG left over from an unrelated project) can never win over
+// the config. Manual `worker foreground` runs keep the inherit semantics:
+// this scrub applies only to the detached daemon.
+func envWithoutWorkerVars(environ []string) []string {
+	names := config.AllWorkerEnvVars()
 	scrub := make(map[string]bool, len(names))
 	for _, name := range names {
 		scrub[name] = true
@@ -194,7 +200,7 @@ func workerStart(cfg config.Config, configPath, workerType string) error {
 		return fmt.Errorf("write config record %s: %w", confFile, err)
 	}
 	cmd := exec.Command(self, childArgs...)
-	cmd.Env = append(envWithoutProviderVars(os.Environ()), daemonEnv+"=1")
+	cmd.Env = append(envWithoutWorkerVars(os.Environ()), daemonEnv+"=1")
 	cmd.Stdout = log
 	cmd.Stderr = log
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from the terminal

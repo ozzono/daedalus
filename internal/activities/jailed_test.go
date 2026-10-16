@@ -137,17 +137,13 @@ func TestAiderJailMounts(t *testing.T) {
 	})
 }
 
-// TestRunJailedClaudeActivityAiderOpenAIModel pins the model wiring an
-// openai-configured round gets on top of the base aider argv: the argv
-// flags select the prefixed model and point at the staged metadata and
-// settings files (the prefix is what routes aider's litellm layer to the
-// custom endpoint, so neither half is redundant), the metadata file is a
-// JSON object keyed by that prefixed model name (aider parses it with
-// json5.loads — a YAML shape would silently fall back to litellm's tiny
-// default budget), the settings file caps the wire request's max_tokens,
-// and OPENAI_API_BASE rides the round env next to OPENAI_BASE_URL — the
-// failover bridge for environments that never went through AgentEnv.
-func TestRunJailedClaudeActivityAiderOpenAIModel(t *testing.T) {
+// stageAiderOpenAIRound is the fixture truth shared by
+// TestRunJailedClaudeActivityAiderOpenAIModel and the hermeticity
+// probe: the aider openai wiring round — stubs, agent/model/endpoint
+// env, worktree, run — returning the recorded ai-jail call and the
+// worktree for the deeper assertions.
+func stageAiderOpenAIRound(t *testing.T) ([]stubCall, string) {
+	t.Helper()
 	fakeAiderInstall(t, "tree")
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "exit 0")
@@ -167,6 +163,33 @@ func TestRunJailedClaudeActivityAiderOpenAIModel(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
+	return calls, wt
+}
+
+// assertAiderOpenAIEndpoint pins the endpoint wiring both tests assert:
+// the round's OPENAI_BASE_URL and the OPENAI_API_BASE bridge beside it
+// carry the staged endpoint value, never a rewritten one.
+func assertAiderOpenAIEndpoint(t *testing.T, calls []stubCall) {
+	t.Helper()
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_API_BASE"} {
+		if got := calls[0].Env[key]; got != "https://selfhost.example/v1" {
+			t.Errorf("round env %s = %q, want OPENAI_BASE_URL's value", key, got)
+		}
+	}
+}
+
+// TestRunJailedClaudeActivityAiderOpenAIModel pins the model wiring an
+// openai-configured round gets on top of the base aider argv: the argv
+// flags select the prefixed model and point at the staged metadata and
+// settings files (the prefix is what routes aider's litellm layer to the
+// custom endpoint, so neither half is redundant), the metadata file is a
+// JSON object keyed by that prefixed model name (aider parses it with
+// json5.loads — a YAML shape would silently fall back to litellm's tiny
+// default budget), the settings file caps the wire request's max_tokens,
+// and OPENAI_API_BASE rides the round env next to OPENAI_BASE_URL — the
+// failover bridge for environments that never went through AgentEnv.
+func TestRunJailedClaudeActivityAiderOpenAIModel(t *testing.T) {
+	calls, wt := stageAiderOpenAIRound(t)
 	args := calls[0].Args
 	mi := slices.Index(args, "--message-file")
 	if mi < 0 {
@@ -181,9 +204,7 @@ func TestRunJailedClaudeActivityAiderOpenAIModel(t *testing.T) {
 		"--model-settings-file", ".daedalus-aider/model.settings.yml",
 	}, "aider model wiring")
 
-	if got := calls[0].Env["OPENAI_API_BASE"]; got != "https://selfhost.example/v1" {
-		t.Errorf("round env OPENAI_API_BASE = %q, want OPENAI_BASE_URL's value", got)
-	}
+	assertAiderOpenAIEndpoint(t, calls)
 
 	metadata, err := os.ReadFile(filepath.Join(wt, ".daedalus-aider", "model.metadata.json"))
 	if err != nil {

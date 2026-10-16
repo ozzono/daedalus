@@ -1,10 +1,17 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -12,6 +19,16 @@ import (
 
 	"github.com/ozzono/daedalus/internal/config"
 )
+
+// pkgSources is this package's own production source, embedded at
+// build: the reconciliation scan anchors on it, immune to both the
+// process cwd and -trimpath (a runtime.Caller path is module-relative
+// under trimpath; a cwd-relative read breaks outside the package dir).
+// The embed pattern cannot express the test-file negation — the scan's
+// walk skips _test.go names itself.
+//
+//go:embed all:*.go
+var pkgSources embed.FS
 
 // TestWorkerTypePollerSelection pins the run type → poller mapping: the
 // empty type starts both pollers (there is deliberately no "all" spelling),
@@ -86,13 +103,16 @@ func restoreProcessEnv(t *testing.T, names ...string) {
 // startup: a slim config exports DAEDALUS_SLIM=1, an explicit thinking:
 // false exports DAEDALUS_THINKING=off (the sole thinking value daedalus
 // ever sends), an explicit stream: true/false exports DAEDALUS_STREAM=
-// on/off, and a config that says off/absent clears each — none of the vars
-// is in the daemon spawn scrub, so a stale export in the invoking shell
-// must not survive into the daemon and silently beat the config. The slim
-// tool relay's DAEDALUS_TOOL_RELAY_URL obeys the same tri-state rule and
-// additionally needs slim.parser_model plus the openai section. runWorker
-// is driven to its first failure (an empty task queue fails worktree
-// preflight before any Temporal dial) purely to observe the exports.
+// on/off, and a config that says off/absent clears each. The daemon spawn
+// scrub (config.AllWorkerEnvVars) covers all of them, and these set/unset
+// branches are the second path guarding the same hazard — neither
+// redundant: the scrub clears the daemon's inherited env at spawn, the
+// branches clear what a process that kept the inherit semantics (worker
+// foreground) carried in. The slim tool relay's
+// DAEDALUS_TOOL_RELAY_URL obeys the same tri-state rule and additionally
+// needs slim.parser_model plus the openai section. runWorker is driven to
+// its first failure (an empty task queue fails worktree preflight before
+// any Temporal dial) purely to observe the exports.
 func TestRunWorkerSlimEnvExports(t *testing.T) {
 	// API_TIMEOUT_MS is in the list because a zero config still exports it
 	// (AgentEnv's strconv.Itoa(0) passes the non-empty gate) — a value
@@ -347,5 +367,216 @@ func TestRunWorkerMirrorEnvExports(t *testing.T) {
 		BugFiling: config.BugFilingConfig{Enabled: true, Mirror: "rel/bugs"},
 	}, ""); err == nil || !strings.Contains(err.Error(), "resolve bug_filing.mirror") || err.Error() != "resolve bug_filing.mirror: "+relErr.Error() {
 		t.Errorf("runWorker (relative bug mirror) error = %v, want the resolver's rejection wrapped under resolve bug_filing.mirror", err)
+	}
+}
+
+// TestRunWorkerExportsAreScrubbed pins the add-direction reconciliation
+// between the worker daemon's env exports and the test-suite scrub
+// lists: every env name the non-test sources of this package set must
+// be in config.AllWorkerEnvVars, else a new export rides the jailed
+// os.Environ() passthrough into every jailed `go test` — green on dev
+// hosts and CI, failing only on a serving worker. This scans the
+// sources' os.Setenv call sites instead of executing runWorker against
+// a representative config: most export sites sit behind metrics/daemon
+// liveness gates a sandboxed subprocess cannot reach, so a behavioral
+// probe would silently under-observe while this static walk sees every
+// site. The walk is a go/ast parse of every non-test file in the
+// package, embedded at build (pkgSources) so the scan is immune to both
+// the process cwd and -trimpath — a text scan would misread a call
+// wrapped across lines as absent, a comment mentioning os.Setenv as a
+// site, and a cwd/trimpath-relative read as an empty package. Receiver
+// idents resolve through the file's import table (any import whose path
+// is os, named or aliased); a .Setenv on an unknown receiver fails
+// loudly. Coverage by first-argument shape: a string literal is checked
+// directly; a config-package env constant is resolved through envConsts;
+// any other expression fails unless it is the single pinned dynamic
+// site — runWorker's AgentEnv application loop (ident arguments key,
+// value), anchored by enclosing function, so a rename, a move to a
+// helper, or a second dynamic site fails loudly and forces a re-anchor
+// (and a scrub-list decision) instead of passing silently. That one
+// site is safe by construction because TestAgentEnvKeysAreProviderEnvVars
+// (internal/config) pins AgentEnv's whole key family into
+// ProviderEnvVars. Package-level func-literal bodies — direct or nested
+// in composite literals, the outermost walked per literal — run at init
+// and are real export sites, under the same rules; a dynamic one there
+// can never be the pinned loop. A name assembled at runtime beyond that
+// loop would evade this scan. This scan and the AgentEnv key scan in
+// internal/config/config_test.go are deliberate twins — the same
+// go/ast machinery twice rather than a shared internal package at this
+// size; change both or fold them later.
+func TestRunWorkerExportsAreScrubbed(t *testing.T) {
+	// envConsts resolves the os.Setenv call sites whose first argument
+	// is a config-package env constant.
+	envConsts := map[string]string{
+		"MetricsRelayAnthropicEnv": config.MetricsRelayAnthropicEnv,
+		"MetricsRelayOpenAIEnv":    config.MetricsRelayOpenAIEnv,
+		"MetricsRelayTokenEnv":     config.MetricsRelayTokenEnv,
+		"ToolRelayURLEnv":          config.ToolRelayURLEnv,
+		"BugDirEnv":                config.BugDirEnv,
+		"BugMirrorEnv":             config.BugMirrorEnv,
+		"TestOutputMirrorEnv":      config.TestOutputMirrorEnv,
+	}
+	const dynamicFunc = "runWorker"
+	scrubbed := config.AllWorkerEnvVars()
+	dynamics := 0
+	// checkSetenv inspects one os.Setenv call found in fname's scope:
+	// the receiver must be the file's os import, string-literal and
+	// config-constant first arguments are resolved against the scrub
+	// set, and any other expression is the single pinned dynamic site.
+	checkSetenv := func(fname string, fset *token.FileSet, srcName string, imports map[string]string, call *ast.CallExpr) {
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return
+		}
+		if sel.Sel.Name != "Setenv" {
+			return
+		}
+		recv, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return
+		}
+		ipath, isImport := imports[recv.Name]
+		if !isImport {
+			t.Fatalf("%s: .Setenv on unknown receiver %s — resolve the receiver or extend the scan", srcName, recv.Name)
+		}
+		if ipath != "os" {
+			return // another package's Setenv
+		}
+		if len(call.Args) == 0 {
+			t.Fatalf("%s: os.Setenv without arguments", srcName)
+		}
+		requireScrubbed := func(envName string) {
+			if !slices.Contains(scrubbed, envName) {
+				t.Errorf("%s sets %s, want it listed in config.AllWorkerEnvVars() so the test scrubs clear it", srcName, envName)
+			}
+		}
+		switch arg := call.Args[0].(type) {
+		case *ast.BasicLit:
+			if arg.Kind != token.STRING {
+				t.Fatalf("%s: os.Setenv first argument is a %s literal, not a string — resolve by hand", srcName, arg.Kind)
+			}
+			lit, err := strconv.Unquote(arg.Value)
+			if err != nil {
+				t.Fatalf("%s: os.Setenv string literal %s does not unquote: %v", srcName, arg.Value, err)
+			}
+			requireScrubbed(lit)
+		case *ast.SelectorExpr:
+			pkg, ok := arg.X.(*ast.Ident)
+			if !ok || pkg.Name != "config" {
+				t.Fatalf("%s: os.Setenv first argument at %s is a selector the scan does not resolve — extend envConsts or the scrub lists", srcName, fset.Position(arg.Pos()))
+			}
+			resolved, ok := envConsts[arg.Sel.Name]
+			if !ok {
+				t.Fatalf("%s sets config.%s — an env constant the scan does not resolve; extend envConsts (and the scrub lists, if new)", srcName, arg.Sel.Name)
+			}
+			requireScrubbed(resolved)
+		default:
+			dynamics++
+			first, ok := arg.(*ast.Ident)
+			// a 1-argument os.Setenv lookalike (a build-tag-excluded file
+			// is parsed even though it never compiles) must hit this
+			// re-anchor failure, not an index panic
+			second, ok2 := (*ast.Ident)(nil), false
+			if len(call.Args) >= 2 {
+				second, ok2 = call.Args[1].(*ast.Ident)
+			}
+			if fname != dynamicFunc || !ok || !ok2 || first.Name != "key" || second.Name != "value" {
+				t.Fatalf("%s: dynamic os.Setenv in %s — outside the pinned AgentEnv loop in %s; extend the scrub lists and re-anchor the pin", srcName, fname, dynamicFunc)
+			}
+		}
+	}
+	// walk the embedded package sources; the embed pattern cannot
+	// express the test-file negation, so the walk skips _test.go itself
+	entries, err := fs.ReadDir(pkgSources, ".")
+	if err != nil {
+		t.Fatalf("list embedded package sources: %v", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		srcBytes, err := fs.ReadFile(pkgSources, name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, name, srcBytes, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		// the file's import table: local name → import path, so an
+		// aliased os import is recognized and a foreign .Setenv is loud
+		imports := map[string]string{}
+		for _, imp := range file.Imports {
+			ipath := strings.Trim(imp.Path.Value, `"`)
+			local := ipath[strings.LastIndexByte(ipath, '/')+1:]
+			if imp.Name != nil {
+				local = imp.Name.Name
+			}
+			imports[local] = ipath
+		}
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Body == nil {
+					continue
+				}
+				ast.Inspect(d.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					checkSetenv(d.Name.Name, fset, name, imports, call)
+					return true
+				})
+			case *ast.GenDecl:
+				// package-level func literals run at init: an os.Setenv
+				// inside one is a real export site, walked under the same
+				// rules (a dynamic one can never be the pinned loop).
+				// FuncLits nested in composite literals are collected by
+				// subtree walk; only outermost literals are walked so a
+				// nested one is not counted twice.
+				for _, spec := range d.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for _, value := range vs.Values {
+						var lits []*ast.FuncLit
+						ast.Inspect(value, func(n ast.Node) bool {
+							if lit, ok := n.(*ast.FuncLit); ok {
+								lits = append(lits, lit)
+							}
+							return true
+						})
+						for _, lit := range lits {
+							contained := false
+							for _, outer := range lits {
+								if outer != lit && outer.Pos() < lit.Pos() && lit.End() < outer.End() {
+									contained = true
+									break
+								}
+							}
+							if contained {
+								continue
+							}
+							owner := vs.Names[0].Name + " (package var)"
+							ast.Inspect(lit.Body, func(n ast.Node) bool {
+								call, ok := n.(*ast.CallExpr)
+								if !ok {
+									return true
+								}
+								checkSetenv(owner, fset, name, imports, call)
+								return true
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+	if dynamics != 1 {
+		t.Errorf("scanned package sources carry %d dynamic os.Setenv sites, want exactly the one pinned AgentEnv loop in %s", dynamics, dynamicFunc)
 	}
 }

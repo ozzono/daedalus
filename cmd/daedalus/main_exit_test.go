@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/version"
 )
 
@@ -63,6 +64,19 @@ func TestMain(m *testing.M) {
 		// by a test's child. A child returning from main() would surface as
 		// an exit-0 mismatch in that test, not a silently passing one.
 		os.Exit(0)
+	}
+	// Scrub the ambient worker environment before the suite runs: a
+	// metrics-enabled worker serving a jailed `go test` exports its relay
+	// roots, registration token, and DAEDALUS_WORKER_NAME into its own
+	// process env, and every var on config.AllWorkerEnvVars (the
+	// config-derived provider set plus the worker's own exports) rides
+	// the same shell when the config carries one — the metrics staging
+	// would rewrite pinned endpoints and an ambient token would defeat
+	// the "unset after a refused registration" assertions. The scrub
+	// sits after the re-exec branches so re-exec'd children (runMainIn,
+	// the argv dumps) keep the env their parent handed them.
+	for _, name := range config.AllWorkerEnvVars() {
+		os.Unsetenv(name)
 	}
 	os.Exit(m.Run())
 }

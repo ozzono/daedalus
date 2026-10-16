@@ -83,10 +83,12 @@ func runWorker(cfg config.Config, workerType string) error {
 	// Slim mode travels the same env channel: activities read DAEDALUS_SLIM
 	// when building a jailed aider round's environment (weak/editor model
 	// pinning). Like the concurrency var it is set here from the recorded
-	// config; the unset branch matters as much as the set one — neither var
-	// is in the daemon spawn scrub, so a stale export in the invoking shell
-	// would otherwise survive into the daemon and silently beat a config
-	// that says off.
+	// config; the unset branch matters as much as the set one — both vars
+	// are in the daemon spawn scrub (config.AllWorkerEnvVars), so a stale
+	// export in the invoking shell is dropped at spawn and the re-export
+	// here (or the unset below) is the only channel a value returns on:
+	// the daemon's own behavior stays config-driven. Foreground runs keep
+	// the inherit semantics by design.
 	if cfg.Slim.Enabled {
 		if err := os.Setenv("DAEDALUS_SLIM", "1"); err != nil {
 			return fmt.Errorf("set DAEDALUS_SLIM: %w", err)
@@ -99,8 +101,9 @@ func runWorker(cfg config.Config, workerType string) error {
 	// (internal/metricsrelay), which keeps the usage ledger the `daedalus
 	// metrics` surface reads. Two things happen here: the relay roots are
 	// exported on the env channel (per-round staging in activities reads
-	// them; symmetric unset plus the ProviderEnvVars scrub keep a stale
-	// export from staging a metrics-disabled worker), and this worker's
+	// them; symmetric unset plus the daemon-spawn scrub
+	// (config.AllWorkerEnvVars) keep a stale export from staging a
+	// metrics-disabled worker), and this worker's
 	// upstream mapping — base URLs and real API keys per wire, the same
 	// values AgentEnv exported above — is registered with the daemon and
 	// refreshed on a heartbeat well inside the registration TTL. workerStart
@@ -172,7 +175,7 @@ func runWorker(cfg config.Config, workerType string) error {
 	// pre-relay behavior. The staged URL (relay address plus the upstream's
 	// path prefix) travels the env channel like every other knob; unset
 	// symmetrically, and scrubbed from the daemon spawn via
-	// ProviderEnvVars, so a stale export can never point a new worker's
+	// config.AllWorkerEnvVars, so a stale export can never point a new worker's
 	// rounds at a dead relay.
 	var relayURL string
 	_, open := cfg.ProviderChannels()
@@ -233,7 +236,7 @@ func runWorker(cfg config.Config, workerType string) error {
 	// bug_filing.dir, default applied) is exported only when filing is
 	// enabled — absent means off, and the absence is load-bearing, like
 	// DAEDALUS_THINKING's only-off export above. Unset symmetrically (and
-	// scrubbed from the daemon spawn via ProviderEnvVars) so a stale export
+	// scrubbed from the daemon spawn via config.AllWorkerEnvVars) so a stale export
 	// in the invoking shell can never re-enable filing for a config that
 	// says off. The prompt-render sites read it in the worker process. Like
 	// DAEDALUS_SLIM and DAEDALUS_WORKER_NAME it passes through to jailed
@@ -253,7 +256,7 @@ func runWorker(cfg config.Config, workerType string) error {
 	// its filed files there after the round that wrote them. Exported only
 	// when the section is enabled and a mirror configured — absent means
 	// off, the same load-bearing absence as DAEDALUS_BUG_DIR, with the
-	// same symmetric unset and daemon-spawn scrub (ProviderEnvVars). They
+	// same symmetric unset and daemon-spawn scrub (config.AllWorkerEnvVars). They
 	// travel worker env, not pipeline input, because a mirror is a host
 	// path: a shared test queue may run a suite on a foreign deployment's
 	// worker, and each deployment mirrors onto its own host.

@@ -11,7 +11,7 @@ slim:
   max_input_tokens: 4098           # optional; 0/unset = DefaultSlimMaxInputTokens, negative fails the load
 ```
 
-- **Flow gating:** `slim.enabled: true` reroutes a defaulted `-w` to the slim flow; `config.flow` is forced to 1 under slim (a cold repo cannot be explored concurrently by a small window).
+- **Flow gating:** `slim.enabled: true` reroutes a defaulted `-w` to the slim flow; `max_concurrent_agent_runs` is clamped to 1 under slim (a cold repo cannot be explored concurrently by a small window).
 - **Aider under slim:** aider's weak/editor models are pinned via `AIDER_MODEL` under `DAEDALUS_SLIM`.
 - **Sampler knob:** the deployment's `temperature` (and the other sampler fields) stage into pi rounds; the planner prompt is written for `temperature: 0.2`.
 - **Breaking reshape (2026-10-02):** the former top-level `slim: true` boolean moved into this section — migrate by renaming it `slim.enabled`; the historical boolean still loads (it decodes into `enabled`), so an un-migrated config keeps working.

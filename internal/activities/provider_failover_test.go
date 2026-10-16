@@ -12,70 +12,41 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 )
 
-// TestMain scrubs the ambient provider environment once for the whole
-// package. A real worker shell exports DAEDALUS_FALLBACK_* (runWorker
-// sets them from config.yaml's fallback section), which arms failover for
-// every jailed-round test — and combined with the dry holds the
-// exhaustion tests leave in the package-global providerState, fails
-// unrelated tests with "both providers in dry holds". Three more ambient
-// hazards ride the same os.Environ() passthrough into runJailedRound:
-// DAEDALUS_SLIM/DAEDALUS_THINKING (runWorker exports both from
-// config.yaml) — an ambient DAEDALUS_SLIM=1 would silently arm aider
-// pinning and an ambient DAEDALUS_THINKING=off would inject a thinking
-// flag in every round test — DAEDALUS_STREAM (runWorker exports it from
-// config.yaml's stream field) would inject --stream/--no-stream into every
-// aider round test — and CLAUDE_CODE_MAX_CONTEXT_TOKENS /
-// DAEDALUS_MAX_OUTPUT_TOKENS, which replace the staged metadata's input
-// and output sides, so an ambient export — agent harnesses set the claude
-// one — would silently rewrite every pinned budget. The DAEDALUS_* sampler
-// exports (runWorker exports them from config.yaml's openai section) would
-// stage sampler params into every pinned settings file.
-// DAEDALUS_AGENT is exported at worker startup from config.yaml's agent
-// field, and jailedAgentCLI("") reads it: an ambient value (aider on an
-// aider-serving worker) silently switches every unpinned round test to
-// that agent's argv/env/scratch-dir wiring, failing them on shapes the
-// claude default never produces. The openai exports (OPENAI_BASE_URL,
-// OPENAI_API_KEY, OPENAI_MODEL, OPENAI_API_BASE — runWorker exports the
-// openai section for tooling) ride the passthrough into every round's
-// child env, so an ambient value breaks the tests that pin the no-openai
-// wiring exactly. With the vars unset, fallbackConfigured() is false
-// package-wide, poisoned holds are inert, staged metadata uses the
-// constants, and unpinned rounds resolve the claude default; tests that
-// need a fallback, a slim profile, a context window, or a non-claude
-// agent arm one explicitly (armFallback or t.Setenv).
+// TestMain scrubs the ambient worker environment once for the whole
+// package: runWorker exports config.ProviderEnvVars plus its own vars
+// (config.WorkerEnvVars — all but OPENCODE_CONFIG, which runWorker
+// deliberately never re-exports: the opencode bridge stages it
+// round-scoped) into the worker's process env, and the jailed
+// os.Environ() passthrough would ride all of them into every test
+// process on a serving worker. The hazards behind that list: DAEDALUS_FALLBACK_* arms
+// failover for every jailed-round test — and combined with the dry holds
+// the exhaustion tests leave in the package-global providerState, fails
+// unrelated tests with "both providers in dry holds"; the reviewer vars
+// would silently arm the reviewer override in every test;
+// DAEDALUS_SLIM=1 would silently arm aider pinning and
+// DAEDALUS_THINKING=off would inject a thinking flag in every round
+// test; DAEDALUS_STREAM would inject --stream/--no-stream into every
+// aider round test; CLAUDE_CODE_MAX_CONTEXT_TOKENS /
+// DAEDALUS_MAX_OUTPUT_TOKENS replace the staged metadata's input and
+// output sides, so an ambient export — agent harnesses set the claude
+// one — would silently rewrite every pinned budget; the DAEDALUS_*
+// sampler exports would stage sampler params into every pinned settings
+// file. DAEDALUS_AGENT is read by jailedAgentCLI(""): an ambient value
+// (aider on an aider-serving worker) silently switches every unpinned
+// round test to that agent's argv/env/scratch-dir wiring, failing them
+// on shapes the claude default never produces. The openai exports
+// (runWorker exports the openai section for tooling) ride the
+// passthrough into every round's child env, so an ambient value breaks
+// the tests that pin the no-openai wiring exactly. The metrics relay
+// roots plus DAEDALUS_WORKER_NAME stage every round onto the serving
+// worker's relay, rewriting every pinned endpoint. With the vars unset,
+// fallbackConfigured() is false package-wide, poisoned holds are inert,
+// staged metadata uses the constants, and unpinned rounds resolve the
+// claude default; tests that need a fallback, a slim profile, a context
+// window, or a non-claude agent arm one explicitly (armFallback or
+// t.Setenv).
 func TestMain(m *testing.M) {
-	for _, name := range []string{
-		"DAEDALUS_FALLBACK_TYPE",
-		"DAEDALUS_FALLBACK_BASE_URL",
-		"DAEDALUS_FALLBACK_API_KEY",
-		"DAEDALUS_FALLBACK_MODEL",
-		"DAEDALUS_FALLBACK_HEARTBEAT_MODEL",
-		"DAEDALUS_SLIM",
-		"DAEDALUS_THINKING",
-		"DAEDALUS_STREAM",
-		"DAEDALUS_AGENT",
-		"OPENAI_BASE_URL",
-		"OPENAI_API_KEY",
-		"OPENAI_MODEL",
-		"OPENAI_API_BASE",
-		// OPENCODE_CONFIG (the opencode bridge stages the round-scoped
-		// config path into the round env) would leak an operator's own
-		// pointer into the pins that read the var back off the ai-jail
-		// call.
-		"OPENCODE_CONFIG",
-		// reviewerEnv reads these from the process env: a live worker host
-		// exporting them (runWorker sets them from config.yaml's reviewer
-		// section) would silently arm the reviewer override in every test.
-		config.ReviewerURLEnv,
-		config.ReviewerKeyEnv,
-		config.ContextTokensEnv,
-		config.MaxOutputTokensEnv,
-		config.TopPEnv,
-		config.PresencePenaltyEnv,
-		config.TopKEnv,
-		config.MinPEnv,
-		config.RepetitionPenaltyEnv,
-	} {
+	for _, name := range config.AllWorkerEnvVars() {
 		os.Unsetenv(name)
 	}
 	os.Exit(m.Run())

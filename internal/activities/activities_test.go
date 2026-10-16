@@ -2484,8 +2484,7 @@ func TestNativeTestsMakefileTargets(t *testing.T) {
 // TestNativeTestsMakefileTestRuleWins pins the static-detection precedence:
 // a Makefile declaring a plain `test:` rule wins over the single-language
 // defaults — a repo that composes its own suite means to run the
-// composition, not the bare default its primary language would suggest
-// (daedalus run 01a125e2 resolved `go test ./...` for exactly such a repo) —
+// composition, not the bare default its primary language would suggest —
 // and over the split test-ui/test-api fallback too.
 func TestNativeTestsMakefileTestRuleWins(t *testing.T) {
 	log := newStubLog(t)
