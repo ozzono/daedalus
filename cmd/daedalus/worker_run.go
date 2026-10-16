@@ -258,6 +258,36 @@ func runWorker(cfg config.Config, workerType string) error {
 	} else if err := os.Unsetenv("DAEDALUS_REVIEWER_THINKING"); err != nil {
 		return fmt.Errorf("unset DAEDALUS_REVIEWER_THINKING: %w", err)
 	}
+	// The per-role provider overrides (the dev and final_reviewer sections,
+	// plus the reviewer section's context window) ride the same env-only
+	// channel, one loop for the whole family — a literal site per var would
+	// only restate config.RoleOverrideEnvVars. Every var is exported only
+	// when its field is set (the unset case is as load-bearing as the set
+	// one: absent means that role's rounds resolve down the fallback chain
+	// — final reviewer → reviewer → serving — exactly as before), and unset
+	// symmetrically with the rest of the scrub set, so a stale shell export
+	// can never retarget a config that says nothing. The jailed-round
+	// builder resolves per round (activities.reviewerEnv / devEnv /
+	// wireThinkingEnv).
+	exported := make(map[string]bool)
+	for _, kv := range cfg.RoleOverrideEnv() {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			return fmt.Errorf("role override export %q: malformed key=value", kv)
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("set %s: %w", key, err)
+		}
+		exported[key] = true
+	}
+	for _, name := range config.RoleOverrideEnvVars() {
+		if exported[name] {
+			continue
+		}
+		if err := os.Unsetenv(name); err != nil {
+			return fmt.Errorf("unset %s: %w", name, err)
+		}
+	}
 	// The streaming toggle: exported (as DAEDALUS_STREAM=on/off) only when
 	// explicitly set — absent means every agent follows its own streaming
 	// default. The jailed-round builder translates the value per agent

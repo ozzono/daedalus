@@ -886,6 +886,9 @@ func TestParseAttribution(t *testing.T) {
 	}{
 		{"full shape", "task-w1-role-dev-round-3", "w1", "dev", "3", "", true},
 		{"with token tail", "task-w1-role-dev-round-3-rk-" + testToken, "w1", "dev", "3", testToken, true},
+		// The slim terminal review's role carries a hyphen; the anchor
+		// split must not mistake it for a delimiter.
+		{"hyphenated role", "task-w1-role-final-review-round-2", "w1", "final-review", "2", "", true},
 		{"role none", "task-w1-role-none-round-0", "w1", "none", "0", "", true},
 		{"round part carrying -rk- still parses", "task-w1-role-dev-round-3-rk-inner-rk-tok", "w1", "dev", "3-rk-inner", "tok", true},
 		{"not the shape", "sk-plain-key", "", "", "", "", false},

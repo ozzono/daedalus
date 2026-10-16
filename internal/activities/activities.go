@@ -109,11 +109,14 @@ type ReviewInput struct {
 	// review) chains its own session; empty starts a fresh one. Agents
 	// without an id-addressable session (amp, aider) ignore it.
 	SessionID string
-	// Role scopes the recorded-session fallback to one of the run's four
-	// chained conversations (RoleDev, RoleTest, RoleDevReview,
-	// RoleTestReview), exactly like AgentRunInput.Role: when SessionID is
+	// Role scopes the recorded-session fallback to one of the run's chained
+	// conversations (RoleDev, RoleTest, RoleDevReview, RoleTestReview,
+	// RoleFinalReview), exactly like AgentRunInput.Role: when SessionID is
 	// empty, the round resumes the conversation the session watcher
-	// recorded for this role, if any. Empty role skips the fallback.
+	// recorded for this role, if any. The role also selects the round's
+	// provider staging (reviewerEnv: the reviewer chain, with the
+	// final_reviewer fields winning on RoleFinalReview) and the wire-level
+	// thinking knob (wireThinkingEnv). Empty role skips the fallback.
 	Role SessionRole
 	// TaskTouchesJail marks a task whose own text names .ai-jail
 	// (submit-time derivation — template.TaskTouchesJail on the run's

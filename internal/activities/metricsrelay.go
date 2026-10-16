@@ -14,11 +14,11 @@
 // token matching the registration, restores the registered real key
 // from, never second-guessing the parts. An unkeyed round (OAuth pass-through) keeps its own
 // credentials untouched and attributes at worker level. Rounds whose
-// endpoint was explicitly overridden — fallback, the reviewer section —
-// had the relay vars removed upstream of here (see fallbackEnv /
-// reviewerEnv: the registry's upstreams are the primary's, so staging a
-// round dialed elsewhere would silently misroute it back to the primary)
-// and stage nothing.
+// endpoint was explicitly overridden — fallback, the per-role provider
+// sections (reviewer / dev / final-reviewer) — had the relay vars removed
+// upstream of here (see fallbackEnv / applyRoleOverride: the registry's
+// upstreams are the primary's, so staging a round dialed elsewhere would
+// silently misroute it back to the primary) and stage nothing.
 package activities
 
 import (

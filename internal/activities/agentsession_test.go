@@ -29,15 +29,16 @@ func TestPathSlug(t *testing.T) {
 	}
 }
 
-// TestSessionStateRoleAccessors pins the role-to-field mapping: each of the
-// run's four conversations lands in (and reads back from) its own field, so
-// one role's id can never be served to another.
+// TestSessionStateRoleAccessors pins the role-to-field mapping: each of
+// the run's chained conversations lands in (and reads back from) its own
+// field, so one role's id can never be served to another.
 func TestSessionStateRoleAccessors(t *testing.T) {
 	ids := map[SessionRole]string{
-		RoleDev:        "d",
-		RoleTest:       "t",
-		RoleDevReview:  "dr",
-		RoleTestReview: "tr",
+		RoleDev:         "d",
+		RoleTest:        "t",
+		RoleDevReview:   "dr",
+		RoleTestReview:  "tr",
+		RoleFinalReview: "fr",
 	}
 	var st sessionState
 	for role, id := range ids {
@@ -64,7 +65,7 @@ func TestRecordedSessionRoundTrip(t *testing.T) {
 	if id != "sess-t" || stale {
 		t.Fatalf("recordedSession = %q (stale=%v), want sess-t live", id, stale)
 	}
-	for _, role := range []SessionRole{RoleDev, RoleDevReview, RoleTestReview} {
+	for _, role := range []SessionRole{RoleDev, RoleDevReview, RoleTestReview, RoleFinalReview} {
 		if id, _ := recordedSession(ctx, wt, role); id != "" {
 			t.Errorf("role %s resumed %q; one role's session must not serve another", role, id)
 		}

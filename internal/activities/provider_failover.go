@@ -204,41 +204,32 @@ func fallbackEnv() []string {
 	return env
 }
 
-// reviewerEnv pins a reviewer round's endpoint and model to the config's
-// reviewer section (ReviewerURLEnv / ReviewerKeyEnv / ReviewerModelEnv,
-// exported by runWorker when reviewer.url/key/model are set): reviewers
-// dial their own url/key and request their own model while dev and test
-// rounds keep the serving provider's. Applied to the round's assembled
-// environment — primary or fallback side alike — in runJailedRound, the
-// one invoker every jailed round goes through. Both wire families are
-// overridden so the section serves regardless of which provider is up;
-// the model override covers both families' model vars, so every staging
-// path (claude's env, aider's --model, the pi/codex/opencode staged model
-// entries) picks the reviewer model up from the round env. Model is
-// independently settable — a model-only section retargets just the model
-// id (same endpoint, different brain), so the endpoint relays stay staged
-// in that shape: their upstreams are the primary's, which is exactly the
-// endpoint a model-only round still dials. All three vars absent (the
-// default) leaves the environment untouched — reviewers share the
-// implementing agent's endpoint and model exactly as before.
-func reviewerEnv(env []string, role SessionRole) []string {
-	if role != RoleDevReview && role != RoleTestReview {
+// reviewRole reports whether the role is one of the review conversations —
+// the roles that never edit and stage from the reviewer chain. The pi edit
+// guardrail and the per-role provider resolution both route on it.
+func reviewRole(role SessionRole) bool {
+	return role == RoleDevReview || role == RoleTestReview || role == RoleFinalReview
+}
+
+// applyRoleOverride writes one resolved role override onto the round env:
+// both wire families' endpoint/key/model vars — the section serves
+// regardless of which provider is up, and the model override covers both
+// families so every staging path (claude's env, aider's --model, the
+// pi/codex/opencode staged model entries) picks it up from the round env —
+// plus the context-window var the stagings read (pi's ContextWindow,
+// aider's staged metadata input side, opencode's limit.context, claude's
+// own var). All four values resolved: empty leaves that dimension
+// untouched. An endpoint or key override removes the relay vars — the
+// key-only form included: the relays' upstreams are the primary's, so a
+// round left on the metrics relay would have its key swapped for the
+// synthetic attribution key (billed to the primary), and left on the slim
+// tool relay it would forward the role's key to the primary-pinned openai
+// upstream. A model-only or window-only override keeps them (the relays'
+// upstream is exactly the endpoint such a round still dials).
+func applyRoleOverride(env []string, url, key, model, window string) []string {
+	if url == "" && key == "" && model == "" && window == "" {
 		return env
 	}
-	url := os.Getenv(config.ReviewerURLEnv)
-	key := os.Getenv(config.ReviewerKeyEnv)
-	model := os.Getenv(config.ReviewerModelEnv)
-	if url == "" && key == "" && model == "" {
-		return env
-	}
-	// The relay vars lose to any endpoint or key override (see fallbackEnv)
-	// — the key-only form included. The relays' upstreams are the primary's:
-	// a reviewer.key-only round left on the metrics relay would have its key
-	// swapped for the synthetic attribution key and the primary's key
-	// restored in its place (billed to the primary), and left on the slim
-	// tool relay it would forward the reviewer key to the primary-pinned
-	// openai upstream. Strip whenever url or key is set; a model-only
-	// section keeps them (see above).
 	if url != "" || key != "" {
 		env = removeEnvVar(env, config.ToolRelayURLEnv)
 		env = removeEnvVar(env, config.MetricsRelayAnthropicEnv)
@@ -259,24 +250,105 @@ func reviewerEnv(env []string, role SessionRole) []string {
 		env = setEnvVar(env, "ANTHROPIC_MODEL", model)
 		env = setEnvVar(env, "OPENAI_MODEL", model)
 	}
+	if window != "" {
+		env = setEnvVar(env, config.ContextTokensEnv, window)
+	}
 	return env
+}
+
+// reviewerEnv pins a reviewer round's endpoint, key, model, and context
+// window to the config's reviewer chain (ReviewerURLEnv / ReviewerKeyEnv /
+// ReviewerModelEnv / ReviewerContextTokensEnv, exported by runWorker when
+// reviewer.url/key/model/context_tokens are set): reviewers dial their own
+// url/key and request their own model and window while dev and test rounds
+// keep the serving provider's. Applied to the round's assembled
+// environment — primary or fallback side alike — in runJailedRound, the
+// one invoker every jailed round goes through. The slim flow's terminal
+// review (RoleFinalReview, the last sub-task's review loop — the rounds
+// that see the cumulative diff of the whole run) resolves the same chain
+// with one precedence step: a final_reviewer field set wins, an unset
+// field falls back to the reviewer section's, and an unset reviewer field
+// leaves the serving value — the fallback chain, resolved per field, per
+// round. All vars absent (the default) leaves the environment untouched.
+func reviewerEnv(env []string, role SessionRole) []string {
+	if !reviewRole(role) {
+		return env
+	}
+	final := role == RoleFinalReview
+	// pick resolves one dimension along the chain: the reviewer section's
+	// value for a plain reviewer round; the final_reviewer section's value
+	// when set — else the reviewer section's — for the terminal review.
+	pick := func(reviewerVar, finalVar string) string {
+		if final {
+			if v := os.Getenv(finalVar); v != "" {
+				return v
+			}
+			return os.Getenv(reviewerVar)
+		}
+		return os.Getenv(reviewerVar)
+	}
+	return applyRoleOverride(env,
+		pick(config.ReviewerURLEnv, config.FinalReviewerURLEnv),
+		pick(config.ReviewerKeyEnv, config.FinalReviewerKeyEnv),
+		pick(config.ReviewerModelEnv, config.FinalReviewerModelEnv),
+		pick(config.ReviewerContextTokensEnv, config.FinalReviewerContextTokensEnv),
+	)
+}
+
+// devEnv pins a dev round's endpoint, key, model, and context window to
+// the config's dev section (DevURLEnv / DevKeyEnv / DevModelEnv /
+// DevContextTokensEnv, exported by runWorker when dev.url/key/model/
+// context_tokens are set): the implementing agent's rounds — the slim
+// flow's plan, parse, step, and fix rounds among them — dial their own
+// url/key and request their own model and window while review roles keep
+// theirs. Same application rules as reviewerEnv (both wire families,
+// relay-strip on an endpoint or key override); every var absent (the
+// default) leaves the serving environment untouched.
+func devEnv(env []string, role SessionRole) []string {
+	if role != RoleDev {
+		return env
+	}
+	return applyRoleOverride(env,
+		os.Getenv(config.DevURLEnv),
+		os.Getenv(config.DevKeyEnv),
+		os.Getenv(config.DevModelEnv),
+		os.Getenv(config.DevContextTokensEnv),
+	)
 }
 
 // wireThinkingEnv resolves the round's wire-level thinking knob into the
 // round env (WireThinkingEnv) — the one channel the provider stagings read
-// for it, since their signatures take the env alone. Reviewer rounds key
-// on the reviewer section's disable_thinking alone and every other role on
-// the openai section's: each role controls its own brain, and an unset
-// knob sends nothing even when the other section toggles
-// (never-send-a-default). The exports carry only the off value
-// ("off"; runWorker's disable_thinking export), matched strictly like
-// DAEDALUS_THINKING — an ambient garbage value is never read as an off.
-// Set-or-removed every round, so a stale foreground export can never
-// leak into a round whose config says nothing.
+// for it, since their signatures take the env alone. Each role keys on its
+// own section's disable_thinking alone, and an unset knob sends nothing
+// even when another section toggles (never-send-a-default) — with two
+// chain steps: the terminal review (RoleFinalReview) falls back to the
+// reviewer section's knob when its own is unset, and the dev role falls
+// back to the openai section's, which is the dev rounds' pre-role behavior
+// (review rounds fall back to nothing: each review role controls its own
+// brain). The exports carry only the off value ("off"; runWorker's
+// disable_thinking export), matched strictly like DAEDALUS_THINKING — an
+// ambient garbage value is never read as an off. Set-or-removed every
+// round, so a stale foreground export can never leak into a round whose
+// config says nothing.
 func wireThinkingEnv(env []string, role SessionRole) []string {
 	name := config.OpenAIThinkingEnv
-	if role == RoleDevReview || role == RoleTestReview {
+	switch {
+	case role == RoleFinalReview:
+		name = config.FinalReviewerThinkingEnv
+		if os.Getenv(name) != "off" {
+			// The fallback chain: the final reviewer's unset knob resolves
+			// to the reviewer section's.
+			name = config.ReviewerThinkingEnv
+		}
+	case reviewRole(role):
 		name = config.ReviewerThinkingEnv
+	case role == RoleDev:
+		name = config.DevThinkingEnv
+		if os.Getenv(name) != "off" {
+			// The dev role's unset knob resolves to the serving section's —
+			// exactly what dev rounds keyed on before the section existed.
+			name = config.OpenAIThinkingEnv
+		}
 	}
 	if os.Getenv(name) == "off" {
 		return setEnvVar(env, config.WireThinkingEnv, "off")

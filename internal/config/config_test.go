@@ -1153,11 +1153,20 @@ func TestExampleYAML(t *testing.T) {
 		cfg.Provider.DisableThinking {
 		t.Errorf("ExampleYAML provider section = %+v, want the typed-but-inert defaults", cfg.Provider)
 	}
-	// The reviewer section documents every field but ships inert: an
-	// example-file deployment shares the serving endpoint, model, and
-	// thinking default exactly as an unconfigured one would.
-	if cfg.Reviewer != (ReviewerConfig{}) {
-		t.Errorf("ExampleYAML reviewer section = %+v, want the documented-but-inert defaults", cfg.Reviewer)
+	// The per-role provider override groups document every field but ship
+	// inert: an example-file deployment shares the serving endpoint, model,
+	// window, and thinking default exactly as an unconfigured one would.
+	for _, g := range []struct {
+		name string
+		got  RoleOverrideConfig
+	}{
+		{"dev", cfg.Dev},
+		{"reviewer", cfg.Reviewer},
+		{"final_reviewer", cfg.FinalReviewer},
+	} {
+		if g.got != (RoleOverrideConfig{}) {
+			t.Errorf("ExampleYAML %s section = %+v, want the documented-but-inert defaults", g.name, g.got)
+		}
 	}
 }
 
@@ -1180,7 +1189,10 @@ func TestExampleYAMLFor(t *testing.T) {
 		{"mid section", "\nmid: false\n"},
 		{"slim section", "\nslim:\n"},
 		{"openai section", "\nopenai:\n"},
-		{"anthropic context_tokens", "\n  context_tokens: 0\n"},
+		// The slim slice's anthropic sizing key: anchored to the slice's
+		// unique opener comment — a bare "\n  context_tokens: 0\n" would
+		// also match the per-role override groups the base carries.
+		{"anthropic context_tokens", "\n  # Context window for the jailed agent's model"},
 		{"provider section", "\nprovider:\n"},
 		{"prompt section", "# Project-wise prompt overrides"},
 	}
@@ -1853,6 +1865,102 @@ func TestAgentEnvKeysAreProviderEnvVars(t *testing.T) {
 	}
 }
 
+// TestRoleOverrideEnvExports pins the per-role provider override groups'
+// env channel (RoleOverrideEnv — the loop runWorker applies and the
+// dynamic os.Setenv site TestRunWorkerExportsAreScrubbed re-anchored to
+// cover): only explicitly-set fields export, so an all-unset config
+// exports nothing and a subset exports exactly its set fields; the
+// thinking knobs speak only the off value ("off"); a context window
+// exports only when positive. A fully-set config emits exactly the
+// RoleOverrideEnvVars family — no stray exports, no dead list entries —
+// and every name in that family is in ProviderEnvVars, the scrub set the
+// worker's unset-symmetry loop and the daemon spawn both key on (the
+// same closure of the dynamic export site TestAgentEnvKeysAreProviderEnvVars
+// provides for AgentEnv). A negative context_tokens is a load error on
+// each of the three sections — the groups stage the same window var the
+// serving section does, so a negative is the same export bug there.
+func TestRoleOverrideEnvExports(t *testing.T) {
+	if env := (Config{}).RoleOverrideEnv(); len(env) != 0 {
+		t.Errorf("RoleOverrideEnv() on an all-unset config = %v, want empty (absent means the fallback chain, never a signal)", env)
+	}
+
+	full := Config{
+		Dev:           RoleOverrideConfig{URL: "https://dev.example", Key: "sk-dev", Model: "qwen3-dev", ContextTokens: 131072, DisableThinking: true},
+		Reviewer:      RoleOverrideConfig{ContextTokens: 65536},
+		FinalReviewer: RoleOverrideConfig{URL: "https://final.example", Key: "sk-final", Model: "qwen3-final", ContextTokens: 262144, DisableThinking: true},
+	}
+	env := full.RoleOverrideEnv()
+	got := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("RoleOverrideEnv() entry %q is not key=value", kv)
+		}
+		got = append(got, name)
+		if value == "" {
+			t.Errorf("RoleOverrideEnv() exported %s with an empty value; unset fields must export nothing", name)
+		}
+	}
+	want := RoleOverrideEnvVars()
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("fully-set config exported %v, want exactly the RoleOverrideEnvVars family %v", got, want)
+	}
+	for _, name := range want {
+		if !slices.Contains(ProviderEnvVars(), name) {
+			t.Errorf("RoleOverrideEnvVars() lists %s, want it in ProviderEnvVars() — an unscrubbed export rides the jailed passthrough", name)
+		}
+	}
+
+	for _, wantKV := range []string{
+		DevURLEnv + "=https://dev.example", DevKeyEnv + "=sk-dev", DevModelEnv + "=qwen3-dev",
+		DevContextTokensEnv + "=131072", DevThinkingEnv + "=off",
+		ReviewerContextTokensEnv + "=65536",
+		FinalReviewerURLEnv + "=https://final.example", FinalReviewerKeyEnv + "=sk-final", FinalReviewerModelEnv + "=qwen3-final",
+		FinalReviewerContextTokensEnv + "=262144", FinalReviewerThinkingEnv + "=off",
+	} {
+		if !slices.Contains(env, wantKV) {
+			t.Errorf("RoleOverrideEnv() = %v, want %q", env, wantKV)
+		}
+	}
+
+	// Subsets: only the set fields travel — a dev model+window config
+	// exports exactly two entries, the reviewer window alone one, and a
+	// final_reviewer disable_thinking alone the single off signal.
+	subset := Config{Dev: RoleOverrideConfig{Model: "qwen3-dev", ContextTokens: 4096}}
+	if got, want := subset.RoleOverrideEnv(), []string{DevModelEnv + "=qwen3-dev", DevContextTokensEnv + "=4096"}; !slices.Equal(got, want) {
+		t.Errorf("dev subset RoleOverrideEnv() = %v, want %v", got, want)
+	}
+	subset = Config{Reviewer: RoleOverrideConfig{ContextTokens: 8192}}
+	if got, want := subset.RoleOverrideEnv(), []string{ReviewerContextTokensEnv + "=8192"}; !slices.Equal(got, want) {
+		t.Errorf("reviewer window subset RoleOverrideEnv() = %v, want %v", got, want)
+	}
+	subset = Config{FinalReviewer: RoleOverrideConfig{DisableThinking: true}}
+	if got, want := subset.RoleOverrideEnv(), []string{FinalReviewerThinkingEnv + "=off"}; !slices.Equal(got, want) {
+		t.Errorf("final_reviewer thinking subset RoleOverrideEnv() = %v, want %v", got, want)
+	}
+
+	// A zero window and an unset (false) thinking knob export nothing even
+	// next to set siblings; a negative window is a load error per section.
+	mixed := Config{Dev: RoleOverrideConfig{Model: "qwen3-dev"}, Reviewer: RoleOverrideConfig{DisableThinking: false}}
+	for _, kv := range mixed.RoleOverrideEnv() {
+		if strings.HasPrefix(kv, DevContextTokensEnv+"=") || strings.HasPrefix(kv, ReviewerContextTokensEnv+"=") ||
+			strings.HasPrefix(kv, DevThinkingEnv+"=") || strings.HasPrefix(kv, ReviewerThinkingEnv+"=") {
+			t.Errorf("RoleOverrideEnv() leaked an unset-dimension signal %q", kv)
+		}
+	}
+	for _, doc := range []string{
+		"dev:\n  context_tokens: -1\n",
+		"reviewer:\n  context_tokens: -5\n",
+		"final_reviewer:\n  context_tokens: -1\n",
+	} {
+		if _, err := Load(writeConfig(t, doc)); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+			t.Errorf("Load(%q) err = %v, want a negative-context_tokens rejection", doc, err)
+		}
+	}
+}
+
 // TestBugFilingDir pins the effective-dir resolution: off (the section
 // absent, or enabled: false) returns "" — the off signal the env export
 // and the prompt render sites key on; enabled without a dir keeps the
@@ -2383,7 +2491,10 @@ func TestProviderEnvVarsIncludesThinkingEnvs(t *testing.T) {
 // openai channel exactly like its sampler knobs (so a provider-typed
 // section's setting governs the openai side), and an anthropic-typed
 // provider carrying it is a load error — a chat-completions request param
-// has no anthropic-wire consumer.
+// has no anthropic-wire consumer. The reviewer section is one of the three
+// RoleOverrideConfig groups (dev, reviewer, final_reviewer): the sibling
+// sections load the same fields, and an absent one loads as the zero
+// value.
 func TestLoadReviewerModelAndThinking(t *testing.T) {
 	cfg, err := Load(writeConfig(t, "reviewer:\n  url: https://review.example\n  model: qwen3-review\n  disable_thinking: true\n"))
 	if err != nil {
@@ -2393,8 +2504,31 @@ func TestLoadReviewerModelAndThinking(t *testing.T) {
 		t.Errorf("Reviewer = %+v, want model qwen3-review with disable_thinking set", cfg.Reviewer)
 	}
 
-	if cfg, err = Load(writeConfig(t, "")); err != nil || (cfg.Reviewer != ReviewerConfig{}) {
-		t.Errorf("absent reviewer section = %+v (err %v), want the zero value", cfg.Reviewer, err)
+	cfg, err = Load(writeConfig(t, "dev:\n  url: https://dev.example\n  key: sk-dev\n  model: qwen3-dev\n  context_tokens: 131072\n  disable_thinking: true\nfinal_reviewer:\n  url: https://final.example\n  model: qwen3-final\n"))
+	if err != nil {
+		t.Fatalf("Load(dev+final_reviewer): %v", err)
+	}
+	if cfg.Dev != (RoleOverrideConfig{URL: "https://dev.example", Key: "sk-dev", Model: "qwen3-dev", ContextTokens: 131072, DisableThinking: true}) {
+		t.Errorf("Dev = %+v, want every field loaded through", cfg.Dev)
+	}
+	if cfg.FinalReviewer != (RoleOverrideConfig{URL: "https://final.example", Model: "qwen3-final"}) {
+		t.Errorf("FinalReviewer = %+v, want url and model loaded through, the rest zero", cfg.FinalReviewer)
+	}
+
+	if cfg, err = Load(writeConfig(t, "")); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, g := range []struct {
+		name string
+		got  RoleOverrideConfig
+	}{
+		{"dev", cfg.Dev},
+		{"reviewer", cfg.Reviewer},
+		{"final_reviewer", cfg.FinalReviewer},
+	} {
+		if g.got != (RoleOverrideConfig{}) {
+			t.Errorf("absent %s section = %+v, want the zero value", g.name, g.got)
+		}
 	}
 
 	cfg, err = Load(writeConfig(t, "openai:\n  disable_thinking: true\n"))

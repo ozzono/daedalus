@@ -237,7 +237,7 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	// The set branches: a reviewer model rides its own var, each knob arms
 	// only its own role's signal, and the two never merge.
 	if err := runWorker(config.Config{
-		Reviewer: config.ReviewerConfig{Model: "qwen3-review", DisableThinking: true},
+		Reviewer: config.RoleOverrideConfig{Model: "qwen3-review", DisableThinking: true},
 		OpenAI:   config.OpenAIConfig{DisableThinking: true},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
@@ -267,7 +267,7 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	}
 
 	// The reviewer knob alone arms only the reviewer signal.
-	if err := runWorker(config.Config{Reviewer: config.ReviewerConfig{DisableThinking: true}}, ""); err == nil {
+	if err := runWorker(config.Config{Reviewer: config.RoleOverrideConfig{DisableThinking: true}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	if got := os.Getenv(config.ReviewerThinkingEnv); got != "off" {
@@ -275,6 +275,67 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	}
 	if got := os.Getenv(config.OpenAIThinkingEnv); got != "" {
 		t.Errorf("%s = %q with no openai disable_thinking, want it unset", config.OpenAIThinkingEnv, got)
+	}
+}
+
+// TestRunWorkerRoleOverrideEnvExports pins the per-role provider override
+// channel at worker startup (runWorker's dynamic os.Setenv loop over
+// config.RoleOverrideEnv, the site TestRunWorkerExportsAreScrubbed
+// re-anchored to cover beside the AgentEnv loop): every field set travels
+// as its own var (dev and final_reviewer url/key/model/context_tokens and
+// the off-only thinking knobs, the reviewer section's context window), a
+// subset config exports only its set fields, and the whole family unsets
+// symmetrically — a stale shell export of any var must not outlive a
+// config that says nothing, or it would retarget a role's rounds behind
+// the config's back. runWorker is driven to its first failure (an empty
+// task queue fails worktree preflight before any Temporal dial) purely to
+// observe the exports.
+func TestRunWorkerRoleOverrideEnvExports(t *testing.T) {
+	restoreProcessEnv(t, config.RoleOverrideEnvVars()...)
+
+	// Stale exports of the whole family must not outlive a config that
+	// says nothing — the set-or-unset symmetry the fallback chain rides on.
+	for _, name := range config.RoleOverrideEnvVars() {
+		t.Setenv(name, "stale")
+	}
+	if err := runWorker(config.Config{}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	for _, name := range config.RoleOverrideEnvVars() {
+		if got := os.Getenv(name); got != "" {
+			t.Errorf("%s = %q after an unconfigured config, want the stale export cleared", name, got)
+		}
+	}
+
+	// The set branches: every configured field rides its own var, and the
+	// thinking knobs export only the off value.
+	if err := runWorker(config.Config{
+		Dev:           config.RoleOverrideConfig{URL: "https://dev.example", Key: "sk-dev", Model: "qwen3-dev", ContextTokens: 131072, DisableThinking: true},
+		Reviewer:      config.RoleOverrideConfig{ContextTokens: 65536},
+		FinalReviewer: config.RoleOverrideConfig{URL: "https://final.example", Model: "qwen3-final"},
+	}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	for name, wantVal := range map[string]string{
+		config.DevURLEnv:                "https://dev.example",
+		config.DevKeyEnv:                "sk-dev",
+		config.DevModelEnv:              "qwen3-dev",
+		config.DevContextTokensEnv:      "131072",
+		config.DevThinkingEnv:           "off",
+		config.ReviewerContextTokensEnv: "65536",
+		config.FinalReviewerURLEnv:      "https://final.example",
+		config.FinalReviewerModelEnv:    "qwen3-final",
+	} {
+		if got := os.Getenv(name); got != wantVal {
+			t.Errorf("%s = %q, want %q", name, got, wantVal)
+		}
+	}
+	// Unset final_reviewer fields export nothing — the fallback chain's
+	// absent-means-fall-back contract, not an empty-string signal.
+	for _, name := range []string{config.FinalReviewerKeyEnv, config.FinalReviewerContextTokensEnv, config.FinalReviewerThinkingEnv} {
+		if got := os.Getenv(name); got != "" {
+			t.Errorf("%s = %q with the field unset, want it unset (absent means fall back)", name, got)
+		}
 	}
 }
 
@@ -466,14 +527,19 @@ func TestRunWorkerMirrorEnvExports(t *testing.T) {
 // is os, named or aliased); a .Setenv on an unknown receiver fails
 // loudly. Coverage by first-argument shape: a string literal is checked
 // directly; a config-package env constant is resolved through envConsts;
-// any other expression fails unless it is the single pinned dynamic
-// site — runWorker's AgentEnv application loop (ident arguments key,
-// value), anchored by enclosing function, so a rename, a move to a
-// helper, or a second dynamic site fails loudly and forces a re-anchor
-// (and a scrub-list decision) instead of passing silently. That one
-// site is safe by construction because TestAgentEnvKeysAreProviderEnvVars
+// any other expression fails unless it is one of the two pinned dynamic
+// sites — runWorker's AgentEnv application loop and its RoleOverrideEnv
+// application loop (both pairs of ident arguments key, value), anchored
+// by enclosing function, so a rename, a move to a helper, or a third
+// dynamic site fails loudly and forces a re-anchor (and a scrub-list
+// decision) instead of passing silently. The AgentEnv site is safe by
+// construction because TestAgentEnvKeysAreProviderEnvVars
 // (internal/config) pins AgentEnv's whole key family into
-// ProviderEnvVars. Package-level func-literal bodies — direct or nested
+// ProviderEnvVars; the RoleOverrideEnv site's twin is
+// TestRoleOverrideEnvExports (internal/config), which pins
+// RoleOverrideEnvVars into ProviderEnvVars and a fully-set config's
+// emitted keys onto that family exactly. Package-level func-literal
+// bodies — direct or nested
 // in composite literals, the outermost walked per literal — run at init
 // and are real export sites, under the same rules; a dynamic one there
 // can never be the pinned loop. A name assembled at runtime beyond that
@@ -558,7 +624,7 @@ func TestRunWorkerExportsAreScrubbed(t *testing.T) {
 				second, ok2 = call.Args[1].(*ast.Ident)
 			}
 			if fname != dynamicFunc || !ok || !ok2 || first.Name != "key" || second.Name != "value" {
-				t.Fatalf("%s: dynamic os.Setenv in %s — outside the pinned AgentEnv loop in %s; extend the scrub lists and re-anchor the pin", srcName, fname, dynamicFunc)
+				t.Fatalf("%s: dynamic os.Setenv in %s — outside the two pinned export loops (AgentEnv, RoleOverrideEnv) in %s; extend the scrub lists and re-anchor the pin", srcName, fname, dynamicFunc)
 			}
 		}
 	}
@@ -653,7 +719,7 @@ func TestRunWorkerExportsAreScrubbed(t *testing.T) {
 			}
 		}
 	}
-	if dynamics != 1 {
-		t.Errorf("scanned package sources carry %d dynamic os.Setenv sites, want exactly the one pinned AgentEnv loop in %s", dynamics, dynamicFunc)
+	if dynamics != 2 {
+		t.Errorf("scanned package sources carry %d dynamic os.Setenv sites, want exactly the two pinned export loops (AgentEnv, RoleOverrideEnv) in %s", dynamics, dynamicFunc)
 	}
 }

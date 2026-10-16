@@ -58,18 +58,26 @@ const (
 	RoleDevReview SessionRole = "dev-review"
 	// RoleTestReview scopes the test reviews.
 	RoleTestReview SessionRole = "test-review"
+	// RoleFinalReview scopes the slim flow's terminal review — the last
+	// sub-task's review loop, the rounds that see the cumulative diff of
+	// the whole run — so its provider staging resolves as the
+	// final_reviewer group (falling back to reviewer, then serving) while
+	// every earlier sub-task's reviews resolve as the plain reviewer. Only
+	// the slim flow produces it, always fresh-review (never resumed).
+	RoleFinalReview SessionRole = "final-review"
 )
 
 // sessionState is the persisted record: one file per worktree, holding the
 // workflow run's conversation ids per role. Best-effort state — a lost or
 // corrupt file only costs a fresh start, never a failed round.
 type sessionState struct {
-	Worktree   string `json:"worktree"`
-	RunID      string `json:"run_id"`
-	Dev        string `json:"dev,omitempty"`
-	Test       string `json:"test,omitempty"`
-	DevReview  string `json:"dev_review,omitempty"`
-	TestReview string `json:"test_review,omitempty"`
+	Worktree    string `json:"worktree"`
+	RunID       string `json:"run_id"`
+	Dev         string `json:"dev,omitempty"`
+	Test        string `json:"test,omitempty"`
+	DevReview   string `json:"dev_review,omitempty"`
+	TestReview  string `json:"test_review,omitempty"`
+	FinalReview string `json:"final_review,omitempty"`
 }
 
 func (s *sessionState) role(role SessionRole) string {
@@ -80,6 +88,8 @@ func (s *sessionState) role(role SessionRole) string {
 		return s.DevReview
 	case RoleTestReview:
 		return s.TestReview
+	case RoleFinalReview:
+		return s.FinalReview
 	default:
 		return s.Dev
 	}
@@ -93,6 +103,13 @@ func (s *sessionState) set(role SessionRole, id string) {
 		s.DevReview = id
 	case RoleTestReview:
 		s.TestReview = id
+	case RoleFinalReview:
+		// The slim flow never resumes a final review (fresh-review mode),
+		// but the transcript watcher records any tracked round: a slot of
+		// its own keeps the id out of the dev conversation's record — a
+		// dev retry resuming a reviewer's transcript would be a
+		// cross-role session leak.
+		s.FinalReview = id
 	default:
 		s.Dev = id
 	}

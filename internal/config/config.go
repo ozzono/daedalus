@@ -182,6 +182,42 @@ const (
 	ReviewerURLEnv   = "DAEDALUS_REVIEWER_BASE_URL"
 	ReviewerKeyEnv   = "DAEDALUS_REVIEWER_API_KEY"
 	ReviewerModelEnv = "DAEDALUS_REVIEWER_MODEL"
+	// ReviewerContextTokensEnv carries the reviewer section's
+	// context_tokens — reviewer rounds' own context window, staged like
+	// the serving anthropic.context_tokens (ContextTokensEnv → pi's
+	// ContextWindow, aider's staged metadata input side, opencode's
+	// limit.context, claude's own var). Exported only when set — absent
+	// means reviewer rounds keep the serving window.
+	ReviewerContextTokensEnv = "DAEDALUS_REVIEWER_CONTEXT_TOKENS"
+	// DevURLEnv, DevKeyEnv, DevModelEnv, DevContextTokensEnv, and
+	// DevThinkingEnv carry the dev section's overrides (dev.url / key /
+	// model / context_tokens / disable_thinking) into the jailed-round
+	// builder, which pins the dev rounds — the implementing agent's
+	// rounds: the slim flow's plan, parse, step, and fix rounds among
+	// them — to them while review roles keep theirs. Exported only when
+	// set — absent means dev rounds keep the serving provider's values
+	// exactly as before.
+	DevURLEnv           = "DAEDALUS_DEV_BASE_URL"
+	DevKeyEnv           = "DAEDALUS_DEV_API_KEY"
+	DevModelEnv         = "DAEDALUS_DEV_MODEL"
+	DevContextTokensEnv = "DAEDALUS_DEV_CONTEXT_TOKENS"
+	DevThinkingEnv      = "DAEDALUS_DEV_THINKING"
+	// FinalReviewerURLEnv, FinalReviewerKeyEnv, FinalReviewerModelEnv,
+	// FinalReviewerContextTokensEnv, and FinalReviewerThinkingEnv carry
+	// the final_reviewer section's overrides into the jailed-round
+	// builder for the terminal review — the last slim sub-task's review
+	// loop, the rounds that see the cumulative diff of the whole run.
+	// Each unset field falls back, per round, to the reviewer section's
+	// (ReviewerURLEnv / ReviewerKeyEnv / ReviewerModelEnv /
+	// ReviewerContextTokensEnv / ReviewerThinkingEnv), then to the
+	// serving sections — resolved by reviewerEnv and wireThinkingEnv.
+	// Exported only when set — absent means the final review stages from
+	// the reviewer chain exactly as before.
+	FinalReviewerURLEnv           = "DAEDALUS_FINAL_REVIEWER_BASE_URL"
+	FinalReviewerKeyEnv           = "DAEDALUS_FINAL_REVIEWER_API_KEY"
+	FinalReviewerModelEnv         = "DAEDALUS_FINAL_REVIEWER_MODEL"
+	FinalReviewerContextTokensEnv = "DAEDALUS_FINAL_REVIEWER_CONTEXT_TOKENS"
+	FinalReviewerThinkingEnv      = "DAEDALUS_FINAL_REVIEWER_THINKING"
 	// OpenAIThinkingEnv and ReviewerThinkingEnv carry the openai and
 	// reviewer sections' disable_thinking knobs to the jailed-round
 	// builder, which resolves them per role into WireThinkingEnv — the
@@ -330,32 +366,40 @@ type FallbackConfig struct {
 	HeartbeatModel string `yaml:"heartbeat_model"`
 }
 
-// ReviewerConfig optionally points the reviewer rounds (code reviewer in
-// the dev loop, test reviewer, docs reviewer) at their own provider
-// endpoint and model, independently of the implementing agent's
-// anthropic/openai sections. Setting url and/or key overrides just those
-// values for reviewer rounds; model overrides the model id alone — legal
-// with the section's other fields unset (same endpoint, different brain).
-// Absent values (the default) mean reviewers authenticate and request the
-// serving section's model exactly like every other round. Values travel
-// the env-only channel (ReviewerURLEnv / ReviewerKeyEnv /
-// ReviewerModelEnv — never workflow history, activity inputs, or argv);
-// see activities.reviewerEnv for the override rules.
-type ReviewerConfig struct {
+// RoleOverrideConfig is one jailed-round role's optional provider override
+// group: endpoint url, key, model id, context window, and wire-level
+// thinking toggle, each independently settable — any subset is legal
+// (model without url is the same-endpoint-different-brain split; a window
+// alone resizes just that role's budget arithmetic). Every unset field
+// falls back — the final reviewer's to the reviewer section's, then every
+// role's to the serving sections — so an all-unset group stages
+// byte-identically to the single-provider behavior. Values travel the
+// env-only channel (never workflow history, activity inputs, or argv); see
+// activities.reviewerEnv and devEnv for the application rules and
+// wireThinkingEnv for the thinking resolution.
+type RoleOverrideConfig struct {
 	URL string `yaml:"url"`
 	Key string `yaml:"key"`
-	// Model, when set, is the model id reviewer rounds request from the
-	// reviewer endpoint — or from the serving endpoint when url is unset —
-	// while implementing and test rounds keep the serving section's model.
-	// It overrides both wire families' model vars, so every staging path
-	// (claude's env, aider's --model, the pi/codex/opencode staged model
-	// entries) picks it up from the round env.
+	// Model, when set, is the model id the role's rounds request — from
+	// the role's endpoint when url is set, else from the serving
+	// endpoint. It overrides both wire families' model vars, so every
+	// staging path (claude's env, aider's --model, the pi/codex/opencode
+	// staged model entries) picks it up from the round env.
 	Model string `yaml:"model"`
-	// DisableThinking, when true, stages the disable-thinking encoding onto
-	// reviewer rounds' wire requests (see OpenAIConfig.DisableThinking).
-	// It keys on the reviewer section alone — reviewer rounds send nothing
-	// when it is unset, even if the serving section toggles — each role
-	// controls its own brain.
+	// ContextTokens, when set, is the role's context window in tokens,
+	// staged like the serving anthropic.context_tokens (ContextTokensEnv
+	// → pi's ContextWindow, aider's staged metadata input side,
+	// opencode's limit.context, claude's own var): only this role's
+	// budget arithmetic changes — the serving window and the other roles'
+	// staged entries are untouched. Zero (unset) keeps the serving window.
+	ContextTokens int `yaml:"context_tokens"`
+	// DisableThinking, when true, stages the disable-thinking encoding
+	// onto the role's wire requests (see OpenAIConfig.DisableThinking).
+	// Each role controls its own brain: an unset knob sends nothing, the
+	// backend's own default standing — except the dev role, whose unset
+	// knob falls back to the serving openai section's toggle (the dev
+	// rounds' pre-role behavior). Backends that ignore the encoding make
+	// it a silent no-op by design.
 	DisableThinking bool `yaml:"disable_thinking"`
 }
 
@@ -1054,9 +1098,22 @@ type Config struct {
 	// Fallback is the independent secondary provider failover uses when
 	// the primary is API-exhausted. Inactive unless Enabled.
 	Fallback FallbackConfig `yaml:"fallback"`
-	// Reviewer is the reviewer rounds' own provider endpoint; empty (the
-	// section absent) means reviewers share the implementing agent's.
-	Reviewer ReviewerConfig `yaml:"reviewer"`
+	// Dev is the dev rounds' own provider override group: the implementing
+	// agent's rounds — the slim flow's plan, parse, step, and fix rounds
+	// among them. Empty (the section absent) means dev rounds share the
+	// serving sections' values exactly as before.
+	Dev RoleOverrideConfig `yaml:"dev"`
+	// Reviewer is the reviewer rounds' own provider override group; empty
+	// (the section absent) means reviewers share the implementing agent's.
+	Reviewer RoleOverrideConfig `yaml:"reviewer"`
+	// FinalReviewer is the terminal review's own provider override group —
+	// the last slim sub-task's review loop, the rounds that see the
+	// cumulative diff of the whole run (the motivating case: a bigger
+	// window or a different brain for exactly that review). Every unset
+	// field falls back to the reviewer section's, then to the serving
+	// sections; empty (the section absent) means the final review stages
+	// from the reviewer chain.
+	FinalReviewer RoleOverrideConfig `yaml:"final_reviewer"`
 	// ReviewSkillList is the ordered list of extra skill reviews each
 	// review-gated phase of the feature-dev flow appends after its default
 	// reviewer approves: the default daedalus review ping-pong runs first,
@@ -1197,7 +1254,9 @@ type renderConfig struct {
 	OpenAI                 OpenAIConfig        `yaml:"openai"`
 	Provider               *ProviderConfig     `yaml:"provider"`
 	Fallback               FallbackConfig      `yaml:"fallback"`
-	Reviewer               ReviewerConfig      `yaml:"reviewer"`
+	Dev                    RoleOverrideConfig  `yaml:"dev"`
+	Reviewer               RoleOverrideConfig  `yaml:"reviewer"`
+	FinalReviewer          RoleOverrideConfig  `yaml:"final_reviewer"`
 	ReviewSkillList        []string            `yaml:"review_skill_list"`
 	VerdictRepair          VerdictRepairConfig `yaml:"verdict_repair"`
 	BugFiling              BugFilingConfig     `yaml:"bug_filing"`
@@ -1234,7 +1293,9 @@ func (c Config) RenderYAML() (string, error) {
 		OpenAI:                 c.OpenAI,
 		Provider:               c.Provider,
 		Fallback:               c.Fallback,
+		Dev:                    c.Dev,
 		Reviewer:               c.Reviewer,
+		FinalReviewer:          c.FinalReviewer,
 		ReviewSkillList:        c.ReviewSkillList,
 		VerdictRepair:          c.VerdictRepair,
 		BugFiling:              c.BugFiling,
@@ -1498,6 +1559,67 @@ func (c Config) AgentEnv() []string {
 	return env
 }
 
+// RoleOverrideEnv translates the per-role provider override groups (dev,
+// reviewer.context_tokens, final_reviewer) into environment variables for
+// the worker, following AgentEnv's rules: only explicitly-set values are
+// exported — an unset field means that role's rounds resolve to the
+// fallback (final reviewer → reviewer → serving; dev and reviewer →
+// serving), and nothing is exported for it. The thinking knobs export
+// only the off value ("off"; an explicit disable_thinking: true),
+// matched strictly like DAEDALUS_THINKING — an ambient garbage value is
+// never read as an off. The values never travel through workflow history
+// or activity inputs.
+func (c Config) RoleOverrideEnv() []string {
+	var env []string
+	add := func(key, value string) {
+		if value != "" {
+			env = append(env, key+"="+value)
+		}
+	}
+	addWindow := func(key string, tokens int) {
+		if tokens > 0 {
+			env = append(env, key+"="+strconv.Itoa(tokens))
+		}
+	}
+	addThinking := func(key string, off bool) {
+		if off {
+			env = append(env, key+"=off")
+		}
+	}
+	add(DevURLEnv, c.Dev.URL)
+	add(DevKeyEnv, c.Dev.Key)
+	add(DevModelEnv, c.Dev.Model)
+	addWindow(DevContextTokensEnv, c.Dev.ContextTokens)
+	addThinking(DevThinkingEnv, c.Dev.DisableThinking)
+	addWindow(ReviewerContextTokensEnv, c.Reviewer.ContextTokens)
+	add(FinalReviewerURLEnv, c.FinalReviewer.URL)
+	add(FinalReviewerKeyEnv, c.FinalReviewer.Key)
+	add(FinalReviewerModelEnv, c.FinalReviewer.Model)
+	addWindow(FinalReviewerContextTokensEnv, c.FinalReviewer.ContextTokens)
+	addThinking(FinalReviewerThinkingEnv, c.FinalReviewer.DisableThinking)
+	return env
+}
+
+// RoleOverrideEnvVars lists every variable RoleOverrideEnv may export —
+// the symmetric-unset list in runWorker and the per-role half of the
+// daemon-spawn scrub (ProviderEnvVars carries them too), so a stale
+// shell export can never win over a config that says nothing.
+func RoleOverrideEnvVars() []string {
+	return []string{
+		DevURLEnv,
+		DevKeyEnv,
+		DevModelEnv,
+		DevContextTokensEnv,
+		DevThinkingEnv,
+		ReviewerContextTokensEnv,
+		FinalReviewerURLEnv,
+		FinalReviewerKeyEnv,
+		FinalReviewerModelEnv,
+		FinalReviewerContextTokensEnv,
+		FinalReviewerThinkingEnv,
+	}
+}
+
 // ProviderEnvVars lists every environment variable daedalus derives from
 // the config's provider sections — the provider-derived half of the
 // union in AllWorkerEnvVars, which is the actual spawn-scrub source
@@ -1533,6 +1655,17 @@ func ProviderEnvVars() []string {
 		ReviewerURLEnv,
 		ReviewerKeyEnv,
 		ReviewerModelEnv,
+		ReviewerContextTokensEnv,
+		DevURLEnv,
+		DevKeyEnv,
+		DevModelEnv,
+		DevContextTokensEnv,
+		DevThinkingEnv,
+		FinalReviewerURLEnv,
+		FinalReviewerKeyEnv,
+		FinalReviewerModelEnv,
+		FinalReviewerContextTokensEnv,
+		FinalReviewerThinkingEnv,
 		OpenAIThinkingEnv,
 		ReviewerThinkingEnv,
 		WireThinkingEnv,
@@ -1588,9 +1721,10 @@ func AllWorkerEnvVars() []string {
 // roundEnvWorkerSideVars is the ProviderEnvVars subset the worker process
 // consumes before the jail spawn, so it never needs to reach the round
 // env (RoundEnvVars): the fallback section (provider_failover.go reads it
-// to build failover envs and bench dry providers), the reviewer and
-// verdict-repair endpoints (reviewerEnv and the repair pass read them
-// worker-side; both carry credentials), the metrics-staging inputs
+// to build failover envs and bench dry providers), the per-role provider
+// endpoints — reviewer, dev, final-reviewer — and the verdict-repair
+// endpoint (reviewerEnv, devEnv, and the repair pass read them
+// worker-side; all carry credentials), the metrics-staging inputs
 // (metricsRelayEnv reads them pre-spawn and stages their output onto the
 // provider vars themselves), and the bug/mirror host paths (the prompt
 // render and the post-round mirror copies consume them worker-side). A
@@ -1604,6 +1738,10 @@ var roundEnvWorkerSideVars = map[string]bool{
 	"DAEDALUS_FALLBACK_HEARTBEAT_MODEL": true,
 	ReviewerURLEnv:                      true,
 	ReviewerKeyEnv:                      true,
+	DevURLEnv:                           true,
+	DevKeyEnv:                           true,
+	FinalReviewerURLEnv:                 true,
+	FinalReviewerKeyEnv:                 true,
 	VerdictRepairURLEnv:                 true,
 	VerdictRepairModelEnv:               true,
 	VerdictRepairKeyEnv:                 true,
@@ -1877,6 +2015,22 @@ func (c Config) validate(path string) error {
 	}
 	if c.Anthropic.ContextTokens < 0 {
 		return fmt.Errorf("config %s: anthropic.context_tokens: must not be negative", path)
+	}
+	// The per-role override groups stage the same window var the serving
+	// section does, so a negative is the same export bug there: rejected
+	// at load, every other subset shape legal (any-subset is the groups'
+	// contract — validation adds no cross-field rules).
+	for _, g := range []struct {
+		name string
+		toks int
+	}{
+		{"dev.context_tokens", c.Dev.ContextTokens},
+		{"reviewer.context_tokens", c.Reviewer.ContextTokens},
+		{"final_reviewer.context_tokens", c.FinalReviewer.ContextTokens},
+	} {
+		if g.toks < 0 {
+			return fmt.Errorf("config %s: %s: must not be negative", path, g.name)
+		}
 	}
 	if c.Anthropic.MaxOutputTokens < 0 {
 		return fmt.Errorf("config %s: anthropic.max_output_tokens: must not be negative", path)

@@ -569,9 +569,10 @@ func runJailed(ctx context.Context, agent, worktreePath, prompt string, agentArg
 
 // runJailedKind is runJailed for a round that belongs to a chained
 // conversation: role names it (RoleDev/RoleTest/RoleDevReview/
-// RoleTestReview), and the round's conversation id is recorded for retry
-// resume as soon as the CLI creates its session state (see agentsession.go;
-// claude, pi, opencode, and codex keep session state daedalus can address).
+// RoleTestReview/RoleFinalReview), and the round's conversation id is
+// recorded for retry resume as soon as the CLI creates its session state
+// (see agentsession.go; claude, pi, opencode, and codex keep session state
+// daedalus can address).
 // An empty role — discovery, and every direct caller that does not chain —
 // skips the tracking.
 func runJailedKind(ctx context.Context, role SessionRole, agent, worktreePath, prompt string, agentArgs ...string) (jailResult, error) {
@@ -637,11 +638,13 @@ func runJailedRound(ctx context.Context, env []string, role SessionRole, agent, 
 // folders (AgentRunInput.Folders); nil mounts nothing (see
 // runJailedKindFolders for the split).
 func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, agent, worktreePath, prompt string, folders []string, agentArgs ...string) (jailResult, error) {
-	// Reviewer rounds dial the config's own reviewer endpoint when one is
-	// configured (see reviewerEnv); every other role keeps the serving
-	// provider's environment untouched. Applied before anything reads the
-	// round env — pi's provider staging included.
+	// Reviewer rounds dial the config's own reviewer chain when one is
+	// configured (see reviewerEnv); dev rounds dial the dev section's (see
+	// devEnv); every other role keeps the serving provider's environment
+	// untouched. Both applied before anything reads the round env — pi's
+	// provider staging included.
 	env = reviewerEnv(env, role)
+	env = devEnv(env, role)
 	// The wire-level thinking knob resolves per role into the round env
 	// (see wireThinkingEnv), before any staging reads it.
 	env = wireThinkingEnv(env, role)
@@ -669,7 +672,7 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// roles — reviewer rounds do not edit — so every flagship prompt stays
 	// byte-identical. Appended per invocation, so a provider-failover retry
 	// (which re-enters with the original prompt) is not double-prefixed.
-	if selected == "pi" && role != RoleDevReview && role != RoleTestReview {
+	if selected == "pi" && !reviewRole(role) {
 		prompt += piEditGuardrail
 	}
 	lim := agentLimiter()

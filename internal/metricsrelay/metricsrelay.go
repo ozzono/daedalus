@@ -18,8 +18,9 @@
 // token as its -rk- tail; the token gates key restoration, anything else
 // attributes at worker level). ponytail: the ledger is in-memory only — a daemon restart drops
 // history, and a 10k-entry ring bounds memory; durable roll-ups wait on
-// the GoLens embed (SQLite), whose pricing table also owns cost (CostUSD
-// stays 0 until then).
+// the GoLens embed (SQLite). Cost stays render-time: the operator's price
+// table (the dashboard's models tab) prices entries when the dashboard
+// reads them, and CostUSD is never written.
 package metricsrelay
 
 import (
@@ -89,8 +90,8 @@ type Entry struct {
 	OutputTokens     int64     `json:"output_tokens"`
 	CacheReadTokens  int64     `json:"cache_read_tokens"`
 	CacheWriteTokens int64     `json:"cache_write_tokens"`
-	// CostUSD stays 0 until the GoLens embed brings the pricing table
-	// (see the package comment).
+	// Reserved and never written: cost is computed at render time from
+	// the operator's price table (see the package comment).
 	CostUSD    float64 `json:"cost_usd"`
 	DurationMS int64   `json:"duration_ms"`
 	Status     int     `json:"status"`
