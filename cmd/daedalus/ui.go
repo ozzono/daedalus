@@ -1,11 +1,14 @@
 // The dashboard UI (htmx-ui pt2): the views the metrics daemon serves on
 // its LAN listener (metrics.port) — Workers (the `/` landing), Runs,
-// Run detail, New Task, and the metrics view (the relay ledger's
+// Run detail, New Task, the frozen metrics view (the relay ledger's
 // aggregates plus the live session counts; the GoLens embed itself is not
-// part of this build). Everything is
-// read-only except the New-Task submit, which goes through
-// internal/runstart — the exact path `daedalus run` submits through, so
-// the form can never drift from the CLI's gates (Q4 = C). All views read
+// part of this build), and the Models tab — the price table plus the
+// round-2 usage surfaces (ui_metrics.go). Everything is
+// read-only except the New-Task submit — which goes through
+// internal/runstart, the exact path `daedalus run` submits through, so
+// the form can never drift from the CLI's gates (Q4 = C) — and the
+// Models price save, which writes the daemon dir's metrics-models.json.
+// All views read
 // the same walks the CLI reads: Workers and Runs ride the Temporal
 // visibility list `list` uses (one shared status derivation,
 // runDisplayStatus), Run detail's usage table reads the same history
@@ -69,8 +72,10 @@ const uiTestExcerptMax = 64 << 10
 // outlives server restarts), the started-event input cache shared by the
 // Workers and Runs renderers, the TTL-cached provider probes, the relay
 // ledger — the same in-process ledger the relay appends to, read
-// here for the metrics view's aggregates — and the last-sent fragment
-// cache behind the polled views' unchanged-poll 204s.
+// here for the metrics views — the operator's model price table (loaded
+// from the daemon dir at boot, swapped whole on save, read-only to every
+// renderer), and the last-sent fragment cache behind the polled views'
+// unchanged-poll 204s.
 type uiServer struct {
 	cfg    config.Config
 	tpl    *template.Template
@@ -81,6 +86,7 @@ type uiServer struct {
 	inputs map[string]workflows.PipelineInput
 	probes map[string]uiProbe
 	frags  map[string][]byte
+	prices map[string]modelPrice
 }
 
 func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger) *uiServer {
@@ -93,10 +99,14 @@ func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger) *uiServer {
 			}
 			return busy * 100 / total
 		},
+		// tok and usd are the usage tables' token and cost formatters.
+		"tok": fmtTokens,
+		"usd": fmtUSD,
 	}).ParseFS(uiTemplateFS, "ui_templates.html"))
 	return &uiServer{cfg: cfg, tpl: tpl, ledger: ledger,
 		inputs: map[string]workflows.PipelineInput{},
-		probes: map[string]uiProbe{}, frags: map[string][]byte{}}
+		probes: map[string]uiProbe{}, frags: map[string][]byte{},
+		prices: loadModelPrices()}
 }
 
 // temporal returns the cached client, dialing on first use and after any
@@ -192,6 +202,10 @@ func (s *uiServer) routes() http.Handler {
 	mux.HandleFunc("GET /new", s.pageNew)
 	mux.HandleFunc("GET /new/agents", s.fragAgents)
 	mux.HandleFunc("POST /new", s.submitNew)
+	// The Models tab: the price form (GET) and its upsert-only save
+	// (POST, a redirect back to the form).
+	mux.HandleFunc("GET /models", s.pageModels)
+	mux.HandleFunc("POST /models", s.saveModels)
 	// /metrics and everything under it is the metrics view — the paths
 	// beneath are the GoLens mount's when the embed exists; today they all
 	// render the same aggregates-plus-placeholder page.
@@ -718,6 +732,12 @@ type uiRunDetail struct {
 	Nodes       []uiNode
 	Usage       []uiUsage
 	TotalCost   string
+	// LedgerCost is the run's relay-ledger cost section (ui_metrics.go):
+	// per-model rows over the run's own ledger entries, priced models
+	// only. LedgerTotal is the rendered sum, or the dash when no prices
+	// are saved or the run has no priced keyed calls.
+	LedgerCost  []uiRunModelCost
+	LedgerTotal string
 	TestFound   bool
 	TestPassed  bool
 	TestCommand string
@@ -971,6 +991,7 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 		}
 	}
 	d.TotalCost = fmt.Sprintf("%.4f", total)
+	d.LedgerCost, d.LedgerTotal = s.runLedgerCost(workflowID)
 	return d, nil
 }
 
@@ -1057,82 +1078,6 @@ func (s *uiServer) runBody(w http.ResponseWriter, req *http.Request, tpl string)
 	}{uiChrome{Nav: "runs", Title: "daedalus — " + d.WorkflowID}, d})
 }
 
-// uiRelayWorker is one worker's relay-ledger aggregate.
-type uiRelayWorker struct {
-	Worker string
-	Calls  int64
-	In     int64
-	Out    int64
-	Errors int64
-	Last   string
-}
-
-// uiRelayStats aggregates the relay ledger for the metrics view. The
-// ledger is the relay's bounded ring, so the totals describe the window
-// it holds; and only relay-served rounds appear at all — a round dialing
-// its CLI-default upstream directly never passes the relay (the documented
-// per-CLI-wiring coverage limit), so these counts never claim to be a
-// worker's whole provider traffic.
-type uiRelayStats struct {
-	Calls  int64
-	Hour   int64
-	Errors int64
-	In     int64
-	Out    int64
-	Window string
-	Worker []uiRelayWorker
-}
-
-// relayStats folds the whole ledger into the counters the metrics view
-// renders. Workers order by call count; Last comes free from the query's
-// newest-first ordering.
-func (s *uiServer) relayStats(now time.Time) uiRelayStats {
-	st := uiRelayStats{Window: "no relayed calls yet"}
-	if s.ledger == nil {
-		return st
-	}
-	// pageSize above the cap is clamped to it: one call reads the ring.
-	entries, _, _ := s.ledger.Query("", 1, 1<<30)
-	byWorker := map[string]*uiRelayWorker{}
-	var oldest time.Time
-	for _, e := range entries {
-		st.Calls++
-		if now.Sub(e.At) < time.Hour {
-			st.Hour++
-		}
-		st.In += e.InputTokens
-		st.Out += e.OutputTokens
-		if oldest.IsZero() || e.At.Before(oldest) {
-			oldest = e.At
-		}
-		w := byWorker[e.Worker]
-		if w == nil {
-			w = &uiRelayWorker{Worker: e.Worker}
-			byWorker[e.Worker] = w
-		}
-		w.Calls++
-		w.In += e.InputTokens
-		w.Out += e.OutputTokens
-		if e.Status < 200 || e.Status > 299 {
-			st.Errors++
-			w.Errors++
-		}
-		if w.Last == "" {
-			w.Last = relTime(e.At, now)
-		}
-	}
-	if len(entries) > 0 {
-		st.Window = dur(now.Sub(oldest).Round(time.Second)) + " window"
-	}
-	for _, w := range byWorker {
-		st.Worker = append(st.Worker, *w)
-	}
-	sort.SliceStable(st.Worker, func(i, j int) bool {
-		return st.Worker[i].Calls > st.Worker[j].Calls
-	})
-	return st
-}
-
 // uiQueueSessions is one queue's live session gauges — the counts the
 // operator reads as "how much is this queue doing right now".
 type uiQueueSessions struct {
@@ -1142,10 +1087,12 @@ type uiQueueSessions struct {
 	Total   int
 }
 
-// pageMetrics renders the metrics view: the daemon's own aggregates — the
-// relay ledger's counters and the live session counts — plus the note
-// that the GoLens embed is not part of this build, so the mount has no
-// charts to serve where those would render.
+// pageMetrics renders the frozen metrics view: the daemon's own
+// aggregates — the relay ledger's counters and the live session counts —
+// plus the note that the GoLens embed is not part of this build, so the
+// mount has no charts to serve where those would render. The counters
+// come from the same folds the Models tab reads (foldRelayTotals), so
+// the two views can never disagree.
 func (s *uiServer) pageMetrics(w http.ResponseWriter, req *http.Request) {
 	snap := s.snapshot()
 	now := snap.Generated
@@ -1168,10 +1115,10 @@ func (s *uiServer) pageMetrics(w http.ResponseWriter, req *http.Request) {
 	}
 	s.render(w, http.StatusOK, "page_metrics", struct {
 		Chrome   uiChrome
-		Relay    uiRelayStats
+		Relay    relayTotals
 		Sessions []uiQueueSessions
 		WalkErr  string
-	}{uiChrome{Nav: "metrics", Title: "daedalus — metrics"}, s.relayStats(now), sessions, snap.WalkErr})
+	}{uiChrome{Nav: "metrics", Title: "daedalus — metrics"}, foldRelayTotals(s.ledgerEntries(), now), sessions, snap.WalkErr})
 }
 
 // uiWorkerOption is one New-Task worker choice.
