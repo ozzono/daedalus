@@ -285,6 +285,27 @@ func slimAiderEnv(env []string) []string {
 	return env
 }
 
+// roundEnvAllowlist filters an assembled round environment down to
+// config.RoundEnvVars — the spawn gate in runJailedRoundFolders, run
+// after every staging step has read its inputs from the inherited
+// environment. Unlisted entries stop at the sandbox door: the jailed CLI
+// sees the provider wires it dials, the overlay the builder staged, and
+// the ambient base, and nothing else — no unselected family's key, no
+// worker control knob, no ambient value.
+func roundEnvAllowlist(env []string) []string {
+	allow := make(map[string]bool)
+	for _, name := range config.RoundEnvVars() {
+		allow[name] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if n, _, ok := cutEnv(kv); ok && allow[n] {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 // setEnvVar returns env with name set to value (appended when absent).
 func setEnvVar(env []string, name, value string) []string {
 	for i, kv := range env {

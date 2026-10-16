@@ -13,16 +13,18 @@ import (
 
 // The suite must be hermetic against the env a serving worker exports:
 // runWorker mints its registration and sets the metrics-relay roots and
-// token plus DAEDALUS_WORKER_NAME into its own process env, the jailed
-// env passthrough rides them into every `go test` the worker's jailed
-// rounds serve, and metricsRelayEnv — correctly, given its inputs —
-// rewrites the staged provider endpoints, breaking every exact-match
-// staging pin. The fix is a TestMain scrub, so this regression test
-// exercises the whole-process path: the driver seeds the worker's
-// ambient values and runs the probe in a child test binary whose
-// TestMain stands between the inherited env and the probe's assertions.
-// Per-test t.Setenv cannot do that job — it applies after TestMain, and
-// re-seeding in-process would re-pollute the very env the scrub cleaned.
+// token plus DAEDALUS_WORKER_NAME into its own process env, and
+// metricsRelayEnv — correctly, given its inputs — rewrites the staged
+// provider endpoints, breaking every exact-match staging pin. The root
+// containment for the jailed child is the round-env allow-list gate
+// (roundEnvAllowlist at the spawn, pinned in roundenv_test.go); this
+// package's TestMain scrub is the belt-and-suspenders layer for the
+// suite's own in-process readers, and this regression test exercises the
+// whole-process path: the driver seeds the worker's ambient values and
+// runs the probe in a child test binary whose TestMain stands between the
+// inherited env and the probe's assertions. Per-test t.Setenv cannot do
+// that job — it applies after TestMain, and re-seeding in-process would
+// re-pollute the very env the scrub cleaned.
 
 // hermeticProbeTest is the child-side test the driver runs; the exact
 // name is the -test.run anchor that keeps the child from recursing into
