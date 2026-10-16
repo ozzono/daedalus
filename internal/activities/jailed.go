@@ -1071,16 +1071,22 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	setProcessGroup(cmd)
 	defer killGroup(cmd)
 	cmd.Dir = worktreePath
-	// env carries the provider settings the worker exported from
+	// env opens as the provider settings the worker exported from
 	// config.yaml (primary, or the fallback overrides for a failover
-	// round); everything else passes through from os.Environ(). Under slim
-	// mode, jailed aider rounds pin aider's weak/editor wires to the
+	// round) on top of the worker's inherited environment, and every
+	// staging step above reads its inputs from that passthrough. Under
+	// slim mode, jailed aider rounds pin aider's weak/editor wires to the
 	// effective AIDER_MODEL — without it those wires silently dial a cloud
 	// default, i.e. a self-hosted deployment making surprise paid-API
-	// calls (see slimAiderEnv).
+	// calls (see slimAiderEnv). The allow-list gate is the passthrough's
+	// last stop before the spawn: only config.RoundEnvVars reaches the
+	// sandbox, so the worker's other families — an unselected provider's
+	// key, the control knobs, the metrics registration token — stop here
+	// instead of riding into every round.
 	if selected == "aider" {
 		env = slimAiderEnv(env)
 	}
+	env = roundEnvAllowlist(env)
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(prompt)
 

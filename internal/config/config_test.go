@@ -663,6 +663,71 @@ func TestProviderEnvVarsIncludesOpenAIAPIBase(t *testing.T) {
 	}
 }
 
+// TestRoundEnvVarsExcludesWorkerConsumedVars pins the sandbox-door
+// exclusion half of the round-env allow-list: the ProviderEnvVars subset
+// the worker consumes before the jail spawn (roundEnvWorkerSideVars — the
+// fallback section, the reviewer and verdict-repair endpoints, the metrics
+// trio, the bug/mirror paths; every one credential-carrying) and the
+// worker's own control exports never appear in RoundEnvVars, and the list
+// carries no duplicates. OPENCODE_CONFIG is the one WorkerEnvVars member
+// allowed through: the daemon scrub removes it, but the opencode bridge
+// stages it round-scoped and the jailed CLI reads it there.
+func TestRoundEnvVarsExcludesWorkerConsumedVars(t *testing.T) {
+	round := RoundEnvVars()
+	seen := make(map[string]bool, len(round))
+	for _, name := range round {
+		if seen[name] {
+			t.Errorf("RoundEnvVars() lists %q twice", name)
+		}
+		seen[name] = true
+	}
+	for name := range roundEnvWorkerSideVars {
+		if seen[name] {
+			t.Errorf("RoundEnvVars() carries %q; worker-consumed vars must stop at the spawn gate", name)
+		}
+	}
+	for _, name := range WorkerEnvVars() {
+		if name == "OPENCODE_CONFIG" {
+			continue
+		}
+		if seen[name] {
+			t.Errorf("RoundEnvVars() carries worker control knob %q", name)
+		}
+	}
+}
+
+// TestRoundEnvVarsCoversServedAndStagedVars pins the admission half: every
+// provider-derived var the jailed CLI serves from directly (ProviderEnvVars
+// minus roundEnvWorkerSideVars) is allow-listed, so a var added to a
+// provider section reaches the round env without a second edit, and the
+// named entries the round builder stages or a jailed tool cannot run
+// without are listed.
+func TestRoundEnvVarsCoversServedAndStagedVars(t *testing.T) {
+	round := RoundEnvVars()
+	for _, name := range ProviderEnvVars() {
+		if roundEnvWorkerSideVars[name] {
+			continue
+		}
+		if !slices.Contains(round, name) {
+			t.Errorf("RoundEnvVars() drops %q; a provider var the jail serves from must stay allow-listed", name)
+		}
+	}
+	for _, name := range []string{
+		"OPENCODE_CONFIG",                                       // opencode bridge staging
+		"MAX_THINKING_TOKENS",                                   // claude thinking pin
+		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",                         // claude output budget
+		"AIDER_MODEL", "AIDER_WEAK_MODEL", "AIDER_EDITOR_MODEL", // slim pins + operator exports
+		"AMP_API_KEY", "CODEX_HOME", "XDG_DATA_HOME", // named agents' in-jail exports
+		"PATH", "HOME", "TMPDIR", // exec, identity, scratch
+		"HTTPS_PROXY", "SSL_CERT_FILE", // egress trust shape
+		"GOPROXY", // a jailed `go test`'s module fetch
+	} {
+		if !slices.Contains(round, name) {
+			t.Errorf("RoundEnvVars() drops %q; the round builder or an in-jail tool needs it", name)
+		}
+	}
+}
+
 // TestLoadContextTokens pins the context_tokens knob end to end: a set
 // value loads through and exports as ContextTokensEnv (the var jailed
 // claude reads and the aider staging consumes), zero/unset exports

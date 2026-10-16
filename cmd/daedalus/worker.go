@@ -147,6 +147,43 @@ func envWithoutWorkerVars(environ []string) []string {
 	return out
 }
 
+// spawnDaemon is the one detached-daemon spawn shape (workerStart,
+// metricsStart): it re-executes this binary with args in its own session,
+// stdout and stderr appended into logFile, on an environment scrubbed of
+// every worker-exported variable (envWithoutWorkerVars) with the daemon
+// marker re-appended, and records the pid in pidFile. The scrub lives
+// here so a new spawn site inherits it instead of copying the block and
+// dropping the line. Returns the daemon's pid.
+func spawnDaemon(pidFile, logFile string, args ...string) (int, error) {
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		return 0, fmt.Errorf("create %s: %w", daemonDir, err)
+	}
+	pruneOldLogs()
+	log, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return 0, fmt.Errorf("open log %s: %w", logFile, err)
+	}
+	defer log.Close()
+	self, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("resolve executable: %w", err)
+	}
+	cmd := exec.Command(self, args...)
+	cmd.Env = append(envWithoutWorkerVars(os.Environ()), daemonEnv+"=1")
+	cmd.Stdout = log
+	cmd.Stderr = log
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from the terminal
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("start daemon: %w", err)
+	}
+	pid := cmd.Process.Pid
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		return 0, fmt.Errorf("write pid file %s: %w", pidFile, err)
+	}
+	cmd.Process.Release() // the daemon outlives this process
+	return pid, nil
+}
+
 // workerStart launches the worker as a detached daemon: it re-executes
 // itself with `worker foreground`, redirected into the per-queue log, in
 // its own session so the terminal is released immediately. workerType is
@@ -166,27 +203,12 @@ func workerStart(cfg config.Config, configPath, workerType string) error {
 			return err
 		}
 	}
-	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", daemonDir, err)
-	}
-	pruneOldLogs()
-
-	log, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return fmt.Errorf("open log %s: %w", logFile, err)
-	}
-	defer log.Close()
-
-	self, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve executable: %w", err)
-	}
+	childArgs := []string{"worker", "foreground", "-c", configPath}
 	// The resolved config path is absolute (resolveConfigPath), so the
 	// daemon never re-resolves against the working directory it was
-	// started from — it keeps serving if that directory goes away.
-	childArgs := []string{"worker", "foreground", "-c", configPath}
-	// The run type must survive the re-exec or the daemon silently comes
-	// up untyped; record-driven restarters pass "" and the child stays
+	// started from — it keeps serving if that directory goes away. The run
+	// type must survive the re-exec or the daemon silently comes up
+	// untyped; record-driven restarters pass "" and the child stays
 	// untyped too (a run config is never persisted).
 	if workerType != "" {
 		childArgs = append(childArgs, "-t", workerType)
@@ -199,19 +221,10 @@ func workerStart(cfg config.Config, configPath, workerType string) error {
 	if err := os.WriteFile(confFile, []byte(configPath), 0o644); err != nil {
 		return fmt.Errorf("write config record %s: %w", confFile, err)
 	}
-	cmd := exec.Command(self, childArgs...)
-	cmd.Env = append(envWithoutWorkerVars(os.Environ()), daemonEnv+"=1")
-	cmd.Stdout = log
-	cmd.Stderr = log
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from the terminal
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start daemon: %w", err)
+	pid, err := spawnDaemon(pidFile, logFile, childArgs...)
+	if err != nil {
+		return err
 	}
-	pid := cmd.Process.Pid
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(pid)), 0o644); err != nil {
-		return fmt.Errorf("write pid file %s: %w", pidFile, err)
-	}
-	cmd.Process.Release() // the daemon outlives this process
 
 	fmt.Printf("worker started (pid %d)\n", pid)
 	fmt.Printf("  log:     %s\n", logFile)

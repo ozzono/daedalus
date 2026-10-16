@@ -1585,6 +1585,80 @@ func AllWorkerEnvVars() []string {
 	return append(ProviderEnvVars(), WorkerEnvVars()...)
 }
 
+// roundEnvWorkerSideVars is the ProviderEnvVars subset the worker process
+// consumes before the jail spawn, so it never needs to reach the round
+// env (RoundEnvVars): the fallback section (provider_failover.go reads it
+// to build failover envs and bench dry providers), the reviewer and
+// verdict-repair endpoints (reviewerEnv and the repair pass read them
+// worker-side; both carry credentials), the metrics-staging inputs
+// (metricsRelayEnv reads them pre-spawn and stages their output onto the
+// provider vars themselves), and the bug/mirror host paths (the prompt
+// render and the post-round mirror copies consume them worker-side). A
+// ProviderEnvVars member not listed here serves the jailed CLI directly
+// and reaches the round env by default.
+var roundEnvWorkerSideVars = map[string]bool{
+	"DAEDALUS_FALLBACK_TYPE":            true,
+	"DAEDALUS_FALLBACK_BASE_URL":        true,
+	"DAEDALUS_FALLBACK_API_KEY":         true,
+	"DAEDALUS_FALLBACK_MODEL":           true,
+	"DAEDALUS_FALLBACK_HEARTBEAT_MODEL": true,
+	ReviewerURLEnv:                      true,
+	ReviewerKeyEnv:                      true,
+	VerdictRepairURLEnv:                 true,
+	VerdictRepairModelEnv:               true,
+	VerdictRepairKeyEnv:                 true,
+	MetricsRelayAnthropicEnv:            true,
+	MetricsRelayOpenAIEnv:               true,
+	MetricsRelayTokenEnv:                true,
+	BugDirEnv:                           true,
+	BugMirrorEnv:                        true,
+	TestOutputMirrorEnv:                 true,
+}
+
+// RoundEnvVars is the jailed round env's allow-list: the only variables
+// the sandbox may receive (roundEnvAllowlist in internal/activities
+// strips everything else from the assembled round env right before the
+// ai-jail spawn, so no other family's key, worker control knob, or
+// ambient value rides in). Beyond the provider-derived set —
+// ProviderEnvVars minus roundEnvWorkerSideVars — it carries the names the
+// round builder itself stages (OPENCODE_CONFIG; claude's
+// MAX_THINKING_TOKENS and CLAUDE_CODE_MAX_OUTPUT_TOKENS; the slim aider
+// pins), the operator exports named agents consume in-jail (AIDER_MODEL,
+// and AMP_API_KEY / CODEX_HOME / XDG_DATA_HOME, which the builder's
+// --env passthrough copies from this same round env), and the ambient
+// base every round needs: shell identity and locale, the proxy and TLS
+// trust shape, and the go module-fetch knobs a jailed `go test` inherits.
+// The base is the whole vouch list — an agent knob it does not name (the
+// wider AIDER_*/CLAUDE_CODE_* families, NODE_EXTRA_CA_CERTS, …) stops at
+// the sandbox door and joins this list only as a conscious addition.
+// ponytail: the base's sufficiency on a deployment is proven only by
+// rounds running there; a missing entry surfaces as a round-level tool
+// failure, never silently.
+func RoundEnvVars() []string {
+	vars := make([]string, 0, len(ProviderEnvVars())+33)
+	for _, name := range ProviderEnvVars() {
+		if !roundEnvWorkerSideVars[name] {
+			vars = append(vars, name)
+		}
+	}
+	return append(vars,
+		"OPENCODE_CONFIG",
+		"MAX_THINKING_TOKENS",
+		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+		"AIDER_MODEL",
+		"AIDER_WEAK_MODEL",
+		"AIDER_EDITOR_MODEL",
+		"AMP_API_KEY",
+		"CODEX_HOME",
+		"XDG_DATA_HOME",
+		"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "no_proxy",
+		"SSL_CERT_FILE", "SSL_CERT_DIR",
+		"GOPROXY", "GONOPROXY", "GOPRIVATE", "GOINSECURE", "GOSUMDB", "GOFLAGS", "GOTOOLCHAIN",
+	)
+}
+
 // Load reads the YAML configuration at path and applies defaults for every
 // unset field.
 func Load(path string) (Config, error) {

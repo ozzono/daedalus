@@ -16,9 +16,12 @@ import (
 // package: runWorker exports config.ProviderEnvVars plus its own vars
 // (config.WorkerEnvVars — all but OPENCODE_CONFIG, which runWorker
 // deliberately never re-exports: the opencode bridge stages it
-// round-scoped) into the worker's process env, and the jailed
-// os.Environ() passthrough would ride all of them into every test
-// process on a serving worker. The hazards behind that list: DAEDALUS_FALLBACK_* arms
+// round-scoped) into the worker's process env. A suite running under a
+// serving worker inherits all of them, and this package reads them
+// in-process — DAEDALUS_FALLBACK_* arms failover through fallbackConfigured,
+// the reviewer vars arm reviewerEnv, DAEDALUS_AGENT steers jailedAgentCLI,
+// the metrics trio feeds metricsRelayEnv — so an ambient value would arm
+// all of that in every test. The hazards behind that list: DAEDALUS_FALLBACK_* arms
 // failover for every jailed-round test — and combined with the dry holds
 // the exhaustion tests leave in the package-global providerState, fails
 // unrelated tests with "both providers in dry holds"; the reviewer vars
@@ -45,6 +48,13 @@ import (
 // claude default; tests that need a fallback, a slim profile, a context
 // window, or a non-claude agent arm one explicitly (armFallback or
 // t.Setenv).
+//
+// The jail-side half of the old hazard — the same values riding the
+// round-env passthrough into a jailed child — is now the round-env
+// allow-list gate's job (roundEnvAllowlist at the spawn; see
+// roundenv_test.go), which also covers target-repo suites served by a
+// worker that carry no TestMain of their own. This scrub stays for the
+// in-process readers above; it is belt-and-suspenders for the spawn.
 func TestMain(m *testing.M) {
 	for _, name := range config.AllWorkerEnvVars() {
 		os.Unsetenv(name)
@@ -863,10 +873,12 @@ func TestReviewerRoundDialsReviewerEndpoint(t *testing.T) {
 	// A fixed env, not os.Environ()+overrides: production round envs never
 	// carry a name twice (os.Environ() is unique, fallbackEnv starts from
 	// it), and a duplicate would let the appended primary shadow the
-	// first-occurrence replacement setEnvVar performs.
+	// first-occurrence replacement setEnvVar performs. PATH is staged so
+	// the stubbed ai-jail resolves; STUB_LOG needs no staging — the stub
+	// script carries its own log path (see stubBin), and the allow-list
+	// gate would strip the name anyway.
 	base := append(reviewerRoundBaseEnv(),
 		"PATH="+os.Getenv("PATH"),
-		"STUB_LOG="+log,
 	)
 	for _, role := range []SessionRole{RoleDevReview, RoleDev} {
 		if _, err := runJailedRound(context.Background(), slices.Clone(base), role, "claude", t.TempDir(), "round prompt"); err != nil {

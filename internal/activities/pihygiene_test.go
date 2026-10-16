@@ -311,15 +311,14 @@ func TestRunJailedClaudeActivityPiSteersEditLoopResume(t *testing.T) {
 // hygiene gate: a poisoned transcript is not resumed, while a failed-edit
 // loop neither drops the session nor steers — reviewers do not edit.
 func TestRunJailedReviewerActivityPiHygiene(t *testing.T) {
-	stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
-exit 0`)
-	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"session","id":"rev-out"}' '{"type":"message_end","message":{"content":[{"type":"text","text":"Fine.\nAPPROVED"}]}}'; exit 0`)
-
 	t.Run("poisoned transcript drops the resume", func(t *testing.T) {
 		scrubBugFilingEnv(t)
 		fakeHome(t)
 		wt := t.TempDir()
 		log := newStubLog(t)
+		stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+		stubBin(t, "ai-jail", `printf '%s\n' '{"type":"session","id":"rev-out"}' '{"type":"message_end","message":{"content":[{"type":"text","text":"Fine.\nAPPROVED"}]}}'; exit 0`)
 		writePiTranscript(t, wt, "rev-poison",
 			`{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"{\"oldText\":\"X\"}"}]}}`)
 
@@ -355,6 +354,9 @@ exit 0`)
 		fakeHome(t)
 		wt := t.TempDir()
 		log := newStubLog(t)
+		stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+		stubBin(t, "ai-jail", `printf '%s\n' '{"type":"session","id":"rev-out"}' '{"type":"message_end","message":{"content":[{"type":"text","text":"Fine.\nAPPROVED"}]}}'; exit 0`)
 		writePiTranscript(t, wt, "rev-loop",
 			piAssistantToolCall("t1", "a.go", "X"),
 			piToolResult("t1", "edit", true),
