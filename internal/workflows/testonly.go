@@ -11,12 +11,13 @@ import (
 
 // TestOnlyWorkflow drives a test-improvement run: the agent modifies test
 // files only, the native suite gates every round, and a test reviewer
-// approves the suite. There is no implementation loop: a reviewer REBUILD —
-// a finding the test-only agent cannot apply because the fix is an
-// implementation change — parks the run for the maintainer instead, so a
-// known-buggy diff can never finalize as approved work. Suite executions
-// record Go statement coverage, and the reviewer sees the delta across
-// rounds.
+// approves the suite. A reviewer REBUILD — a finding the test-only agent
+// cannot apply because the fix is an implementation change — spends a
+// capped rebuild round: a dev-role agent run on the finding, the flow's
+// one dev-code path, after which the test loop resumes with the widened
+// write scope the rebuilt state needs. Only a spent cap parks the run for
+// the maintainer. Suite executions record Go statement coverage, and the
+// reviewer sees the delta across rounds.
 func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	run, cleanup, err := startRun(ctx, input)
 	if err != nil {
@@ -39,7 +40,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {
-		initialPrompt, err = template.Tests(bugDir())
+		initialPrompt, err = template.TestsForTask(input.Prompt, bugDir())
 	}
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)
@@ -52,6 +53,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	// lastCoverage is the previous round's recorded coverage, so the
 	// reviewer sees the delta, not just the level.
 	lastCoverage := ""
+	rebuilds := 0
 	for {
 		command, err := run.resolveTestCommand()
 		if err != nil {
@@ -75,12 +77,29 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 				verdict.Comments))
 		}
 		if verdict.Rebuild {
-			// No implementation loop exists in this flow to rebuild into:
-			// the finding parks for the maintainer with the reviewer's
-			// reasoning, keeping "merged work is approved work" true.
-			run.logger.Info("Test review requested a rebuild; parking for the maintainer")
-			return "", run.park(fmt.Sprintf("test review requested a rebuild — the fix is an implementation change, outside this flow's test-only scope: %s",
-				verdict.Comments))
+			// The rebuild round is the flow's one dev-code path, budgeted
+			// like the feature-dev green stage: a dev-role agent run on the
+			// finding, then the test loop resumes. Widening the run's write
+			// scope here is what lets the rebuilt state — implementation
+			// fix included — pass the finalize gate; the mutation rides the
+			// verdict, so replay is deterministic.
+			rebuilds++
+			if rebuilds > maxTestPhaseRebuilds {
+				run.logger.Info("Test phase exceeded the rebuild cap; parking the run")
+				return "", run.park(fmt.Sprintf("test phase failed to converge — the test review issued rebuild %d and its approval never coincided with a green suite; last finding: %s",
+					rebuilds, verdict.Comments))
+			}
+			run.logger.Info("Test review requested a rebuild; running a dev round on the finding",
+				"Rebuilds", rebuilds, "Of", maxTestPhaseRebuilds)
+			run.input.AllowedPaths = nil
+			prompt, err := template.Rebuild(verdict.Comments)
+			if err != nil {
+				return "", fmt.Errorf("build rebuild prompt: %w", err)
+			}
+			if _, err := run.runAgent(prompt, "rebuild", activities.RoleDev, &run.devSession); err != nil {
+				return "", fmt.Errorf("rebuild agent run: %w", err)
+			}
+			continue
 		}
 		if result.Passed && verdict.Approved {
 			run.logger.Info("Tests pass and test review approved")

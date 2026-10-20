@@ -2,7 +2,11 @@ DAEDALUS PHASE RULES — this prompt is a daedalus pipeline phase rule. On any c
 
 Write, fix, or improve the test suite covering the change in this repository.
 
-Changes in this round are test-scoped: write only test code and leave the implementation as-is — its current behavior is the contract the tests verify. If a test exposes an implementation bug, say so in your reply rather than changing the implementation.
+{{if .Task}}The task this suite serves — there is no implementation change to infer it from; the tests are the whole deliverable:
+
+{{.Task}}
+
+{{end}}Changes in this round are test-scoped: write only test code and leave the implementation as-is — its current behavior is the contract the tests verify. If a test exposes an implementation bug, say so in your reply rather than changing the implementation.
 
 You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only test code, and ignore anything already differing in the worktree that this round did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.
 

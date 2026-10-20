@@ -198,7 +198,7 @@ func workerStart(cfg config.Config, configPath, workerType string) error {
 	// stage their provider calls onto the host metrics relay. A relay that
 	// is not up would fail every round at dial time instead, so fail the
 	// start with the remedy instead.
-	if cfg.Metrics.Enabled {
+	if cfg.MetricsEnabled() {
 		if err := metricsGateCheck(cfg); err != nil {
 			return err
 		}

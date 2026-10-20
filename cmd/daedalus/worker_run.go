@@ -123,7 +123,7 @@ func runWorker(cfg config.Config, workerType string) error {
 	// foreground` too, so a metrics-enabled start fails the same way on
 	// either path.
 	var metricsRoot, metricsToken string
-	if cfg.Metrics.Enabled {
+	if cfg.MetricsEnabled() {
 		if err := metricsGateCheck(cfg); err != nil {
 			return err
 		}

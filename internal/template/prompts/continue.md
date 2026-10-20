@@ -6,7 +6,9 @@ You are continuing a previous attempt at this task. The worktree already contain
 
 If the task as stated cannot be completed — contradictory requirements, something missing from the worktree or outside your reach — say exactly what is impossible and why in your reply, then do the best sound partial work you can. Never silently loop over an impossible goal; your reply is what lets the reviewer halt the run for maintainer input instead of requesting changes forever.
 
-You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.
+{{if .Handoff}}If the task is entirely test-scoped work — writing or improving tests, with no implementation change needed — do not fabricate an edit to have something to show: make no changes, explain in your reply why the task needs no implementation, and end your reply with a final line containing exactly TEST-ONLY HANDOFF and nothing else. The pipeline asks the reviewer to confirm the claim; a confirmed hand-off takes the task straight to its test phase, where this work belongs, and a rejected one comes back to you as review findings.
+
+{{end}}You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.
 {{if .PriorFeedback}}
 The previous attempt's last review feedback — the reason it stopped where it did:
 
