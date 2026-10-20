@@ -31,7 +31,7 @@ func useDaemonDir(t *testing.T) string {
 func writeQueueConfig(t *testing.T, queue string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("agent: claude\ntemporal:\n  task_queue: "+queue+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("agent: claude\nmetrics:\n  enabled: false\ntemporal:\n  task_queue: "+queue+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -43,7 +43,7 @@ func writeQueueConfig(t *testing.T, queue string) string {
 func writeWorkerIDConfig(t *testing.T, id string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("agent: claude\nworker_id: "+id+"\ntemporal:\n  task_queue: q7\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("agent: claude\nmetrics:\n  enabled: false\nworker_id: "+id+"\ntemporal:\n  task_queue: q7\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
