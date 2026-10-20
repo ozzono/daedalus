@@ -277,6 +277,49 @@ func TestParseFlagsYes(t *testing.T) {
 	}
 }
 
+// TestParseFlagsSkipPreflight pins the preflight opt-out's flag surface:
+// both the flag-before-command and trailing spellings parse into
+// skipPreflight on a fresh run, it stays off by default, and every other
+// command shape — append mode (the baseline was validated or skipped
+// before the pipeline existed), a continue, and the non-run commands — is
+// rejected at parse time instead of silently dropping the flag.
+func TestParseFlagsSkipPreflight(t *testing.T) {
+	for _, args := range [][]string{
+		{"--skip-preflight", "run", "/repo", "42", "do it"},
+		{"run", "--skip-preflight", "/repo", "42", "do it"},
+	} {
+		f, rest, err := parseFlags(args)
+		if err != nil {
+			t.Errorf("parseFlags(%v): %v", args, err)
+			continue
+		}
+		if !f.skipPreflight {
+			t.Errorf("parseFlags(%v) skipPreflight = false, want true", args)
+		}
+		if !reflect.DeepEqual(rest, []string{"run", "/repo", "42", "do it"}) {
+			t.Errorf("parseFlags(%v) rest = %v, want [run /repo 42 do it]", args, rest)
+		}
+	}
+
+	f, _, err := parseFlags([]string{"run", "/repo", "42", "do it"})
+	if err != nil || f.skipPreflight {
+		t.Errorf("parseFlags(run without --skip-preflight): skipPreflight = %v, err = %v, want false/nil", f.skipPreflight, err)
+	}
+
+	const rejection = "--skip-preflight only applies to a fresh run"
+	for _, args := range [][]string{
+		{"run", "-a", "wf-1", "--skip-preflight", "steer it"},
+		{"--skip-preflight", "run", "-a", "wf-1", "steer it"},
+		{"continue", "--skip-preflight", "wf-1", "resume it"},
+		{"--skip-preflight", "list"},
+		{"log", "--status", "--skip-preflight", "daedalus-issue-42"},
+	} {
+		if _, _, err := parseFlags(args); err == nil || err.Error() != rejection {
+			t.Errorf("parseFlags(%v) err = %v, want %q", args, err, rejection)
+		}
+	}
+}
+
 // TestParseFlagsFolder pins the folder-grant flag surface: -folder/--folder
 // is repeatable and accumulates in argument order (the "=" spelling
 // included), a missing value is a parse error, and the grants are refused

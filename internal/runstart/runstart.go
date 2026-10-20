@@ -92,6 +92,12 @@ type Request struct {
 	// answered "y" is not refused by the gate they just passed. The
 	// dashboard leaves it unset — a form submit is refused, not asked.
 	DirtyOK bool
+	// SkipPreflight carries `run --skip-preflight`: the run's preflight
+	// gate opens on a red baseline instead of parking (the suite still
+	// runs and the red result stays on record). The dashboard leaves it
+	// unset — opting a form submit into an unvalidated baseline is a
+	// deliberate act that belongs on the command line.
+	SkipPreflight bool
 }
 
 // Run names the execution a Start started.
@@ -334,6 +340,7 @@ func Start(cfg config.Config, req Request) (Run, error) {
 		DependsOn:       req.Depends,
 		Dependency:      cfg.Dependency,
 		ReviewSkillList: cfg.ReviewSkillList,
+		SkipPreflight:   req.SkipPreflight,
 	})
 	if err != nil {
 		return Run{}, fmt.Errorf("start workflow: %w", err)

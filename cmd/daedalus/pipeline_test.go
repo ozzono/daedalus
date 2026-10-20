@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +13,11 @@ import (
 
 	commonpb "go.temporal.io/api/common/v1"
 	historypb "go.temporal.io/api/history/v1"
+	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/converter"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
@@ -599,6 +605,138 @@ func TestReadPriorRunBaselineValidation(t *testing.T) {
 		}
 		if gateGreen {
 			t.Error("gateGreen = true, want false — an undecodable result must not read as a green suite")
+		}
+	})
+}
+
+// continueFrontend is the gRPC face `continuePipeline` dials: canned
+// histories per workflow id for readPriorRun's walk, and a captured start
+// for the dispatch under test. Everything else fails the RPC.
+type continueFrontend struct {
+	workflowservice.UnimplementedWorkflowServiceServer
+
+	histories map[string][]*historypb.HistoryEvent
+	starts    []*workflowservice.StartWorkflowExecutionRequest
+}
+
+func (f *continueFrontend) GetSystemInfo(_ context.Context, _ *workflowservice.GetSystemInfoRequest) (*workflowservice.GetSystemInfoResponse, error) {
+	return &workflowservice.GetSystemInfoResponse{Capabilities: &workflowservice.GetSystemInfoResponse_Capabilities{}}, nil
+}
+
+func (f *continueFrontend) StartWorkflowExecution(_ context.Context, req *workflowservice.StartWorkflowExecutionRequest) (*workflowservice.StartWorkflowExecutionResponse, error) {
+	f.starts = append(f.starts, req)
+	return &workflowservice.StartWorkflowExecutionResponse{RunId: "run-1"}, nil
+}
+
+func (f *continueFrontend) GetWorkflowExecutionHistory(_ context.Context, req *workflowservice.GetWorkflowExecutionHistoryRequest) (*workflowservice.GetWorkflowExecutionHistoryResponse, error) {
+	id := req.GetExecution().GetWorkflowId()
+	events, ok := f.histories[id]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no history for %s", id)
+	}
+	return &workflowservice.GetWorkflowExecutionHistoryResponse{
+		History: &historypb.History{Events: events},
+	}, nil
+}
+
+// serveContinueFake serves the fake on a loopback port and returns the
+// config pointing at it; Dial connects eagerly, so the server listens
+// before continuePipeline runs.
+func serveContinueFake(t *testing.T, fake *continueFrontend) config.Config {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind the fake frontend: %v", err)
+	}
+	srv := grpc.NewServer()
+	workflowservice.RegisterWorkflowServiceServer(srv, fake)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	return config.Config{Temporal: config.TemporalConfig{Host: lis.Addr().String(), TaskQueue: "continue-q"}}
+}
+
+// dispatchedInput decodes the PipelineInput a captured continue start carried.
+func dispatchedInput(t *testing.T, req *workflowservice.StartWorkflowExecutionRequest) workflows.PipelineInput {
+	t.Helper()
+	ps := req.GetInput().GetPayloads()
+	if len(ps) != 1 {
+		t.Fatalf("continue start carried %d input payloads, want 1", len(ps))
+	}
+	var in workflows.PipelineInput
+	if err := converter.GetDefaultDataConverter().FromPayload(ps[0], &in); err != nil {
+		t.Fatalf("decode the dispatched input: %v", err)
+	}
+	return in
+}
+
+// TestContinuePipelineSkipPreflightThreading pins the skipped run's twin
+// key at the dispatch itself. Continue's CLI rejects the flag, so the
+// restarted run's SkipPreflight has exactly one source: the started input
+// readPriorRun decodes, threaded by continuePipeline's
+// `SkipPreflight: prev.SkipPreflight`. The decode half alone does not pin
+// the seam — a dispatch that drops the field still decodes history
+// correctly — so the capture is the pin: a chain opened under
+// --skip-preflight that died before any green suite round (its red
+// baseline recorded like every gate execution — gateGreen false,
+// BaselineValidated false) restarts with the recorded flag in the new
+// run's input, and a plain prior — every pre-field chain — restarts with
+// it unset.
+func TestContinuePipelineSkipPreflightThreading(t *testing.T) {
+	at := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	repo := initGitRepo(t)
+	git := func(args ...string) {
+		t.Helper()
+		full := append([]string{"-C", repo, "-c", "user.email=test@example.com", "-c", "user.name=test"}, args...)
+		if out, err := exec.Command("git", full...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	// The preserved aborted branch is verifyBranch's precondition — the
+	// resume path's own gate, not this pin's subject.
+	git("commit", "--allow-empty", "--quiet", "-m", "seed")
+	git("branch", "aborted/issue-42")
+
+	// continueRun dispatches a continue of workflow wf whose history
+	// carries a prior input with (or without) the recorded flag and, for
+	// the skipped chain, its red baseline — the
+	// died-before-any-green-round shape — and returns the input the
+	// restart was dispatched with.
+	continueRun := func(t *testing.T, skip bool) workflows.PipelineInput {
+		t.Helper()
+		in := workflows.PipelineInput{RepoPath: repo, IssueID: "42", Prompt: "implement the feature", BaseBranch: "aborted/issue-42"}
+		in.SkipPreflight = skip
+		history := []*historypb.HistoryEvent{startedInputEvent(t, in)}
+		if skip {
+			history = append(history,
+				scheduledEvent(2, at, "RunTestSuiteActivity"),
+				completedEvent(t, 2, at, activities.TestResult{Passed: false, Logs: "--- FAIL: TestBase"}))
+		}
+		fake := &continueFrontend{histories: map[string][]*historypb.HistoryEvent{"wf": history}}
+		cfg := serveContinueFake(t, fake)
+		captureStdout(t, func() {
+			if err := continuePipeline(cfg, "wf", "carry on", true); err != nil {
+				t.Fatalf("continuePipeline: %v", err)
+			}
+		})
+		if len(fake.starts) != 1 {
+			t.Fatalf("continue issued %d starts, want 1", len(fake.starts))
+		}
+		return dispatchedInput(t, fake.starts[0])
+	}
+
+	t.Run("the skipped chain's flag lands in the restarted input", func(t *testing.T) {
+		got := continueRun(t, true)
+		if !got.SkipPreflight {
+			t.Error("dispatched SkipPreflight = false, want true — the recorded flag must ride the restarted run's input")
+		}
+		if got.BaselineValidated {
+			t.Error("dispatched BaselineValidated = true, want false — the chain died before any green round; the recorded flag is its only skip evidence")
+		}
+	})
+
+	t.Run("a plain prior continues without the skip", func(t *testing.T) {
+		if got := continueRun(t, false); got.SkipPreflight {
+			t.Error("dispatched SkipPreflight = true, want false — a chain without the flag continues gated, as before")
 		}
 	})
 }

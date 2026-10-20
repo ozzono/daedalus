@@ -605,6 +605,65 @@ func TestPlainTailState(t *testing.T) {
 	}
 }
 
+// TestTaskLogTailWindow pins the detail view's seek-window read: a file
+// larger than the render window contributes only its final 8192 bytes —
+// earlier content is absent from the payload, and the freshness state is
+// derived from the window's final round headers — a smaller file arrives
+// whole, a missing log degrades to the not-started note, and a window that
+// splits a multi-byte rune trims the orphaned continuation bytes instead of
+// emitting them.
+func TestTaskLogTailWindow(t *testing.T) {
+	useTaskLogDir(t)
+	const started = "=== 2026-09-25T10:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ==="
+
+	t.Run("a missing log degrades to the not-started note", func(t *testing.T) {
+		got := taskLogTail("wf-absent")
+		if want := "(no task log yet — the run has not started any rounds)"; got != want {
+			t.Errorf("taskLogTail(no log) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a small file arrives whole with the freshness block", func(t *testing.T) {
+		writeTaskLogFile(t, "wf-small", started, "round output")
+		got := taskLogTail("wf-small")
+		if !strings.Contains(got, started) || !strings.Contains(got, "round output") {
+			t.Errorf("taskLogTail = %q, want the whole log", got)
+		}
+		if !strings.Contains(got, "round in flight (stage=dev)") {
+			t.Errorf("taskLogTail = %q, want the freshness state from the log's final round", got)
+		}
+	})
+
+	t.Run("a large file contributes only its final window", func(t *testing.T) {
+		const beginMark = "BEGIN-MARK"
+		writeTaskLogFile(t, "wf-big", beginMark+"\n"+strings.Repeat("a", 10000), started)
+		got := taskLogTail("wf-big")
+		if strings.Contains(got, beginMark) {
+			t.Errorf("taskLogTail read past the window: %q…", got[:80])
+		}
+		if !strings.Contains(got, started) {
+			t.Errorf("taskLogTail = %q…, want the window's final round header", got[:80])
+		}
+		if !strings.Contains(got, "round in flight (stage=dev)") {
+			t.Errorf("taskLogTail = %q…, want the freshness state from the window", got[:80])
+		}
+	})
+
+	t.Run("a split rune is trimmed from the window's first byte", func(t *testing.T) {
+		// 10 x's, a two-byte é straddling the window start, then a b-run
+		// pushing the size past 8192: the window opens on é's continuation
+		// byte, which must be trimmed, not printed.
+		writeTaskLogFile(t, "wf-rune", strings.Repeat("x", 10)+"é"+strings.Repeat("b", 8191))
+		got := taskLogTail("wf-rune")
+		if !strings.HasPrefix(got, "b") {
+			t.Errorf("taskLogTail starts %q, want the trimmed window opening on the b-run", got[:8])
+		}
+		if strings.Contains(got, "é") {
+			t.Error("taskLogTail emitted the split rune's bytes")
+		}
+	})
+}
+
 // fakeTailClient answers only DescribeWorkflowExecution — the one client
 // call cotTailState makes. The embedded nil interface keeps the rest of
 // client.Client unreachable: a panic there is the test failing loudly, not

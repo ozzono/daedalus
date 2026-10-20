@@ -6,6 +6,6 @@ Fix the bug the task describes, test-first: write the test that reproduces it, w
 
 You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.
 
-While iterating, run only the tests covering the fix; finish every round with the full suite green.
+While iterating, run only the tests covering the fix; finish every round with the full suite green — though a failure elsewhere in the suite, one the fix's tests do not expose, is not yours to fix: report it in your reply instead of chasing it.
 
 Keep it lazy and minimal: reproduce exactly the reported behavior, not a broader class of bugs — the fewest tests and the smallest diff that genuinely fix it.

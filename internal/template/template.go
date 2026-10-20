@@ -426,6 +426,10 @@ type Jail struct {
 type implementData struct {
 	Task, BugDir string
 	TouchesJail  bool
+	// Handoff arms the test-only hand-off clause — set only by a flow whose
+	// workflow implements the marker check (feature-dev); the prompt must
+	// never promise a reroute the pipeline does not perform.
+	Handoff bool
 }
 
 // Implement builds the phase-1 opener: the issue task, framed so the
@@ -434,22 +438,27 @@ type implementData struct {
 // drops the file-filing instruction from the bug policy (the project-own
 // record note and reply-reporting duty stay). A task that itself names .ai-jail
 // gets the carve-out branch: editing .ai-jail is in scope instead of
-// barred.
-func Implement(task, bugDir string) (string, error) {
-	return render("implement", implementData{task, bugDir, TaskTouchesJail(task)})
+// barred. The trailing handoff flag arms the test-only hand-off clause;
+// variadic so flows without the marker check keep the plain call.
+func Implement(task, bugDir string, handoff ...bool) (string, error) {
+	return render("implement", implementData{Task: task, BugDir: bugDir, TouchesJail: TaskTouchesJail(task), Handoff: len(handoff) > 0 && handoff[0]})
 }
 
 // continueData is continue.md's data.
 type continueData struct {
 	Task          string
 	PriorFeedback string
+	// Handoff arms the test-only hand-off clause — see implementData.
+	Handoff bool
 }
 
 // Continue builds the phase-1 opener for a resumed run: the new task, the
 // framing that the worktree already contains an aborted attempt's work, and
-// that attempt's last review feedback when available.
-func Continue(task, priorFeedback string) (string, error) {
-	return render("continue", continueData{task, priorFeedback})
+// that attempt's last review feedback when available. The trailing handoff
+// flag arms the test-only hand-off clause; variadic so flows without the
+// marker check keep the plain call.
+func Continue(task, priorFeedback string, handoff ...bool) (string, error) {
+	return render("continue", continueData{Task: task, PriorFeedback: priorFeedback, Handoff: len(handoff) > 0 && handoff[0]})
 }
 
 // implementFixData is implement_fix.md's data.
@@ -471,14 +480,57 @@ func ImplementFix(comments string, jail ...Jail) (string, error) {
 	return render("implement_fix", implementFixData{comments, j.Touches})
 }
 
-// testsData is tests.md's data.
-type testsData struct{ BugDir string }
+// testsData is tests.md's data. Task, when set, carries the run's task
+// text — the hand-off framings (a confirmed test-only hand-off, the
+// test-only flow) have no implementation diff for the tester to infer the
+// task from.
+type testsData struct{ Task, BugDir string }
 
 // Tests opens phase 2: the agent writes or improves the test suite covering
 // the change. bugDir is the configured out-of-scope-bug filing folder; empty
 // drops the file-filing instruction from the bug policy.
 func Tests(bugDir string) (string, error) {
-	return render("tests", testsData{bugDir})
+	return render("tests", testsData{BugDir: bugDir})
+}
+
+// TestsForTask is Tests' hand-off framing: the opener carries the task
+// text (see testsData.Task).
+func TestsForTask(task, bugDir string) (string, error) {
+	return render("tests", testsData{Task: task, BugDir: bugDir})
+}
+
+// TestOnlyHandoff is the machine marker a dev session ends its reply with
+// when the task turned out to be entirely test-scoped work (implement.md
+// and continue.md's hand-off clause): the exact last non-empty line, the
+// same shape as the reviewer verdict protocol — a marker mentioned
+// anywhere else in the reply is not a hand-off.
+const TestOnlyHandoff = "TEST-ONLY HANDOFF"
+
+// IsTestOnlyHandoff reports whether reply ends with the TestOnlyHandoff
+// line — the dev session's structured "no implementation is needed; take
+// the task to the test phase". The line is compared decoration-tolerant:
+// surrounding markdown bold/italics and whitespace are stripped before the
+// match, because a dev that emits the emphasized form ("**TEST-ONLY
+// HANDOFF**") means the hand-off, and a parse that misses it parks the run
+// through the empty-diff review instead — the exact failure shape the
+// reviewer verdict marker's bold-emission incident fixed on the parsing
+// side.
+func IsTestOnlyHandoff(reply string) bool {
+	lines := strings.Split(strings.TrimSpace(reply), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		// Emptiness is decided on the raw line: a `***` divider is
+		// non-empty text, not nothing — stripping its asterisks before
+		// the check would make the divider invisible and let a hand-off
+		// marker above a trailing divider parse as the reply's end.
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		// Decoration stripping applies to the comparison only: the
+		// emphasized form ("**TEST-ONLY HANDOFF**") means the hand-off.
+		return strings.ReplaceAll(line, "*", "") == TestOnlyHandoff
+	}
+	return false
 }
 
 // TestsFix feeds phase-2 (tests ↔ test review) failures back to the agent:
@@ -540,10 +592,10 @@ type DiffHandoff struct {
 }
 
 // ReviewExtra is one optional attachment to a reviewer prompt. The
-// interface is sealed by its unexported method to this package's three
+// interface is sealed by its unexported method to this package's four
 // concrete kinds: Jail (the jail carve-out), *DiffHandoff (the
-// oversized-diff file handoff), and Skill (one skill review's resolved
-// instructions).
+// oversized-diff file handoff), Skill (one skill review's resolved
+// instructions), and Claim (the test-only hand-off confirmation).
 type ReviewExtra interface{ reviewExtra() }
 
 func (Jail) reviewExtra() {}
@@ -562,12 +614,24 @@ type Skill struct{ Instructions string }
 
 func (Skill) reviewExtra() {}
 
+// Claim is the test-only hand-off confirmation's attachment: the empty
+// diff this review sees is by design (the implementing session reports no
+// implementation change is needed), so the template swaps the NO-DIFF
+// paragraph — which reads emptiness as a collection failure — for the
+// claim-verification contract, and the repository inspection the claim's
+// verification demands is in scope rather than forbidden.
+type Claim struct{}
+
+func (Claim) reviewExtra() {}
+
 // reviewExtras splits a review builder's optional attachments into their
-// parts. At most one of each kind is meaningful; the last one wins.
-func reviewExtras(extra []ReviewExtra) (Jail, *DiffHandoff, Skill) {
+// parts. At most one of each kind is meaningful; the last one wins. Claim
+// has no payload, so its presence travels as a bool.
+func reviewExtras(extra []ReviewExtra) (Jail, *DiffHandoff, Skill, bool) {
 	var j Jail
 	var h *DiffHandoff
 	var s Skill
+	claim := false
 	for _, e := range extra {
 		switch v := e.(type) {
 		case Jail:
@@ -576,9 +640,11 @@ func reviewExtras(extra []ReviewExtra) (Jail, *DiffHandoff, Skill) {
 			h = v
 		case Skill:
 			s = v
+		case Claim:
+			claim = true
 		}
 	}
-	return j, h, s
+	return j, h, s, claim
 }
 
 // reviewData is the shared data of review.md. AcceptanceCriteria, when
@@ -593,6 +659,10 @@ type reviewData struct {
 	AcceptanceCriteria                                  []string
 	Handoff                                             *DiffHandoff
 	SkillInstructions                                   string
+	// ClaimReview marks the test-only hand-off confirmation: the empty
+	// diff is by design, and the NO-DIFF paragraph gives way to the
+	// claim-verification contract (see Claim).
+	ClaimReview bool
 }
 
 // review renders the shared reviewer template for all framings.
@@ -620,7 +690,7 @@ func review(d reviewData) (string, error) {
 // handoff (see DiffHandoff), and a Skill adds the skill-review section (see
 // Skill). They trail as variadic so existing callers stay valid.
 func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir string, extra ...ReviewExtra) (string, error) {
-	jail, handoff, skill := reviewExtras(extra)
+	jail, handoff, skill, claim := reviewExtras(extra)
 	return review(reviewData{
 		Focus:             focus,
 		Diff:              diff,
@@ -632,6 +702,7 @@ func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir 
 		JailSpec:          jail.Spec,
 		Handoff:           handoff,
 		SkillInstructions: skill.Instructions,
+		ClaimReview:       claim,
 	})
 }
 
@@ -641,7 +712,7 @@ func Review(focus, diff, testLogs string, testsInScope bool, agentReply, bugDir 
 // REBUILD verdict exists in this framing. The trailing extras are Review's
 // (jail carve-out, diff file handoff, skill section).
 func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, extra ...ReviewExtra) (string, error) {
-	jail, handoff, skill := reviewExtras(extra)
+	jail, handoff, skill, _ := reviewExtras(extra)
 	return review(reviewData{
 		Focus:             focus,
 		Diff:              diff,
@@ -664,7 +735,7 @@ func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, extra ...Revi
 // testLogs), and no REBUILD verdict. The trailing extras are Review's
 // (jail carve-out, diff file handoff, skill section).
 func SlimReview(focus, diff, testLogs, bugDir string, criteria []string, extra ...ReviewExtra) (string, error) {
-	jail, handoff, skill := reviewExtras(extra)
+	jail, handoff, skill, _ := reviewExtras(extra)
 	return review(reviewData{
 		Focus:              focus,
 		Diff:               diff,

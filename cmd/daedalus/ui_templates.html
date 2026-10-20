@@ -38,6 +38,10 @@ html:not(.dark){color-scheme:light;--dd-thumb:#cbd5e1}
 body{@apply bg-slate-50 text-slate-900;}
 html.dark body{@apply bg-slate-950 text-slate-200;}
 *{scrollbar-width:thin;scrollbar-color:var(--dd-thumb) transparent}
+summary.dd-nomark{list-style:none}
+summary.dd-nomark::-webkit-details-marker{display:none}
+details>summary{list-style:none;cursor:pointer}
+details>summary::-webkit-details-marker{display:none}
 </style>
 </head>
 <body hx-boost="true" class="font-sans antialiased min-h-screen">
@@ -55,17 +59,31 @@ html.dark body{@apply bg-slate-950 text-slate-200;}
    <a class="tab {{if eq .Nav "metrics"}}on{{end}}" href="/metrics">Metrics</a>
   </nav>
   <div class="ml-auto flex items-center gap-3 text-xs">
-   <div class="flex items-center gap-1.5" title="auto-refresh every 5s">
-    <svg class="h-5 w-5 -rotate-90" viewBox="0 0 20 20" aria-hidden="true">
-     <circle cx="10" cy="10" r="8" fill="none" stroke-width="2.5" class="stroke-slate-200 dark:stroke-slate-700"></circle>
-     <circle id="cd" cx="10" cy="10" r="8" fill="none" stroke-width="2.5" stroke-linecap="round" class="stroke-emerald-700 dark:stroke-emerald-400" stroke-dasharray="50.265" stroke-dashoffset="0"></circle>
-    </svg>
+   <div id="cdw-wrap" class="flex items-center gap-1.5" title="auto-refresh — click the ring to pause or resume">
+    <button id="cdw" class="relative h-5 w-5 cursor-pointer" aria-label="pause auto-refresh" aria-pressed="true">
+     <svg class="h-5 w-5 -rotate-90" viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="10" cy="10" r="8" fill="none" stroke-width="2.5" class="stroke-slate-200 dark:stroke-slate-700"></circle>
+      <circle id="cd" cx="10" cy="10" r="8" fill="none" stroke-width="2.5" stroke-linecap="round" class="stroke-emerald-700 dark:stroke-emerald-400" stroke-dasharray="50.265" stroke-dashoffset="0"></circle>
+     </svg>
+     <span id="cdn" class="absolute inset-0 grid place-items-center text-[8px] leading-none text-slate-500" aria-hidden="true">5</span>
+     <svg id="cdp" class="absolute inset-0 h-5 w-5 hidden" viewBox="0 0 20 20" aria-hidden="true"><rect x="7" y="6" width="2" height="8" rx="0.5" class="fill-amber-600"></rect><rect x="11" y="6" width="2" height="8" rx="0.5" class="fill-amber-600"></rect></svg>
+    </button>
     <span class="text-slate-500 hidden sm:inline">last polled <span id="lp" class="mono">--:--:--</span></span>
    </div>
    <button id="theme" class="btn !p-1.5" aria-label="toggle theme" aria-pressed="true">
     <svg class="h-4 w-4 hidden dark:block" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
     <svg class="h-4 w-4 dark:hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
    </button>
+   <details id="cfg" class="relative">
+    <summary class="btn !p-1.5 dd-nomark cursor-pointer" aria-label="dashboard settings">
+     <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </summary>
+    <div class="absolute right-0 mt-2 w-60 card p-3 z-20">
+     <label class="lbl" for="dd-interval">Refresh interval (seconds)</label>
+     <input id="dd-interval" type="number" min="2" max="120" step="1" class="inp !py-1.5 mono" value="5">
+     <p class="text-slate-500 mt-2">Applies to this browser only; saved locally. Click the ring to pause.</p>
+    </div>
+   </details>
   </div>
  </div>
 </header>
@@ -83,72 +101,160 @@ ddTheme.onclick=function(){
  ddTheme.setAttribute('aria-pressed',d);
  try{localStorage.setItem('dd-theme',d?'dark':'light')}catch(e){}
 };
-/* 5s poll countdown ring: the #cd circle's stroke-dashoffset maps the
-   remaining fraction, so the ring depletes 5→0 across the interval and
-   snaps full on each successful poll; a feed that stops answering leaves
-   it empty — the honest stall signal. The ring only claims anything on a
-   page that actually polls, so pages without an every-trigger hide the
-   widget instead of sitting clamped at 0 — a healthy page is not a
-   stalled one. Both the element re-query and the interval guard exist
-   because hx-boost swaps re-run this script. */
-if(window.__ddTick)clearInterval(window.__ddTick);
-var n=5,ddC=2*Math.PI*8;
-var ddLive=!!document.querySelector('[hx-trigger*="every"]');
-function ddRing(){
- var el=document.getElementById('cd');
- if(el){
-  el.setAttribute('stroke-dasharray',ddC);
-  el.setAttribute('stroke-dashoffset',ddC*(1-n/5));
- }
+/* poll cadence state lives on window: hx-boost swaps re-run this script
+   and replace the header DOM, but the browser keeps the document (and
+   localStorage) — interval and pause survive navigation. */
+window.__ddPoll=window.__ddPoll||{iv:5000,dl:0,paused:false};
+(function(){
+ try{
+  var iv=parseInt(localStorage.getItem('dd-interval'),10);
+  if(iv>=2&&iv<=120)__ddPoll.iv=iv*1000;
+  __ddPoll.paused=localStorage.getItem('dd-paused')==='1';
+ }catch(e){}
+})();
+window.__ddPaused=function(){return __ddPoll.paused};
+var ddTrigger=function(sec){
+ return 'every '+sec+'s [!document.hidden && !window.__ddPaused()]';
+};
+/* per-swap boot: re-arm every polled region at the stored interval (a
+   rewrite plus htmx.process makes htmx tear down its old poll timer and
+   start a new one — the filter term alone would leave the period fixed),
+   and wire the header widgets this swap just created. */
+var ddLive=false;
+var ddRearm=function(){
+ document.querySelectorAll('[hx-trigger*="every"]').forEach(function(el){
+  ddLive=true;
+  var cur=el.getAttribute('hx-trigger');
+  /* swap out only the every term: a region may carry further specs after
+     it (the runs rows' change from:#fq/#fs), and rewriting the whole
+     attribute would deregister them */
+  var next=cur.replace(/every \d+s \[[^\]]*\]/,ddTrigger(__ddPoll.iv/1000));
+  if(next!==cur){
+   el.setAttribute('hx-trigger',next);
+   htmx.process(el);
+  }
+ });
+};
+ddRearm();
+__ddPoll.dl=Date.now()+__ddPoll.iv;
+var cdWrap=document.getElementById('cdw-wrap');
+if(!ddLive&&cdWrap)cdWrap.classList.add('hidden');
+var cdw=document.getElementById('cdw');
+if(cdw){
+ cdw.setAttribute('aria-pressed',__ddPoll.paused?'false':'true');
+ cdw.onclick=function(){
+  __ddPoll.paused=!__ddPoll.paused;
+  cdw.setAttribute('aria-pressed',__ddPoll.paused?'false':'true');
+  try{localStorage.setItem('dd-paused',__ddPoll.paused?'1':'0')}catch(e){}
+  if(!__ddPoll.paused)__ddPoll.dl=Date.now()+__ddPoll.iv;
+ };
 }
-if(ddLive){
- ddRing();
- window.__ddTick=setInterval(function(){if(n>0)n--;ddRing()},1000);
-}else{
- var cdEl=document.getElementById('cd');
- if(cdEl)cdEl.closest('div').classList.add('hidden');
+var ddi=document.getElementById('dd-interval');
+if(ddi){
+ ddi.value=__ddPoll.iv/1000;
+ ddi.onchange=function(){
+  var iv=parseInt(ddi.value,10);
+  if(!(iv>=2&&iv<=120)){ddi.value=__ddPoll.iv/1000;return;}
+  __ddPoll.iv=iv*1000;
+  try{localStorage.setItem('dd-interval',String(iv))}catch(e){}
+  __ddPoll.dl=Date.now()+__ddPoll.iv;
+  ddRearm();
+ };
 }
-document.body.addEventListener('htmx:afterRequest',function(ev){
- var lp=document.getElementById('lp');
- if(ev.detail.successful){
-  n=5;ddRing();
-  if(lp){lp.textContent=new Date().toTimeString().slice(0,8);lp.classList.remove('text-red-600','dark:text-red-400')}
- }else if(lp){
-  lp.textContent='poll failed';
-  lp.classList.add('text-red-600','dark:text-red-400');
- }
-});
-/* a poll's innerHTML swap replaces the region's DOM wholesale, so a swap
-   landing on open reading state destroys it: the test excerpt's scroll
-   resets and a selection — mid-drag included — dies. A poll whose target
-   holds an active (non-collapsed) selection skips its swap (the next
-   content change retries); a plain click leaves a collapsed caret, which
-   vetoes nothing. Otherwise the excerpt pre's scroll offset is carried
-   across the swap, which re-renders the same panel in the same slot. The
-   hx-trigger-ancestor match keeps this scoped to the polled regions (the
-   runs rows swap into a tbody under the trigger div) — boosted
-   navigations and the New-Task panel swap through the same events. A
-   vetoed poll still counts as polled — the ring snaps full and
-   last-polled advances — so the stall signal stays about the feed, not
-   the withheld swap. */
-var ddScroll=0;
-document.body.addEventListener('htmx:beforeSwap',function(ev){
- var t=ev.detail.target;
- if(!ev.detail.shouldSwap||!t||!t.closest('[hx-trigger]'))return;
- var sel=document.getSelection();
- if(sel.rangeCount&&!sel.isCollapsed&&t.contains(sel.getRangeAt(0).commonAncestorContainer)){
-  ev.detail.shouldSwap=false;
+/* the ring: one requestAnimationFrame loop for the document's life (a
+   swap only replaces the circles it redraws), depleting continuously
+   across the interval instead of stepping once a second, with the
+   seconds left rendered inside it. A paused ring holds full and amber
+   with the pause glyph; a feed that stops answering lets the ring empty
+   — the honest stall signal. A page nothing polls (the wrap carries the
+   ddLive guard's hidden class) stops the loop outright — a hidden widget
+   gets no frames, and the script's boot line below restarts it when a
+   swap brings a poll region back — instead of paying 60 no-op reschedules
+   a second on pages that never poll. */
+var ddC=2*Math.PI*8;
+var ddFrame=function(){
+ var wrap=document.getElementById('cdw-wrap');
+ if(!wrap||wrap.classList.contains('hidden')){
+  window.__ddRaf=0;
   return;
  }
- var pre=t.querySelector('pre');
- if(pre)ddScroll=pre.scrollTop;
-});
-document.body.addEventListener('htmx:afterSwap',function(ev){
- var t=ev.detail.target;
- if(!t||!t.closest('[hx-trigger]'))return;
- var pre=t.querySelector('pre');
- if(pre)pre.scrollTop=ddScroll;
-});
+ window.__ddRaf=requestAnimationFrame(ddFrame);
+ var el=document.getElementById('cd');
+ if(!el)return;
+ var num=document.getElementById('cdn'),picon=document.getElementById('cdp'),btn=document.getElementById('cdw');
+ if(__ddPoll.paused){
+  el.classList.remove('stroke-emerald-700','dark:stroke-emerald-400');
+  el.classList.add('stroke-amber-600');
+  el.setAttribute('stroke-dashoffset',0);
+  if(num)num.textContent='';
+  if(picon)picon.classList.remove('hidden');
+  if(btn)btn.setAttribute('aria-pressed','false');
+  return;
+ }
+ el.classList.remove('stroke-amber-600');
+ el.classList.add('stroke-emerald-700','dark:stroke-emerald-400');
+ if(picon)picon.classList.add('hidden');
+ if(btn)btn.setAttribute('aria-pressed','true');
+ var left=__ddPoll.dl-Date.now();
+ var frac=Math.max(0,Math.min(1,left/__ddPoll.iv));
+ el.setAttribute('stroke-dasharray',ddC);
+ el.setAttribute('stroke-dashoffset',ddC*(1-frac));
+ if(num)num.textContent=String(Math.max(0,Math.ceil(left/1000)));
+};
+/* boot (re)start: the loop only idles as 0 when the last frame stopped it
+   on a non-polling page, and every boosted swap re-runs this script — so
+   this line is what carries the loop across a navigation onto a polling
+   page. */
+if(!window.__ddRaf)window.__ddRaf=requestAnimationFrame(ddFrame);
+/* document-level htmx listeners register once — this script re-runs on
+   every boosted swap, and a listener per swap accumulates. */
+if(!window.__ddWired){
+ window.__ddWired=true;
+ document.body.addEventListener('htmx:afterRequest',function(ev){
+  var lp=document.getElementById('lp');
+  if(ev.detail.successful){
+   __ddPoll.dl=Date.now()+__ddPoll.iv;
+   if(lp){lp.textContent=new Date().toTimeString().slice(0,8);lp.classList.remove('text-red-600','dark:text-red-400')}
+  }else if(lp){
+   lp.textContent='poll failed';
+   lp.classList.add('text-red-600','dark:text-red-400');
+  }
+ });
+ /* a poll's innerHTML swap replaces the region's DOM wholesale, so a swap
+    landing on open reading state destroys it: the test excerpt's scroll
+    resets, a selection — mid-drag included — dies, and an open details
+    (the run detail's log tail and CoT box) collapses. A poll whose target
+    holds an active selection or an open details skips its swap (the next
+    content change retries); a plain click leaves a collapsed caret and a
+    closed details, which veto nothing. Otherwise the excerpt pre's scroll
+    offset is carried across the swap. The hx-trigger-ancestor match keeps
+    this scoped to the polled regions — boosted navigations and the
+    New-Task panel swap through the same events. A vetoed poll still
+    counts as polled — the ring resets and last-polled advances — so the
+    stall signal stays about the feed, not the withheld swap. */
+ var ddScroll=0;
+ document.body.addEventListener('htmx:beforeSwap',function(ev){
+  var t=ev.detail.target;
+  if(!ev.detail.shouldSwap||!t||!t.closest('[hx-trigger]'))return;
+  var sel=document.getSelection();
+  if(sel.rangeCount&&!sel.isCollapsed&&t.contains(sel.getRangeAt(0).commonAncestorContainer)){
+   ev.detail.shouldSwap=false;
+   return;
+  }
+  if(t.querySelector('details[open]')){
+   ev.detail.shouldSwap=false;
+   return;
+  }
+  var pre=t.querySelector('pre');
+  if(pre)ddScroll=pre.scrollTop;
+ });
+ document.body.addEventListener('htmx:afterSwap',function(ev){
+  var t=ev.detail.target;
+  if(!t||!t.closest('[hx-trigger]'))return;
+  var pre=t.querySelector('pre');
+  if(pre)pre.scrollTop=ddScroll;
+ });
+}
 /* the runs filters re-render the rows immediately (the poll region's
    change trigger) and sync the location so a filtered view survives a
    reload and can be shared; replaceState rather than push, because
@@ -400,10 +506,41 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  <pre class="mono text-xs whitespace-pre-wrap break-words text-slate-700 dark:text-slate-300">{{.ReviewBody}}</pre>
 </div>
 {{end}}
+
+<details class="card p-4 mb-4">
+ <summary class="text-sm font-medium">Task log tail</summary>
+ <pre class="mono text-xs whitespace-pre-wrap break-words max-h-96 overflow-y-auto mt-2 text-slate-700 dark:text-slate-300">{{.LogTail}}</pre>
+</details>
+
+<details class="card p-4 mb-4">
+ <summary class="text-sm font-medium">Last round CoT</summary>
+ <div hx-get="/runs/{{.WorkflowID}}/cot" hx-trigger="toggle once from:closest details" hx-swap="innerHTML">
+  <p class="text-sm text-slate-500 mt-2">Loads on first open — the CoT walk reads the run's whole Temporal history, so it stays out of the polled body.</p>
+ </div>
+</details>
 {{end}}
 
 {{define "frag_error"}}
 <div class="card p-4 text-sm text-red-600 dark:text-red-400">{{.}}</div>
+{{end}}
+
+{{define "frag_cot"}}
+{{if .Err}}
+<div class="text-sm text-red-600 dark:text-red-400">{{.Err}}</div>
+{{else if .Body}}
+<div class="mono text-xs text-slate-500 mb-1">{{.Head}}</div>
+<pre class="mono text-xs whitespace-pre-wrap break-words max-h-96 overflow-y-auto text-slate-700 dark:text-slate-300">{{.Body}}</pre>
+{{else}}
+<p class="text-sm text-slate-500 mt-2">No jailed agent rounds in this run's history yet.</p>
+{{end}}
+{{end}}
+
+{{define "page_error"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
+<main class="mx-auto max-w-6xl px-4 py-6">
+{{template "frag_error" .Err}}
+<p class="text-xs text-slate-500 mt-3">The page shell renders even when its content fails — a refresh on this URL retries the content, and the navigation above stays live.</p>
+</main>
+{{template "foot"}}
 {{end}}
 
 {{define "usage_table"}}{{/* the replicated column set both usage tables render; .Head names the key column */}}
@@ -566,20 +703,22 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  <div class="card p-5 max-w-2xl">
   <form hx-post="/new" hx-target="#res" hx-swap="innerHTML">
    <div class="grid sm:grid-cols-2 gap-4">
-    <div><label class="lbl" for="nq">Worker / queue</label>
-     <select id="nq" name="worker" class="inp mono" hx-get="/new/agents" hx-target="#agent-slot" hx-swap="innerHTML">
-      {{range .Form.Workers}}<option value="{{.Name}}" {{if .Selected}}selected{{end}} {{if not .Available}}disabled{{end}}>{{.Name}} ({{.State}}){{if not .Available}} — no config record{{end}}</option>{{end}}
-     </select></div>
+    <div class="sm:col-span-2 grid sm:grid-cols-2 gap-4">
+     <div><label class="lbl" for="nq">Worker / queue</label>
+      <select id="nq" name="worker" class="inp mono" hx-get="/new/agents" hx-target="#agent-slot" hx-swap="innerHTML">
+       {{range .Form.Workers}}<option value="{{.Name}}" {{if .Selected}}selected{{end}} {{if not .Available}}disabled{{end}}>{{.Name}} ({{.State}}){{if not .Available}} — no config record{{end}}</option>{{end}}
+      </select></div>
+     <div id="agent-slot">{{template "frag_agents" .Agents}}</div>
+    </div>
     <div><label class="lbl" for="nwf">Workflow</label>
      <select id="nwf" name="workflow" class="inp mono">
       <option value="" {{if not .Form.Workflow}}selected{{end}}>default</option>
       {{range .Form.Flows}}<option value="{{.}}" {{if eq . $.Form.Workflow}}selected{{end}}>{{.}}</option>{{end}}
      </select></div>
-    <div class="sm:col-span-2"><label class="lbl" for="nrepo">Repo path</label>
-     <input id="nrepo" name="repo" class="inp mono" placeholder="~/src/billing-api" value="{{.Form.Repo}}"></div>
     <div><label class="lbl" for="nissue">Issue id</label>
      <input id="nissue" name="issue" class="inp mono" placeholder="ISS-501" value="{{.Form.Issue}}"></div>
-    <div id="agent-slot">{{template "frag_agents" .Agents}}</div>
+    <div class="sm:col-span-2"><label class="lbl" for="nrepo">Repo path</label>
+     <input id="nrepo" name="repo" class="inp mono" placeholder="~/src/billing-api" value="{{.Form.Repo}}"></div>
     <div class="sm:col-span-2"><label class="lbl" for="nprompt">Task instructions</label>
      <div class="flex gap-2 mb-2 text-sm">
       <label class="tab {{if ne .Form.Mode "file"}}on{{end}}"><input type="radio" name="mode" value="text" class="sr-only" {{if ne .Form.Mode "file"}}checked{{end}}>Direct Text</label>

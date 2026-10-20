@@ -23,8 +23,11 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
+	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -85,8 +88,11 @@ type uiServer struct {
 	cl     client.Client
 	inputs map[string]workflows.PipelineInput
 	probes map[string]uiProbe
-	frags  map[string][]byte
-	prices map[string]modelPrice
+	// probing marks the configs with a background probe refresh in
+	// flight, so every expiring render does not start its own.
+	probing map[string]bool
+	frags   map[string][]byte
+	prices  map[string]modelPrice
 }
 
 func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger) *uiServer {
@@ -199,6 +205,7 @@ func (s *uiServer) routes() http.Handler {
 	mux.HandleFunc("GET /runs/rows", s.fragRuns)
 	mux.HandleFunc("GET /runs/{id}", s.pageRun)
 	mux.HandleFunc("GET /runs/{id}/body", s.fragRun)
+	mux.HandleFunc("GET /runs/{id}/cot", s.fragCot)
 	mux.HandleFunc("GET /new", s.pageNew)
 	mux.HandleFunc("GET /new/agents", s.fragAgents)
 	mux.HandleFunc("POST /new", s.submitNew)
@@ -373,24 +380,50 @@ type uiProbe struct {
 }
 
 // probeFor returns the config's probes, serving uiProbeTTL off the cache.
-// probeProvider runs unlocked: it can block seconds on the worker's
-// endpoints, and s.mu also guards the shared Temporal client — two
-// renders racing one expiry just probe twice.
+// An expired entry never blocks the render: probeProvider dials the
+// worker's provider — it can block seconds, and once it blocked every
+// page render and poll that walked the roster, so a navigation landed
+// only after the provider answered. The refresh instead runs in the
+// background (one in flight per config — two renders racing one expiry
+// just probe twice otherwise) and a later poll picks the fresh probes
+// up; the current answer renders stale for one cycle, which is the
+// badge's own contract ("TTL-cached, may be stale"). An entry that does
+// not exist yet — first render after a daemon start, or after the cache
+// cap reset — has no current answer, and the zero struct's !Main.OK
+// would paint a failed face for a probe that never ran: the NA contract
+// (non-empty means nothing was probed, with the reason) covers it until
+// the first probe lands.
 func (s *uiServer) probeFor(confPath string) providerProbes {
 	s.mu.Lock()
-	if p, ok := s.probes[confPath]; ok && time.Since(p.at) < uiProbeTTL {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	p := s.probes[confPath]
+	if confPath == "" || time.Since(p.at) < uiProbeTTL {
 		return p.p
 	}
-	s.mu.Unlock()
-	p := probeProvider(confPath)
-	s.mu.Lock()
-	if len(s.probes) >= uiCacheCap {
-		s.probes = map[string]uiProbe{}
+	if s.probing == nil {
+		s.probing = map[string]bool{}
 	}
-	s.probes[confPath] = uiProbe{p: p, at: time.Now()}
-	s.mu.Unlock()
-	return p
+	// Mark and spawn before any early return: the goroutine is the only
+	// writer of s.probes, so returning first would leave a cold entry
+	// probing forever.
+	cold := p.at.IsZero()
+	if !s.probing[confPath] {
+		s.probing[confPath] = true
+		go func() {
+			fresh := probeProvider(confPath)
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if len(s.probes) >= uiCacheCap {
+				s.probes = map[string]uiProbe{}
+			}
+			s.probes[confPath] = uiProbe{p: fresh, at: time.Now()}
+			delete(s.probing, confPath)
+		}()
+	}
+	if cold {
+		return providerProbes{NA: "probing…"}
+	}
+	return p.p
 }
 
 // uiWorkerCard is one roster card, display-ready.
@@ -746,6 +779,11 @@ type uiRunDetail struct {
 	ReviewVd    string
 	ReviewBadge string
 	ReviewBody  string
+	// LogTail is the run's captured task log, bounded to its tail, with
+	// the CLI's freshness line appended (taskLogTail) — the same material
+	// `daedalus log` prints, kept out of the page's first paint inside a
+	// collapsed details.
+	LogTail string
 }
 
 // reviewVerdict names a reviewer round's outcome and its badge — the
@@ -992,7 +1030,54 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 	}
 	d.TotalCost = fmt.Sprintf("%.4f", total)
 	d.LedgerCost, d.LedgerTotal = s.runLedgerCost(workflowID)
+	d.LogTail = taskLogTail(workflowID)
 	return d, nil
+}
+
+// taskLogTail reads the run's captured task log for the detail view — the
+// material `daedalus log` prints, bounded to its tail so a long session
+// cannot bloat every poll's payload, with the same freshness line the CLI
+// appends. A missing or unreadable log degrades to a note: the detail page
+// never fails on it.
+func taskLogTail(workflowID string) string {
+	const uiLogTailBytes = 8192
+	path, err := activities.TaskLogPath(workflowID)
+	if err != nil {
+		return fmt.Sprintf("(no task log: %v)", err)
+	}
+	// Seek-window read, not ReadFile: the detail body polls every few
+	// seconds, so the read is O(window), never O(file) — a tens-of-MB
+	// session log made every poll an O(file) read plus two O(file)
+	// string conversions for material only the last 8 KiB of which
+	// renders (ui-tasklogtail-whole-file-read-per-poll in
+	// backlog/bugs/bug-index.md). Only the final round's headers bear on
+	// the freshness state, and the window holds them.
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "(no task log yet — the run has not started any rounds)"
+		}
+		return fmt.Sprintf("(task log unreadable: %v)", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Sprintf("(task log unreadable: %v)", err)
+	}
+	start := max(0, info.Size()-uiLogTailBytes)
+	buf := make([]byte, info.Size()-start)
+	n, err := f.ReadAt(buf, start)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Sprintf("(task log unreadable: %v)", err)
+	}
+	// n < len(buf) (with io.EOF) means the file shrank between the Stat
+	// and the read; rendering the zero tail would print NUL padding.
+	tail := string(buf[:n])
+	// the byte window can split a rune; continuation bytes say so
+	for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
+		tail = tail[1:]
+	}
+	return tail + logTail(workflowID, plainTailState(tail))
 }
 
 // runBranch resolves the run's branch line for the detail header: the
@@ -1047,6 +1132,53 @@ func (s *uiServer) fragRun(w http.ResponseWriter, req *http.Request) {
 	s.runBody(w, req, "frag_run")
 }
 
+// uiCot is the run detail's last-round CoT box payload.
+type uiCot struct {
+	Err  string
+	Head string
+	Body string
+}
+
+// fragCot serves the detail page's collapsed CoT box, fetched on first
+// open — the walk reads every execution's full history (the same walk the
+// CLI's `log -cot` prints), so rendering it into the polled body would
+// double every poll's work for a box that is closed almost all of the
+// time. It serves the tail-1 view: the last completed round's section,
+// with the in-flight live section standing in before any round completes.
+func (s *uiServer) fragCot(w http.ResponseWriter, req *http.Request) {
+	id := req.PathValue("id")
+	// listWorkflowRuns exits on an id its visibility query cannot carry;
+	// the daemon must answer, not die, so the guard lands here first.
+	if strings.ContainsAny(id, "'\\") {
+		s.render(w, http.StatusOK, "frag_cot", uiCot{Err: "workflow id carries characters the CoT walk cannot query"})
+		return
+	}
+	c, err := s.temporal()
+	if err != nil {
+		s.render(w, http.StatusOK, "frag_cot", uiCot{Err: err.Error()})
+		return
+	}
+	var out uiCot
+	runs := listWorkflowRuns(c, id)
+	if len(runs) == 0 {
+		runs = []string{""}
+	}
+	sections, err := cotSections(c, id, runs)
+	if err != nil {
+		s.render(w, http.StatusOK, "frag_cot", uiCot{Err: err.Error()})
+		return
+	}
+	if len(sections) > 0 {
+		out.Head, out.Body, _ = strings.Cut(sections[len(sections)-1], "\n")
+	}
+	if out.Head == "" {
+		if live := liveCotSectionWith(id, c); live != "" {
+			out.Head, out.Body, _ = strings.Cut(strings.TrimRight(live, "\n"), "\n")
+		}
+	}
+	s.render(w, http.StatusOK, "frag_cot", out)
+}
+
 func (s *uiServer) runBody(w http.ResponseWriter, req *http.Request, tpl string) {
 	d, err := s.detail(req.PathValue("id"))
 	if err != nil {
@@ -1062,7 +1194,17 @@ func (s *uiServer) runBody(w http.ResponseWriter, req *http.Request, tpl string)
 			s.renderFrag(w, req, "frag_error", err.Error())
 			return
 		}
-		s.render(w, http.StatusOK, "frag_error", err.Error())
+		// The page shell answers with the full document — head, header,
+		// nav, script — never the bare fragment. A fragment as the whole
+		// page is what a deep-link refresh landed on when the detail could
+		// not resolve (the Temporal dial is lazy, so the window includes
+		// every daemon restart and blip): a nav-less error card that read
+		// as the view being lost. Inside the shell the error is one card
+		// among live navigation, and a refresh retries the content.
+		s.render(w, http.StatusOK, "page_error", struct {
+			Chrome uiChrome
+			Err    string
+		}{uiChrome{Nav: "runs", Title: "daedalus — error"}, err.Error()})
 		return
 	}
 	// frag_run reads the bare detail — here and where page_run includes it

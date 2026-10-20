@@ -77,6 +77,12 @@ type flags struct {
 	// behind another workflow: the id travels with the run's workflow
 	// input and the gate inside it blocks until the dependency resolves.
 	depends string
+	// skipPreflight, set via --skip-preflight on `run`, tells the run's
+	// preflight gate to open on a red baseline instead of parking: the
+	// suite still runs and the red result stays on record, but the run
+	// proceeds — a red baseline is the submitter's stated premise, and
+	// the flow's own suite gating is the expected route for the fix.
+	skipPreflight bool
 	// status, set via --status on `log`, prints the task's status brief
 	// instead of the raw log.
 	status bool
@@ -109,32 +115,33 @@ type flagSpec struct {
 // (completion.go), so a flag added once is parsed and completed. Long
 // spellings also accept the "--name=" value form.
 var flagTable = map[string]flagSpec{
-	"-c":         {name: "config", value: true},
-	"--config":   {name: "config", value: true},
-	"-w":         {name: "workflow", value: true},
-	"--workflow": {name: "workflow", value: true},
-	"-f":         {name: "file", value: true},
-	"--file":     {name: "file", value: true},
-	"-a":         {name: "append", value: true},
-	"--append":   {name: "append", value: true},
-	"-p":         {name: "prefix", value: true},
-	"--prefix":   {name: "prefix", value: true},
-	"-cli":       {name: "cli", value: true},
-	"--cli":      {name: "cli", value: true},
-	"-folder":    {name: "folder", value: true},
-	"--folder":   {name: "folder", value: true},
-	"-dep":       {name: "depends", value: true},
-	"--depends":  {name: "depends", value: true},
-	"-t":         {name: "type", value: true},
-	"--type":     {name: "type", value: true},
-	"-d":         {name: "detach"},
-	"--detach":   {name: "detach"},
-	"--yes":      {name: "yes"},
-	"--status":   {name: "status"},
-	"-cot":       {name: "cot"},
-	"--cot":      {name: "cot"},
-	"-cot-n":     {name: "cot-n", value: true},
-	"--cot-n":    {name: "cot-n", value: true},
+	"-c":               {name: "config", value: true},
+	"--config":         {name: "config", value: true},
+	"-w":               {name: "workflow", value: true},
+	"--workflow":       {name: "workflow", value: true},
+	"-f":               {name: "file", value: true},
+	"--file":           {name: "file", value: true},
+	"-a":               {name: "append", value: true},
+	"--append":         {name: "append", value: true},
+	"-p":               {name: "prefix", value: true},
+	"--prefix":         {name: "prefix", value: true},
+	"-cli":             {name: "cli", value: true},
+	"--cli":            {name: "cli", value: true},
+	"-folder":          {name: "folder", value: true},
+	"--folder":         {name: "folder", value: true},
+	"-dep":             {name: "depends", value: true},
+	"--depends":        {name: "depends", value: true},
+	"-t":               {name: "type", value: true},
+	"--type":           {name: "type", value: true},
+	"-d":               {name: "detach"},
+	"--detach":         {name: "detach"},
+	"--skip-preflight": {name: "skip-preflight"},
+	"--yes":            {name: "yes"},
+	"--status":         {name: "status"},
+	"-cot":             {name: "cot"},
+	"--cot":            {name: "cot"},
+	"-cot-n":           {name: "cot-n", value: true},
+	"--cot-n":          {name: "cot-n", value: true},
 }
 
 // parseFlags extracts -c/--config and -w/--workflow (which may appear
@@ -228,6 +235,8 @@ parse:
 		switch spec.name {
 		case "detach":
 			f.detach = true
+		case "skip-preflight":
+			f.skipPreflight = true
 		case "yes":
 			f.yes = true
 		case "status":
@@ -288,6 +297,13 @@ parse:
 	// there — and no other command blocks on a pipeline at all.
 	if f.detach && len(rest) > 0 && ((rest[0] != "run" && rest[0] != "continue") || f.appendID != "") {
 		return f, nil, errors.New("-d/--detach only applies to a fresh run and continue")
+	}
+	// Likewise --skip-preflight: the gate decision is made once, at the
+	// fresh run's start (the workflow input carries it), so only a fresh
+	// `run` can carry it — append mode steers a pipeline whose baseline
+	// was validated or skipped before it existed.
+	if f.skipPreflight && len(rest) > 0 && (rest[0] != "run" || f.appendID != "") {
+		return f, nil, errors.New("--skip-preflight only applies to a fresh run")
 	}
 	// The record-driven worker commands (`worker restart all`, `worker
 	// restart <name>`, `worker status`) work from the recorded configs

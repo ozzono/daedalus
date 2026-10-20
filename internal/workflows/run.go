@@ -129,6 +129,12 @@ type pipelineRun struct {
 	quotaHeartbeats     int
 	consecutiveTimeouts int
 	reviewTimeouts      int
+	// testRebuilds counts the REBUILD rounds the test phase has spent
+	// against maxTestPhaseRebuilds (pipelineRun.rebuildRound, shared by
+	// every test-phase flow). Replayed history re-increments it
+	// deterministically — the counter rides recorded verdicts, like every
+	// workflow-local counter here.
+	testRebuilds int
 	// verdictlessReviews counts consecutive review rounds that completed
 	// without any verdict marker (see maxVerdictlessReviews). Only a
 	// review carrying a real verdict resets it.
@@ -592,49 +598,71 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 	}
 }
 
+// reviewOpts names one review round's inputs at the call site — review()'s
+// former positional list, whose bare booleans compiled silently even when
+// transposed into a wrong prompt. session stays a pointer: review stores
+// the round's conversation id back through it, so the next round of the
+// same review role resumes that conversation. skill carries the
+// skill-review entry, if any: at most one is meaningful (the last wins,
+// like every attachment); empty keeps the round an ordinary default
+// review.
+type reviewOpts struct {
+	focus        string
+	testLogs     string
+	testsInScope bool
+	reproInScope bool
+	agentReply   string
+	role         activities.SessionRole
+	session      *string
+	touchesJail  bool
+	claimReview  bool
+	skill        string
+}
+
 // review asks the reviewer for a verdict on the worktree's current state,
 // retrying the same round across timeouts — there is no partial work to
-// continue, the verdict simply never arrived. touchesJail marks the
+// continue, the verdict simply never arrived. opts.touchesJail marks the
 // phase-1 implementation code review of a task whose text names .ai-jail —
 // the only review whose agent can act on jail findings (test, docs, bugfix,
 // and refactor rounds pass false: their agents are barred from touching
 // .ai-jail, so an audit mandate there would be a demand no round can
-// satisfy). The trailing skill carries the skill-review entry, if any: at
-// most one is meaningful (the last wins, like every attachment); empty
-// keeps the round an ordinary default review.
-func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string, touchesJail bool, skill ...string) (activities.ReviewResult, error) {
-	skillEntry := ""
-	if len(skill) > 0 {
-		skillEntry = skill[len(skill)-1]
-	}
+// satisfy). opts.claimReview marks the test-only hand-off confirmation —
+// the empty diff is by design and the review verifies the claim (see
+// ReviewInput.ClaimReview); only the hand-off confirmation passes true.
+func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
+	focus, role, session := opts.focus, opts.role, opts.session
 	// Same lost-session fallback as the agent rounds: one fresh retry.
 	freshFallback := false
 	for {
 		var result activities.ReviewResult
 		err := workflow.ExecuteActivity(r.reviewCtx, activities.RunJailedReviewerActivity, activities.ReviewInput{
 			WorktreePath: r.worktree.WorktreePath,
-			Focus:        focus,
-			TestLogs:     testLogs,
-			TestsInScope: testsInScope,
-			ReproInScope: reproInScope,
-			AgentReply:   agentReply,
+			Focus:        opts.focus,
+			TestLogs:     opts.testLogs,
+			TestsInScope: opts.testsInScope,
+			ReproInScope: opts.reproInScope,
+			AgentReply:   opts.agentReply,
 			// Explicitly threaded from the workflow's submit-time
 			// derivation — never the diff (template.TaskTouchesJail
 			// documents why), never re-derived here.
-			TaskTouchesJail: touchesJail,
+			TaskTouchesJail: opts.touchesJail,
 			Agent:           r.input.Agent,
-			SessionID:       *session,
-			Role:            role,
+			SessionID:       *opts.session,
+			Role:            opts.role,
 			// Fresh-review mode (slim): the activity starts a brand-new
 			// reviewer conversation every round — no session id is ever
 			// stored back and no recorded-session fallback fires — while
 			// the role itself still selects the configured reviewer
 			// endpoint and keeps the pi edit guardrail excluded.
 			FreshReview: r.freshReviews,
+			ClaimReview: opts.claimReview,
 			// Slim's per-sub-task acceptance criteria; nil elsewhere.
 			AcceptanceCriteria: r.reviewCriteria,
 			// The skill-review round's entry, if any; empty elsewhere.
-			SkillEntry: skillEntry,
+			SkillEntry: opts.skill,
+			// The worktree's starting sha — the empty-diff detector's
+			// anchor (ReviewInput.BaseHead); empty when unrecorded.
+			BaseHead: r.worktree.BaseHead,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.reviewTimeouts = 0

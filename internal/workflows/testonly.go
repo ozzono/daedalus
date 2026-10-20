@@ -11,10 +11,16 @@ import (
 
 // TestOnlyWorkflow drives a test-improvement run: the agent modifies test
 // files only, the native suite gates every round, and a test reviewer
-// approves the suite. There is no implementation loop: a reviewer REBUILD —
-// a finding the test-only agent cannot apply because the fix is an
-// implementation change — parks the run for the maintainer instead, so a
-// known-buggy diff can never finalize as approved work. Suite executions
+// approves the suite. A reviewer REBUILD — a finding the test-only agent
+// cannot apply because the fix is an implementation change — spends a
+// capped rebuild round: a dev-role agent run on the finding, the flow's
+// one dev-code path, its result gated by the code reviewer before the
+// test loop resumes. AllowedPaths is solely the finalize scope check's
+// policy — nothing reads it mid-round, so the tester's fencing is
+// prompt-level — and one rebuild lifts the check for the rest of the
+// run: the approved implementation change rides the working tree, and
+// that wholesale lift is the price of the rebuild path. Only a spent
+// cap parks the run for the maintainer. Suite executions
 // record Go statement coverage, and the reviewer sees the delta across
 // rounds.
 func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
@@ -39,7 +45,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	if input.BaseBranch != "" {
 		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
 	} else {
-		initialPrompt, err = template.Tests(bugDir())
+		initialPrompt, err = template.TestsForTask(input.Prompt, bugDir())
 	}
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)
@@ -65,7 +71,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 		if result.Coverage != "" {
 			lastCoverage = result.Coverage
 		}
-		verdict, err := run.review("the test suite", logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false)
+		verdict, err := run.review(reviewOpts{focus: "the test suite", testLogs: logs, testsInScope: true, agentReply: testerReply.Text, role: activities.RoleTestReview, session: &run.testReviewSession})
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
@@ -75,15 +81,39 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 				verdict.Comments))
 		}
 		if verdict.Rebuild {
-			// No implementation loop exists in this flow to rebuild into:
-			// the finding parks for the maintainer with the reviewer's
-			// reasoning, keeping "merged work is approved work" true.
-			run.logger.Info("Test review requested a rebuild; parking for the maintainer")
-			return "", run.park(fmt.Sprintf("test review requested a rebuild — the fix is an implementation change, outside this flow's test-only scope: %s",
-				verdict.Comments))
+			// The rebuild round is the flow's one dev-code path, budgeted
+			// like the feature-dev green stage (pipelineRun.rebuildRound):
+			// a dev-role agent run on the finding, its change gated by the
+			// full code review loop, then the test loop resumes. The dev
+			// round's write fencing is prompt-level only: AllowedPaths has
+			// no mid-run consumer — its one read is the finalize scope
+			// check. The rebuild rides the verdict, so replay is
+			// deterministic.
+			reply, restart, rerr := run.rebuildRound(verdict.Comments, false)
+			if !restart {
+				return "", rerr
+			}
+			// The rebuild round's reply is what the test reviewer next sees
+			// as the latest reply: quoting the pre-rebuild tester here would
+			// describe a change the reviewer is not looking at.
+			testerReply = reply
+			continue
 		}
 		if result.Passed && verdict.Approved {
 			run.logger.Info("Tests pass and test review approved")
+			if run.testRebuilds > 0 {
+				// A rebuild's approved implementation change is still
+				// working-tree state at finalize — rounds never commit —
+				// and the test-path-only scope check would park the run
+				// on it. The lift is per-run, not per-change: from the
+				// first rebuild on, the structural check is skipped for
+				// the whole tree (an empty scope short-circuits it), so
+				// every later edit — the code-reviewed change included —
+				// finalizes unchecked. That is the price of letting the
+				// rebuild's implementation change through; with no
+				// rebuild the check runs as always.
+				run.input.AllowedPaths = nil
+			}
 			if err := run.checkWriteScope(); err != nil {
 				return "", err
 			}

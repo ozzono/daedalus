@@ -9,7 +9,7 @@ USAGE
 
 WORKFLOW COMMANDS
   run         Start an implementation pipeline for an issue
-              flags: -w -d -p -cli -folder -dep -f -a
+              flags: -w -d -p -cli -folder -dep -f -a --skip-preflight
   continue    Resume a closed, failed, or parked session
               flags: -d
   guide       Send operator instructions to a running pipeline
@@ -70,7 +70,7 @@ var commandHelp = map[string]string{
 	"run": `daedalus run — start an implementation pipeline for an issue.
 
 USAGE
-  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] [-dep workflow-id] <repo-path> <issue-id> "<prompt>"
+  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] [-dep workflow-id] [--skip-preflight] <repo-path> <issue-id> "<prompt>"
   daedalus [-c config.yaml] run -a <workflow-id> ["<prompt>"]   (append mode)
 
 ARGUMENTS
@@ -154,6 +154,16 @@ FLAGS
                           a raw git error (its preserved branch exists only
                           in its own repo).
                           Fresh runs only — rejected in append mode.
+  --skip-preflight        Open the run even when the preflight gate's baseline
+                          suite is red: the suite still runs and the red result
+                          stays on record (task log + history), but the run
+                          proceeds instead of parking — a red baseline is the
+                          run's stated premise, and the flow's own suite
+                          gating is the expected route for the fix it calls
+                          for. Landing the run still requires a green suite:
+                          finalize is unchanged. Default runs (no flag) park on
+                          a red baseline, as before. Fresh runs only —
+                          rejected in append mode.
   -f, --file <path>       Read the task description from a file. A glob pattern
                           (e.g. notes/*.md) expands to every matching file,
                           concatenated in lexical order. The file's containing
@@ -552,15 +562,17 @@ CONFIGURATION REFERENCE
                         "<task_queue>-test" queue, schedulable only by its
                         own workers — flip it and upgrade this
                         deployment's daemons in the same pass.
-  metrics               Host metrics participation: enabled: true gates the
-                        worker's start on the host metrics daemon ("daedalus
-                        metrics start"), stages every provider round through
-                        its loopback relay, and lands per-round token usage
-                        in its ledger. port (default 7777) is the daemon's
-                        dashboard listener (LAN-wide, no auth); relay_port
-                        (default 7778) the loopback relay. The daemon is
-                        host-global — one per machine, its ports taken from
-                        the config it was started with
+  metrics               Host metrics participation: on unless the config
+                        opts out (enabled: false). The worker's start is
+                        gated on the host metrics daemon ("daedalus
+                        metrics start"), every provider round is staged
+                        through its loopback relay, and per-round token
+                        usage lands in its ledger. port (default 7777) is
+                        the daemon's dashboard listener (LAN-wide, no
+                        auth); relay_port (default 7778) the loopback
+                        relay. The daemon is host-global — one per
+                        machine, its ports taken from the config it was
+                        started with
   bug_filing            Out-of-scope-bug filing toggle. Off by default (the
                         section absent, or enabled: false): no bug files are
                         written and out-of-scope bugs surface in round
@@ -744,10 +756,11 @@ key. The dashboard binds all interfaces with no authentication — any LAN
 peer can read every run's data and start runs. That is the accepted
 posture for a local tool on a trusted LAN; do not expose the port further.
 
-Workers with metrics.enabled gate their start on the relay (an unreachable
-daemon fails the worker start, naming the port and the remedy) and
-register their provider upstreams with it, so their rounds' token usage
-lands in the ledger attributed per round. Workers without it are unaffected.
+Workers with metrics on — the default; only an explicit enabled: false
+opts out — gate their start on the relay (an unreachable daemon fails the
+worker start, naming the port and the remedy) and register their provider
+upstreams with it, so their rounds' token usage lands in the ledger
+attributed per round.
 
 EXAMPLES
   $ daedalus metrics start

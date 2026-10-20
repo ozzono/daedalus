@@ -814,7 +814,10 @@ dependency:
 # stream always carries usage, but an openai-wire stream carries it only
 # when the client asks for it (stream_options.include_usage — most CLIs
 # do not), so a streamed openai-wire round can ledger zero tokens while
-# the round itself ran fine. Off by default, and never silently on: with metrics enabled
+# the round itself ran fine. On unless the project opts out (an unset
+# enabled is on): the dashboard is the operator's window into runs and the
+# relay is what makes its usage numbers exist. The cost of on is named so
+# the opt-out is a decision: with metrics enabled
 # every round's prompt transits the localhost relay process — that is
 # acceptable for a self-hosted relay you own, and it is your call to make.
 # What enabling does: "daedalus worker start" and "restart" then require
@@ -835,6 +838,9 @@ dependency:
 # only ever replaced by its own secret) — wait the minute out and restart,
 # or clear it immediately with "daedalus metrics restart".
 metrics:
+  # false opts this project's rounds out of the subsystem entirely — no
+  # relay staging, no boot-time daemon requirement. Unset (delete this
+  # line) is on.
   enabled: false
   # The dashboard's port, bound on the LAN (no auth — any LAN peer can
   # read run data and start runs; that is a decided, accepted posture for

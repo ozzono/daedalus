@@ -584,7 +584,7 @@ func TestFeatureDevWorkflowSkillRebuildSharesTheCap(t *testing.T) {
 	}
 	for _, want := range []string{
 		ErrAwaitingMaintainer.Error(),
-		"green stage failed to converge",
+		"test phase failed to converge",
 		"issued rebuild 9",
 		"the suite pins the wrong invariant (skill rebuild 9)",
 	} {

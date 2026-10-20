@@ -113,7 +113,7 @@ func TestTests(t *testing.T) {
 		"Write, fix, or improve the test suite covering the change in this repository.\n\n" +
 		"Changes in this round are test-scoped: write only test code and leave the implementation as-is — its current behavior is the contract the tests verify. If a test exposes an implementation bug, say so in your reply rather than changing the implementation.\n\n" +
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only test code, and ignore anything already differing in the worktree that this round did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
-		"While iterating, run only the tests covering the change — the test packages or files the change touched. Finish every round with the full suite: once the covering tests pass, run the whole suite, and the round is not done until it runs green — a known-red suite is not acceptable. Report the suite and its outcome in your reply: the pipeline runs the full suite again on the test worker and feeds that output to your reviewer, so your report is cross-checked, not taken on faith.\n\n" +
+		"While iterating, run only the tests covering the change — the test packages or files the change touched. Finish every round with the full suite: once the covering tests pass, run the whole suite, and the round is not done until it runs green — a known-red suite is not acceptable. A failure elsewhere in the suite, one no covering test exposes, is not yours to fix: name it in your reply and finish the round rather than chasing it green. Report the suite and its outcome in your reply: the pipeline runs the full suite again on the test worker and feeds that output to your reviewer, so your report is cross-checked, not taken on faith.\n\n" +
 		"Never buy a green suite by gaming the tests: removing, skipping, obfuscating, or tweaking tests so they pass is invalid. Test changes follow code changes — a test may change only because the behavior it verifies legitimately changed, never to force a pass. When a test is right and the code is wrong, leave both alone and say so in your reply; the reviewer routes the fix back to the implementation.\n\n" +
 		"Bug policy — zero tolerance: every bug you find, in the tests or anywhere you looked, is either fixed or recorded in the project's own bug records if it keeps any, with out-of-scope bugs reported in your reply — never silently dropped. Every record carries two duties: verified — repro, probe output, or exact lines proving the bug, never \"this might be wrong\" — and deduplicated — the existing records searched first and a matching file extended instead of a duplicate opened; a bug an existing verified record already carries is dropped without a new record. Scope decides who acts: a bug in the tests you are writing is in scope — fix it now, in this phase. Everything else — implementation bugs the tests expose included — is out of your scope to fix, never fixed here: report what you found in your reply so the reviewer can route it back to the implementation cycle. If the project keeps its own bug-record convention (its tracker, folder, or docs), that convention governs where records go — resolve it from the project's own surface; a configured records folder is only the carrier for projects that keep none.\n\n" +
 		"Keep it lazy and minimal: test observable behavior, not implementation details. Cover the change's behavior, edge cases, and error paths with the fewest tests that genuinely verify them — no redundant happy-path duplicates, no speculative tests, no over-mocking."
@@ -256,11 +256,13 @@ func TestReview(t *testing.T) {
 		"Hunt for: incorrect edge cases (empty, nil, zero, off-by-one, overflow); error paths and cleanup skipped on failure branches; docs or names that contradict behavior; mishandled cancellation, timeouts, and concurrency; " +
 		"trust-boundary breaches (path traversal, injection, secrets leaking into logs, argv, or history); " +
 		"and bloat — speculative abstractions, dead code, needless dependencies, diffs wider than the task. " +
-		"When uncertain, request changes and state exactly what must be verified; approve only what you have checked in full.\n\n" +
+		"When uncertain, request changes and state exactly what must be verified; approve only what you have checked in full. " +
+		"Ground every verdict in the change itself: each finding cites the file and lines that prove it, and an approval names what you checked — " +
+		"a comment that could stand without this diff is not a finding, and an approval grounded in nothing cited is not a review.\n\n" +
 		"Everything here — your review included — runs inside the same sandbox, and git writes are forbidden to every agent: never request a git operation (stage, commit, branch, restore) or a change to anything beyond the implementing agent's reach. Your scope is the diff above and the code it touches, nothing else: changes outside it — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated worktree noise — are not part of this work; ignore them and never flag them, no matter how wrong they look. Every finding must be fixable by editing files in this worktree alone; anything that is not, is not a finding — unless it makes the task itself impossible to complete as stated, which is the one case where you halt instead (see NEEDS_MAINTAINER below).\n\n" +
 		"Tests are out of scope for this review. The test suite is written and reviewed in a separate phase after this one: missing, absent, or thin tests are not findings — do not request changes over test coverage. Judge only the implementation. (You may still build and run the existing suite to verify the change is sound.)\n\n" +
 		"Bug policy — zero tolerance: every bug you find, in the diff or anywhere you looked, is either a finding or recorded in the project's own bug records if it keeps any, with out-of-scope bugs named in your comments — never silently dropped. Every record carries two duties: verified — repro, probe output, or exact lines proving the bug, never \"this might be wrong\" — and deduplicated — the existing records searched first and a matching file extended instead of a duplicate opened; a record without evidence or one duplicating an existing file is itself a finding, and a bug an existing verified record already carries is dropped without re-filing. If it is in scope for this review, make it a finding and request changes — in scope is fixed this round, never deferred. If it is out of scope, do not block approval over it and never widen the diff for it — record it and move on. If the project keeps its own bug-record convention (its tracker, folder, or docs), that convention governs where records go — resolve it from the project's own surface; a configured records folder is only the carrier for projects that keep none.\n\n" +
-		"End your response with a final line containing exactly APPROVED if it is acceptable as-is, " +
+		"End your response with a final line that is exactly one bare verdict word — no markdown, no bold, no punctuation, nothing else on the line: APPROVED if it is acceptable as-is, " +
 		"CHANGES_REQUESTED if changes are required, " +
 		"or NEEDS_MAINTAINER if the task as stated cannot be completed by editing files in this worktree alone — " +
 		"contradictory or impossible requirements, a missing dependency or resource outside the worktree, " +
@@ -680,6 +682,15 @@ func TestSlimReview(t *testing.T) {
 	if strings.Contains(got, "REBUILD") {
 		t.Error("SlimReview must not offer the REBUILD verdict (the slim loop runs the suite itself)")
 	}
+	// The slim framing carries its own coverage lead: no false promise of a
+	// separate test phase that never comes, and the criteria-keyed missing-
+	// test rule in its place.
+	if strings.Contains(got, "reviewed in a separate phase after this one") {
+		t.Error("SlimReview must not promise the standard flow's separate test phase")
+	}
+	if !strings.Contains(got, "no separate phase in this flow") {
+		t.Error("SlimReview should state the slim coverage rule in the standard arm's place")
+	}
 
 	// The ordinary framing stays untouched: without criteria, the same
 	// shared template carries no sub-task lens.
@@ -689,6 +700,155 @@ func TestSlimReview(t *testing.T) {
 	}
 	if strings.Contains(plain, "atomized sub-task") || strings.Contains(plain, "acceptance criteria:") {
 		t.Errorf("Review = %q, want no sub-task framing without acceptance criteria", plain)
+	}
+}
+
+// TestReviewEmptyDiff pins the blind-collection guard: a review handed no
+// diff must not go hunting the worktree — the prompt forbids reconstructing
+// the change, routes NEEDS_MAINTAINER when the prompt's inputs describe
+// work the collection failed to carry and CHANGES_REQUESTED when nothing
+// describes any, and a non-empty diff renders none of it.
+func TestReviewEmptyDiff(t *testing.T) {
+	got, err := Review("the implementation", "", "", false, "", "")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	for _, want := range []string{
+		"has NO DIFF",
+		"Do not search the worktree",
+		"the collection failed and the verdict is NEEDS_MAINTAINER, naming the empty diff",
+		"delivered nothing and the verdict is CHANGES_REQUESTED, saying exactly that",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Review = %q, want it to contain %q", got, want)
+		}
+	}
+	full, err := Review("the implementation", "M foo.go", "", false, "", "")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if strings.Contains(full, "NO DIFF") {
+		t.Errorf("Review = %q, a non-empty diff must not carry the empty-diff contract", full)
+	}
+}
+
+// TestReviewClaimDiff pins the hand-off confirmation framing: a claim
+// review's empty diff is by design, so the prompt carries the
+// claim-verification contract — repository inspection in scope, the claim
+// approved or rejected, NEEDS_MAINTAINER never for the emptiness — and the
+// blind-collection guard stays out of it. Neither framing leaks into the
+// other, and the scope clause speaks of the claim, not a diff above that
+// does not exist.
+func TestReviewClaimDiff(t *testing.T) {
+	got, err := Review("the implementing session's test-only hand-off claim", "", "", false, "", "", Claim{})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	for _, want := range []string{
+		"NO DIFF — by design, not by failure",
+		"Verifying the claim against the repository is this review's job",
+		"a confirmed hand-off — verdict APPROVED",
+		"a rejected claim — verdict CHANGES_REQUESTED, naming exactly that change",
+		"NEEDS_MAINTAINER stays reserved for a task that cannot be completed as stated at all",
+		"the claim in the focus above",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Review = %q, want it to contain %q", got, want)
+		}
+	}
+	for _, ban := range []string{
+		"Do not search the worktree",
+		"the collection failed and the verdict is NEEDS_MAINTAINER, naming the empty diff",
+		"Your scope is the diff above",
+	} {
+		if strings.Contains(got, ban) {
+			t.Errorf("Review = %q, the claim framing must not carry %q", got, ban)
+		}
+	}
+	// Without the claim flag the plain empty-diff review keeps its guard —
+	// a genuine empty collection is still a failed collection.
+	plain, err := Review("the implementation", "", "", false, "", "")
+	if err != nil {
+		t.Fatalf("Review (plain): %v", err)
+	}
+	if !strings.Contains(plain, "Do not search the worktree") || strings.Contains(plain, "by design, not by failure") {
+		t.Errorf("Review (plain) = %q, want the blind-collection guard and no claim framing", plain)
+	}
+}
+
+// TestIsTestOnlyHandoff pins the hand-off marker's parse: the bare final
+// line is the hand-off, and so are its markdown-emphasized forms — a dev
+// that emits the bolded marker means the hand-off, and a parse that misses
+// it strands the run in the empty-diff review. A marker buried mid-reply
+// or a near-miss final line is not a hand-off. Lockstep with the prompt
+// contract: implement.md's hand-off clause names the exact marker this
+// parse accepts, so a template rewording that drops it fails here.
+func TestIsTestOnlyHandoff(t *testing.T) {
+	impl, err := Implement("write tests only", "", true)
+	if err != nil {
+		t.Fatalf("Implement: %v", err)
+	}
+	if !strings.Contains(impl, "exactly "+TestOnlyHandoff) {
+		t.Errorf("implement prompt = %q, want the hand-off clause naming the exact marker %q", impl, TestOnlyHandoff)
+	}
+	for _, c := range []struct {
+		reply string
+		want  bool
+	}{
+		{"investigated the task; no implementation change is needed\n" + TestOnlyHandoff, true},
+		{"investigated the task\n**" + TestOnlyHandoff + "**", true},
+		{"investigated the task\n*" + TestOnlyHandoff + "*", true},
+		{"investigated the task\n  " + TestOnlyHandoff + "  ", true},
+		{"\n\n" + TestOnlyHandoff + "\n", true},
+		{TestOnlyHandoff + " would end this\nbut more work happened", false},
+		{"investigated the task\nTEST ONLY HANDOFF", false},
+		{"investigated the task\n**" + TestOnlyHandoff + "** — thanks", false},
+		// Emptiness is decided on the raw line: a trailing *** divider is
+		// non-empty text, so a marker above it is not the reply's end —
+		// stripping before the check would let the divider pass for
+		// nothing and parse the marker as the hand-off.
+		{"investigated the task\n" + TestOnlyHandoff + "\n***", false},
+		{"investigated the task\n***", false},
+		{"", false},
+	} {
+		if got := IsTestOnlyHandoff(c.reply); got != c.want {
+			t.Errorf("IsTestOnlyHandoff(%q) = %v, want %v", c.reply, got, c.want)
+		}
+	}
+}
+
+// TestReviewTestScopeAndGateWording pins the two test-review clauses that
+// key on the diff handoff and the relayed logs: with a diff file handoff
+// the scope clause names the digest and the file — never "the diff above" —
+// and with no relayed output the gate clause speaks of the run, not an
+// output above that does not exist.
+func TestReviewTestScopeAndGateWording(t *testing.T) {
+	handoff := &DiffHandoff{
+		Path:  ".daedalus-review/diff.patch",
+		Lines: 3,
+		Stat:  "M x_test.go | 2 +-\n",
+		Files: []string{"lines 1-3: x_test.go"},
+	}
+	got, err := Review("the test suite", "", "", true, "", "", handoff)
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !strings.Contains(got, "the digest and diff file above name them") {
+		t.Errorf("Review = %q, want the handoff-aware scope clause", got)
+	}
+	if strings.Contains(got, "the diff above shows them") {
+		t.Errorf("Review = %q, handoff framing must not claim the diff is above", got)
+	}
+
+	noLogs, err := Review("the test suite", "A foo_test.go", "", true, "", "")
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if !strings.Contains(noLogs, "The full-suite run is the gate") {
+		t.Errorf("Review = %q, want the run wording when no logs relay", noLogs)
+	}
+	if strings.Contains(noLogs, "full-suite output above") {
+		t.Errorf("Review = %q, gate clause must not point at an absent output", noLogs)
 	}
 }
 
@@ -752,7 +912,7 @@ func TestSlimPrompts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SlimStep: %v", err)
 	}
-	for _, want := range []string{"sub-tasks 2 of 3", "patch it", "[a.go]", "tests pass", "lint clean"} {
+	for _, want := range []string{"sub-tasks 2 of 3", "patch it", `"a.go"`, "tests pass", "lint clean"} {
 		if !strings.Contains(step, want) {
 			t.Errorf("SlimStep = %q, want it to contain %q", step, want)
 		}

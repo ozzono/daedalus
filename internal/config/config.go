@@ -925,22 +925,34 @@ func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
 // MetricsConfig gates the metrics subsystem: the local LLM relay, its
 // per-request usage ledger, and the `daedalus metrics` daemon that hosts
 // them (plus the dashboard served on the same process — see the htmx-ui
-// pt1 design). Off by default: metrics never silently on, because with it
-// on every round's prompt transits the localhost relay process. When on,
-// the project requires the host-global daemon (worker start/restart
-// probes the relay listener and fails fast without it), and the worker
-// stages the relay's URL into every round's provider environment so the
-// relay reads each request's usage block — wire-shaped, not CLI-shaped:
-// an anthropic stream always carries usage, an openai-wire stream only
-// when the client asks for it (stream_options.include_usage), so a
-// streamed openai-wire round can ledger zero tokens. A CLI dialing its
-// provider directly (no staged URL override) bypasses the relay
-// invisibly: coverage is per-CLI-wiring.
+// pt1 design). On by default (an unset enabled is on): the dashboard is
+// the operator's window into runs, and the relay is what makes its usage
+// numbers exist — a subsystem that required an opt-in per project was
+// off more often than anyone meant it to be. The cost of on is named so
+// the opt-out is a decision, not a forgotten default: with metrics on,
+// every round's prompt transits the localhost relay process. Set
+// `enabled: false` to turn the subsystem off for this project's rounds.
+// When on, the project requires the host-global daemon (worker
+// start/restart probes the relay listener and fails fast without it),
+// and the worker stages the relay's URL into every round's provider
+// environment so the relay reads each request's usage block —
+// wire-shaped, not CLI-shaped: an anthropic stream always carries usage,
+// an openai-wire stream only when the client asks for it
+// (stream_options.include_usage), so a streamed openai-wire round can
+// ledger zero tokens. A CLI dialing its provider directly (no staged URL
+// override) bypasses the relay invisibly: coverage is per-CLI-wiring.
 type MetricsConfig struct {
-	// Enabled turns the subsystem on for this project's rounds: the worker
-	// boot verifies the metrics daemon, registers this worker's upstream
-	// mapping with it, and stages the relay URL into jailed rounds.
-	Enabled bool `yaml:"enabled"`
+	// Enabled turns the subsystem on for this project's rounds — nil
+	// (unset) is on; false opts out. When on, the worker boot verifies
+	// the metrics daemon, registers this worker's upstream mapping with
+	// it, and stages the relay URL into jailed rounds. omitempty is the
+	// render contract (RenderYAML): an unset key renders absent —
+	// marshaling the nil pointer would print `enabled: null`, a shape
+	// no config line means. The repo's two other defaulted pointer keys
+	// still have that wart (shared_test_queue, dependency.enabled;
+	// backlog/bugs/config-render-defaulted-pointer-keys-emit-null.md) —
+	// this field is fixed, not the family.
+	Enabled *bool `yaml:"enabled,omitempty"`
 	// Port is the daemon's UI listener (the dashboard mux). Zero (unset)
 	// defaults to DefaultMetricsUIPort; equal to relay_port is a load
 	// error — one port, one listener.
@@ -1147,11 +1159,11 @@ type Config struct {
 	// historical default) or release onto a fallback branch (see
 	// DependencyConfig).
 	Dependency DependencyConfig `yaml:"dependency"`
-	// Metrics is the metrics-subsystem toggle; inactive unless Enabled
-	// (see MetricsConfig). Global daemon, per-project switch: the daemon
-	// is host-global (one port pair, one process), while this per-project
-	// section gates that project's relay staging and the boot-time
-	// daemon check.
+	// Metrics is the metrics-subsystem gate; on unless Enabled is
+	// explicitly false (see MetricsConfig). Global daemon, per-project
+	// switch: the daemon is host-global (one port pair, one process),
+	// while this per-project section gates that project's relay staging
+	// and the boot-time daemon check.
 	Metrics MetricsConfig `yaml:"metrics"`
 	// Prompt points at a directory of prompt-template overrides: every .md
 	// file directly inside it whose file stem names a prompt (the
@@ -1354,6 +1366,11 @@ func ValidateAgent(a string) error {
 // fleet-shared suites, the historical routing — unless the config
 // explicitly opts out with false.
 func (c Config) SharesTestQueue() bool { return c.SharedTestQueue == nil || *c.SharedTestQueue }
+
+// MetricsEnabled reports the effective metrics enabled value: true — the
+// subsystem on — unless the config explicitly opts out with false. Same
+// pointer idiom as SharesTestQueue.
+func (c Config) MetricsEnabled() bool { return c.Metrics.Enabled == nil || *c.Metrics.Enabled }
 
 // TestQueueFor derives the suite-execution queue of the deployment whose
 // main task queue is queue: queue + "-test". A config with

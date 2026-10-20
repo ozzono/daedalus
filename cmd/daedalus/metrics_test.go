@@ -804,7 +804,7 @@ func TestRunWorkerMetricsEnvExports(t *testing.T) {
 	t.Setenv(config.MetricsRelayAnthropicEnv, "http://127.0.0.1:1")
 	t.Setenv(config.MetricsRelayOpenAIEnv, "http://127.0.0.1:1")
 	t.Setenv(config.MetricsRelayTokenEnv, "stale-tok")
-	if err := runWorker(config.Config{}, ""); err == nil {
+	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	for _, name := range []string{config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv, config.MetricsRelayTokenEnv} {
@@ -815,7 +815,7 @@ func TestRunWorkerMetricsEnvExports(t *testing.T) {
 
 	// An unreachable daemon fails the start with the remedy before any
 	// export.
-	err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: true, RelayPort: 1}}, "")
+	err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(true), RelayPort: 1}}, "")
 	if err == nil || !strings.Contains(err.Error(), "daedalus metrics start") {
 		t.Fatalf("runWorker with metrics on a dead daemon = %v, want the boot gate", err)
 	}
@@ -839,7 +839,7 @@ func TestRunWorkerMetricsEnvExports(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-a")
 	if err := runWorker(config.Config{
 		WorkerID: "w-metrics",
-		Metrics:  config.MetricsConfig{Enabled: true, RelayPort: port},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(true), RelayPort: port},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -867,7 +867,7 @@ func TestRunWorkerMetricsEnvExports(t *testing.T) {
 	// metrics relay → upstream.
 	if err := runWorker(config.Config{
 		WorkerID: "w-metrics",
-		Metrics:  config.MetricsConfig{Enabled: true, RelayPort: port},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(true), RelayPort: port},
 		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
 		OpenAI:   config.OpenAIConfig{URL: "https://o.example/v1"},
 	}, ""); err == nil {

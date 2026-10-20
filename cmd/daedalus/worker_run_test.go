@@ -128,7 +128,7 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	t.Setenv("DAEDALUS_THINKING", "off")
 	t.Setenv("DAEDALUS_STREAM", "on")
 	t.Setenv(config.ToolRelayURLEnv, "http://127.0.0.1:1/stale-relay")
-	if err := runWorker(config.Config{}, ""); err == nil {
+	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	if got := os.Getenv("DAEDALUS_SLIM"); got != "" {
@@ -148,7 +148,7 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	// relay: without a parser model (and an openai upstream) the staged
 	// URL stays unset, the pre-relay behavior.
 	off := false
-	if err := runWorker(config.Config{Slim: config.SlimConfig{Enabled: true}, Thinking: &off}, ""); err == nil {
+	if err := runWorker(config.Config{Slim: config.SlimConfig{Enabled: true}, Thinking: &off, Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	if got := os.Getenv("DAEDALUS_SLIM"); got != "1" {
@@ -169,6 +169,7 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
 		OpenAI:   config.OpenAIConfig{URL: "http://127.0.0.1:11434/v1"},
 		Thinking: &off,
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -192,7 +193,7 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 		{true, "on"},
 		{false, "off"},
 	} {
-		if err := runWorker(config.Config{Stream: &c.stream}, ""); err == nil {
+		if err := runWorker(config.Config{Stream: &c.stream, Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 			t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 		}
 		if got := os.Getenv("DAEDALUS_STREAM"); got != c.want {
@@ -224,7 +225,7 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	// the toggles' set-or-unset symmetry.
 	t.Setenv(config.OpenAIThinkingEnv, "off")
 	t.Setenv(config.ReviewerThinkingEnv, "off")
-	if err := runWorker(config.Config{}, ""); err == nil {
+	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	if got := os.Getenv(config.OpenAIThinkingEnv); got != "" {
@@ -239,6 +240,7 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	if err := runWorker(config.Config{
 		Reviewer: config.RoleOverrideConfig{Model: "qwen3-review", DisableThinking: true},
 		OpenAI:   config.OpenAIConfig{DisableThinking: true},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -256,6 +258,7 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	// the projected channel; the reviewer side stays silent on its own.
 	if err := runWorker(config.Config{
 		Provider: &config.ProviderConfig{Type: config.FallbackTypeOpenAI, URL: "http://127.0.0.1:11434/v1", DisableThinking: true},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -267,7 +270,7 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	}
 
 	// The reviewer knob alone arms only the reviewer signal.
-	if err := runWorker(config.Config{Reviewer: config.RoleOverrideConfig{DisableThinking: true}}, ""); err == nil {
+	if err := runWorker(config.Config{Reviewer: config.RoleOverrideConfig{DisableThinking: true}, Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	if got := os.Getenv(config.ReviewerThinkingEnv); got != "off" {
@@ -298,7 +301,7 @@ func TestRunWorkerRoleOverrideEnvExports(t *testing.T) {
 	for _, name := range config.RoleOverrideEnvVars() {
 		t.Setenv(name, "stale")
 	}
-	if err := runWorker(config.Config{}, ""); err == nil {
+	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	for _, name := range config.RoleOverrideEnvVars() {
@@ -313,6 +316,7 @@ func TestRunWorkerRoleOverrideEnvExports(t *testing.T) {
 		Dev:           config.RoleOverrideConfig{URL: "https://dev.example", Key: "sk-dev", Model: "qwen3-dev", ContextTokens: 131072, DisableThinking: true},
 		Reviewer:      config.RoleOverrideConfig{ContextTokens: 65536},
 		FinalReviewer: config.RoleOverrideConfig{URL: "https://final.example", Model: "qwen3-final"},
+		Metrics:       config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -350,9 +354,12 @@ func TestRunWorkerRelayProviderUpstream(t *testing.T) {
 		"OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_KEY", "OPENAI_MODEL", "API_TIMEOUT_MS")
 
 	// An openai-typed provider: the relay arms on the section's url.
+	// Metrics is opted out explicitly: the default is on, and these pins
+	// are about the relay staging, not the metrics boot gate.
 	if err := runWorker(config.Config{
 		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
 		Provider: &config.ProviderConfig{Type: config.FallbackTypeOpenAI, URL: "http://127.0.0.1:11434/v1", Key: "k"},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -369,6 +376,7 @@ func TestRunWorkerRelayProviderUpstream(t *testing.T) {
 	if err := runWorker(config.Config{
 		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
 		Provider: &config.ProviderConfig{Type: config.FallbackTypeAnthropic, URL: "http://127.0.0.1:8082", Key: "k"},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -381,6 +389,7 @@ func TestRunWorkerRelayProviderUpstream(t *testing.T) {
 		Slim:     config.SlimConfig{Enabled: true, ParserModel: "qwen2.5-coder:3b-parser"},
 		Provider: &config.ProviderConfig{Type: config.FallbackTypeAnthropic, URL: "http://127.0.0.1:8082", Key: "k"},
 		OpenAI:   config.OpenAIConfig{URL: "http://127.0.0.1:11434/v1"},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -403,7 +412,7 @@ func TestRunWorkerBugDirEnvExports(t *testing.T) {
 
 	// A stale export must not outlive a config that says off.
 	t.Setenv("DAEDALUS_BUG_DIR", "stale/bugs")
-	if err := runWorker(config.Config{}, ""); err == nil {
+	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	if got := os.Getenv("DAEDALUS_BUG_DIR"); got != "" {
@@ -416,8 +425,8 @@ func TestRunWorkerBugDirEnvExports(t *testing.T) {
 		cfg  config.Config
 		want string
 	}{
-		{config.Config{BugFiling: config.BugFilingConfig{Enabled: true}}, config.DefaultBugDir},
-		{config.Config{BugFiling: config.BugFilingConfig{Enabled: true, Dir: "docs/known-bugs"}}, "docs/known-bugs"},
+		{config.Config{BugFiling: config.BugFilingConfig{Enabled: true}, Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, config.DefaultBugDir},
+		{config.Config{BugFiling: config.BugFilingConfig{Enabled: true, Dir: "docs/known-bugs"}, Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, "docs/known-bugs"},
 	} {
 		if err := runWorker(c.cfg, ""); err == nil {
 			t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
@@ -441,7 +450,7 @@ func TestRunWorkerMirrorEnvExports(t *testing.T) {
 	// A stale export must not outlive a config that says off.
 	t.Setenv("DAEDALUS_BUG_MIRROR", "stale/host")
 	t.Setenv("DAEDALUS_TEST_OUTPUT_MIRROR", "stale/host")
-	if err := runWorker(config.Config{}, ""); err == nil {
+	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
 	for _, env := range []string{"DAEDALUS_BUG_MIRROR", "DAEDALUS_TEST_OUTPUT_MIRROR"} {
@@ -459,6 +468,7 @@ func TestRunWorkerMirrorEnvExports(t *testing.T) {
 	cfg := config.Config{
 		BugFiling:  config.BugFilingConfig{Enabled: true, Dir: "docs/bugs", Mirror: "/host/bugs"},
 		TestOutput: config.TestOutputConfig{Enabled: true, Dir: "dumps", Mirror: "~/mirror"},
+		Metrics:    config.MetricsConfig{Enabled: boolPtr(false)},
 	}
 	if err := runWorker(cfg, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
@@ -474,6 +484,7 @@ func TestRunWorkerMirrorEnvExports(t *testing.T) {
 	if err := runWorker(config.Config{
 		BugFiling:  config.BugFilingConfig{Enabled: true, Dir: "docs/bugs"},
 		TestOutput: config.TestOutputConfig{Enabled: true, Dir: "dumps"},
+		Metrics:    config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -488,6 +499,7 @@ func TestRunWorkerMirrorEnvExports(t *testing.T) {
 	if err := runWorker(config.Config{
 		BugFiling:  config.BugFilingConfig{Mirror: "/host/bugs"},
 		TestOutput: config.TestOutputConfig{Mirror: "~/mirror"},
+		Metrics:    config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -503,6 +515,7 @@ func TestRunWorkerMirrorEnvExports(t *testing.T) {
 	_, relErr := config.ResolveMirror("bug_filing mirror", "rel/bugs")
 	if err := runWorker(config.Config{
 		BugFiling: config.BugFilingConfig{Enabled: true, Mirror: "rel/bugs"},
+		Metrics:   config.MetricsConfig{Enabled: boolPtr(false)},
 	}, ""); err == nil || !strings.Contains(err.Error(), "resolve bug_filing.mirror") || err.Error() != "resolve bug_filing.mirror: "+relErr.Error() {
 		t.Errorf("runWorker (relative bug mirror) error = %v, want the resolver's rejection wrapped under resolve bug_filing.mirror", err)
 	}

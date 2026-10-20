@@ -659,6 +659,119 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"Looks good.\nAPPRO
 	}
 }
 
+// TestRunJailedReviewerActivityEmptyDiffBlindHalt pins the empty-diff
+// detector's halt arm: a collected diff that is empty while the branch's
+// HEAD has moved past the recorded base is a blind collection — the work
+// lives in commits the diff against HEAD cannot see — and halts with the
+// NEEDS_MAINTAINER verdict naming the base..head range before any reviewer
+// round runs on nothing.
+func TestRunJailedReviewerActivityEmptyDiffBlindHalt(t *testing.T) {
+	fakeHome(t)
+	wt := t.TempDir()
+	log := newStubLog(t)
+	// Empty worktree diff; HEAD resolves to a sha past the recorded base.
+	stubBin(t, "git", `if [ "$3" = "rev-parse" ]; then printf 'head999\n'; fi
+exit 0`)
+	// The reviewer must never run: the stub fails loudly if it does.
+	stubBin(t, "ai-jail", `echo "the reviewer must not run on a blind collection" >&2; exit 1`)
+
+	res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+		WorktreePath: wt,
+		Focus:        "the implementation",
+		Role:         RoleDevReview,
+		BaseHead:     "base111",
+	})
+	if err != nil {
+		t.Fatalf("the blind state halts with a verdict, not an error: %v", err)
+	}
+	if !res.NeedsMaintainer {
+		t.Error("NeedsMaintainer = false, want the blind-collection halt")
+	}
+	if !strings.Contains(res.Comments, "base111..head999") {
+		t.Errorf("halt comments %q should name the base..head range", res.Comments)
+	}
+	for _, call := range readCalls(t, log) {
+		if len(call.Args) > 0 && call.Args[0] == "--worktree" {
+			t.Errorf("ai-jail ran for a blind collection: %v", call.Args)
+		}
+	}
+}
+
+// TestRunJailedReviewerActivityEmptyDiffDecides pins the detector's
+// pass-through arms: an empty diff with HEAD still at the recorded base is a
+// legitimately empty round the reviewer must rule on; an unrecorded base (a
+// worktree predating the field, an unborn HEAD) and the hand-off claim
+// review both leave the detector off — the ordinary review runs in every
+// one.
+func TestRunJailedReviewerActivityEmptyDiffDecides(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		baseHead    string
+		head        string
+		claimReview bool
+	}{
+		{"head at base is a real empty round", "base111", "base111", false},
+		{"an unrecorded base disables the detector", "", "head999", false},
+		{"the hand-off claim review is exempt", "base111", "head999", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fakeHome(t)
+			wt := t.TempDir()
+			log := newStubLog(t)
+			// Empty worktree diff; HEAD resolves to the case's sha.
+			stubBin(t, "git", `if [ "$3" = "rev-parse" ]; then printf '`+c.head+`\n'; fi
+exit 0`)
+			stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Nothing to review yet.\nCHANGES_REQUESTED","session_id":"rev-1"}'; exit 0`)
+
+			res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+				WorktreePath: wt,
+				Focus:        "the implementation",
+				Role:         RoleDevReview,
+				BaseHead:     c.baseHead,
+				ClaimReview:  c.claimReview,
+			})
+			if err != nil {
+				t.Fatalf("RunJailedReviewerActivity: %v", err)
+			}
+			if res.NeedsMaintainer {
+				t.Error("NeedsMaintainer = true, want the ordinary review to run")
+			}
+			var jailCalls int
+			for _, call := range readCalls(t, log) {
+				if len(call.Args) > 0 && call.Args[0] == "--worktree" {
+					jailCalls++
+				}
+			}
+			if jailCalls != 1 {
+				t.Errorf("ai-jail called %d times, want 1 (the reviewer saw the empty diff)", jailCalls)
+			}
+		})
+	}
+}
+
+// TestRunJailedReviewerActivityBlindProbeErrorFails pins the detector's
+// error arm: a HEAD that cannot be resolved during the blind check is a git
+// failure the activity surfaces, never a silent "not moved" that would
+// blanket-approve a blind review.
+func TestRunJailedReviewerActivityBlindProbeErrorFails(t *testing.T) {
+	fakeHome(t)
+	wt := t.TempDir()
+	newStubLog(t)
+	stubBin(t, "git", `if [ "$3" = "rev-parse" ]; then exit 1; fi
+exit 0`)
+	stubBin(t, "ai-jail", `echo "the reviewer must not run" >&2; exit 1`)
+
+	_, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+		WorktreePath: wt,
+		Focus:        "the implementation",
+		Role:         RoleDevReview,
+		BaseHead:     "base111",
+	})
+	if err == nil || !strings.Contains(err.Error(), "resolve worktree HEAD") {
+		t.Fatalf("error = %v, want the HEAD resolution failure surfaced", err)
+	}
+}
+
 // TestCleanupWorktreeActivityRemovesSessionRecord pins the litter control:
 // the worktree's session record goes away with the worktree it is keyed to.
 func TestCleanupWorktreeActivityRemovesSessionRecord(t *testing.T) {

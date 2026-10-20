@@ -124,17 +124,54 @@ func runTaskLogCot(workflowID string, cotN int) {
 		// backend lagging behind): fall back to the latest run's history.
 		runs = []string{""}
 	}
+	sections, err := cotSections(c, workflowID, runs)
+	if err != nil {
+		exitf("%v", err)
+	}
+	// cotN tails the completed sections to the last N; whole sections
+	// only — the no-truncation rule is per section, never per byte.
+	shown := sections
+	if cotN >= 0 && len(sections) > cotN {
+		shown = sections[len(sections)-cotN:]
+	}
+	for _, s := range shown {
+		fmt.Print("=====================================\n")
+		fmt.Print(s)
+		fmt.Print("\n")
+	}
+	// The in-flight section replaces, never accompanies, the no-rounds
+	// message: a round running with zero completed rounds is exactly the
+	// case the live view exists for. It rides outside the tail: the round
+	// it renders is newer than every completed one.
+	live := liveCotSectionWith(workflowID, c)
+	if live != "" {
+		fmt.Print("=====================================\n")
+		fmt.Print(live)
+	}
+	if len(sections) == 0 && live == "" {
+		exitf("no jailed agent rounds in %s's Temporal history — the run has not started any rounds yet, or predates structured round capture", workflowID)
+	}
+	// The tail rides only on the dump path: the zero-round error above
+	// already names that state ("not started"), and an error line plus a
+	// tail would say it twice.
+	fmt.Print(logTail(workflowID, cotTailState(c, workflowID)))
+}
 
-	// Walk each run's history like the usage report does: pair every jailed
-	// round's completed result with its scheduled input, which carries the
-	// round's role and (when the run pinned one) its agent.
+// cotSections walks each run's history like the usage report does: pair
+// every jailed round's completed result with its scheduled input, which
+// carries the round's role and (when the run pinned one) its agent, and
+// render one section per completed round, oldest first. Each section is
+// its header line then its body — the round's CoT, or the no-CoT note —
+// without the ===== divider; the printers add their own. Shared by the
+// CLI's -cot dump and the run detail's last-round box.
+func cotSections(c client.Client, workflowID string, runs []string) ([]string, error) {
 	dc := converter.GetDefaultDataConverter()
 	type scheduledRound struct {
-		typ   string
-		role  activities.SessionRole
-		agent string
+		typ      string
+		role     activities.SessionRole
+		agent    string
+		worktree string
 	}
-	rounds := 0
 	var sections []string
 	for _, runID := range runs {
 		scheduled := map[int64]scheduledRound{}
@@ -143,7 +180,7 @@ func runTaskLogCot(workflowID string, cotN int) {
 		for iter.HasNext() {
 			ev, err := iter.Next()
 			if err != nil {
-				exitf("read history of %s: %v", workflowID, err)
+				return nil, fmt.Errorf("read history of %s: %w", workflowID, err)
 			}
 			if s := ev.GetActivityTaskScheduledEventAttributes(); s != nil {
 				typ := s.GetActivityType().GetName()
@@ -157,12 +194,12 @@ func runTaskLogCot(workflowID string, cotN int) {
 					if typ == "RunJailedClaudeActivity" {
 						var in activities.AgentRunInput
 						if dc.FromPayload(ps[0], &in) == nil {
-							sr.role, sr.agent = in.Role, in.Agent
+							sr.role, sr.agent, sr.worktree = in.Role, in.Agent, in.WorktreePath
 						}
 					} else {
 						var in activities.ReviewInput
 						if dc.FromPayload(ps[0], &in) == nil {
-							sr.role, sr.agent = in.Role, in.Agent
+							sr.role, sr.agent, sr.worktree = in.Role, in.Agent, in.WorktreePath
 						}
 					}
 				}
@@ -189,6 +226,17 @@ func runTaskLogCot(workflowID string, cotN int) {
 				if cot == "" {
 					cot = inlineCoT(r.Text)
 				}
+				if cot == "" {
+					// json-mode claude stdout carries only the terminal
+					// result event, so Thinking is structurally empty for
+					// every json-mode claude round; the host-side
+					// transcript holds the round's full assistant stream,
+					// and the round's own SessionID pins the file
+					// (claudeTranscriptCoT). Empty when that transcript is
+					// absent — a round that ran on another host, or a
+					// pruned ~/.claude — and the no-CoT note stands.
+					cot = claudeTranscriptCoT(sr.worktree, r.SessionID)
+				}
 			case "RunJailedReviewerActivity":
 				var r activities.ReviewResult
 				if dc.FromPayload(ps[0], &r) != nil {
@@ -205,8 +253,7 @@ func runTaskLogCot(workflowID string, cotN int) {
 			default:
 				continue
 			}
-			rounds++
-			header := fmt.Sprintf("=== round %d: %s", rounds, sr.role)
+			header := fmt.Sprintf("=== round %d: %s", len(sections)+1, sr.role)
 			if sr.agent != "" {
 				header += fmt.Sprintf(" (%s)", sr.agent)
 			}
@@ -226,42 +273,36 @@ func runTaskLogCot(workflowID string, cotN int) {
 			// became final — the honest per-round stamp.
 			header += fmt.Sprintf(" @ %s ===", ev.GetEventTime().AsTime().Format("2006-01-02 15:04:05 MST"))
 			var b strings.Builder
-			b.WriteString("=====================================\n")
 			b.WriteString(header + "\n")
 			if cot == "" {
 				b.WriteString("no CoT captured for this round\n")
 			} else {
 				b.WriteString(cot + "\n")
 			}
-			b.WriteString("\n")
 			sections = append(sections, b.String())
 		}
 	}
-	// cotN tails the completed sections to the last N; whole sections
-	// only — the no-truncation rule is per section, never per byte.
-	shown := sections
-	if cotN >= 0 && len(sections) > cotN {
-		shown = sections[len(sections)-cotN:]
+	return sections, nil
+}
+
+// claudeTranscriptCoT renders a completed claude round's CoT from its
+// host-side session transcript: <claude-projects>/<worktree-slug>/<session
+// id>.jsonl. Empty when the round ran with no worktree or session id on
+// record, or the transcript is unreadable — the caller's no-CoT note
+// stands, never a fabricated section.
+func claudeTranscriptCoT(worktree, sessionID string) string {
+	if worktree == "" || sessionID == "" {
+		return ""
 	}
-	for _, s := range shown {
-		fmt.Print(s)
+	dir, err := claudeProjectsDir(worktree)
+	if err != nil {
+		return ""
 	}
-	// The in-flight section replaces, never accompanies, the no-rounds
-	// message: a round running with zero completed rounds is exactly the
-	// case the live view exists for. It rides outside the tail: the round
-	// it renders is newer than every completed one.
-	live := liveCotSectionWith(workflowID, c)
-	if live != "" {
-		fmt.Print("=====================================\n")
-		fmt.Print(live)
+	cot, found := transcriptCoT(filepath.Join(dir, sessionID+".jsonl"), "claude")
+	if !found {
+		return ""
 	}
-	if rounds == 0 && live == "" {
-		exitf("no jailed agent rounds in %s's Temporal history — the run has not started any rounds yet, or predates structured round capture", workflowID)
-	}
-	// The tail rides only on the dump path: the zero-round error above
-	// already names that state ("not started"), and an error line plus a
-	// tail would say it twice.
-	fmt.Print(logTail(workflowID, cotTailState(c, workflowID)))
+	return cot
 }
 
 // cotTailState renders -cot's run-state clause from the workflow's live

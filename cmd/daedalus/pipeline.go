@@ -258,7 +258,7 @@ func issueIDGate(issueID string) error {
 // -cli/--cli, overrides the config's jailed agent for this run. Unless
 // detach is set, it then blocks until the pipeline finishes.
 func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string) error {
-	return startPipelineFolders(cfg, configPath, workflowName, repoPath, issueID, prompt, detach, branchPrefix, agent, nil, "")
+	return startPipelineFolders(cfg, configPath, workflowName, repoPath, issueID, prompt, detach, false, branchPrefix, agent, nil, "")
 }
 
 // startPipelineFolders is startPipeline with the run's validated folder
@@ -272,20 +272,21 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 // run instead of dead-ending on the seam's refusal — and the worker
 // daemon auto-start, in the same order the preflights always ran — repo
 // confirm before anything touches a daemon file.
-func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string, folders []string, depends string) error {
+func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach, skipPreflight bool, branchPrefix, agent string, folders []string, depends string) error {
 	// The cheap submit gates first, exactly where they always ran: a bad
 	// issue id or wire conflict must not cost a repo prompt or spawn a
 	// worker daemon.
 	req := runstart.Request{
-		WorkflowName: workflowName,
-		RepoPath:     repoPath,
-		IssueID:      issueID,
-		Prompt:       prompt,
-		BranchPrefix: branchPrefix,
-		Agent:        agent,
-		Folders:      folders,
-		Depends:      depends,
-		Warn:         os.Stdout,
+		WorkflowName:  workflowName,
+		RepoPath:      repoPath,
+		IssueID:       issueID,
+		Prompt:        prompt,
+		BranchPrefix:  branchPrefix,
+		Agent:         agent,
+		Folders:       folders,
+		Depends:       depends,
+		Warn:          os.Stdout,
+		SkipPreflight: skipPreflight,
 	}
 	if err := runstart.Validate(cfg, req); err != nil {
 		return err
@@ -734,6 +735,14 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		// preserved mid-flight worktree. A never-validated chain carries
 		// neither and re-runs the gate on every continue.
 		BaselineValidated: gateGreen || prev.BaselineValidated,
+		// The skipped run's twin key: a chain opened on a red baseline
+		// under --skip-preflight has no green round to derive
+		// BaselineValidated from, so its continue would re-run the gate
+		// and re-park on the very baseline the fresh run declared
+		// acceptable — the recorded skip decision travels instead, frozen
+		// at start like the policy fields above. Continue's CLI rejects
+		// the flag; it rides the recorded input.
+		SkipPreflight: prev.SkipPreflight,
 		// No truncation anywhere in the app: the complete last review rides
 		// into the continued run's opening prompt.
 		PriorFeedback: lastReview.Comments,
