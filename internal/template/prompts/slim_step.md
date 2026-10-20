@@ -5,7 +5,7 @@ Worker. Plan and earlier sub-tasks are in this conversation. Worktree state: sub
 This sub-task — the only work in scope:
 
 - id: {{.Subtask.ID}} ({{.Subtask.Type}})
-- target files: {{.Subtask.TargetFiles}}
+- target files: {{range $i, $f := .Subtask.TargetFiles}}{{if $i}}, {{end}}"{{$f}}"{{end}}
 - description: {{.Subtask.Description}}
 - acceptance criteria:
 {{range .Subtask.AcceptanceCriteria}}  - {{.}}
