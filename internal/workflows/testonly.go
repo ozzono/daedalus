@@ -14,10 +14,11 @@ import (
 // approves the suite. A reviewer REBUILD — a finding the test-only agent
 // cannot apply because the fix is an implementation change — spends a
 // capped rebuild round: a dev-role agent run on the finding, the flow's
-// one dev-code path, after which the test loop resumes with the widened
-// write scope the rebuilt state needs. Only a spent cap parks the run for
-// the maintainer. Suite executions record Go statement coverage, and the
-// reviewer sees the delta across rounds.
+// one dev-code path, its result gated by the code reviewer before the
+// test loop resumes with the widened write scope the rebuilt state needs.
+// Only a spent cap parks the run for the maintainer. Suite executions
+// record Go statement coverage, and the reviewer sees the delta across
+// rounds.
 func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	run, cleanup, err := startRun(ctx, input)
 	if err != nil {
@@ -67,7 +68,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 		if result.Coverage != "" {
 			lastCoverage = result.Coverage
 		}
-		verdict, err := run.review("the test suite", logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false)
+		verdict, err := run.review("the test suite", logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false, false)
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
@@ -96,8 +97,20 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 			if err != nil {
 				return "", fmt.Errorf("build rebuild prompt: %w", err)
 			}
-			if _, err := run.runAgent(prompt, "rebuild", activities.RoleDev, &run.devSession); err != nil {
+			rebuildReply, err := run.runAgent(prompt, "rebuild", activities.RoleDev, &run.devSession)
+			if err != nil {
 				return "", fmt.Errorf("rebuild agent run: %w", err)
+			}
+			// The rebuild round's reply is what the test reviewer next sees
+			// as the latest reply: quoting the pre-rebuild tester here would
+			// describe a change the reviewer is not looking at.
+			testerReply = rebuildReply
+			// The rebuild's implementation change is unreviewed code until
+			// the code reviewer approves it — the same gate feature-dev's
+			// REBUILD path passes through, keeping "merged work is approved
+			// work" true across the flow's one dev-code path.
+			if err := run.codeReviewLoop(false); err != nil {
+				return "", fmt.Errorf("post-rebuild code review: %w", err)
 			}
 			continue
 		}

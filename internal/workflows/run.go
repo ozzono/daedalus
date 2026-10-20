@@ -599,10 +599,13 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 // the only review whose agent can act on jail findings (test, docs, bugfix,
 // and refactor rounds pass false: their agents are barred from touching
 // .ai-jail, so an audit mandate there would be a demand no round can
-// satisfy). The trailing skill carries the skill-review entry, if any: at
-// most one is meaningful (the last wins, like every attachment); empty
-// keeps the round an ordinary default review.
-func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string, touchesJail bool, skill ...string) (activities.ReviewResult, error) {
+// satisfy). claimReview marks the test-only hand-off confirmation — the
+// empty diff is by design and the review verifies the claim (see
+// ReviewInput.ClaimReview); only the hand-off confirmation passes true.
+// The trailing skill carries the skill-review entry, if any: at most one
+// is meaningful (the last wins, like every attachment); empty keeps the
+// round an ordinary default review.
+func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope bool, agentReply string, role activities.SessionRole, session *string, touchesJail, claimReview bool, skill ...string) (activities.ReviewResult, error) {
 	skillEntry := ""
 	if len(skill) > 0 {
 		skillEntry = skill[len(skill)-1]
@@ -631,6 +634,7 @@ func (r *pipelineRun) review(focus, testLogs string, testsInScope, reproInScope 
 			// the role itself still selects the configured reviewer
 			// endpoint and keeps the pi edit guardrail excluded.
 			FreshReview: r.freshReviews,
+			ClaimReview: claimReview,
 			// Slim's per-sub-task acceptance criteria; nil elsewhere.
 			AcceptanceCriteria: r.reviewCriteria,
 			// The skill-review round's entry, if any; empty elsewhere.

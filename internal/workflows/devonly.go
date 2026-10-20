@@ -48,7 +48,7 @@ func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) 
 	}
 
 	for {
-		verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
+		verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail, false)
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
 		}

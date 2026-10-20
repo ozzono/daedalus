@@ -146,6 +146,14 @@ type ReviewInput struct {
 	// edit-guardrail exclusion, and session tracking all key on Role and
 	// behave exactly like a flagship review's.
 	FreshReview bool
+	// ClaimReview marks the test-only hand-off confirmation: the diff is
+	// empty by design (the implementing session reports no implementation
+	// change is needed) and the review verifies that claim against the
+	// repository. The reviewer prompt swaps the NO-DIFF paragraph — which
+	// reads emptiness as a collection failure — for the claim-verification
+	// contract (template.Claim); without it every hand-off confirmation
+	// would park the run as a failed collection.
+	ClaimReview bool
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -391,6 +399,9 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 		// (the global skills dir).
 		extras := []template.ReviewExtra{
 			template.Jail{Touches: input.TaskTouchesJail, Spec: jailSpec},
+		}
+		if input.ClaimReview {
+			extras = append(extras, template.Claim{})
 		}
 		if handoff != nil {
 			extras = append(extras, handoff)

@@ -3356,17 +3356,28 @@ func TestAgentWireConflict(t *testing.T) {
 	})
 }
 
-// TestLoadMetricsDefaults pins the metrics subsystem's defaults: off until
-// enabled, and the daemon's two listeners default to the decided ports
-// (7777 dashboard, 7778 loopback relay) so an unset section is loadable
-// and inert.
+// TestLoadMetricsDefaults pins the metrics subsystem's defaults: an unset
+// section is on (the Enabled tri-state's nil — see MetricsEnabled), an
+// explicit enabled: false is the opt-out, and the daemon's two listeners
+// default to the decided ports (7777 dashboard, 7778 loopback relay) so
+// an absent section is loadable and live.
 func TestLoadMetricsDefaults(t *testing.T) {
 	cfg, err := Load(writeConfig(t, ""))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Metrics.Enabled {
-		t.Errorf("Metrics.Enabled = true on an absent section, want off")
+	if cfg.Metrics.Enabled != nil {
+		t.Errorf("Metrics.Enabled = %v on an absent section, want nil (unset)", *cfg.Metrics.Enabled)
+	}
+	if !cfg.MetricsEnabled() {
+		t.Error("MetricsEnabled() = false on an absent section, want the unset default on")
+	}
+	cfg, err = Load(writeConfig(t, "metrics:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load(explicit off): %v", err)
+	}
+	if cfg.MetricsEnabled() {
+		t.Error("MetricsEnabled() = true with enabled: false, want the explicit opt-out honored")
 	}
 	if cfg.Metrics.Port != DefaultMetricsUIPort {
 		t.Errorf("Metrics.Port = %d, want the default %d", cfg.Metrics.Port, DefaultMetricsUIPort)
@@ -3383,7 +3394,7 @@ func TestLoadMetricsSection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !cfg.Metrics.Enabled || cfg.Metrics.Port != 7801 || cfg.Metrics.RelayPort != 7802 {
+	if !cfg.MetricsEnabled() || cfg.Metrics.Port != 7801 || cfg.Metrics.RelayPort != 7802 {
 		t.Errorf("Metrics = %+v, want enabled with ports 7801/7802", cfg.Metrics)
 	}
 }
@@ -3448,7 +3459,7 @@ func TestRenderYAMLMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse rendered metrics section: %v\n%s", err, out)
 	}
-	if !cfg.Metrics.Enabled || cfg.Metrics.Port != 7801 || cfg.Metrics.RelayPort != 7802 {
+	if !cfg.MetricsEnabled() || cfg.Metrics.Port != 7801 || cfg.Metrics.RelayPort != 7802 {
 		t.Errorf("reloaded Metrics = %+v, want the rendered values", cfg.Metrics)
 	}
 }

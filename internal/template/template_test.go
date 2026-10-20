@@ -732,6 +732,85 @@ func TestReviewEmptyDiff(t *testing.T) {
 	}
 }
 
+// TestReviewClaimDiff pins the hand-off confirmation framing: a claim
+// review's empty diff is by design, so the prompt carries the
+// claim-verification contract — repository inspection in scope, the claim
+// approved or rejected, NEEDS_MAINTAINER never for the emptiness — and the
+// blind-collection guard stays out of it. Neither framing leaks into the
+// other, and the scope clause speaks of the claim, not a diff above that
+// does not exist.
+func TestReviewClaimDiff(t *testing.T) {
+	got, err := Review("the implementing session's test-only hand-off claim", "", "", false, "", "", Claim{})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	for _, want := range []string{
+		"NO DIFF — by design, not by failure",
+		"Verifying the claim against the repository is this review's job",
+		"a confirmed hand-off — verdict APPROVED",
+		"a rejected claim — verdict CHANGES_REQUESTED, naming exactly that change",
+		"NEEDS_MAINTAINER stays reserved for a task that cannot be completed as stated at all",
+		"the claim in the focus above",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Review = %q, want it to contain %q", got, want)
+		}
+	}
+	for _, ban := range []string{
+		"Do not search the worktree",
+		"the collection failed and the verdict is NEEDS_MAINTAINER, naming the empty diff",
+		"Your scope is the diff above",
+	} {
+		if strings.Contains(got, ban) {
+			t.Errorf("Review = %q, the claim framing must not carry %q", got, ban)
+		}
+	}
+	// Without the claim flag the plain empty-diff review keeps its guard —
+	// a genuine empty collection is still a failed collection.
+	plain, err := Review("the implementation", "", "", false, "", "")
+	if err != nil {
+		t.Fatalf("Review (plain): %v", err)
+	}
+	if !strings.Contains(plain, "Do not search the worktree") || strings.Contains(plain, "by design, not by failure") {
+		t.Errorf("Review (plain) = %q, want the blind-collection guard and no claim framing", plain)
+	}
+}
+
+// TestIsTestOnlyHandoff pins the hand-off marker's parse: the bare final
+// line is the hand-off, and so are its markdown-emphasized forms — a dev
+// that emits the bolded marker means the hand-off, and a parse that misses
+// it strands the run in the empty-diff review. A marker buried mid-reply
+// or a near-miss final line is not a hand-off. Lockstep with the prompt
+// contract: implement.md's hand-off clause names the exact marker this
+// parse accepts, so a template rewording that drops it fails here.
+func TestIsTestOnlyHandoff(t *testing.T) {
+	impl, err := Implement("write tests only", "", true)
+	if err != nil {
+		t.Fatalf("Implement: %v", err)
+	}
+	if !strings.Contains(impl, "exactly "+TestOnlyHandoff) {
+		t.Errorf("implement prompt = %q, want the hand-off clause naming the exact marker %q", impl, TestOnlyHandoff)
+	}
+	for _, c := range []struct {
+		reply string
+		want  bool
+	}{
+		{"investigated the task; no implementation change is needed\n" + TestOnlyHandoff, true},
+		{"investigated the task\n**" + TestOnlyHandoff + "**", true},
+		{"investigated the task\n*" + TestOnlyHandoff + "*", true},
+		{"investigated the task\n  " + TestOnlyHandoff + "  ", true},
+		{"\n\n" + TestOnlyHandoff + "\n", true},
+		{TestOnlyHandoff + " would end this\nbut more work happened", false},
+		{"investigated the task\nTEST ONLY HANDOFF", false},
+		{"investigated the task\n**" + TestOnlyHandoff + "** — thanks", false},
+		{"", false},
+	} {
+		if got := IsTestOnlyHandoff(c.reply); got != c.want {
+			t.Errorf("IsTestOnlyHandoff(%q) = %v, want %v", c.reply, got, c.want)
+		}
+	}
+}
+
 // TestReviewTestScopeAndGateWording pins the two test-review clauses that
 // key on the diff handoff and the relayed logs: with a diff file handoff
 // the scope clause names the digest and the file — never "the diff above" —

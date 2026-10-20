@@ -489,6 +489,22 @@ func uiFailedEvent(scheduledID int64, when time.Time, message string) *historypb
 	}
 }
 
+// warmProbes drives the roster's async probe cache to quiescence: the
+// first GET spawns the config's background probe, later polls pick its
+// result up, and the loop re-renders until no cold "probing…" face
+// remains — so assertions see landed probes, not the cold-cache answer.
+func warmProbes(t *testing.T, h *uiHarness, path string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		out := h.get(t, path)
+		if !strings.Contains(out, "probing…") || time.Now().After(deadline) {
+			return out
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestUIWorkersPage pins the roster view: an empty host says how to start
 // one; a recorded stopped worker renders its name, its not-running face,
 // and the queue its config names; the page shell embeds the polled rows;
@@ -534,7 +550,7 @@ func TestUIWorkersPage(t *testing.T) {
 		writeWorkerUIRecord(t, "w2", uiWorkerConfig(h.cfg.Temporal.Host, "listq"))
 		writeLivePidFile(t, "w2")
 
-		out := h.get(t, "/workers/rows")
+		out := warmProbes(t, h, "/workers/rows")
 		if !strings.Contains(out, "running · pid ") {
 			t.Errorf("rows output lacks the running face:\n%s", out)
 		}
@@ -655,7 +671,7 @@ func TestUIWorkerProbeTooltips(t *testing.T) {
 		h := newUIHarness(t)
 		prov := providerServer(t, http.StatusOK, "{}")
 		rec(t, h, "w-ok", "provider:\n  type: anthropic\n  url: "+prov+"\n  key: k\n  model: m\n")
-		out := h.get(t, "/workers/rows")
+		out := warmProbes(t, h, "/workers/rows")
 		if !strings.Contains(out, `title="last probe reached the primary provider (ok (http 200)); TTL-cached, may be stale"`) {
 			t.Errorf("rows lack the reached-primary tooltip:\n%s", out)
 		}
@@ -668,7 +684,7 @@ func TestUIWorkerProbeTooltips(t *testing.T) {
 		h := newUIHarness(t)
 		prov := providerServer(t, http.StatusUnauthorized, "no")
 		rec(t, h, "w-bad", "provider:\n  type: anthropic\n  url: "+prov+"\n  key: k\n  model: m\n")
-		out := h.get(t, "/workers/rows")
+		out := warmProbes(t, h, "/workers/rows")
 		if !strings.Contains(out, `title="last probe failed (401 auth rejected) — next rounds may stall or fail over to the fallback; TTL-cached, may be stale"`) {
 			t.Errorf("rows lack the failed-primary tooltip:\n%s", out)
 		}
@@ -683,7 +699,7 @@ func TestUIWorkerProbeTooltips(t *testing.T) {
 		fb := providerServer(t, http.StatusOK, "{}")
 		rec(t, h, "w-fb", "provider:\n  type: anthropic\n  url: "+main+"\n  key: k\n  model: m\n"+
 			"fallback:\n  enabled: true\n  url: "+fb+"\n  key: fk\n  model: fm\n")
-		out := h.get(t, "/workers/rows")
+		out := warmProbes(t, h, "/workers/rows")
 		for _, want := range []string{
 			`title="last probe reached the fallback provider (ok (http 200)); TTL-cached, may be stale"`,
 			">fallback ✓</span>",
@@ -1135,8 +1151,8 @@ func TestUIPolledPageFaces(t *testing.T) {
 
 	t.Run("the ring hides where nothing polls", func(t *testing.T) {
 		for _, want := range []string{
-			`var ddLive=!!document.querySelector('[hx-trigger*="every"]');`,
-			`if(cdEl)cdEl.closest('div').classList.add('hidden');`,
+			`var ddLive=false;`,
+			`if(!ddLive&&cdWrap)cdWrap.classList.add('hidden');`,
 		} {
 			if !strings.Contains(index, want) {
 				t.Errorf("the page shell lacks the ring's every-trigger probe or its hide branch:\n%s", want)

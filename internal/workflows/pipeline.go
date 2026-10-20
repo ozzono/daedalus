@@ -480,6 +480,76 @@ func skillLabel(i int, entry string) string {
 	return fmt.Sprintf("#%d", i+1)
 }
 
+// devFixRound feeds one round of review comments back to the dev
+// session — the default reviewer's and each skill reviewer's fixes ride
+// the same implementing conversation.
+func (r *pipelineRun) devFixRound(comments string, touchesJail bool) error {
+	fixPrompt, err := template.ImplementFix(comments, template.Jail{Touches: touchesJail})
+	if err != nil {
+		return fmt.Errorf("build implement-fix prompt: %w", err)
+	}
+	if g := r.drainGuidance(); g != "" {
+		r.logger.Info("Operator guidance received, folding into fix prompt")
+		fixPrompt = g + "\n\n" + fixPrompt
+	}
+	if _, err := r.runAgent(fixPrompt, "implement-fix", activities.RoleDev, &r.devSession); err != nil {
+		return fmt.Errorf("agent run after code review: %w", err)
+	}
+	return nil
+}
+
+// codeReviewLoop runs implementation ↔ code-review rounds until the code
+// reviewer approves, parking on NEEDS_MAINTAINER — then one ping-pong per
+// review_skill_list entry, in order, each a reviewer conversation of its
+// own riding the same dev session for its fixes. The phase's gate is the
+// whole chain: every skill must approve too. Feature-dev's first pass and
+// the test-only flow's post-rebuild review land here, so a rebuild
+// re-enters the same reviewer conversations instead of starting cold.
+func (r *pipelineRun) codeReviewLoop(touchesJail bool) error {
+	for {
+		verdict, err := r.review("the implementation", "", false, false, "", activities.RoleDevReview, &r.devReviewSession, touchesJail, false)
+		if err != nil {
+			return fmt.Errorf("code review: %w", err)
+		}
+		if verdict.NeedsMaintainer {
+			r.logger.Info("Code review halted the run for maintainer input")
+			return r.park(fmt.Sprintf("code review halted the run — the task cannot be completed as stated: %s",
+				verdict.Comments))
+		}
+		if verdict.Approved {
+			r.logger.Info("Code review approved")
+			break
+		}
+		r.logger.Info("Code review requested changes")
+		if err := r.devFixRound(verdict.Comments+verdictNote(verdict), touchesJail); err != nil {
+			return err
+		}
+	}
+	for i, entry := range r.input.ReviewSkillList {
+		label := skillLabel(i, entry)
+		for {
+			verdict, err := r.review("the implementation", "", false, false, "", activities.RoleDevReview, &r.skillDevReviewSessions[i], touchesJail, false, entry)
+			if err != nil {
+				return fmt.Errorf("skill review %s: %w", label, err)
+			}
+			if verdict.NeedsMaintainer {
+				r.logger.Info("Skill review halted the run for maintainer input")
+				return r.park(fmt.Sprintf("skill review (%s) halted the run — the task cannot be completed as stated: %s",
+					label, verdict.Comments))
+			}
+			if verdict.Approved {
+				r.logger.Info("Skill review approved", "Skill", label)
+				break
+			}
+			r.logger.Info("Skill review requested changes", "Skill", label)
+			if err := r.devFixRound(verdict.Comments+verdictNote(verdict), touchesJail); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // FeatureDevWorkflow drives a full issue-development cycle in two
 // review-gated phases: (1) implementation ↔ code review until the reviewer
 // approves, then (2) tests ↔ test review until the reviewer approves AND the
@@ -523,75 +593,13 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return "", err
 	}
 
-	// devFixRound feeds one round of review comments back to the dev
-	// session — the default reviewer's and each skill reviewer's fixes ride
-	// the same implementing conversation.
-	devFixRound := func(comments string) error {
-		fixPrompt, err := template.ImplementFix(comments, template.Jail{Touches: touchesJail})
-		if err != nil {
-			return fmt.Errorf("build implement-fix prompt: %w", err)
-		}
-		if g := run.drainGuidance(); g != "" {
-			run.logger.Info("Operator guidance received, folding into fix prompt")
-			fixPrompt = g + "\n\n" + fixPrompt
-		}
-		if _, err := run.runAgent(fixPrompt, "implement-fix", activities.RoleDev, &run.devSession); err != nil {
-			return fmt.Errorf("agent run after code review: %w", err)
-		}
-		return nil
-	}
-
 	// codeReviewLoop runs implementation ↔ code-review rounds until the
-	// code reviewer approves, parking on NEEDS_MAINTAINER — then one
-	// ping-pong per review_skill_list entry, in order, each a reviewer
-	// conversation of its own riding the same dev session for its fixes.
-	// The phase's gate is the whole chain: every skill must approve too.
-	// Both the first pass and a test-phase REBUILD land here, so the
-	// rebuild re-enters the same reviewer conversations instead of starting
-	// cold.
+	// code reviewer approves — then one ping-pong per review_skill_list
+	// entry, in order. Both the first pass and a test-phase REBUILD land
+	// here, so the rebuild re-enters the same reviewer conversations
+	// instead of starting cold.
 	codeReviewLoop := func() error {
-		for {
-			verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
-			if err != nil {
-				return fmt.Errorf("code review: %w", err)
-			}
-			if verdict.NeedsMaintainer {
-				run.logger.Info("Code review halted the run for maintainer input")
-				return run.park(fmt.Sprintf("code review halted the run — the task cannot be completed as stated: %s",
-					verdict.Comments))
-			}
-			if verdict.Approved {
-				run.logger.Info("Code review approved")
-				break
-			}
-			run.logger.Info("Code review requested changes")
-			if err := devFixRound(verdict.Comments + verdictNote(verdict)); err != nil {
-				return err
-			}
-		}
-		for i, entry := range run.input.ReviewSkillList {
-			label := skillLabel(i, entry)
-			for {
-				verdict, err := run.review("the implementation", "", false, false, "", activities.RoleDevReview, &run.skillDevReviewSessions[i], touchesJail, entry)
-				if err != nil {
-					return fmt.Errorf("skill review %s: %w", label, err)
-				}
-				if verdict.NeedsMaintainer {
-					run.logger.Info("Skill review halted the run for maintainer input")
-					return run.park(fmt.Sprintf("skill review (%s) halted the run — the task cannot be completed as stated: %s",
-						label, verdict.Comments))
-				}
-				if verdict.Approved {
-					run.logger.Info("Skill review approved", "Skill", label)
-					break
-				}
-				run.logger.Info("Skill review requested changes", "Skill", label)
-				if err := devFixRound(verdict.Comments + verdictNote(verdict)); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
+		return run.codeReviewLoop(touchesJail)
 	}
 
 	// rebuild routes a test-review REBUILD finding back through the dev
@@ -637,7 +645,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if template.IsTestOnlyHandoff(implReply.Text) {
 		run.logger.Info("Dev session declared the task test-only; asking the code reviewer to confirm")
 		focus := fmt.Sprintf("the implementing session's test-only hand-off claim. The task:\n\n%s\n\nThe implementing session reports the task is entirely test-scoped work: no implementation change is needed, the diff is empty by design, and the work belongs in the pipeline's test phase. Verify the claim against the repository: if an implementation change is in fact needed for this task, request changes and say exactly what it is; if the task genuinely needs only tests, approve the hand-off.", input.Prompt)
-		verdict, err := run.review(focus, "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
+		verdict, err := run.review(focus, "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail, true)
 		if err != nil {
 			return "", fmt.Errorf("test-only hand-off review: %w", err)
 		}
@@ -700,7 +708,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			session = &run.skillTestReviewSessions[skillIdx]
 			entry = run.input.ReviewSkillList[skillIdx]
 		}
-		return run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, session, false, entry)
+		return run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, session, false, false, entry)
 	}
 
 	// testFixRound feeds a failed round back to the tester: the red suite

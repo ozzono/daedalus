@@ -314,12 +314,12 @@ func TestTestOnlyWorkflowSuiteLoop(t *testing.T) {
 	if len(rec.inputs) != 2 {
 		t.Fatalf("agent ran %d times, want 2 (tests, tests-fix — no implementation round)", len(rec.inputs))
 	}
-	want, err := template.Tests("")
+	want, err := template.TestsForTask(in.Prompt, bugDir())
 	if err != nil {
 		t.Fatalf("build expected tests prompt: %v", err)
 	}
 	if rec.inputs[0].Prompt != want {
-		t.Errorf("opening prompt = %q, want the tests prompt (the flow starts in the test loop)", rec.inputs[0].Prompt)
+		t.Errorf("opening prompt = %q, want the tests-for-task prompt (the flow opens on the task, not a diff)", rec.inputs[0].Prompt)
 	}
 	if got := rec.inputs[0].Role; got != activities.RoleTest {
 		t.Errorf("tests round Role = %q, want %q", got, activities.RoleTest)
@@ -368,27 +368,36 @@ func TestTestOnlyWorkflowSuiteLoop(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
-// TestTestOnlyWorkflowRebuildParks pins the flow's defining constraint:
-// there is no implementation loop to rebuild into, so a test-review REBUILD
-// parks the run for the maintainer — with the finding in the message —
-// keeping "merged work is approved work" true.
-func TestTestOnlyWorkflowRebuildParks(t *testing.T) {
+// TestTestOnlyWorkflowRebuildRound pins the flow's one dev-code path: a
+// test-review REBUILD — a finding the test-only agent cannot apply because
+// the fix is an implementation change — spends a dev-role rebuild round on
+// the finding, puts the rebuilt implementation code in front of the code
+// reviewer (unreviewed code never finalizes), and resumes the test loop,
+// where the reviewer sees the rebuild round's reply — not the pre-rebuild
+// tester's — and a green suite plus approval finalizes. Only a spent
+// rebuild cap (maxTestPhaseRebuilds) parks the run for the maintainer; a
+// single REBUILD never does.
+func TestTestOnlyWorkflowRebuildRound(t *testing.T) {
 	env := newTestEnv(t)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/test-only-issue-42"}, nil)
 
-	rec := &agentRecorder{env: env}
-	rec.record()
-	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
-		{Rebuild: true, Comments: "handler drops the error path"},
+	rec := &agentRecorder{env: env, script: []agentStep{
+		{result: activities.AgentRunResult{Text: "wrote the covering test"}},
+		{result: activities.AgentRunResult{Text: "rebuilt the handler"}},
 	}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: activities.ReviewResult{Rebuild: true, Comments: "handler drops the error path"}},
+		{result: activities.ReviewResult{Approved: true}},
+	}, stub: []activities.ReviewResult{{Approved: true}}}
 	rev.record()
 
 	stubTestPhase(env)
 
-	var cleanupCount int
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/test-only-issue-42-1", nil).Once()
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) { cleanupCount++ }).
 		Return(nil).Once()
 
 	in := baseInput()
@@ -396,25 +405,36 @@ func TestTestOnlyWorkflowRebuildParks(t *testing.T) {
 	in.AllowedPaths = activities.TestPathPatterns
 	env.ExecuteWorkflow(TestOnlyWorkflow, in)
 
-	err := env.GetWorkflowError()
-	if err == nil {
-		t.Fatal("want workflow error from a REBUILD verdict")
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
 	}
-	for _, want := range []string{
-		ErrAwaitingMaintainer.Error(),
-		"requested a rebuild",
-		"outside this flow's test-only scope",
-		"handler drops the error path",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("park error %q should contain %q", err, want)
-		}
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (tests, dev rebuild)", len(rec.inputs))
 	}
-	if len(rec.inputs) != 1 {
-		t.Errorf("agent ran %d times, want 1 (no dev rebuild round exists in this flow)", len(rec.inputs))
+	if got := rec.inputs[1].Role; got != activities.RoleDev {
+		t.Errorf("rebuild round Role = %q, want %q (the flow's one dev-code path)", got, activities.RoleDev)
 	}
-	if cleanupCount != 1 {
-		t.Errorf("cleanup ran %d times, want 1 (the attempt's work is preserved for continue)", cleanupCount)
+	if !strings.Contains(rec.inputs[1].Prompt, "handler drops the error path") {
+		t.Errorf("rebuild prompt %q should carry the reviewer's finding", rec.inputs[1].Prompt)
+	}
+	if len(rev.inputs) != 3 {
+		t.Fatalf("reviewer ran %d times, want 3 (test review rebuild, code review of the rebuild, test review approval)", len(rev.inputs))
+	}
+	if got := rev.inputs[1].Role; got != activities.RoleDevReview {
+		t.Errorf("post-rebuild review Role = %q, want %q (the rebuilt implementation code is reviewed before the test loop resumes)", got, activities.RoleDevReview)
+	}
+	if got := rev.inputs[2].Role; got != activities.RoleTestReview {
+		t.Errorf("final review Role = %q, want %q (the test loop resumed after the rebuild's code review)", got, activities.RoleTestReview)
+	}
+	if got := rev.inputs[2].AgentReply; got != "rebuilt the handler" {
+		t.Errorf("final review AgentReply = %q, want the rebuild round's reply — the pre-rebuild tester's reply describes a change the reviewer is not looking at", got)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/test-only-issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
 	}
 	env.AssertExpectations(t)
 }

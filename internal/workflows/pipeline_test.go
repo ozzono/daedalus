@@ -323,7 +323,7 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	if len(rec.inputs) != 2 {
 		t.Fatalf("agent ran %d times, want 2 (implement + tests)", len(rec.inputs))
 	}
-	want, err := template.Implement("implement the feature", "")
+	want, err := template.Implement("implement the feature", "", true)
 	if err != nil {
 		t.Fatalf("build expected implement prompt: %v", err)
 	}
@@ -348,6 +348,62 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	}
 	if cleanupCount != 1 {
 		t.Errorf("cleanup ran %d times, want 1", cleanupCount)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowHandoffClaimReview pins the test-only hand-off
+// confirmation round: a dev reply ending in the hand-off marker sends the
+// code reviewer a claim-confirmation review — flagged ClaimReview, so the
+// rendered prompt carries the claim-verification contract instead of the
+// empty-diff guard that would park every hand-off — and an approval
+// advances straight into the test phase on the task-framed opener.
+func TestFeatureDevWorkflowHandoffClaimReview(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "")
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env, script: []agentStep{
+		{result: activities.AgentRunResult{Text: "investigated the task; only tests are needed\n" + template.TestOnlyHandoff}},
+	}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	stubTestPhase(env)
+
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rev.inputs) != 2 {
+		t.Fatalf("reviewer ran %d times, want 2 (claim confirmation + test suite)", len(rev.inputs))
+	}
+	if !rev.inputs[0].ClaimReview {
+		t.Error("claim review input ClaimReview = false, want the hand-off confirmation flagged — without it the prompt's empty-diff guard parks every hand-off")
+	}
+	if !strings.Contains(rev.inputs[0].Focus, "implement the feature") {
+		t.Errorf("claim review focus = %q, want the task text the claim is about", rev.inputs[0].Focus)
+	}
+	if got := rev.inputs[1].Focus; got != "the test suite" {
+		t.Errorf("second review focus = %q, want the test suite (a confirmed hand-off advances to phase 2)", got)
+	}
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (implement + tests)", len(rec.inputs))
+	}
+	want, err := template.TestsForTask("implement the feature", "")
+	if err != nil {
+		t.Fatalf("build expected tests-for-task prompt: %v", err)
+	}
+	if rec.inputs[1].Prompt != want {
+		t.Errorf("test-phase prompt = %q, want the task-framed opener (there is no implementation diff to infer the task from)", rec.inputs[1].Prompt)
 	}
 	env.AssertExpectations(t)
 }
@@ -385,7 +441,7 @@ func TestFeatureDevWorkflowBugDirPrompt(t *testing.T) {
 	if len(rec.inputs) != 2 {
 		t.Fatalf("agent ran %d times, want 2 (implement + tests)", len(rec.inputs))
 	}
-	want, err := template.Implement("implement the feature", "docs/known-bugs")
+	want, err := template.Implement("implement the feature", "docs/known-bugs", true)
 	if err != nil {
 		t.Fatalf("build expected implement prompt: %v", err)
 	}
