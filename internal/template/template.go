@@ -426,6 +426,10 @@ type Jail struct {
 type implementData struct {
 	Task, BugDir string
 	TouchesJail  bool
+	// Handoff arms the test-only hand-off clause — set only by a flow whose
+	// workflow implements the marker check (feature-dev); the prompt must
+	// never promise a reroute the pipeline does not perform.
+	Handoff bool
 }
 
 // Implement builds the phase-1 opener: the issue task, framed so the
@@ -434,22 +438,27 @@ type implementData struct {
 // drops the file-filing instruction from the bug policy (the project-own
 // record note and reply-reporting duty stay). A task that itself names .ai-jail
 // gets the carve-out branch: editing .ai-jail is in scope instead of
-// barred.
-func Implement(task, bugDir string) (string, error) {
-	return render("implement", implementData{task, bugDir, TaskTouchesJail(task)})
+// barred. The trailing handoff flag arms the test-only hand-off clause;
+// variadic so flows without the marker check keep the plain call.
+func Implement(task, bugDir string, handoff ...bool) (string, error) {
+	return render("implement", implementData{Task: task, BugDir: bugDir, TouchesJail: TaskTouchesJail(task), Handoff: len(handoff) > 0 && handoff[0]})
 }
 
 // continueData is continue.md's data.
 type continueData struct {
 	Task          string
 	PriorFeedback string
+	// Handoff arms the test-only hand-off clause — see implementData.
+	Handoff bool
 }
 
 // Continue builds the phase-1 opener for a resumed run: the new task, the
 // framing that the worktree already contains an aborted attempt's work, and
-// that attempt's last review feedback when available.
-func Continue(task, priorFeedback string) (string, error) {
-	return render("continue", continueData{task, priorFeedback})
+// that attempt's last review feedback when available. The trailing handoff
+// flag arms the test-only hand-off clause; variadic so flows without the
+// marker check keep the plain call.
+func Continue(task, priorFeedback string, handoff ...bool) (string, error) {
+	return render("continue", continueData{Task: task, PriorFeedback: priorFeedback, Handoff: len(handoff) > 0 && handoff[0]})
 }
 
 // implementFixData is implement_fix.md's data.
@@ -471,14 +480,44 @@ func ImplementFix(comments string, jail ...Jail) (string, error) {
 	return render("implement_fix", implementFixData{comments, j.Touches})
 }
 
-// testsData is tests.md's data.
-type testsData struct{ BugDir string }
+// testsData is tests.md's data. Task, when set, carries the run's task
+// text — the hand-off framings (a confirmed test-only hand-off, the
+// test-only flow) have no implementation diff for the tester to infer the
+// task from.
+type testsData struct{ Task, BugDir string }
 
 // Tests opens phase 2: the agent writes or improves the test suite covering
 // the change. bugDir is the configured out-of-scope-bug filing folder; empty
 // drops the file-filing instruction from the bug policy.
 func Tests(bugDir string) (string, error) {
-	return render("tests", testsData{bugDir})
+	return render("tests", testsData{BugDir: bugDir})
+}
+
+// TestsForTask is Tests' hand-off framing: the opener carries the task
+// text (see testsData.Task).
+func TestsForTask(task, bugDir string) (string, error) {
+	return render("tests", testsData{Task: task, BugDir: bugDir})
+}
+
+// TestOnlyHandoff is the machine marker a dev session ends its reply with
+// when the task turned out to be entirely test-scoped work (implement.md
+// and continue.md's hand-off clause): the exact last non-empty line, the
+// same shape as the reviewer verdict protocol — a marker mentioned
+// anywhere else in the reply is not a hand-off.
+const TestOnlyHandoff = "TEST-ONLY HANDOFF"
+
+// IsTestOnlyHandoff reports whether reply ends with the exact
+// TestOnlyHandoff line — the dev session's structured "no implementation
+// is needed; take the task to the test phase".
+func IsTestOnlyHandoff(reply string) bool {
+	lines := strings.Split(strings.TrimSpace(reply), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		return lines[i] == TestOnlyHandoff
+	}
+	return false
 }
 
 // TestsFix feeds phase-2 (tests ↔ test review) failures back to the agent:

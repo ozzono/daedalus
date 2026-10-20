@@ -613,18 +613,50 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// A continued run opens on the aborted attempt's preserved work.
 	var initialPrompt string
 	if input.BaseBranch != "" {
-		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback)
+		initialPrompt, err = template.Continue(input.Prompt, input.PriorFeedback, true)
 	} else {
-		initialPrompt, err = template.Implement(input.Prompt, bugDir())
+		initialPrompt, err = template.Implement(input.Prompt, bugDir(), true)
 	}
 	if err != nil {
 		return "", fmt.Errorf("build implement prompt: %w", err)
 	}
-	if _, err := run.runAgent(initialPrompt, "implement", activities.RoleDev, &run.devSession); err != nil {
+	implReply, err := run.runAgent(initialPrompt, "implement", activities.RoleDev, &run.devSession)
+	if err != nil {
 		return "", fmt.Errorf("initial agent run: %w", err)
 	}
-	if err := codeReviewLoop(); err != nil {
-		return "", err
+	// A task that is entirely test-scoped work arrives through the dev
+	// session's hand-off marker (implement.md / continue.md): no
+	// implementation edit was fabricated, and the code reviewer confirms
+	// the claim before the run advances into phase 2 — where the work
+	// belongs, and where the tester's opener carries the task text, since
+	// there is no implementation diff to infer it from. A rejected claim
+	// falls into the normal code-review loop: the reviewer's findings
+	// route back through the fix rounds as ever. Parks stay reserved for
+	// NEEDS_MAINTAINER.
+	handoff := false
+	if template.IsTestOnlyHandoff(implReply.Text) {
+		run.logger.Info("Dev session declared the task test-only; asking the code reviewer to confirm")
+		focus := fmt.Sprintf("the implementing session's test-only hand-off claim. The task:\n\n%s\n\nThe implementing session reports the task is entirely test-scoped work: no implementation change is needed, the diff is empty by design, and the work belongs in the pipeline's test phase. Verify the claim against the repository: if an implementation change is in fact needed for this task, request changes and say exactly what it is; if the task genuinely needs only tests, approve the hand-off.", input.Prompt)
+		verdict, err := run.review(focus, "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail)
+		if err != nil {
+			return "", fmt.Errorf("test-only hand-off review: %w", err)
+		}
+		if verdict.NeedsMaintainer {
+			run.logger.Info("Code review halted the run for maintainer input")
+			return "", run.park(fmt.Sprintf("code review halted the run — the task cannot be completed as stated: %s",
+				verdict.Comments))
+		}
+		handoff = verdict.Approved
+		if handoff {
+			run.logger.Info("Test-only hand-off confirmed; advancing to the test phase")
+		} else {
+			run.logger.Info("Code review rejected the test-only hand-off; entering the implementation loop")
+		}
+	}
+	if !handoff {
+		if err := codeReviewLoop(); err != nil {
+			return "", err
+		}
 	}
 
 	// Phase 2: tests ↔ test review, until the reviewer approves AND the
@@ -632,7 +664,12 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	// reviewer, which alone can verdict REBUILD — routing an
 	// implementation-level finding back through the dev cycle (above)
 	// before the test loop resumes with both sessions intact.
-	testsPrompt, err := template.Tests(bugDir())
+	var testsPrompt string
+	if handoff {
+		testsPrompt, err = template.TestsForTask(input.Prompt, bugDir())
+	} else {
+		testsPrompt, err = template.Tests(bugDir())
+	}
 	if err != nil {
 		return "", fmt.Errorf("build tests prompt: %w", err)
 	}
