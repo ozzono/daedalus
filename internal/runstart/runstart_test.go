@@ -397,6 +397,24 @@ func TestStartDispatch(t *testing.T) {
 		if in.SharedTestQueue == nil || *in.SharedTestQueue != cfg.SharesTestQueue() {
 			t.Errorf("input SharedTestQueue = %v, want the config's routing (%v), never nil", in.SharedTestQueue, cfg.SharesTestQueue())
 		}
+		if in.SkipPreflight {
+			t.Errorf("input SkipPreflight = true on a plain submission, want the default false (the gate keeps its park)")
+		}
+	})
+
+	t.Run("the preflight opt-out rides the dispatch input", func(t *testing.T) {
+		repo := gitRepo(t, "main")
+		fake := &fakeFrontend{}
+		cfg := startFake(t, fake)
+
+		req := valid(repo)
+		req.SkipPreflight = true
+		if _, err := Start(cfg, req); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if in := dispatchInput(t, fake.starts[0]); !in.SkipPreflight {
+			t.Errorf("input SkipPreflight = false, want the submission's opt-out carried into the workflow input")
+		}
 	})
 
 	t.Run("a non-default flow scopes the id with its name", func(t *testing.T) {

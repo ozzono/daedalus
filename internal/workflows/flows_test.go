@@ -439,6 +439,61 @@ func TestTestOnlyWorkflowRebuildRound(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestTestOnlyWorkflowRebuildLiftsScopeCheckAtFinalize pins the rebuild
+// path's finalize side: the AllowedPaths lift happens at finalize, not at
+// the rebuild — a run that spent a rebuild skips the structural write-scope
+// check for the whole tree (the approved implementation change rides the
+// working tree, and the test-path-only policy would park on it), while a
+// run without a rebuild keeps the check (pinned by
+// TestTestOnlyWorkflowSuiteLoop's one scope call).
+func TestTestOnlyWorkflowRebuildLiftsScopeCheckAtFinalize(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/test-only-issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: activities.ReviewResult{Rebuild: true, Comments: "handler drops the error path"}},
+	}, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	stubTestPhase(env)
+
+	scope := &scopeRecorder{env: env}
+	scope.record()
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/test-only-issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	in := baseInput()
+	in.Flow = "test-only"
+	in.AllowedPaths = activities.TestPathPatterns
+	env.ExecuteWorkflow(TestOnlyWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 (tests, dev rebuild)", len(rec.inputs))
+	}
+	if len(rev.inputs) != 3 {
+		t.Fatalf("reviewer ran %d times, want 3 (test rebuild, code review, test approval)", len(rev.inputs))
+	}
+	if len(scope.inputs) != 0 {
+		t.Errorf("write-scope gate ran %d times, want 0 — a rebuild spent lifts the check for the run", len(scope.inputs))
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/test-only-issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	env.AssertExpectations(t)
+}
+
 // TestRefactorWorkflowLoop pins the behavior-frozen flow: the refactor
 // prompt opens the run, a red suite still goes to the reviewer (who judges
 // structure), both the red logs and the comments travel in the fix prompt,
@@ -784,6 +839,81 @@ func TestFlowsPreflightGateParksOnRedBaseline(t *testing.T) {
 			}
 			if cleanupCount != 1 {
 				t.Errorf("cleanup ran %d times, want 1 (the untouched worktree is preserved for continue)", cleanupCount)
+			}
+			env.AssertExpectations(t)
+		})
+	}
+}
+
+// TestFlowsPreflightSkipOpensOnRedBaseline pins the gate's opt-out: a run
+// whose input carries SkipPreflight (`daedalus run --skip-preflight`) opens
+// on a red baseline instead of parking — the baseline suite still ran once
+// in the run's own worktree and its red result is on record, but every
+// gated flow proceeds into its rounds, the worktree's recorded base sha
+// rides into every review round, and the run finalizes like any other.
+func TestFlowsPreflightSkipOpensOnRedBaseline(t *testing.T) {
+	flows := []struct {
+		name      string
+		fn        func(workflowContext, PipelineInput) (string, error)
+		flow      string
+		agentRuns int
+		reviews   int
+	}{
+		{"feature-dev", FeatureDevWorkflow, "", 2, 2},
+		{"test-only", TestOnlyWorkflow, "test-only", 1, 1},
+		{"refactor", RefactorWorkflow, "refactor", 1, 1},
+		{"bug-fix", BugFixWorkflow, "bug-fix", 1, 1},
+	}
+	for _, f := range flows {
+		t.Run(f.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+				Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42", BaseHead: "base111"}, nil)
+			rec := &agentRecorder{env: env}
+			rec.record()
+			rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+			rev.record()
+			_, suiteRec := stubTestPhase(env)
+			// The red first entry is the preflight gate's baseline; the
+			// flow's own rounds run on the green fallback.
+			suiteRec.script = []suiteStep{
+				{result: activities.TestResult{Passed: false, Logs: "--- FAIL: TestBase"}},
+			}
+			gate := &reproGateRecorder{env: env}
+			gate.record()
+			env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+				Return("daedalus/issue-42-1", nil).Once()
+			env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+				Return(nil).Once()
+
+			in := baseInput()
+			in.Flow = f.flow
+			in.SkipPreflight = true
+			env.ExecuteWorkflow(f.fn, in)
+
+			if err := env.GetWorkflowError(); err != nil {
+				t.Fatalf("workflow error: %v (a skipped gate opens on the red baseline)", err)
+			}
+			var branch string
+			if err := env.GetWorkflowResult(&branch); err != nil {
+				t.Fatalf("workflow result: %v", err)
+			}
+			if branch != "daedalus/issue-42-1" {
+				t.Errorf("workflow result = %q, want the preserved branch name", branch)
+			}
+			if len(rec.inputs) < f.agentRuns {
+				t.Errorf("agent ran %d times, want at least %d (the run opened its sessions)", len(rec.inputs), f.agentRuns)
+			}
+			if len(rev.inputs) < f.reviews {
+				t.Errorf("reviewer ran %d times, want at least %d", len(rev.inputs), f.reviews)
+			}
+			if len(suiteRec.runs) < 2 || suiteRec.runs[0].WorktreePath != "/wt/issue-42" {
+				t.Errorf("suite runs = %+v, want the red baseline in the run's own worktree plus the flow's rounds", suiteRec.runs)
+			}
+			for i, ri := range rev.inputs {
+				if ri.BaseHead != "base111" {
+					t.Errorf("review %d BaseHead = %q, want the worktree's recorded base (the empty-diff detector's anchor)", i, ri.BaseHead)
+				}
 			}
 			env.AssertExpectations(t)
 		})

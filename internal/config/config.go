@@ -945,8 +945,14 @@ type MetricsConfig struct {
 	// Enabled turns the subsystem on for this project's rounds — nil
 	// (unset) is on; false opts out. When on, the worker boot verifies
 	// the metrics daemon, registers this worker's upstream mapping with
-	// it, and stages the relay URL into jailed rounds.
-	Enabled *bool `yaml:"enabled"`
+	// it, and stages the relay URL into jailed rounds. omitempty is the
+	// render contract (RenderYAML): an unset key renders absent —
+	// marshaling the nil pointer would print `enabled: null`, a shape
+	// no config line means. The repo's two other defaulted pointer keys
+	// still have that wart (shared_test_queue, dependency.enabled;
+	// backlog/bugs/config-render-defaulted-pointer-keys-emit-null.md) —
+	// this field is fixed, not the family.
+	Enabled *bool `yaml:"enabled,omitempty"`
 	// Port is the daemon's UI listener (the dashboard mux). Zero (unset)
 	// defaults to DefaultMetricsUIPort; equal to relay_port is a load
 	// error — one port, one listener.

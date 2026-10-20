@@ -1469,6 +1469,58 @@ prompt: overrides/
 	}
 }
 
+// TestRenderYAMLMetricsEnabledContract pins the metrics section's render
+// contract: an unset `enabled` (the tri-state nil — on by default) renders
+// absent, never `enabled: null` — a shape no config line means — while an
+// explicit false prints its value; both renders load back unchanged.
+func TestRenderYAMLMetricsEnabledContract(t *testing.T) {
+	render := func(t *testing.T, cfgYAML string) string {
+		t.Helper()
+		raw, err := LoadRaw(writeConfig(t, cfgYAML))
+		if err != nil {
+			t.Fatalf("LoadRaw: %v", err)
+		}
+		out, err := raw.RenderYAML()
+		if err != nil {
+			t.Fatalf("RenderYAML: %v", err)
+		}
+		return out
+	}
+
+	unset := render(t, "metrics:\n  port: 7801\n")
+	if !strings.Contains(unset, "port: 7801") {
+		t.Errorf("RenderYAML =\n%s\nwant the metrics section rendered", unset)
+	}
+	// The absence check is scoped to the metrics section: the family wart
+	// this fix does not touch (dependency.enabled et al.) still prints
+	// null elsewhere.
+	start := strings.Index(unset, "metrics:")
+	end := start + strings.Index(unset[start:], "\nprompt:")
+	section := unset[start:end]
+	if strings.Contains(section, "enabled") {
+		t.Errorf("metrics render =\n%s\nwant the unset enabled key absent, not null", section)
+	}
+	back, err := LoadRaw(writeConfig(t, unset))
+	if err != nil {
+		t.Fatalf("parse the unset render: %v\n%s", err, unset)
+	}
+	if back.Metrics.Enabled != nil {
+		t.Errorf("round-trip Metrics.Enabled = %v, want nil (unset stays unset)", *back.Metrics.Enabled)
+	}
+
+	off := render(t, "metrics:\n  enabled: false\n")
+	if !strings.Contains(off, "enabled: false") {
+		t.Errorf("RenderYAML =\n%s\nwant the explicit opt-out printed", off)
+	}
+	back, err = LoadRaw(writeConfig(t, off))
+	if err != nil {
+		t.Fatalf("parse the opt-out render: %v\n%s", err, off)
+	}
+	if back.Metrics.Enabled == nil || *back.Metrics.Enabled {
+		t.Errorf("round-trip Metrics.Enabled = %v, want false", back.Metrics.Enabled)
+	}
+}
+
 // TestRenderYAMLUnsetFields pins the pre-defaults view of an empty config:
 // unset durations print as "0s" — zero's own canonical string, still the
 // "documented default applies" marker rather than an actual zero ceiling —

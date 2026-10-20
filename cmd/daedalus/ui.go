@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -1044,22 +1045,39 @@ func taskLogTail(workflowID string) string {
 	if err != nil {
 		return fmt.Sprintf("(no task log: %v)", err)
 	}
-	data, err := os.ReadFile(path)
+	// Seek-window read, not ReadFile: the detail body polls every few
+	// seconds, so the read is O(window), never O(file) — a tens-of-MB
+	// session log made every poll an O(file) read plus two O(file)
+	// string conversions for material only the last 8 KiB of which
+	// renders (ui-tasklogtail-whole-file-read-per-poll in
+	// backlog/bugs/bug-index.md). Only the final round's headers bear on
+	// the freshness state, and the window holds them.
+	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return "(no task log yet — the run has not started any rounds)"
 		}
 		return fmt.Sprintf("(task log unreadable: %v)", err)
 	}
-	tail := string(data)
-	if len(tail) > uiLogTailBytes {
-		tail = tail[len(tail)-uiLogTailBytes:]
-		// the byte window can split a rune; continuation bytes say so
-		for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
-			tail = tail[1:]
-		}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Sprintf("(task log unreadable: %v)", err)
 	}
-	return tail + logTail(workflowID, plainTailState(string(data)))
+	start := max(0, info.Size()-uiLogTailBytes)
+	buf := make([]byte, info.Size()-start)
+	n, err := f.ReadAt(buf, start)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Sprintf("(task log unreadable: %v)", err)
+	}
+	// n < len(buf) (with io.EOF) means the file shrank between the Stat
+	// and the read; rendering the zero tail would print NUL padding.
+	tail := string(buf[:n])
+	// the byte window can split a rune; continuation bytes say so
+	for len(tail) > 0 && tail[0]&0xC0 == 0x80 {
+		tail = tail[1:]
+	}
+	return tail + logTail(workflowID, plainTailState(tail))
 }
 
 // runBranch resolves the run's branch line for the detail header: the

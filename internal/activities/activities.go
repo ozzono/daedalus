@@ -154,6 +154,18 @@ type ReviewInput struct {
 	// contract (template.Claim); without it every hand-off confirmation
 	// would park the run as a failed collection.
 	ClaimReview bool
+	// BaseHead is the sha the worktree's branch started from, recorded at
+	// creation (WorktreeOutput.BaseHead). It is the empty-diff detector's
+	// anchor: a review whose collected diff is empty is blind — never
+	// merely idle — when HEAD has moved past this base, because the work
+	// then lives in commits `git diff HEAD` cannot see (agent-committed
+	// work despite the ban, or a preservation commit the worktree was
+	// created on top of; record:
+	// backlog/bugs/stagediff-committed-work-empty-review-diff.md). Empty —
+	// a run whose worktree predates the field, an unborn HEAD, or a replay
+	// on an old worker — disables the detector: degrade to the ordinary
+	// review, never a false halt.
+	BaseHead string
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -370,6 +382,36 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	diff, handoff, err := stagedDiff(ctx, input.WorktreePath)
 	if err != nil {
 		return ReviewResult{}, err
+	}
+	// An empty collection is two different states, and only one may reach
+	// a reviewer: a round that genuinely changed nothing — the reviewer
+	// must see the empty diff and rule on it (CHANGES_REQUESTED per the
+	// prompt's NO-DIFF contract) — and a blind one, where the branch
+	// carries commits the diff against HEAD cannot see, so the work the
+	// prompt describes was never collected at all. Only the second halts,
+	// with the NEEDS_MAINTAINER verdict the prompt's contract routes a
+	// collection failure to — the park arms turn it into a maintainer
+	// halt without a reviewer round ever running on nothing. HEAD past
+	// the recorded base is the proof (agent-committed work despite the
+	// ban, or a preservation commit the worktree was created on top of —
+	// record: backlog/bugs/stagediff-committed-work-empty-review-diff.md);
+	// the hand-off confirmation is exempt, its empty diff being the claim
+	// under review, and an unrecorded base (a worktree predating the
+	// field, an unborn HEAD) disables the check rather than guess.
+	if diff == "" && handoff == nil && !input.ClaimReview && input.BaseHead != "" {
+		blind, head, err := branchPastBase(ctx, input.WorktreePath, input.BaseHead)
+		if err != nil {
+			return ReviewResult{}, err
+		}
+		if blind {
+			activityLogger(ctx).Warn("Review collection came back empty with HEAD past the round's base; halting instead of a blind review",
+				"Worktree", input.WorktreePath, "Base", input.BaseHead, "Head", head)
+			return ReviewResult{
+				NeedsMaintainer: true,
+				Comments: fmt.Sprintf("the review was halted before any reviewer round: the worktree's collected diff is empty while its branch carries commits past the round's base (%s..%s) — the work lives in commits this collection cannot see, and a review run on nothing would judge an empty diff. That state violates the pipeline's own invariants (rounds are barred from committing; preservation commits belong to closed runs), so it is a maintainer decision: resolve the branch state — rebase the committed work onto a fresh base for this run, or restart from one — and continue.",
+					input.BaseHead, head),
+			}, nil
+		}
 	}
 	prompt, err := func() (string, error) {
 		// The configured out-of-scope-bug filing folder, exported at worker
@@ -808,6 +850,23 @@ func gitDiffAgainstHead(ctx context.Context, worktreePath string, format ...stri
 		return runGit(ctx, append([]string{"-C", worktreePath, "diff"}, format...)...)
 	}
 	return "", err
+}
+
+// branchPastBase reports whether the worktree's HEAD has moved off base —
+// commits exist on the branch beyond the sha recorded when the worktree was
+// created — and returns the current HEAD either way. HEAD moves only by
+// commit here (the pipeline's own index resets touch the index alone), so
+// a sha mismatch is the whole proof. A worktree whose HEAD has gone unborn
+// since the base was recorded cannot happen (the base IS a commit on that
+// HEAD's branch), so a rev-parse failure is a git error the caller
+// surfaces, never a "not moved".
+func branchPastBase(ctx context.Context, worktreePath, base string) (moved bool, head string, err error) {
+	out, err := runGit(ctx, "-C", worktreePath, "rev-parse", "HEAD")
+	if err != nil {
+		return false, "", fmt.Errorf("resolve worktree HEAD: %w", err)
+	}
+	head = strings.TrimSpace(out)
+	return head != base, head, nil
 }
 
 // writeDiffHandoff routes an oversized review diff to the worktree: the

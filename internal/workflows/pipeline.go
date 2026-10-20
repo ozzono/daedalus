@@ -71,6 +71,23 @@ type PipelineInput struct {
 	// before the gate existed) — runs the gate: replay-safe in the loud
 	// direction, like every zero-value fallback here.
 	BaselineValidated bool
+	// SkipPreflight, set by `daedalus run --skip-preflight` on a fresh
+	// run, downgrades the preflight gate's red-baseline park to a recorded
+	// pass: the suite still runs and its red result stays on record (the
+	// task log's suite block, the gate's history line), but the run opens
+	// on it deliberately — a red baseline is the run's stated premise, and
+	// the flow's own suite gating — whatever rounds it takes to reach the
+	// green finalize round — is the expected route for the fix it will
+	// call for. Finalize is untouched:
+	// the done path still requires a green suite round, so baseline debt
+	// cannot finalize. False — every run before the field existed, and
+	// every run without the flag — keeps the gate's park. The decision is
+	// made once, at the fresh run's start, and travels with the run:
+	// continue threads the recorded flag into the restarted workflow like
+	// its other frozen-at-start policy fields, so a skip chain never
+	// re-gates on the baseline it opened on; a pre-field attempt's false
+	// re-runs the gate, the loud direction.
+	SkipPreflight bool
 	// Agent, set by `run -cli/--cli`, overrides the config's jailed agent
 	// for this run; empty — a run whose input predates the field, replayed
 	// by a newer worker — falls back to the worker's DAEDALUS_AGENT.
@@ -507,7 +524,7 @@ func (r *pipelineRun) devFixRound(comments string, touchesJail bool) error {
 // re-enters the same reviewer conversations instead of starting cold.
 func (r *pipelineRun) codeReviewLoop(touchesJail bool) error {
 	for {
-		verdict, err := r.review("the implementation", "", false, false, "", activities.RoleDevReview, &r.devReviewSession, touchesJail, false)
+		verdict, err := r.review(reviewOpts{focus: "the implementation", role: activities.RoleDevReview, session: &r.devReviewSession, touchesJail: touchesJail})
 		if err != nil {
 			return fmt.Errorf("code review: %w", err)
 		}
@@ -528,7 +545,7 @@ func (r *pipelineRun) codeReviewLoop(touchesJail bool) error {
 	for i, entry := range r.input.ReviewSkillList {
 		label := skillLabel(i, entry)
 		for {
-			verdict, err := r.review("the implementation", "", false, false, "", activities.RoleDevReview, &r.skillDevReviewSessions[i], touchesJail, false, entry)
+			verdict, err := r.review(reviewOpts{focus: "the implementation", role: activities.RoleDevReview, session: &r.skillDevReviewSessions[i], touchesJail: touchesJail, skill: entry})
 			if err != nil {
 				return fmt.Errorf("skill review %s: %w", label, err)
 			}
@@ -548,6 +565,43 @@ func (r *pipelineRun) codeReviewLoop(touchesJail bool) error {
 		}
 	}
 	return nil
+}
+
+// rebuildRound spends one REBUILD against the test phase's shared cap
+// (maxTestPhaseRebuilds): a dev-role agent run on the finding — the one
+// dev-code path a test-phase flow carries deliberately — then the full
+// code review loop gates the rebuilt state before the caller's test loop
+// resumes. That gate is codeReviewLoop whole: a flow whose other reviews
+// are skill-free (test-only) still re-enters the feature-dev chain
+// review_skill_list included, because the rebuild is where the run's
+// implementation-review budget is spent — on the path that writes
+// application code. reply is the dev round's answer; both callers re-point
+// their latest-reply tracking at it, since the test reviewer must next see
+// the round that produced the change it is looking at, not the
+// pre-rebuild tester. restart reports whether the test phase must start
+// over; false is a park (cap spent) or a failed round — err is the
+// workflow's return, never dropped.
+func (r *pipelineRun) rebuildRound(finding string, touchesJail bool) (reply activities.AgentRunResult, restart bool, err error) {
+	r.testRebuilds++
+	if r.testRebuilds > maxTestPhaseRebuilds {
+		r.logger.Info("Test phase exceeded the rebuild cap; parking the run")
+		return activities.AgentRunResult{}, false, r.park(fmt.Sprintf("test phase failed to converge — the test review issued rebuild %d and suite green and review approval never coincided; last finding: %s",
+			r.testRebuilds, finding))
+	}
+	r.logger.Info("Test review requested a rebuild; returning to the dev cycle",
+		"Rebuilds", r.testRebuilds, "Of", maxTestPhaseRebuilds)
+	prompt, err := template.Rebuild(finding)
+	if err != nil {
+		return activities.AgentRunResult{}, false, fmt.Errorf("build rebuild prompt: %w", err)
+	}
+	reply, err = r.runAgent(prompt, "rebuild", activities.RoleDev, &r.devSession)
+	if err != nil {
+		return activities.AgentRunResult{}, false, fmt.Errorf("rebuild agent run: %w", err)
+	}
+	if err := r.codeReviewLoop(touchesJail); err != nil {
+		return activities.AgentRunResult{}, false, fmt.Errorf("post-rebuild code review: %w", err)
+	}
+	return reply, true, nil
 }
 
 // FeatureDevWorkflow drives a full issue-development cycle in two
@@ -602,21 +656,6 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return run.codeReviewLoop(touchesJail)
 	}
 
-	// rebuild routes a test-review REBUILD finding back through the dev
-	// cycle: a tight, finding-only prompt into the dev session, then code
-	// review until approved. The test loop resumes afterwards with its own
-	// sessions intact.
-	rebuild := func(finding string) error {
-		prompt, err := template.Rebuild(finding)
-		if err != nil {
-			return fmt.Errorf("build rebuild prompt: %w", err)
-		}
-		if _, err := run.runAgent(prompt, "rebuild", activities.RoleDev, &run.devSession); err != nil {
-			return fmt.Errorf("rebuild agent run: %w", err)
-		}
-		return codeReviewLoop()
-	}
-
 	// Phase 1: implementation ↔ code review, until the reviewer approves.
 	// A continued run opens on the aborted attempt's preserved work.
 	var initialPrompt string
@@ -645,7 +684,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if template.IsTestOnlyHandoff(implReply.Text) {
 		run.logger.Info("Dev session declared the task test-only; asking the code reviewer to confirm")
 		focus := fmt.Sprintf("the implementing session's test-only hand-off claim. The task:\n\n%s\n\nThe implementing session reports the task is entirely test-scoped work: no implementation change is needed, the diff is empty by design, and the work belongs in the pipeline's test phase. Verify the claim against the repository: if an implementation change is in fact needed for this task, request changes and say exactly what it is; if the task genuinely needs only tests, approve the hand-off.", input.Prompt)
-		verdict, err := run.review(focus, "", false, false, "", activities.RoleDevReview, &run.devReviewSession, touchesJail, true)
+		verdict, err := run.review(reviewOpts{focus: focus, role: activities.RoleDevReview, session: &run.devReviewSession, touchesJail: touchesJail, claimReview: true})
 		if err != nil {
 			return "", fmt.Errorf("test-only hand-off review: %w", err)
 		}
@@ -658,7 +697,18 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		if handoff {
 			run.logger.Info("Test-only hand-off confirmed; advancing to the test phase")
 		} else {
-			run.logger.Info("Code review rejected the test-only hand-off; entering the implementation loop")
+			// A rejected hand-off is a review verdict like any other: the
+			// reviewer's findings say exactly what implementation change is
+			// missing, and they ride the ordinary fix round into the dev
+			// session — the edit that produces puts a real diff under the
+			// code review loop below. Entering that loop without the fix
+			// round would open a default review on the still-empty diff,
+			// whose blind-collection contract parks the run instead of
+			// acting on the findings.
+			run.logger.Info("Code review rejected the test-only hand-off; feeding the findings to the dev session")
+			if err := run.devFixRound(verdict.Comments+verdictNote(verdict), touchesJail); err != nil {
+				return "", err
+			}
 		}
 	}
 	if !handoff {
@@ -685,7 +735,6 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("test-phase agent run: %w", err)
 	}
-	rebuilds := 0
 
 	// suiteRound resolves the entrypoint and executes the suite once —
 	// the ground truth a review round is put against.
@@ -708,7 +757,7 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 			session = &run.skillTestReviewSessions[skillIdx]
 			entry = run.input.ReviewSkillList[skillIdx]
 		}
-		return run.review("the test suite", result.Logs, true, false, testerReply.Text, activities.RoleTestReview, session, false, false, entry)
+		return run.review(reviewOpts{focus: "the test suite", testLogs: result.Logs, testsInScope: true, agentReply: testerReply.Text, role: activities.RoleTestReview, session: session, skill: entry})
 	}
 
 	// testFixRound feeds a failed round back to the tester: the red suite
@@ -728,23 +777,17 @@ func FeatureDevWorkflow(ctx workflow.Context, input PipelineInput) (string, erro
 		return nil
 	}
 
-	// rebuildRound spends one REBUILD against the green stage's cap,
-	// routing the finding through the dev cycle (which re-enters the whole
-	// code gate). restart reports whether the test phase must start over;
-	// false is a park (cap spent) or a failed rebuild round — its error is
-	// the workflow's return, never dropped.
+	// rebuildRound spends one REBUILD against the test phase's shared cap
+	// (pipelineRun.rebuildRound): the dev round rides the dev session, the
+	// whole code gate re-reviews its change, and the tester's latest-reply
+	// tracking moves to the rebuild round — the reviewer's next look must
+	// describe the change it is reviewing.
 	rebuildRound := func(finding string) (restart bool, err error) {
-		rebuilds++
-		if rebuilds > maxTestPhaseRebuilds {
-			run.logger.Info("Green stage exceeded the rebuild cap; parking the run")
-			return false, run.park(fmt.Sprintf("green stage failed to converge — the test review issued rebuild %d and suite green and review approval never coincided; last finding: %s",
-				rebuilds, finding))
-		}
-		run.logger.Info("Test review requested a rebuild; returning to the dev cycle",
-			"Rebuilds", rebuilds, "Of", maxTestPhaseRebuilds)
-		if err := rebuild(finding); err != nil {
+		reply, restart, err := run.rebuildRound(finding, touchesJail)
+		if !restart {
 			return false, err
 		}
+		testerReply = reply
 		return true, nil
 	}
 
@@ -841,8 +884,12 @@ testPhase:
 
 // preFlightGate resolves and runs the native suite on the untouched
 // worktree before the first agent round. A red baseline parks the run —
-// no session may start on a failing suite. Uses the same discovery and
-// test-queue execution the test session uses, and returns the resolved
+// no session may start on a failing suite — unless the run's input opts
+// out (PipelineInput.SkipPreflight, `run --skip-preflight`): the opted-in
+// run still executes the suite and records the red result, then opens on
+// it deliberately, the flow's own suite gating expected to carry the fix.
+// Uses the same discovery and test-queue execution the test session
+// uses, and returns the resolved
 // suite command for flows that keep executing it (slim re-runs the same
 // suite per sub-task; the others ignore it). A discovery concluding the
 // repository has no suite at all (activities.ErrNoSuite) passes vacuously:
@@ -891,6 +938,17 @@ func (r *pipelineRun) preFlightGate() (string, error) {
 	}
 	if result.Passed {
 		r.logger.Info("Preflight suite green; opening the first session", "Command", command)
+		return command, nil
+	}
+	// The opted-in run's premise, on record: the red baseline is the
+	// stated reason this run exists, so the gate opens instead of parking.
+	// The suite block above is already in the task log and this line in
+	// the history — the run's record shows it opened on red, and the
+	// flow's own suite gating is what works the baseline's fix into the
+	// green round finalize requires. The done path is unchanged: finalize
+	// still requires a green suite round, so the debt cannot slip through.
+	if r.input.SkipPreflight {
+		r.logger.Info("Preflight suite red; the run's input skips the gate — opening on the unvalidated baseline, the flow's own suite gating covers the fix", "Command", command)
 		return command, nil
 	}
 	r.logger.Info("Preflight suite failed; parking before the first session")

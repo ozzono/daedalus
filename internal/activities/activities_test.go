@@ -343,7 +343,8 @@ func TestPreflightWorktreeRootRejectsBadQueue(t *testing.T) {
 func TestCreateWorktreeActivity(t *testing.T) {
 	home := fakeHome(t)
 	log := newStubLog(t)
-	stubBin(t, "git", "exit 0")
+	stubBin(t, "git", `if [ "$3" = "rev-parse" ]; then printf 'abc123def456\n'; fi
+exit 0`)
 
 	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
 	fakeGitWorktree(t, worktreePath)
@@ -364,6 +365,11 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	if out.WorktreePath != worktreePath {
 		t.Errorf("WorktreePath = %q, want %q", out.WorktreePath, worktreePath)
 	}
+	// The branch's starting sha rides the output — the review rounds'
+	// empty-diff detector anchors on it.
+	if out.BaseHead != "abc123def456" {
+		t.Errorf("BaseHead = %q, want the branch's starting sha", out.BaseHead)
+	}
 
 	// The stale directory must be gone before git worktree add ran.
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
@@ -371,8 +377,8 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 10 {
-		t.Fatalf("git called %d times, want 10 (preserve list, add, commit, checkout probe, drop aborted, rename, remove, prune, stale sweep, worktree add)", len(calls))
+	if len(calls) != 11 {
+		t.Fatalf("git called %d times, want 11 (preserve list, add, commit, checkout probe, drop aborted, rename, remove, prune, stale sweep, worktree add, base sha)", len(calls))
 	}
 	// A stale worktree from a crashed run is preserved, not discarded: its
 	// contents are committed and its branch renamed to aborted/issue-42.
@@ -389,6 +395,38 @@ func TestCreateWorktreeActivity(t *testing.T) {
 	assertArgs(t, calls[7].Args, []string{"-C", "/repo", "worktree", "prune"}, "pre-clean prune")
 	assertArgs(t, calls[8].Args, []string{"-C", "/repo", "branch", "--list", "feat/issue-42-*", "--format=%(refname:short)"}, "pre-clean stale branch sweep")
 	assertArgs(t, calls[9].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123"}, "worktree add")
+	assertArgs(t, calls[10].Args, []string{"-C", worktreePath, "rev-parse", "--verify", "-q", "HEAD"}, "base sha record")
+}
+
+// TestCreateWorktreeActivityUnbornHeadLeavesBaseUnrecorded pins the degrade:
+// a zero-commit repo's worktree has no HEAD to resolve (`worktree add -b`
+// infers --orphan), the base sha stays unrecorded, and the creation itself
+// still succeeds — the empty-diff detector is an addition, never a
+// creation failure.
+func TestCreateWorktreeActivityUnbornHeadLeavesBaseUnrecorded(t *testing.T) {
+	home := fakeHome(t)
+	newStubLog(t)
+	stubBin(t, "git", `if [ "$3" = "rev-parse" ]; then exit 1; fi
+exit 0`)
+
+	worktreePath := filepath.Join(home, ".daedalus", "worktrees", "daedalus", "issue-42")
+	fakeGitWorktree(t, worktreePath)
+
+	out, err := CreateWorktreeActivity(context.Background(), WorktreeInput{
+		RepoPath:   "/repo",
+		TaskQueue:  "daedalus",
+		IssueID:    "42",
+		BranchName: "feat/issue-42-123",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktreeActivity must succeed without a resolvable HEAD: %v", err)
+	}
+	if out.WorktreePath != worktreePath {
+		t.Errorf("WorktreePath = %q, want %q", out.WorktreePath, worktreePath)
+	}
+	if out.BaseHead != "" {
+		t.Errorf("BaseHead = %q, want empty (an unborn HEAD has no sha to record)", out.BaseHead)
+	}
 }
 
 // TestCreateWorktreeFromAbortedBase pins the continued-run path: the new
@@ -411,11 +449,12 @@ func TestCreateWorktreeFromAbortedBase(t *testing.T) {
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 6 {
-		t.Fatalf("git called %d times, want 6 (preserve list, remove, prune, stale sweep, add, drop base)", len(calls))
+	if len(calls) != 7 {
+		t.Fatalf("git called %d times, want 7 (preserve list, remove, prune, stale sweep, add, drop base, base sha)", len(calls))
 	}
 	assertArgs(t, calls[4].Args, []string{"-C", "/repo", "worktree", "add", worktreePath, "-b", "feat/issue-42-123", "aborted/issue-42"}, "worktree add from base")
 	assertArgs(t, calls[5].Args, []string{"-C", "/repo", "branch", "-D", "aborted/issue-42"}, "drop consumed base")
+	assertArgs(t, calls[6].Args, []string{"-C", worktreePath, "rev-parse", "--verify", "-q", "HEAD"}, "base sha record")
 }
 
 // TestAuthorshipIdentityForced pins the authorship opt-in: with
@@ -482,8 +521,8 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 10 {
-		t.Fatalf("git called %d times, want 10", len(calls))
+	if len(calls) != 11 {
+		t.Fatalf("git called %d times, want 11", len(calls))
 	}
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Errorf("stale directory should be removed even when git remove failed (stat err = %v)", err)

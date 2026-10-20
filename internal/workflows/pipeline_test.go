@@ -408,6 +408,69 @@ func TestFeatureDevWorkflowHandoffClaimReview(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowHandoffRejectionFeedsFindingsToDev pins the
+// rejected-hand-off path: the confirmation round's findings ride the
+// ordinary dev fix round — the edit that produces puts a real diff under
+// the code review loop — instead of the loop opening a default review on
+// the still-empty diff, and the phase-2 opener is the diff-framed tests
+// prompt (there is no confirmed claim to frame the task from).
+func TestFeatureDevWorkflowHandoffRejectionFeedsFindingsToDev(t *testing.T) {
+	t.Setenv(config.BugDirEnv, "")
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env, script: []agentStep{
+		{result: activities.AgentRunResult{Text: "investigated the task; only tests are needed\n" + template.TestOnlyHandoff}},
+	}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, script: []reviewStep{
+		{result: activities.ReviewResult{Approved: false, Comments: "the handler still needs its change: return the error"}},
+	}, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	stubTestPhase(env)
+
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (implement, dev fix on the rejection, tests)", len(rec.inputs))
+	}
+	wantFix, err := template.ImplementFix("the handler still needs its change: return the error", template.Jail{})
+	if err != nil {
+		t.Fatalf("build expected fix prompt: %v", err)
+	}
+	if rec.inputs[1].Prompt != wantFix {
+		t.Errorf("fix prompt = %q, want the rejection findings fed to the dev session", rec.inputs[1].Prompt)
+	}
+	want, err := template.Tests("")
+	if err != nil {
+		t.Fatalf("build expected tests prompt: %v", err)
+	}
+	if rec.inputs[2].Prompt != want {
+		t.Errorf("test-phase prompt = %q, want the diff-framed opener after a rejected hand-off", rec.inputs[2].Prompt)
+	}
+	if len(rev.inputs) != 3 {
+		t.Fatalf("reviewer ran %d times, want 3 (claim rejection, code review of the fix, test review)", len(rev.inputs))
+	}
+	if !rev.inputs[0].ClaimReview {
+		t.Error("first review ClaimReview = false, want the hand-off confirmation")
+	}
+	if rev.inputs[1].ClaimReview || rev.inputs[1].Focus != "the implementation" {
+		t.Errorf("second review = (claim %v, focus %q), want the ordinary implementation review of the fixed state",
+			rev.inputs[1].ClaimReview, rev.inputs[1].Focus)
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowBugDirPrompt pins the env channel the bug-filing
 // toggle travels on: the workflow reads DAEDALUS_BUG_DIR from the worker
 // process (exported at startup iff bug_filing is enabled — never workflow
@@ -3064,7 +3127,7 @@ func TestFeatureDevWorkflowRebuildCapParks(t *testing.T) {
 	}
 	for _, want := range []string{
 		ErrAwaitingMaintainer.Error(),
-		"green stage failed to converge",
+		"test phase failed to converge",
 		"issued rebuild 9",
 		"the handler still drops the error path on the ninth pass",
 	} {

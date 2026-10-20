@@ -803,6 +803,12 @@ func TestIsTestOnlyHandoff(t *testing.T) {
 		{TestOnlyHandoff + " would end this\nbut more work happened", false},
 		{"investigated the task\nTEST ONLY HANDOFF", false},
 		{"investigated the task\n**" + TestOnlyHandoff + "** — thanks", false},
+		// Emptiness is decided on the raw line: a trailing *** divider is
+		// non-empty text, so a marker above it is not the reply's end —
+		// stripping before the check would let the divider pass for
+		// nothing and parse the marker as the hand-off.
+		{"investigated the task\n" + TestOnlyHandoff + "\n***", false},
+		{"investigated the task\n***", false},
 		{"", false},
 	} {
 		if got := IsTestOnlyHandoff(c.reply); got != c.want {

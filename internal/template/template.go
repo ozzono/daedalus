@@ -518,11 +518,17 @@ const TestOnlyHandoff = "TEST-ONLY HANDOFF"
 func IsTestOnlyHandoff(reply string) bool {
 	lines := strings.Split(strings.TrimSpace(reply), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(strings.ReplaceAll(lines[i], "*", ""))
+		// Emptiness is decided on the raw line: a `***` divider is
+		// non-empty text, not nothing — stripping its asterisks before
+		// the check would make the divider invisible and let a hand-off
+		// marker above a trailing divider parse as the reply's end.
+		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
 		}
-		return line == TestOnlyHandoff
+		// Decoration stripping applies to the comparison only: the
+		// emphasized form ("**TEST-ONLY HANDOFF**") means the hand-off.
+		return strings.ReplaceAll(line, "*", "") == TestOnlyHandoff
 	}
 	return false
 }

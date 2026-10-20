@@ -166,35 +166,46 @@ if(ddi){
    across the interval instead of stepping once a second, with the
    seconds left rendered inside it. A paused ring holds full and amber
    with the pause glyph; a feed that stops answering lets the ring empty
-   — the honest stall signal. */
+   — the honest stall signal. A page nothing polls (the wrap carries the
+   ddLive guard's hidden class) stops the loop outright — a hidden widget
+   gets no frames, and the script's boot line below restarts it when a
+   swap brings a poll region back — instead of paying 60 no-op reschedules
+   a second on pages that never poll. */
 var ddC=2*Math.PI*8;
-if(!window.__ddRaf){
- var ddFrame=function(){
-  window.__ddRaf=requestAnimationFrame(ddFrame);
-  var el=document.getElementById('cd');
-  if(!el)return;
-  var num=document.getElementById('cdn'),picon=document.getElementById('cdp'),btn=document.getElementById('cdw');
-  if(__ddPoll.paused){
-   el.classList.remove('stroke-emerald-700','dark:stroke-emerald-400');
-   el.classList.add('stroke-amber-600');
-   el.setAttribute('stroke-dashoffset',0);
-   if(num)num.textContent='';
-   if(picon)picon.classList.remove('hidden');
-   if(btn)btn.setAttribute('aria-pressed','false');
-   return;
-  }
-  el.classList.remove('stroke-amber-600');
-  el.classList.add('stroke-emerald-700','dark:stroke-emerald-400');
-  if(picon)picon.classList.add('hidden');
-  if(btn)btn.setAttribute('aria-pressed','true');
-  var left=__ddPoll.dl-Date.now();
-  var frac=Math.max(0,Math.min(1,left/__ddPoll.iv));
-  el.setAttribute('stroke-dasharray',ddC);
-  el.setAttribute('stroke-dashoffset',ddC*(1-frac));
-  if(num)num.textContent=String(Math.max(0,Math.ceil(left/1000)));
- };
+var ddFrame=function(){
+ var wrap=document.getElementById('cdw-wrap');
+ if(!wrap||wrap.classList.contains('hidden')){
+  window.__ddRaf=0;
+  return;
+ }
  window.__ddRaf=requestAnimationFrame(ddFrame);
-}
+ var el=document.getElementById('cd');
+ if(!el)return;
+ var num=document.getElementById('cdn'),picon=document.getElementById('cdp'),btn=document.getElementById('cdw');
+ if(__ddPoll.paused){
+  el.classList.remove('stroke-emerald-700','dark:stroke-emerald-400');
+  el.classList.add('stroke-amber-600');
+  el.setAttribute('stroke-dashoffset',0);
+  if(num)num.textContent='';
+  if(picon)picon.classList.remove('hidden');
+  if(btn)btn.setAttribute('aria-pressed','false');
+  return;
+ }
+ el.classList.remove('stroke-amber-600');
+ el.classList.add('stroke-emerald-700','dark:stroke-emerald-400');
+ if(picon)picon.classList.add('hidden');
+ if(btn)btn.setAttribute('aria-pressed','true');
+ var left=__ddPoll.dl-Date.now();
+ var frac=Math.max(0,Math.min(1,left/__ddPoll.iv));
+ el.setAttribute('stroke-dasharray',ddC);
+ el.setAttribute('stroke-dashoffset',ddC*(1-frac));
+ if(num)num.textContent=String(Math.max(0,Math.ceil(left/1000)));
+};
+/* boot (re)start: the loop only idles as 0 when the last frame stopped it
+   on a non-polling page, and every boosted swap re-runs this script — so
+   this line is what carries the loop across a navigation onto a polling
+   page. */
+if(!window.__ddRaf)window.__ddRaf=requestAnimationFrame(ddFrame);
 /* document-level htmx listeners register once — this script re-runs on
    every boosted swap, and a listener per swap accumulates. */
 if(!window.__ddWired){

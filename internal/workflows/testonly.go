@@ -15,8 +15,12 @@ import (
 // cannot apply because the fix is an implementation change — spends a
 // capped rebuild round: a dev-role agent run on the finding, the flow's
 // one dev-code path, its result gated by the code reviewer before the
-// test loop resumes with the widened write scope the rebuilt state needs.
-// Only a spent cap parks the run for the maintainer. Suite executions
+// test loop resumes. AllowedPaths is solely the finalize scope check's
+// policy — nothing reads it mid-round, so the tester's fencing is
+// prompt-level — and one rebuild lifts the check for the rest of the
+// run: the approved implementation change rides the working tree, and
+// that wholesale lift is the price of the rebuild path. Only a spent
+// cap parks the run for the maintainer. Suite executions
 // record Go statement coverage, and the reviewer sees the delta across
 // rounds.
 func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
@@ -54,7 +58,6 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 	// lastCoverage is the previous round's recorded coverage, so the
 	// reviewer sees the delta, not just the level.
 	lastCoverage := ""
-	rebuilds := 0
 	for {
 		command, err := run.resolveTestCommand()
 		if err != nil {
@@ -68,7 +71,7 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 		if result.Coverage != "" {
 			lastCoverage = result.Coverage
 		}
-		verdict, err := run.review("the test suite", logs, true, false, testerReply.Text, activities.RoleTestReview, &run.testReviewSession, false, false)
+		verdict, err := run.review(reviewOpts{focus: "the test suite", testLogs: logs, testsInScope: true, agentReply: testerReply.Text, role: activities.RoleTestReview, session: &run.testReviewSession})
 		if err != nil {
 			return "", fmt.Errorf("test review: %w", err)
 		}
@@ -79,43 +82,38 @@ func TestOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 		}
 		if verdict.Rebuild {
 			// The rebuild round is the flow's one dev-code path, budgeted
-			// like the feature-dev green stage: a dev-role agent run on the
-			// finding, then the test loop resumes. Widening the run's write
-			// scope here is what lets the rebuilt state — implementation
-			// fix included — pass the finalize gate; the mutation rides the
-			// verdict, so replay is deterministic.
-			rebuilds++
-			if rebuilds > maxTestPhaseRebuilds {
-				run.logger.Info("Test phase exceeded the rebuild cap; parking the run")
-				return "", run.park(fmt.Sprintf("test phase failed to converge — the test review issued rebuild %d and its approval never coincided with a green suite; last finding: %s",
-					rebuilds, verdict.Comments))
-			}
-			run.logger.Info("Test review requested a rebuild; running a dev round on the finding",
-				"Rebuilds", rebuilds, "Of", maxTestPhaseRebuilds)
-			run.input.AllowedPaths = nil
-			prompt, err := template.Rebuild(verdict.Comments)
-			if err != nil {
-				return "", fmt.Errorf("build rebuild prompt: %w", err)
-			}
-			rebuildReply, err := run.runAgent(prompt, "rebuild", activities.RoleDev, &run.devSession)
-			if err != nil {
-				return "", fmt.Errorf("rebuild agent run: %w", err)
+			// like the feature-dev green stage (pipelineRun.rebuildRound):
+			// a dev-role agent run on the finding, its change gated by the
+			// full code review loop, then the test loop resumes. The dev
+			// round's write fencing is prompt-level only: AllowedPaths has
+			// no mid-run consumer — its one read is the finalize scope
+			// check. The rebuild rides the verdict, so replay is
+			// deterministic.
+			reply, restart, rerr := run.rebuildRound(verdict.Comments, false)
+			if !restart {
+				return "", rerr
 			}
 			// The rebuild round's reply is what the test reviewer next sees
 			// as the latest reply: quoting the pre-rebuild tester here would
 			// describe a change the reviewer is not looking at.
-			testerReply = rebuildReply
-			// The rebuild's implementation change is unreviewed code until
-			// the code reviewer approves it — the same gate feature-dev's
-			// REBUILD path passes through, keeping "merged work is approved
-			// work" true across the flow's one dev-code path.
-			if err := run.codeReviewLoop(false); err != nil {
-				return "", fmt.Errorf("post-rebuild code review: %w", err)
-			}
+			testerReply = reply
 			continue
 		}
 		if result.Passed && verdict.Approved {
 			run.logger.Info("Tests pass and test review approved")
+			if run.testRebuilds > 0 {
+				// A rebuild's approved implementation change is still
+				// working-tree state at finalize — rounds never commit —
+				// and the test-path-only scope check would park the run
+				// on it. The lift is per-run, not per-change: from the
+				// first rebuild on, the structural check is skipped for
+				// the whole tree (an empty scope short-circuits it), so
+				// every later edit — the code-reviewed change included —
+				// finalizes unchecked. That is the price of letting the
+				// rebuild's implementation change through; with no
+				// rebuild the check runs as always.
+				run.input.AllowedPaths = nil
+			}
 			if err := run.checkWriteScope(); err != nil {
 				return "", err
 			}

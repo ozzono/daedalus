@@ -9,7 +9,7 @@ USAGE
 
 WORKFLOW COMMANDS
   run         Start an implementation pipeline for an issue
-              flags: -w -d -p -cli -folder -dep -f -a
+              flags: -w -d -p -cli -folder -dep -f -a --skip-preflight
   continue    Resume a closed, failed, or parked session
               flags: -d
   guide       Send operator instructions to a running pipeline
@@ -70,7 +70,7 @@ var commandHelp = map[string]string{
 	"run": `daedalus run — start an implementation pipeline for an issue.
 
 USAGE
-  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] [-dep workflow-id] <repo-path> <issue-id> "<prompt>"
+  daedalus [-c config.yaml] [-w workflow] run [-d] [-p prefix] [-cli agent] [-dep workflow-id] [--skip-preflight] <repo-path> <issue-id> "<prompt>"
   daedalus [-c config.yaml] run -a <workflow-id> ["<prompt>"]   (append mode)
 
 ARGUMENTS
@@ -154,6 +154,16 @@ FLAGS
                           a raw git error (its preserved branch exists only
                           in its own repo).
                           Fresh runs only — rejected in append mode.
+  --skip-preflight        Open the run even when the preflight gate's baseline
+                          suite is red: the suite still runs and the red result
+                          stays on record (task log + history), but the run
+                          proceeds instead of parking — a red baseline is the
+                          run's stated premise, and the flow's own suite
+                          gating is the expected route for the fix it calls
+                          for. Landing the run still requires a green suite:
+                          finalize is unchanged. Default runs (no flag) park on
+                          a red baseline, as before. Fresh runs only —
+                          rejected in append mode.
   -f, --file <path>       Read the task description from a file. A glob pattern
                           (e.g. notes/*.md) expands to every matching file,
                           concatenated in lexical order. The file's containing

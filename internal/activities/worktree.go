@@ -55,6 +55,15 @@ type WorktreeInput struct {
 // WorktreeOutput reports the location of a created worktree.
 type WorktreeOutput struct {
 	WorktreePath string
+	// BaseHead is the sha the branch started from — repo HEAD for a fresh
+	// run, the aborted ref's tip for a continue — recorded here so every
+	// review round can tell a legitimately-empty diff (HEAD still at
+	// base, nothing changed) from a blind one (HEAD past base, the work
+	// committed beyond the collection's reach; the review input's
+	// BaseHead carries it onward). Empty means unrecorded: a zero-commit
+	// repo's unborn HEAD has no sha, and the empty-diff detector stays
+	// off — there is nothing there to be blind to.
+	BaseHead string
 }
 
 // commitAuthorArgs prefixes a git invocation with the forced "daedalus
@@ -558,7 +567,23 @@ func CreateWorktreeActivity(ctx context.Context, input WorktreeInput) (WorktreeO
 		_, _ = runGit(ctx, "-C", input.RepoPath, "branch", "-D", input.BaseBranch)
 	}
 
-	return WorktreeOutput{WorktreePath: worktreePath}, nil
+	// Record the branch's starting sha — the empty-diff detector's anchor
+	// for every review this run schedules. An unborn HEAD (a zero-commit
+	// repo's `worktree add -b` infers --orphan) has no sha to record: the
+	// field stays empty and the detector stays off. That degrade is
+	// forced — the empty field is shared with legacy pre-field worktrees,
+	// so the two cases are indistinguishable at the guard — and it has a
+	// real gap, not an exact one: on such a worktree a round that commits
+	// moves HEAD off nothing while the base stays unrecorded, the exact
+	// blind state the detector exists for. The residual is noted in the
+	// detector's record. The creation itself never fails on this: the
+	// detector is an addition, and a worktree without a recordable base
+	// must keep working exactly as before.
+	out, err := runGit(ctx, "-C", worktreePath, "rev-parse", "--verify", "-q", "HEAD")
+	if err != nil {
+		return WorktreeOutput{WorktreePath: worktreePath}, nil
+	}
+	return WorktreeOutput{WorktreePath: worktreePath, BaseHead: strings.TrimSpace(out)}, nil
 }
 
 // FinalizeWorktreeActivity commits the approved work and renames the run's
