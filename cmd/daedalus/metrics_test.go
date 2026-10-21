@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -235,6 +236,51 @@ func TestMetricsStop(t *testing.T) {
 			t.Errorf("stale pid file survived the stop: %v", err)
 		}
 	})
+
+	// The workerStop twin's guard: a stop racing a concurrent restart —
+	// the pid file rewritten mid-wait to name the replacement daemon —
+	// must leave the replacement's record alone; the unlink happens only
+	// while the file still names the pid that was signaled.
+	t.Run("a replacement's pid file survives the stop", func(t *testing.T) {
+		useDaemonDir(t)
+		replacement := sleepIgnoring(t, "TERM")
+		marker := filepath.Join(t.TempDir(), "signaled")
+		old := termTrappedChild(t, marker)
+		pidFile, _, _ := metricsPaths()
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(old)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		out := captureStdout(t, func() {
+			errc := make(chan error, 1)
+			go func() { errc <- metricsStop() }()
+			awaitMarker(t, marker)
+			if err := os.WriteFile(pidFile, []byte(strconv.Itoa(replacement)), 0o644); err != nil {
+				t.Error(err)
+			}
+			select {
+			case stopErr := <-errc:
+				if stopErr != nil {
+					t.Errorf("metricsStop: %v", stopErr)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("metricsStop never returned — it waited on the wrong pid")
+			}
+		})
+		if !strings.Contains(out, "metrics daemon stopped (pid "+strconv.Itoa(old)+")") {
+			t.Errorf("stop output %q, want the old daemon's stopped line", out)
+		}
+		b, err := os.ReadFile(pidFile)
+		if err != nil {
+			t.Fatalf("the replacement's pid file vanished during the stop: %v", err)
+		}
+		if got, _ := strconv.Atoi(strings.TrimSpace(string(b))); got != replacement {
+			t.Errorf("pid file holds %d — a stop must never unname its replacement", got)
+		}
+		if !stillAlive(t, replacement) {
+			t.Error("the replacement died during the stop — it was signaled")
+		}
+	})
 }
 
 // TestMetricsGateCheck pins the boot gate: a metrics-enabled worker
@@ -448,6 +494,86 @@ func TestMetricsRegister(t *testing.T) {
 		t.Setenv("ANTHROPIC_BASE_URL", "https://a.example")
 		if err := metricsRegister(config.Config{WorkerID: "w1"}, "http://127.0.0.1:1", "worker-minted-tok"); err == nil {
 			t.Error("metricsRegister against a dead daemon: nil, want the dial error")
+		}
+	})
+}
+
+// TestMetricsRegisterBootRetry pins the restart-TTL wedge's fix at the boot
+// call site: a 409 name conflict — a worker restarted inside the
+// registration TTL, the dead process's entry still held — no longer exits
+// the replacement daemon; the boot retries on its tick until the entry can
+// have lapsed (the budget: the TTL plus two heartbeat intervals), printing
+// the remedy once. The raw register stays single-attempt — that is the
+// property the heartbeat call site leans on (a conflict there is logged and
+// left to the next tick) — and a non-conflict refusal fails the boot
+// immediately, the budget never spent on it.
+func TestMetricsRegisterBootRetry(t *testing.T) {
+	t.Setenv("ANTHROPIC_BASE_URL", "https://a.example")
+	if metricsRegistrationRetryWait != metricsRegistrationTTL+2*metricsHeartbeatInterval {
+		t.Errorf("retry budget = %s, want the TTL plus two heartbeat intervals (%s)",
+			metricsRegistrationRetryWait, metricsRegistrationTTL+2*metricsHeartbeatInterval)
+	}
+
+	t.Run("the raw register returns the conflict immediately", func(t *testing.T) {
+		attempts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			http.Error(w, `metricsrelay: worker "w1" is already registered`, http.StatusConflict)
+		}))
+		defer srv.Close()
+		err := metricsRegister(config.Config{WorkerID: "w1"}, srv.URL, "worker-minted-tok")
+		if !errors.Is(err, errRegistrationConflict) {
+			t.Fatalf("metricsRegister = %v, want it to carry errRegistrationConflict", err)
+		}
+		if attempts != 1 {
+			t.Errorf("raw register made %d attempts, want 1 — the heartbeat path must never retry in place", attempts)
+		}
+	})
+
+	t.Run("the boot retries a conflict to success", func(t *testing.T) {
+		attempts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			if attempts <= 2 {
+				http.Error(w, `metricsrelay: worker "w1" is already registered`, http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+		out := captureStdout(t, func() {
+			if err := metricsRegisterBootRetry(config.Config{WorkerID: "w1"}, srv.URL, "worker-minted-tok"); err != nil {
+				t.Errorf("metricsRegisterBootRetry: %v", err)
+			}
+		})
+		if attempts != 3 {
+			t.Errorf("boot made %d attempts, want the two conflicts retried then the success", attempts)
+		}
+		// The remedy prints once, so the boot log carries the reason
+		// without spamming the wait.
+		if got := strings.Count(out, "retrying boot registration"); got != 1 {
+			t.Errorf("boot output %q names the retry %d times, want once", out, got)
+		}
+	})
+
+	t.Run("a non-conflict refusal returns immediately", func(t *testing.T) {
+		attempts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			http.Error(w, "metricsrelay: registration needs worker and at least one upstream", http.StatusBadRequest)
+		}))
+		defer srv.Close()
+		out := captureStdout(t, func() {
+			err := metricsRegisterBootRetry(config.Config{WorkerID: "w1"}, srv.URL, "worker-minted-tok")
+			if err == nil || !strings.Contains(err.Error(), "registration refused") {
+				t.Errorf("metricsRegisterBootRetry = %v, want the refusal surfaced", err)
+			}
+		})
+		if attempts != 1 {
+			t.Errorf("boot made %d attempts on a non-conflict refusal, want 1 — the budget is not for this", attempts)
+		}
+		if strings.Contains(out, "retrying boot registration") {
+			t.Errorf("boot output %q must not announce a retry it never makes", out)
 		}
 	})
 }

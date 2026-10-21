@@ -375,6 +375,65 @@ func TestFoldUsageRows(t *testing.T) {
 	}
 }
 
+// TestLatencyDur pins the usage tables' latency formatter: per-call figures
+// round to milliseconds under a second — whole-second rounding collapses
+// fast calls into fabricated zeros (a 400ms p50 reading "0s") — and defer
+// to the runs-table humanizer above it at a second and beyond.
+func TestLatencyDur(t *testing.T) {
+	for _, c := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0s"}, // a genuine zero recording reads as one
+		{100 * time.Millisecond, "100ms"},
+		{400 * time.Millisecond, "400ms"},
+		{999 * time.Millisecond, "999ms"},
+		{time.Second, "1s"},             // the boundary defers to dur
+		{1500 * time.Millisecond, "2s"}, // dur's whole-second rounding
+		{90 * time.Second, "1m30s"},
+	} {
+		if got := latencyDur(c.d); got != c.want {
+			t.Errorf("latencyDur(%s) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
+// TestFoldUsageSubSecondLatencies pins the P50/P95 columns routing through
+// the latency formatter: the sub-second tail renders as measured — the
+// nearest-rank percentiles of the 100/200/300ms shape land at 200ms/300ms,
+// not the "0s" a whole-second render fabricated — while a row whose p95
+// crosses a second keeps the runs-table humanizer above it.
+func TestFoldUsageSubSecondLatencies(t *testing.T) {
+	now := time.Now()
+	entries := []metricsrelay.Entry{
+		{At: now.Add(-3 * time.Second), Worker: "w", Wire: metricsrelay.WireOpenAI, Model: "fast",
+			DurationMS: 100, Status: 200},
+		{At: now.Add(-2 * time.Second), Worker: "w", Wire: metricsrelay.WireOpenAI, Model: "fast",
+			DurationMS: 200, Status: 200},
+		{At: now.Add(-1 * time.Second), Worker: "w", Wire: metricsrelay.WireOpenAI, Model: "fast",
+			DurationMS: 300, Status: 200},
+		{At: now.Add(-4 * time.Second), Worker: "w", Wire: metricsrelay.WireOpenAI, Model: "mixed",
+			DurationMS: 100, Status: 200},
+		{At: now.Add(-5 * time.Second), Worker: "w", Wire: metricsrelay.WireOpenAI, Model: "mixed",
+			DurationMS: 1500, Status: 200},
+	}
+	rows := foldUsage(entries, now, nil, usageModelKey)
+	if len(rows) != 2 {
+		t.Fatalf("foldUsage = %d rows, want 2 (fast, mixed)", len(rows))
+	}
+	if rows[0].Key != "fast" {
+		t.Fatalf("first row = %q, want fast (most calls)", rows[0].Key)
+	}
+	if rows[0].P50 != "200ms" || rows[0].P95 != "300ms" {
+		t.Errorf("fast latencies = %q / %q, want 200ms / 300ms", rows[0].P50, rows[0].P95)
+	}
+	// mixed: sorted [100, 1500] — p50 = 100ms, p95 = the 1500ms tail,
+	// which dur renders at whole-second scale.
+	if rows[1].P50 != "100ms" || rows[1].P95 != "2s" {
+		t.Errorf("mixed latencies = %q / %q, want 100ms / 2s", rows[1].P50, rows[1].P95)
+	}
+}
+
 // TestFoldLoopsAverages pins the loop tiles' fold: per keyed run, the gap
 // from the last implementation call to the first matching review — first
 // review only (later review rounds would skew the reading) and the

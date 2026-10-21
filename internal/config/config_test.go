@@ -3235,8 +3235,9 @@ func TestLoadRawProviderRawView(t *testing.T) {
 // TestRenderYAMLProvider pins the section's `daedalus config` render: it
 // prints between openai: and fallback: with the fields in struct order and
 // the key unredacted, and the output round-trips to the same section. A
-// config without the section renders the nil pointer as `provider: null`
-// and reloads provider-less, so a legacy config's render stays a legacy
+// config without the section renders provider-less — the defaulted pointer
+// key renders absent, never `provider: null`, a shape no config line means
+// — and reloads provider-less, so a legacy config's render stays a legacy
 // config.
 func TestRenderYAMLProvider(t *testing.T) {
 	// The durations are pinned because the render of an unset duration is a
@@ -3294,8 +3295,8 @@ func TestRenderYAMLProvider(t *testing.T) {
 		t.Errorf("RenderYAML round-trip =\n%s\nwant\n%s", roundTrip, out)
 	}
 
-	// The unset render reloads provider-less (same duration pinning as
-	// above).
+	// The unset render is provider-less: the defaulted pointer key renders
+	// absent (same duration pinning as above).
 	emptyRaw, err := LoadRaw(writeConfig(t, "tests_timeout: 45m\nagent_run_timeout: 30m\nreview_timeout: 15m\ncleanup_timeout: 5m\n"))
 	if err != nil {
 		t.Fatalf("LoadRaw(empty): %v", err)
@@ -3304,8 +3305,8 @@ func TestRenderYAMLProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderYAML(empty): %v", err)
 	}
-	if !strings.Contains(empty, "provider: null") {
-		t.Errorf("RenderYAML(empty) is missing the nil provider line:\n%s", empty)
+	if strings.Contains(empty, "provider") {
+		t.Errorf("RenderYAML(empty) prints the unset provider:\n%s", empty)
 	}
 	reloaded, err := Load(writeConfig(t, empty))
 	if err != nil {
@@ -3314,6 +3315,81 @@ func TestRenderYAMLProvider(t *testing.T) {
 	if reloaded.Provider != nil {
 		t.Errorf("reloaded Provider = %+v, want nil (the render of a legacy config stays legacy)", reloaded.Provider)
 	}
+}
+
+// TestRenderYAMLDefaultedPointerKeys pins the omitempty family's render
+// contract: a defaulted pointer key unset renders absent — `key: null` is
+// a shape no config line means — while an explicit false renders and
+// round-trips as the opt-out it is. Covers every defaulted pointer key the
+// render can print (shared_test_queue, provider, dependency.enabled,
+// dependency.skip_parked) beyond the metrics sibling
+// TestRenderYAMLMetricsEnabledContract and the provider section
+// TestRenderYAMLProvider pin alone.
+func TestRenderYAMLDefaultedPointerKeys(t *testing.T) {
+	// The durations are pinned because the render of an unset duration is
+	// a bare 0, which Load's time.Duration decode rejects outright (filed
+	// separately) — the round trips here must not stand on that bug.
+	const durations = "tests_timeout: 45m\nagent_run_timeout: 30m\nreview_timeout: 15m\ncleanup_timeout: 5m\n"
+
+	t.Run("unset keys render absent", func(t *testing.T) {
+		raw, err := LoadRaw(writeConfig(t, durations+"dependency:\n  skip_failed: true\n"))
+		if err != nil {
+			t.Fatalf("LoadRaw: %v", err)
+		}
+		out, err := raw.RenderYAML()
+		if err != nil {
+			t.Fatalf("RenderYAML: %v", err)
+		}
+		for _, key := range []string{"shared_test_queue", "provider"} {
+			if strings.Contains(out, key) {
+				t.Errorf("RenderYAML output prints the unset %s:\n%s", key, out)
+			}
+		}
+		if !strings.Contains(out, "dependency:") {
+			t.Fatalf("RenderYAML output dropped the dependency section:\n%s", out)
+		}
+		dep := out[strings.Index(out, "dependency:"):]
+		for _, key := range []string{"enabled", "skip_parked"} {
+			if strings.Contains(dep, key) {
+				t.Errorf("RenderYAML output prints the unset dependency.%s:\n%s", key, out)
+			}
+		}
+	})
+
+	t.Run("explicit false renders and round-trips", func(t *testing.T) {
+		raw, err := LoadRaw(writeConfig(t, durations+
+			"shared_test_queue: false\n"+
+			"provider:\n  type: openai\n  url: https://o.example\n"+
+			"dependency:\n  enabled: false\n  skip_parked: false\n"))
+		if err != nil {
+			t.Fatalf("LoadRaw: %v", err)
+		}
+		out, err := raw.RenderYAML()
+		if err != nil {
+			t.Fatalf("RenderYAML: %v", err)
+		}
+		for _, key := range []string{"shared_test_queue: false", "enabled: false", "skip_parked: false"} {
+			if !strings.Contains(out, key) {
+				t.Errorf("RenderYAML output is missing the explicit opt-out %q:\n%s", key, out)
+			}
+		}
+		back, err := Load(writeConfig(t, out))
+		if err != nil {
+			t.Fatalf("Load(render): %v\n%s", err, out)
+		}
+		if back.SharedTestQueue == nil || *back.SharedTestQueue {
+			t.Errorf("round-trip SharedTestQueue = %v, want an explicit false", back.SharedTestQueue)
+		}
+		if back.Dependency.Enabled == nil || *back.Dependency.Enabled {
+			t.Errorf("round-trip Dependency.Enabled = %v, want an explicit false", back.Dependency.Enabled)
+		}
+		if back.Dependency.SkipParked == nil || *back.Dependency.SkipParked {
+			t.Errorf("round-trip Dependency.SkipParked = %v, want an explicit false", back.Dependency.SkipParked)
+		}
+		if back.Provider == nil || *back.Provider != *raw.Provider {
+			t.Errorf("round-trip Provider = %+v, want %+v", back.Provider, raw.Provider)
+		}
+	})
 }
 
 // TestLoadMid pins the mid toggle's load contract: the boolean decodes both

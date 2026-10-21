@@ -738,7 +738,7 @@ type DependencyConfig struct {
 	// refusal whatever the other fields say. Default true; tri-state
 	// (*bool) because applyDefaults cannot tell an explicit false from an
 	// unset field — the same idiom as SharedTestQueue.
-	Enabled *bool `yaml:"enabled"`
+	Enabled *bool `yaml:"enabled,omitempty"`
 	// FallbackBranch names the branch a released run starts its worktree
 	// from. Empty — the default — means the invocation branch, resolved
 	// once at submit against the run's repo (a detached HEAD refuses with
@@ -753,7 +753,7 @@ type DependencyConfig struct {
 	// continue`). Default true — a parked dependency is the one stopped
 	// state whose work survives, so its dependent is routinely started
 	// rather than stranded; tri-state like Enabled for the same reason.
-	SkipParked *bool `yaml:"skip_parked"`
+	SkipParked *bool `yaml:"skip_parked,omitempty"`
 	// SkipFailed releases past a dependency whose workflow failed. Default
 	// false: a failed dependency produced nothing to build on.
 	SkipFailed bool `yaml:"skip_failed"`
@@ -901,10 +901,9 @@ type MetricsConfig struct {
 	// it, and stages the relay URL into jailed rounds. omitempty is the
 	// render contract (RenderYAML): an unset key renders absent —
 	// marshaling the nil pointer would print `enabled: null`, a shape
-	// no config line means. The repo's two other defaulted pointer keys
-	// still have that wart (shared_test_queue, dependency.enabled;
-	// backlog/bugs/config-render-defaulted-pointer-keys-emit-null.md) —
-	// this field is fixed, not the family.
+	// no config line means. Every defaulted pointer key the render can
+	// print carries omitempty now too (shared_test_queue, provider,
+	// dependency.enabled, dependency.skip_parked).
 	Enabled *bool `yaml:"enabled,omitempty"`
 	// Port is the daemon's UI listener (the dashboard mux). Zero (unset)
 	// defaults to DefaultMetricsUIPort; equal to relay_port is a load
@@ -1212,13 +1211,13 @@ type renderConfig struct {
 	MaxConcurrentAgentRuns int                 `yaml:"max_concurrent_agent_runs"`
 	MaxRequestsPerMinute   int                 `yaml:"max_requests_per_minute"`
 	MaxConcurrentTests     int                 `yaml:"max_concurrent_tests"`
-	SharedTestQueue        *bool               `yaml:"shared_test_queue"`
+	SharedTestQueue        *bool               `yaml:"shared_test_queue,omitempty"`
 	Slim                   SlimConfig          `yaml:"slim"`
 	Mid                    bool                `yaml:"mid"`
 	Temporal               TemporalConfig      `yaml:"temporal"`
 	Anthropic              AnthropicConfig     `yaml:"anthropic"`
 	OpenAI                 OpenAIConfig        `yaml:"openai"`
-	Provider               *ProviderConfig     `yaml:"provider"`
+	Provider               *ProviderConfig     `yaml:"provider,omitempty"`
 	Fallback               FallbackConfig      `yaml:"fallback"`
 	Dev                    RoleOverrideConfig  `yaml:"dev"`
 	Reviewer               RoleOverrideConfig  `yaml:"reviewer"`
@@ -1234,7 +1233,9 @@ type renderConfig struct {
 
 // RenderYAML renders the config as YAML covering every field of the struct,
 // in struct order: set values verbatim, unset fields as their zero value
-// ("what the file says", not what applyDefaults would fill in). Intended
+// ("what the file says", not what applyDefaults would fill in). A
+// defaulted pointer key (the omitempty family) renders absent when unset —
+// `key: null` is a shape no config line means. Intended
 // for a LoadRaw result — rendering a defaulted Config would misrepresent
 // absent fields as set. Keys print unredacted by design: the command shows
 // the operator their own file.

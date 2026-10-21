@@ -197,7 +197,7 @@ the help text are kept in agreement.
 | `worker status` | — | — | List every worker on record (plus live strays) with live probes; the stuck-work recapture point |
 | `worker restart` | — | `-c -t` | Stop + start this config's worker with the config re-read from disk |
 | `worker restart <worker>` | `<worker>` | — | Restart one worker from its recorded config, from any directory |
-| `worker restart all` | — | — | Restart every worker on record, each from its own record |
+| `worker restart all` | — | — | Restart every worker on record, each from its own record — host-global: every worker on record in /tmp/daedalus regardless of the invoking directory |
 | `worker foreground` | — | `-c -t` | Run the worker attached to this terminal |
 | `worker wakeup` | `<workflow-id>` | `-c` | Interrupt a RUNNING session's quota heartbeat so the round resumes |
 | `worker report` | — | `--json --table` | Summarize AI provider usage (cost, tokens, time) for this config's worker, plus worker slots |
@@ -233,7 +233,8 @@ Flag reference:
 | `-cot` | `log` | Print the run's chain-of-thought logs from Temporal history |
 | `-cot-n <N>` | `log -cot` | Tail the CoT view to the last N completed rounds (whole sections only) |
 | `-t, --type dev\|test` | `worker start`, bare `worker restart`, `worker foreground` | Which pollers the daemon starts (`dev` or `test`; omit for both). Rejected everywhere else — `run`, `worker status`, the record-driven restarts, `worker stop`/`wakeup`, and every non-worker command |
-| `--all` | `worker restart` | Restart every worker on record (same as the `all` argument) |
+| `--all` | `worker restart` | Restart every worker on record (same as the `all` argument; host-global — every worker on record in /tmp/daedalus, any invoking directory) |
+| `--force` (`-f`) | `worker restart` | Immediate swap: SIGTERM the old daemon and start the replacement at once instead of scheduling a drain. The drain restart keeps the old daemon serving until it has drained, then re-executes in place, so only a failure at or after the re-exec takes it down; a forced replacement is a fresh start — a failure after the old daemon was signaled (a relay dying mid-swap, a config deleted after it was loaded, a spawn or boot failure) leaves that worker down |
 | `--yes` | `wipe` | Skip the interactive confirmation (scripted use) |
 | `--json` / `--table` | `worker report`, `metrics list` | JSON vs table output (table is the default; `--table` is accepted for explicitness) |
 | `--worker <name>` / `--page <n>` | `metrics list` | Filter the ledger page to one worker / pick the page (50 entries per page, newest first) |
@@ -281,7 +282,14 @@ Flag reference:
    `start -c <new>` to move a worker to a different config.
    `daedalus worker restart all` restarts every worker on record, each
    with its own config, in one call — records alone, no config needed
-   (an explicit `-c` is rejected there; it would have no effect).
+   (an explicit `-c` is rejected there; it would have no effect). "all" is
+   host-global: it signals every worker on record in `/tmp/daedalus`
+   regardless of the invoking directory, and `--force` trades the drain —
+   which keeps the old daemon serving until it has drained and re-executes
+   in place, so only a failure at or after the re-exec takes it down — for
+   an instant kill whose replacement is a fresh start: a failure after the
+   old daemon was signaled (a relay dying mid-swap, a config deleted after
+   it was loaded, a spawn or boot failure) leaves that worker down.
    `daedalus worker status` lists every worker on record — plus any live
    stray running without one, shown as "(no config record)" — queue,
    running pid, a live provider API probe, the repo path each worker's

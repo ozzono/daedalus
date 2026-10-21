@@ -466,6 +466,16 @@ ACTIONS
                 --force (also -f after "worker restart") skips the drain: the
                 old daemon is stopped and a replacement starts immediately,
                 both pids reported, without blocking.
+                Blast radius: a bare "worker restart" touches exactly the one
+                worker it resolves to; "all"/--all signals every worker on
+                record in the host-global record dir (/tmp/daedalus)
+                regardless of the invoking directory. The drain restart keeps
+                the old daemon serving until it has drained, then re-executes
+                in place — only a failure at or after the re-exec takes it
+                down; --force's replacement is a fresh start, so a failure
+                after the old daemon was signaled (a relay dying mid-swap, a
+                config deleted after it was loaded, a spawn or boot failure)
+                leaves that worker down.
   status        List every worker on record — plus any live stray running without
                 one, shown as "(no config record)" — with worker name, running
                 pid, the binary version that worker is executing (so a daemon
@@ -506,7 +516,9 @@ ACTIONS
 ARGUMENTS
   <action>              One of the actions above (default: start).
   restart <worker>      That one worker, from its recorded config, from any directory.
-  restart all | --all   Every worker on record, each with its own recorded config.
+  restart all | --all   Every worker on record, each with its own recorded config —
+                        host-global: every worker on record in /tmp/daedalus,
+                        whatever directory the command runs from.
 
 FLAGS
   -c, --config <path>   Path to the config file. Accepted by start, stop, bare
@@ -529,8 +541,14 @@ FLAGS
   -f, --force           Immediate-swap restart: accepted after "worker restart"
                         only, in either spelling, where it stops the old
                         daemon and starts the replacement right away instead
-                        of scheduling a drain. Anywhere else -f stays the
-                        global --file.
+                        of scheduling a drain. The drain restart keeps the old
+                        daemon serving until it has drained, then re-executes
+                        in place, so only a failure at or after the re-exec
+                        takes it down; a forced replacement is a fresh start —
+                        a failure after the old daemon was signaled (a relay
+                        dying mid-swap, a config deleted after it was loaded,
+                        a spawn or boot failure) leaves that worker down.
+                        Anywhere else -f stays the global --file.
 
 The untyped daemon (no -t) also serves the deployment's suite task queue —
 the Temporal-wide shared "test" queue with shared_test_queue true (the

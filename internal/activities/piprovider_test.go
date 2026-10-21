@@ -507,6 +507,42 @@ func TestStagePiProviderSamplingParams(t *testing.T) {
 			t.Errorf("samplingParams top_k = %v, want 40 kept", params["top_k"])
 		}
 	})
+
+	// Temperature as the ONLY knob must stage too: the staging gate
+	// (anySampler) keys on the same field set the parser fills, so a knob
+	// missing from the gate silently served the backend's own value.
+	t.Run("temperature-only export stages samplingParams", func(t *testing.T) {
+		home := piTestHome(t)
+		if _, _, err := stagePiProvider(piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1",
+			"OPENAI_MODEL=qwen",
+			config.TemperatureEnv+"=0.7",
+		)); err != nil {
+			t.Fatalf("stagePiProvider: %v", err)
+		}
+		_, entry := stagedDaedalusEntry(t, home)
+		params := entry.Models[0].SamplingParams
+		if params == nil {
+			t.Fatal("samplingParams = nil, want the temperature-only config staged")
+		}
+		if got, ok := params["temperature"].(float64); !ok || got != 0.7 {
+			t.Errorf("samplingParams[temperature] = %v, want 0.7", params["temperature"])
+		}
+	})
+
+	t.Run("no sampler knob stages no samplingParams", func(t *testing.T) {
+		home := piTestHome(t)
+		if _, _, err := stagePiProvider(piEnv(
+			"OPENAI_BASE_URL=http://localhost:11434/v1",
+			"OPENAI_MODEL=qwen",
+		)); err != nil {
+			t.Fatalf("stagePiProvider: %v", err)
+		}
+		_, entry := stagedDaedalusEntry(t, home)
+		if params := entry.Models[0].SamplingParams; len(params) != 0 {
+			t.Errorf("samplingParams = %v, want none — an all-nil sampler must not invent a block", params)
+		}
+	})
 }
 
 // TestStagePiProviderWireThinking pins the wire-level disable-thinking

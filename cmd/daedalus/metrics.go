@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -162,10 +163,10 @@ func metricsStop() error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	if pidAlive(pid) {
-		os.Remove(pidFile)
+		// Still alive after the grace: the daemon owns the pid file — leave it.
 		return fmt.Errorf("pid %d still alive after 30s — it may need SIGKILL; log: %s", pid, logFile)
 	}
-	os.Remove(pidFile)
+	removePidFileFor(pidFile, pid)
 	fmt.Printf("metrics daemon stopped (pid %d)\n", pid)
 	return nil
 }
@@ -475,9 +476,12 @@ func metricsRegister(cfg config.Config, root, token string) error {
 		// inside the registration TTL (the legitimate face — the dead
 		// process's entry lingers up to a minute) or another process
 		// squatted the name; neither can be told apart from here, and both
-		// clear the same way, so name the remedy.
+		// clear the same way, so name the remedy. errRegistrationConflict rides
+		// the error so the boot caller can retry the documented wait away
+		// instead of exiting (the heartbeat caller just logs and retries on
+		// its next tick).
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("registration refused (%s): %s — a worker restarted inside the registration TTL hits this; wait for the old registration to lapse (up to a minute) and restart, or clear it now with `daedalus dash restart`", resp.Status, strings.TrimSpace(string(b)))
+		return fmt.Errorf("registration refused (%s): %s — a worker restarted inside the registration TTL hits this; wait for the old registration to lapse (up to a minute) and restart, or clear it now with `daedalus dash restart`: %w", resp.Status, strings.TrimSpace(string(b)), errRegistrationConflict)
 	}
 	if resp.StatusCode != http.StatusNoContent {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -487,4 +491,43 @@ func metricsRegister(cfg config.Config, root, token string) error {
 		return fmt.Errorf("set %s: %w", config.MetricsRelayTokenEnv, err)
 	}
 	return nil
+}
+
+// errRegistrationConflict marks the relay's 409: a registration still
+// holds the worker name — a dead process's entry lingering inside the TTL,
+// or a live squatter, indistinguishable client-side.
+var errRegistrationConflict = errors.New("registration conflict")
+
+// metricsRegistrationRetryWait bounds the boot registration's conflict
+// retry: restarting inside the registration TTL used to exit the worker
+// while the dead process's entry lingered (up to the TTL past its last
+// heartbeat), bricking it for the same window the entry needed to lapse.
+// Boot retries instead until the entry can have lapsed — TTL plus two
+// heartbeat intervals of margin — turning the boot failure into a delayed
+// boot. Bounded, not open-ended: a live squatter or a still-draining
+// predecessor cannot be told apart from the dead face, so past the budget
+// the boot fails with the same remedy text as before.
+const metricsRegistrationRetryWait = metricsRegistrationTTL + 2*metricsHeartbeatInterval
+
+// metricsRegisterBootRetry wraps metricsRegister for the boot call only —
+// the heartbeat call site must not use it (a conflict there is logged and
+// left to the next tick). On a conflict it retries on a fixed two-second
+// tick until the budget lapses; the remedy text prints once, so the boot
+// log carries the reason without spamming the wait.
+// ponytail: fixed tick, no backoff — the attempts are cheap loopback POSTs
+// and the budget is the bound that matters.
+func metricsRegisterBootRetry(cfg config.Config, root, token string) error {
+	deadline := time.Now().Add(metricsRegistrationRetryWait)
+	retrying := false
+	for {
+		err := metricsRegister(cfg, root, token)
+		if err == nil || !errors.Is(err, errRegistrationConflict) || time.Now().After(deadline) {
+			return err
+		}
+		if !retrying {
+			retrying = true
+			fmt.Printf("metrics relay: %v — retrying boot registration for up to %s while the old registration lapses\n", err, metricsRegistrationRetryWait)
+		}
+		time.Sleep(2 * time.Second)
+	}
 }

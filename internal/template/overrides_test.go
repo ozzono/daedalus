@@ -164,6 +164,17 @@ func TestLoadOverridesRejects(t *testing.T) {
 			want: "(with a diff handoff attached)",
 		},
 		{
+			// The skill-review branch's guard, same shape: both extra
+			// startup review renders carry SkillInstructions non-empty, so a
+			// broken reference behind a surviving {{if .SkillInstructions}}
+			// fails the start instead of killing the first configured skill
+			// round mid-flight.
+			name: "broken access behind the skill-instructions guard",
+			files: map[string]string{"review.md": "{{if .SkillInstructions}}{{.SkillInstructions.Nope}}{{end}} " +
+				"APPROVED CHANGES_REQUESTED NEEDS_MAINTAINER REBUILD"},
+			want: "(with a diff handoff attached)",
+		},
+		{
 			// Whole-word matching: DISAPPROVED contains APPROVED as a
 			// substring, and the source-level contains-check this guard once
 			// used took it as vouching for the verdict.
