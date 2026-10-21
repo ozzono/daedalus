@@ -298,6 +298,11 @@ temporal:
 # per-invocation "-c" config overrides (see the openai section below); only
 # these knob rows have no codex route.
 
+# Legacy compatibility section — the preferred home for these values is the
+# provider: section below (wire-agnostic; its comment states the precedence
+# order). This section keeps working unchanged and indefinitely; where the
+# provider section sets a field, that value wins and this section's is
+# ignored.
 anthropic:
   # API base URL. Empty (the default) means "use whatever the worker's
   # environment already provides" — set it only to override, e.g. a
@@ -345,6 +350,10 @@ anthropic:
   max_output_tokens: 0
 
 openai:
+  # Legacy compatibility section — the preferred home is the provider:
+  # section above with type: openai (per-field precedence: a field the
+  # provider section sets wins, an unset one falls through to this
+  # section's). Kept working unchanged and indefinitely.
   # Optional OpenAI settings, injected into the jailed agent's environment
   # (OPENAI_BASE_URL / OPENAI_API_BASE / OPENAI_API_KEY / OPENAI_MODEL —
   # both URL vars carry the same value, because litellm versions disagree
@@ -444,21 +453,28 @@ openai:
   # disable_thinking instead — the two never cross.
   disable_thinking: false
 
-# The wire-agnostic primary provider: type — not the section name — selects
-# the wire format, so one section fully determines how the model behind it
-# is served: endpoint, request ceiling, honest sizing, and (openai only) the
-# sampler knobs. Its values export on the env channel its type names
-# (ANTHROPIC_* or OPENAI_*), so every consumer — jailed claude, the
-# aider/pi/codex/opencode staging, "worker status", the slim tool relay —
-# serves a provider-served round exactly as it would the equivalent legacy
-# section. The legacy anthropic:/openai: sections keep working unchanged
-# and indefinitely; the one forbidden mix is this section plus the
-# same-wire legacy section (two sources of truth for one channel is a load
-# error, never a silent override) — across wires the mix is legal and is
-# the incremental migration path (e.g. this section with type: openai for
-# a self-hosted model while jailed claude stays on the anthropic: section;
-# keep the sizing pair in one place, it is one channel whichever wire
-# serves).
+# The wire-agnostic primary provider: the PREFERRED section for serving a
+# model. Its type — not the section name — selects the wire format, so one
+# section fully determines how the model behind it is served: endpoint,
+# request ceiling, honest sizing, and (openai only) the sampler knobs. Its
+# values export on the env channel its type names (ANTHROPIC_* or
+# OPENAI_*), so every consumer — jailed claude, the aider/pi/codex/opencode
+# staging, "worker status", the slim tool relay — serves a provider-served
+# round exactly as it would the equivalent legacy section. The legacy
+# anthropic:/openai: sections below are the compatibility surface, kept
+# working unchanged and indefinitely. When both are present, precedence is
+# per field, provider wins: each field set in this section overwrites the
+# same channel field from the legacy sections, and each field left unset
+# here falls through to the legacy value (a same-wire legacy section
+# alongside is legal and simply loses every contested field). The full
+# resolution order for any round's provider values: the per-role overrides
+# (dev:, reviewer:, final_reviewer: below) beat this section, which beats
+# the legacy sections. A legacy section aimed at the other wire keeps
+# serving that wire (the cross-wire migration path, e.g. this section with
+# type: openai for a self-hosted model while jailed claude stays on the
+# anthropic: section) — except the wire-agnostic knobs, the sizing pair and
+# timeout_ms, which are one channel whichever wire serves: a value set in
+# this section wins over either legacy section's.
 provider:
   # Wire format this section serves, and the env channel its values export
   # on: "anthropic" or "openai". Required — a missing or unknown value is a
@@ -479,15 +495,18 @@ provider:
   # agent's own default.
   heartbeat_model: ""
   # API request timeout for the jailed agent, in milliseconds, exported as
-  # API_TIMEOUT_MS — both wire styles need it. Zero/unset falls back to the
-  # same generous default as the legacy sections (3000000 = 50 minutes), so
-  # a ceiling is always exported.
+  # API_TIMEOUT_MS — both wire styles need it. Set, it wins over either
+  # legacy section's timeout_ms; zero/unset falls through to the legacy
+  # sections' value, else the same generous default (3000000 = 50 minutes),
+  # so a ceiling is always exported.
   timeout_ms: 3000000
   # Sizing pair, valid on both wire styles and deliberately wire-agnostic:
   # they ride the same exports as their anthropic-section counterparts
   # (CLAUDE_CODE_MAX_CONTEXT_TOKENS / DAEDALUS_MAX_OUTPUT_TOKENS), which is
   # the point — an openai-served model's sizing used to be expressible only
-  # under anthropic:, the mis-sectioning this section removes. They reach
+  # under anthropic:, the mis-sectioning this section removes. Set here,
+  # they win over the legacy sections' values; zero/unset falls through to
+  # the legacy value. They reach
   # every staging path that consumes sizing: claude's env re-export,
   # aider's model metadata, the pi and opencode staged model entries. Load
   # rejects negative values. Sizing caveat for pi rounds (the 2026-10-10

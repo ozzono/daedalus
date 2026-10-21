@@ -519,32 +519,10 @@ type OpenAIConfig struct {
 	DisableThinking bool `yaml:"disable_thinking"`
 }
 
-// configured reports whether the section carries any operator-set value —
-// the provider mixing rule's "both set" test. Validation runs after
-// applyDefaults, which fills the timeout on every loaded config, so the
-// comparison is against the defaulted zero section rather than the bare
-// zero with the field excluded: an absent section and one that named only
-// timeout_ms differ by that field alone, and excluding the field (the
-// earlier shape) called the only-timeout section absent — slipping it
-// past the mixing gate with its value sitting unused in favor of the
-// provider section's.
-// ponytail: zero-ness still cannot see an explicit timeout_ms equal to
-// DefaultAnthropicTimeoutMS — it reads as absent, and the value only
-// survives because it equals what the provider channel exports anyway;
-// telling every explicit value apart needs tracking which fields the
-// file actually named, not just their zero-ness.
-func (a AnthropicConfig) configured() bool {
-	return a != (AnthropicConfig{TimeoutMS: DefaultAnthropicTimeoutMS})
-}
-
-// configured is AnthropicConfig.configured's openai-side counterpart; no
-// field of this section is defaulted before validation.
-func (o OpenAIConfig) configured() bool { return o != (OpenAIConfig{}) }
-
 // ProviderConfig is the wire-agnostic primary provider section: its type
 // field — not the section name — selects the wire format, so one section
-// fully determines how the model behind it is served. It is the single home
-// for the per-model-class knobs a round needs: the endpoint surface
+// fully determines how the model behind it is served. It is the preferred
+// home for the per-model-class knobs a round needs: the endpoint surface
 // (url/key/model), the request ceiling (timeout_ms), the honest-sizing pair
 // (context_tokens/max_output_tokens — wire-agnostic by design, since the
 // staging paths that consume sizing key on the exports, not on a section;
@@ -552,13 +530,19 @@ func (o OpenAIConfig) configured() bool { return o != (OpenAIConfig{}) }
 // anthropic:), and the sampler fields (an openai-wire property — request
 // params only an OpenAI-compatible backend accepts).
 //
-// The legacy anthropic:/openai: sections keep working unchanged and
-// indefinitely. The accepted mixes: a provider section alone, or one plus
-// the *other* wire's legacy section (e.g. type: openai for a self-hosted
-// model while jailed claude stays on anthropic:) — the incremental
-// migration path. The same-wire legacy section alongside is a load error,
-// never a silent override: two sources of truth for one channel is exactly
-// the section-name confusion this section removes.
+// The legacy anthropic:/openai: sections are the compatibility surface:
+// they keep working unchanged and indefinitely. When both are present,
+// precedence is per field, provider wins: each field the provider section
+// sets overwrites the same channel field from the legacy sections, and each
+// field it leaves unset falls through to the legacy value — a same-wire
+// legacy section alongside is legal and simply loses every contested field.
+// The full resolution order for any round's provider values: the role
+// overrides (reviewer:/dev:/final_reviewer:) beat the provider section,
+// which beats the legacy sections. A legacy section aimed at the other wire
+// keeps serving that wire (the cross-wire migration path), except the
+// wire-agnostic knobs — the sizing pair and the request ceiling — which are
+// one channel whichever wire serves, so a set provider value wins over
+// either legacy section's (see ProviderChannels).
 //
 // Which jailed CLI consumes the section is still agent:'s decision (it
 // stays top-level, as do the agent-native levers thinking/stream): staging
@@ -588,8 +572,10 @@ type ProviderConfig struct {
 	// never silently no-op. Empty means the agent's own default.
 	HeartbeatModel string `yaml:"heartbeat_model"`
 	// TimeoutMS bounds the jailed agent's API requests, exported as
-	// API_TIMEOUT_MS — both wire styles need it. Zero (unset) defaults to
-	// DefaultAnthropicTimeoutMS, so a ceiling is always exported.
+	// API_TIMEOUT_MS — both wire styles need it. Set, it wins over either
+	// legacy section's timeout_ms; zero (unset) falls through to the legacy
+	// sections' value, else to DefaultAnthropicTimeoutMS at resolution time
+	// (ProviderChannels), so a ceiling is always exported.
 	TimeoutMS int `yaml:"timeout_ms"`
 	// ContextTokens and MaxOutputTokens are the sizing knobs, identical in
 	// shape and channel to their AnthropicConfig counterparts — and
@@ -631,43 +617,10 @@ type ProviderConfig struct {
 	DisableThinking bool `yaml:"disable_thinking"`
 }
 
-// anthropicChannel projects the section onto the ANTHROPIC_* channel —
-// every field the channel's exports read, nothing else.
-func (p ProviderConfig) anthropicChannel() AnthropicConfig {
-	return AnthropicConfig{
-		URL:             p.URL,
-		Key:             p.Key,
-		Model:           p.Model,
-		HeartbeatModel:  p.HeartbeatModel,
-		TimeoutMS:       p.TimeoutMS,
-		ContextTokens:   p.ContextTokens,
-		MaxOutputTokens: p.MaxOutputTokens,
-	}
-}
-
-// openaiChannel projects the section onto the OPENAI_* channel. The sizing
-// pair is absent by construction: those exports are read off the
-// anthropic-side struct, which ProviderChannels feeds for an openai-typed
-// provider.
-func (p ProviderConfig) openaiChannel() OpenAIConfig {
-	return OpenAIConfig{
-		URL:               p.URL,
-		Key:               p.Key,
-		Model:             p.Model,
-		TimeoutMS:         p.TimeoutMS,
-		TopP:              p.TopP,
-		Temperature:       p.Temperature,
-		PresencePenalty:   p.PresencePenalty,
-		TopK:              p.TopK,
-		MinP:              p.MinP,
-		RepetitionPenalty: p.RepetitionPenalty,
-		DisableThinking:   p.DisableThinking,
-	}
-}
-
 // validate rejects the provider sections Load refuses, with Load's
 // diagnostics (Config.validate wraps them with the section name). Call it
-// on a defaults-applied section.
+// on the section as loaded: applyDefaults never touches it, and no rule
+// here reads a defaulted value.
 func (p ProviderConfig) validate() error {
 	if p.Type == "" {
 		return fmt.Errorf("type is required — %q or %q; it selects which env channel the section's values export on",
@@ -1103,9 +1056,10 @@ type Config struct {
 	Anthropic       AnthropicConfig `yaml:"anthropic"`
 	OpenAI          OpenAIConfig    `yaml:"openai"`
 	// Provider is the wire-agnostic primary provider section (see
-	// ProviderConfig). Nil — the key absent, the default — means the legacy
-	// anthropic:/openai: sections stand alone, behavior byte-identical to
-	// before the section existed.
+	// ProviderConfig) — the preferred config surface; the legacy
+	// anthropic:/openai: sections are compatibility. Nil — the key absent,
+	// the default — means the legacy sections stand alone, behavior
+	// byte-identical to before the section existed.
 	Provider *ProviderConfig `yaml:"provider"`
 	// Fallback is the independent secondary provider failover uses when
 	// the primary is API-exhausted. Inactive unless Enabled.
@@ -1421,32 +1375,83 @@ func ValidateWorkerID(id string) error {
 
 // ProviderChannels resolves the config's two provider channels — the
 // structs whose fields AgentEnv exports and worker tooling probes/dials. A
-// legacy-only config resolves to its own sections verbatim. A provider
-// section owns the channel its type names (validation has already rejected
-// a same-wire legacy section, so ownership is unambiguous) while the other
-// wire's legacy section passes through untouched, and its wire-agnostic
-// knobs land where their exporters read them: an openai-typed provider's
-// sizing pair rides the anthropic-side struct — the same channel those
-// exports have always used, now fed from the section that may legally
-// carry them.
+// legacy-only config resolves to its own sections verbatim. With a provider
+// section, precedence is per field, provider wins: the channel the type
+// names takes each of the provider section's set fields and keeps the
+// same-named legacy section's value wherever the provider field is unset;
+// the other wire's legacy section passes through untouched, still serving
+// its own wire exactly as a legacy-only config's does. The wire-agnostic
+// knobs are one channel whichever wire serves, so a set provider value
+// overrides them wherever their exporters read them: the sizing pair rides
+// the anthropic-side struct — the same channel those exports have always
+// used, now fed preferentially from the section that may legally carry
+// them — and the request ceiling is stamped on both sides, so AgentEnv's
+// legacy ordering can never pick a legacy ceiling over a set provider one.
 func (c Config) ProviderChannels() (AnthropicConfig, OpenAIConfig) {
 	if c.Provider == nil {
 		return c.Anthropic, c.OpenAI
 	}
 	p := *c.Provider
+	anth, open := c.Anthropic, c.OpenAI
 	if p.Type == FallbackTypeAnthropic {
-		return p.anthropicChannel(), c.OpenAI
+		if p.URL != "" {
+			anth.URL = p.URL
+		}
+		if p.Key != "" {
+			anth.Key = p.Key
+		}
+		if p.Model != "" {
+			anth.Model = p.Model
+		}
+		if p.HeartbeatModel != "" {
+			anth.HeartbeatModel = p.HeartbeatModel
+		}
+	} else {
+		if p.URL != "" {
+			open.URL = p.URL
+		}
+		if p.Key != "" {
+			open.Key = p.Key
+		}
+		if p.Model != "" {
+			open.Model = p.Model
+		}
+		// The samplers' zero-ness is their unset marker (an explicit 0 is
+		// indistinguishable from unset by the absent-never-sent discipline),
+		// so per-field fall-through keys on it directly.
+		for _, s := range []struct {
+			pv float64
+			lv *float64
+		}{
+			{p.TopP, &open.TopP},
+			{p.Temperature, &open.Temperature},
+			{p.PresencePenalty, &open.PresencePenalty},
+			{p.TopK, &open.TopK},
+			{p.MinP, &open.MinP},
+			{p.RepetitionPenalty, &open.RepetitionPenalty},
+		} {
+			if s.pv != 0 {
+				*s.lv = s.pv
+			}
+		}
+		// A never-send-a-default knob — false and unset are the same no
+		// signal — so the legacy true fills the one gap a bool's zero-ness
+		// cannot see.
+		if p.DisableThinking {
+			open.DisableThinking = true
+		}
 	}
-	anth := c.Anthropic
-	// The sizing pair: the provider section wins when it sizes (validation
-	// has rejected the both-set case, so this only ever overwrites a zero).
 	if p.ContextTokens != 0 {
 		anth.ContextTokens = p.ContextTokens
 	}
 	if p.MaxOutputTokens != 0 {
 		anth.MaxOutputTokens = p.MaxOutputTokens
 	}
-	return anth, p.openaiChannel()
+	if p.TimeoutMS != 0 {
+		anth.TimeoutMS = p.TimeoutMS
+		open.TimeoutMS = p.TimeoutMS
+	}
+	return anth, open
 }
 
 // AgentWireConflict reports whether this config's serving channels leave
@@ -1539,18 +1544,16 @@ func (c Config) AgentEnv() []string {
 	// resolution lands on the configured endpoint.
 	add("OPENAI_API_BASE", open.URL)
 	// API_TIMEOUT_MS comes from whichever channel is serving the jailed
-	// round. With a provider section, that is the provider channel's
-	// ceiling (applyDefaults always gives it one): the cross-wire legacy
-	// timeout this ordering once resolved silently is rejected at load, so
-	// the override below can only replace a value the operator never set.
-	// Legacy-only configs keep the historical ordering: an openai section
-	// with a timeout wins when its URL is set, and an openai section
-	// without one falls back to anthropic's value (Load defaults it),
-	// keeping the invariant that the jailed agent gets an explicit ceiling
-	// either way — exporting "0" would zero the client's ceiling rather
-	// than clear it, and exporting nothing would leave a mixed config's
-	// claude rounds (anthropic-served, openai configured for tooling) with
-	// no ceiling at all.
+	// round. With a provider section carrying timeout_ms, ProviderChannels
+	// has already stamped that ceiling on both channels, so this ordering
+	// yields it. With the provider ceiling unset, the legacy ordering
+	// stands: an openai section with a timeout wins when its URL is set,
+	// and an openai section without one falls back to anthropic's value
+	// (Load defaults it), keeping the invariant that the jailed agent gets
+	// an explicit ceiling either way — exporting "0" would zero the
+	// client's ceiling rather than clear it, and exporting nothing would
+	// leave a mixed config's claude rounds (anthropic-served, openai
+	// configured for tooling) with no ceiling at all.
 	timeoutMS := anth.TimeoutMS
 	if open.URL != "" && open.TimeoutMS != 0 {
 		timeoutMS = open.TimeoutMS
@@ -1851,15 +1854,10 @@ func LoadRaw(path string) (Config, error) {
 	}
 	// Validation sees the defaulted values (an unset fallback.type loads as
 	// "anthropic", an unset agent as "claude"), so validate a copy — the
-	// returned view must stay raw. The provider section is copied deep:
-	// it is the one pointer field applyDefaults writes through, and the
-	// struct copy alone would alias it, letting the defaults pass stamp
-	// its timeout into the returned raw view.
+	// returned view must stay raw. The copy is shallow because applyDefaults
+	// writes no pointer fields: the provider section is only ever read
+	// (ProviderChannels merges from it at resolution time).
 	d := c
-	if c.Provider != nil {
-		p := *c.Provider
-		d.Provider = &p
-	}
 	d.applyDefaults()
 	return c, d.validate(path)
 }
@@ -2086,51 +2084,17 @@ func (c Config) validate(path string) error {
 			return fmt.Errorf("config %s: openai.%s: must not be negative", path, p.name)
 		}
 	}
-	// The provider section: its own field rules, then the mixing rules —
-	// one channel, one source of truth. The provider section and the
-	// same-wire legacy section are a load error (an override would silently
-	// resurrect the mis-sectioned-keys confusion the section removes),
-	// while the other wire's legacy section stays legal — the incremental
-	// migration path. The sizing pair and the request ceiling are one
-	// channel regardless of wire, so a cross-wire legacy section may not
-	// size or time what the provider section also governs: AgentEnv's
-	// legacy ordering (the openai channel's timeout wins when its URL is
-	// set) predates type dispatch and would silently pick between two
-	// values the file's own sections disagree on — precedence flipping
-	// with which side the provider section sits.
+	// The provider section: its own field rules (type required, negatives,
+	// wire-knob placement), then the precedence rule. Provider beats legacy
+	// per field — ProviderChannels resolves the merge — so a legacy section
+	// alongside, same wire or the other, is legal and uncontested: the
+	// provider section's set fields win, its unset fields fall through to
+	// the legacy values, and the other wire's legacy section keeps serving
+	// its own wire. There is no contested-field rejection to make; every
+	// field has a defined winner.
 	if p := c.Provider; p != nil {
 		if err := p.validate(); err != nil {
 			return fmt.Errorf("config %s: provider: %w", path, err)
-		}
-		if p.Type == FallbackTypeAnthropic {
-			if c.Anthropic.configured() {
-				return fmt.Errorf("config %s: provider (type anthropic) and the legacy anthropic: section are both set — both configure the anthropic channel, and the provider section is that section's replacement; keep one of the two (mixing across wires is legal)", path)
-			}
-			// The provider section always carries a post-default ceiling
-			// (applyDefaults fills it set or not), so the cross-wire
-			// openai side alone decides this clash.
-			if c.OpenAI.TimeoutMS != 0 {
-				return fmt.Errorf("config %s: provider.timeout_ms and openai.timeout_ms are both set — the request ceiling is one channel whichever wire serves; keep it in one place", path)
-			}
-		} else {
-			if c.OpenAI.configured() {
-				return fmt.Errorf("config %s: provider (type openai) and the legacy openai: section are both set — both configure the openai channel, and the provider section is that section's replacement; keep one of the two (mixing across wires is legal)", path)
-			}
-			if p.ContextTokens != 0 && c.Anthropic.ContextTokens != 0 {
-				return fmt.Errorf("config %s: provider.context_tokens and anthropic.context_tokens are both set — sizing is one channel whichever wire serves; keep it in one place", path)
-			}
-			if p.MaxOutputTokens != 0 && c.Anthropic.MaxOutputTokens != 0 {
-				return fmt.Errorf("config %s: provider.max_output_tokens and anthropic.max_output_tokens are both set — sizing is one channel whichever wire serves; keep it in one place", path)
-			}
-			// The same one-channel rule for the ceiling: the provider
-			// side always carries a post-default value, so the legacy
-			// side alone decides. The default-filled absent section reads
-			// as unset, and an explicit value equal to the default is
-			// accepted as the same — the provider channel would export
-			// exactly that number either way.
-			if t := c.Anthropic.TimeoutMS; t != 0 && t != DefaultAnthropicTimeoutMS {
-				return fmt.Errorf("config %s: provider.timeout_ms and anthropic.timeout_ms are both set — the request ceiling is one channel whichever wire serves; keep it in one place", path)
-			}
 		}
 	}
 	if f := c.Fallback; f.Active() {
@@ -2352,12 +2316,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Fallback.Type == "" {
 		c.Fallback.Type = DefaultFallbackType
-	}
-	// The provider section's ceiling follows the legacy sections' rule: an
-	// explicit timeout is never required, but a ceiling is always exported,
-	// so unset defaults here rather than at the export.
-	if c.Provider != nil && c.Provider.TimeoutMS == 0 {
-		c.Provider.TimeoutMS = DefaultAnthropicTimeoutMS
 	}
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS
