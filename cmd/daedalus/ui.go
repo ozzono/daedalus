@@ -209,14 +209,19 @@ func (s *uiServer) routes() http.Handler {
 	mux.HandleFunc("GET /new", s.pageNew)
 	mux.HandleFunc("GET /new/agents", s.fragAgents)
 	mux.HandleFunc("POST /new", s.submitNew)
-	// The Models tab: the price form (GET) and its upsert-only save
-	// (POST, a redirect back to the form).
+	// The Models tab: the price form (GET), its upsert-only save
+	// (POST, a redirect back to the form), and the polled body fragment
+	// the header countdown re-fetches — the read-only surfaces below the
+	// form (a poll may never swap the form's editable inputs).
 	mux.HandleFunc("GET /models", s.pageModels)
+	mux.HandleFunc("GET /models/body", s.fragModels)
 	mux.HandleFunc("POST /models", s.saveModels)
 	// /metrics and everything under it is the metrics view — the paths
 	// beneath are the GoLens mount's when the embed exists; today they all
-	// render the same aggregates-plus-placeholder page.
+	// render the same aggregates-plus-placeholder page, with /metrics/body
+	// its polled fragment.
 	mux.HandleFunc("GET /metrics", s.pageMetrics)
+	mux.HandleFunc("GET /metrics/body", s.fragMetrics)
 	mux.HandleFunc("GET /metrics/", s.pageMetrics)
 	return mux
 }
@@ -1229,13 +1234,18 @@ type uiQueueSessions struct {
 	Total   int
 }
 
-// pageMetrics renders the frozen metrics view: the daemon's own
-// aggregates — the relay ledger's counters and the live session counts —
-// plus the note that the GoLens embed is not part of this build, so the
-// mount has no charts to serve where those would render. The counters
-// come from the same folds the Models tab reads (foldRelayTotals), so
-// the two views can never disagree.
-func (s *uiServer) pageMetrics(w http.ResponseWriter, req *http.Request) {
+// uiMetricsView is the metrics tab's data: the headline counters, the
+// per-queue live session counts, and the walk-error face — one build
+// shared by the page shell and its polled body, so the two can never
+// disagree.
+type uiMetricsView struct {
+	Relay    relayTotals
+	Sessions []uiQueueSessions
+	WalkErr  string
+}
+
+// metricsView walks the host once and folds that walk into the view.
+func (s *uiServer) metricsView() uiMetricsView {
 	snap := s.snapshot()
 	now := snap.Generated
 	sessions := make([]uiQueueSessions, 0, len(snap.Queues))
@@ -1255,12 +1265,32 @@ func (s *uiServer) pageMetrics(w http.ResponseWriter, req *http.Request) {
 		}
 		sessions = append(sessions, qs)
 	}
+	return uiMetricsView{
+		Relay:    foldRelayTotals(s.ledgerEntries(), now),
+		Sessions: sessions,
+		WalkErr:  snap.WalkErr,
+	}
+}
+
+// pageMetrics renders the frozen metrics view: the daemon's own
+// aggregates — the relay ledger's counters and the live session counts —
+// plus the note that the GoLens embed is not part of this build, so the
+// mount has no charts to serve where those would render. The counters
+// come from the same folds the Models tab reads (foldRelayTotals), so
+// the two views can never disagree.
+func (s *uiServer) pageMetrics(w http.ResponseWriter, req *http.Request) {
 	s.render(w, http.StatusOK, "page_metrics", struct {
-		Chrome   uiChrome
-		Relay    relayTotals
-		Sessions []uiQueueSessions
-		WalkErr  string
-	}{uiChrome{Nav: "metrics", Title: "daedalus — metrics"}, foldRelayTotals(s.ledgerEntries(), now), sessions, snap.WalkErr})
+		Chrome uiChrome
+		M      uiMetricsView
+	}{uiChrome{Nav: "metrics", Title: "daedalus — metrics"}, s.metricsView()})
+}
+
+// fragMetrics is the metrics view's polled region: everything below the
+// heading, re-rendered from the same walk the page shell used — the
+// models/metrics screens' tick keeps the visible counters current (the
+// Models tab's fragment lives beside its page in ui_metrics.go).
+func (s *uiServer) fragMetrics(w http.ResponseWriter, req *http.Request) {
+	s.renderFrag(w, req, "frag_metrics", s.metricsView())
 }
 
 // uiWorkerOption is one New-Task worker choice.

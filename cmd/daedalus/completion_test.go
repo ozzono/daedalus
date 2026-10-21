@@ -13,12 +13,16 @@ import (
 // probe at the command position: with nothing typed it offers every
 // help-screened command exactly once, sorted — commandHelp is the single
 // source, so a command added once is help-screened and completed together —
-// and a partial word narrows the listing. Global flags before the cursor are
-// skipped wherever they sit (the "--name=value" form included), never
-// mistaken for the command.
+// except the dash command's hidden "metrics" alias: accepted everywhere,
+// offered nowhere. A partial word narrows the listing. Global flags before
+// the cursor are skipped wherever they sit (the "--name=value" form
+// included), never mistaken for the command.
 func TestCompleteTopLevelCommands(t *testing.T) {
 	var want []string
 	for name := range commandHelp {
+		if name == "metrics" {
+			continue // the dash command's hidden compatibility alias
+		}
 		want = append(want, name)
 	}
 	sort.Strings(want)
@@ -30,6 +34,8 @@ func TestCompleteTopLevelCommands(t *testing.T) {
 		{nil, want},
 		{[]string{""}, want},
 		{[]string{"wo"}, []string{"worker"}},
+		{[]string{"das"}, []string{"dash"}},
+		{[]string{"met"}, nil}, // the hidden alias is not offered, even by its own prefix
 		{[]string{"ver"}, []string{"version"}},
 		{[]string{"zzz"}, nil},
 		// A global flag and its value, in either spelling form, precede the
@@ -329,6 +335,9 @@ func TestCompletionScript(t *testing.T) {
 func TestMainCompleteProbe(t *testing.T) {
 	var want []string
 	for name := range commandHelp {
+		if name == "metrics" {
+			continue // the dash command's hidden compatibility alias
+		}
 		want = append(want, name)
 	}
 	sort.Strings(want)
@@ -344,6 +353,17 @@ func TestMainCompleteProbe(t *testing.T) {
 	}
 	if stdout != wantOut {
 		t.Errorf("daedalus __complete stdout = %q, want every command one per line (%q)", stdout, wantOut)
+	}
+
+	// The alias answers nothing at the command position — end to end.
+	stdout, _, code = runMainIn(t, dir, "__complete", "met")
+	if code != 0 || stdout != "" {
+		t.Errorf("daedalus __complete met = (exit %d) %q, want nothing — the metrics alias is offered nowhere", code, stdout)
+	}
+	// ...while its actions still complete once typed.
+	stdout, _, code = runMainIn(t, dir, "__complete", "metrics", "")
+	if code != 0 || stdout != strings.Join([]string{"foreground", "list", "restart", "start", "status", "stop"}, "\n")+"\n" {
+		t.Errorf("daedalus __complete metrics = (exit %d) %q, want the dash actions one per line", code, stdout)
 	}
 
 	stdout, _, code = runMainIn(t, dir, "__complete", "worker", "")

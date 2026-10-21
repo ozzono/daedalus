@@ -49,7 +49,7 @@ details>summary::-webkit-details-marker{display:none}
 
 {{define "header"}}
 <header class="sticky top-0 z-10 border-b border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/70 backdrop-blur" style="top:env(safe-area-inset-top,0px)">
- <div class="mx-auto max-w-6xl px-4 py-2.5 flex items-center gap-3 flex-wrap">
+ <div class="mx-auto max-w-[86.4rem] px-4 py-2.5 flex items-center gap-3 flex-wrap">
   <a class="font-semibold tracking-tight mr-2 flex items-center gap-2" href="/"><span class="h-2 w-2 rounded-full bg-emerald-500"></span>daedalus</a>
   <nav class="flex gap-1 flex-wrap">
    <a class="tab {{if eq .Nav "workers"}}on{{end}}" href="/workers">Workers</a>
@@ -116,10 +116,18 @@ window.__ddPaused=function(){return __ddPoll.paused};
 var ddTrigger=function(sec){
  return 'every '+sec+'s [!document.hidden && !window.__ddPaused()]';
 };
-/* per-swap boot: re-arm every polled region at the stored interval (a
-   rewrite plus htmx.process makes htmx tear down its old poll timer and
-   start a new one — the filter term alone would leave the period fixed),
-   and wire the header widgets this swap just created. */
+/* one global cadence anchor: dl is when the active region fetches next,
+   and the ring counts down to exactly that moment. A swap re-anchors only
+   a passed deadline — navigating mid-cycle keeps both the remaining wait
+   and the fetch schedule, so the cadence never restarts under the
+   operator's feet (the window state survives boosted swaps). */
+if(Date.now()>=__ddPoll.dl)__ddPoll.dl=Date.now()+__ddPoll.iv;
+/* per-swap boot: re-arm every polled region at the time left to the
+   anchor, never the stored interval — a fresh full-interval timer here is
+   what let a mid-cycle navigation restart the fetch schedule (a rewrite
+   plus htmx.process makes htmx tear down its old poll timer and start a
+   new one — the filter term alone would leave the period fixed), and the
+   header widgets this swap just created get wired. */
 var ddLive=false;
 var ddRearm=function(){
  document.querySelectorAll('[hx-trigger*="every"]').forEach(function(el){
@@ -128,7 +136,7 @@ var ddRearm=function(){
   /* swap out only the every term: a region may carry further specs after
      it (the runs rows' change from:#fq/#fs), and rewriting the whole
      attribute would deregister them */
-  var next=cur.replace(/every \d+s \[[^\]]*\]/,ddTrigger(__ddPoll.iv/1000));
+  var next=cur.replace(/every \d+s \[[^\]]*\]/,ddTrigger(Math.max(1,Math.ceil((__ddPoll.dl-Date.now())/1000))));
   if(next!==cur){
    el.setAttribute('hx-trigger',next);
    htmx.process(el);
@@ -136,7 +144,6 @@ var ddRearm=function(){
  });
 };
 ddRearm();
-__ddPoll.dl=Date.now()+__ddPoll.iv;
 var cdWrap=document.getElementById('cdw-wrap');
 if(!ddLive&&cdWrap)cdWrap.classList.add('hidden');
 var cdw=document.getElementById('cdw');
@@ -146,7 +153,7 @@ if(cdw){
   __ddPoll.paused=!__ddPoll.paused;
   cdw.setAttribute('aria-pressed',__ddPoll.paused?'false':'true');
   try{localStorage.setItem('dd-paused',__ddPoll.paused?'1':'0')}catch(e){}
-  if(!__ddPoll.paused)__ddPoll.dl=Date.now()+__ddPoll.iv;
+  if(!__ddPoll.paused){__ddPoll.dl=Date.now()+__ddPoll.iv;ddRearm();}
  };
 }
 var ddi=document.getElementById('dd-interval');
@@ -213,7 +220,14 @@ if(!window.__ddWired){
  document.body.addEventListener('htmx:afterRequest',function(ev){
   var lp=document.getElementById('lp');
   if(ev.detail.successful){
-   __ddPoll.dl=Date.now()+__ddPoll.iv;
+   /* the anchor moves only once it has passed: a successful request that
+      was not the anchor's fetch — a boosted navigation, a form post —
+      must not shift the cadence. The re-arm restores the full period for
+      a region re-armed at remaining time, now that its deadline crossed. */
+   if(Date.now()>=__ddPoll.dl){
+    __ddPoll.dl=Date.now()+__ddPoll.iv;
+    ddRearm();
+   }
    if(lp){lp.textContent=new Date().toTimeString().slice(0,8);lp.classList.remove('text-red-600','dark:text-red-400')}
   }else if(lp){
    lp.textContent='poll failed';
@@ -287,7 +301,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_workers"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-6xl px-4 py-6">
+<main class="mx-auto max-w-[86.4rem] px-4 py-6">
  <h1 class="text-lg font-semibold mb-1">Workers on this host</h1>
  <p class="text-sm text-slate-500 mb-4">Per-host scope · polled every 5s</p>
 <div id="wlist" hx-get="/workers/rows" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
@@ -342,7 +356,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_runs"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-6xl px-4 py-6">
+<main class="mx-auto max-w-[86.4rem] px-4 py-6">
  <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
   <h1 class="text-lg font-semibold">Runs</h1>
   <div class="flex gap-2">
@@ -390,7 +404,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_run"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-6xl px-4 py-6">
+<main class="mx-auto max-w-[86.4rem] px-4 py-6">
 <div hx-get="/runs/{{.D.WorkflowID}}/body" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
 {{template "frag_run" .D}}
 </div>
@@ -536,7 +550,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_error"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-6xl px-4 py-6">
+<main class="mx-auto max-w-[86.4rem] px-4 py-6">
 {{template "frag_error" .Err}}
 <p class="text-xs text-slate-500 mt-3">The page shell renders even when its content fails — a refresh on this URL retries the content, and the navigation above stays live.</p>
 </main>
@@ -545,8 +559,8 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 
 {{define "usage_table"}}{{/* the replicated column set both usage tables render; .Head names the key column */}}
 <div class="card overflow-x-auto mb-4">
- <table class="w-full text-sm min-w-[1180px]">
-  <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+ <table class="w-full text-sm text-center min-w-[1180px]">
+  <thead class="text-center text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
    <tr><th scope="col" class="p-3">{{.Head}}</th><th scope="col">Calls</th><th scope="col">In</th><th scope="col">Out</th><th scope="col">Cache R</th><th scope="col">Cache W</th><th scope="col">Runs</th><th scope="col">Dev</th><th scope="col">Test</th><th scope="col">Review</th><th scope="col">Hit %</th><th scope="col">2xx</th><th scope="col">429</th><th scope="col">4xx</th><th scope="col">5xx</th><th scope="col">p50</th><th scope="col">p95</th><th scope="col">req/min</th><th scope="col">Last</th><th scope="col">Cost USD</th></tr>
   </thead>
   <tbody>
@@ -576,7 +590,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_models"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-6xl px-4 py-6">
+<main class="mx-auto max-w-[86.4rem] px-4 py-6">
  <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
   <h1 class="text-lg font-semibold">Models</h1>
   <span class="text-xs text-slate-500">{{.V.Window}}</span>
@@ -616,45 +630,59 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  </div>
  {{end}}
 
- <div class="grid sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
-  <div class="card p-4"><div class="lbl">Tokens / run</div><div class="text-2xl font-semibold mono">{{.V.Tiles.TokensPerRun}}</div><div class="text-xs text-slate-500 mt-1">in + out over keyed runs</div></div>
-  <div class="card p-4"><div class="lbl">Tokens / worker</div><div class="text-2xl font-semibold mono">{{.V.Tiles.TokensPerWorker}}</div><div class="text-xs text-slate-500 mt-1">in + out over relayed workers</div></div>
-  <div class="card p-4"><div class="lbl">Dev → review</div><div class="text-2xl font-semibold mono">{{.V.Tiles.DevLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last dev call → first review</div></div>
-  <div class="card p-4"><div class="lbl">Test → review</div><div class="text-2xl font-semibold mono">{{.V.Tiles.TestLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last test call → first review</div></div>
-  <div class="card p-4"><div class="lbl">Round drift</div><div class="text-2xl font-semibold mono">{{.V.Tiles.Drift}}</div><div class="text-xs text-slate-500 mt-1">avg input growth within a round</div></div>
- </div>
-
- <div class="mb-2 font-medium">Usage by model</div>
- {{template "usage_table" .V.ModelTable}}
-
- <div class="mb-2 font-medium">Usage by worker</div>
- {{template "usage_table" .V.WorkerTable}}
-
- {{if .V.TokenChart}}<div class="card p-4 mb-4">{{.V.TokenChart}}</div>{{end}}
- {{if .V.WorkerCharts}}
- <div class="grid lg:grid-cols-2 gap-4 mb-4">
-  {{range .V.WorkerCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
- </div>
- {{end}}
-
- {{if .V.CostChart}}<div class="card p-4 mb-4">{{.V.CostChart}}</div>{{end}}
- {{if or .V.WorkerCostCharts .V.ModelCostCharts}}
- <div class="grid lg:grid-cols-2 gap-4 mb-4">
-  {{range .V.WorkerCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
-  {{range .V.ModelCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
- </div>
- {{end}}
-
- <div class="card p-4 text-sm text-slate-500">
-  Coverage: only relay-served rounds appear — unkeyed rounds attribute at worker level only, and a round dialing its CLI-default upstream bypasses the relay entirely. Loop averages span to the first review only and include non-provider time. Per-round rows: <span class="mono">daedalus metrics list</span>.
+ <div hx-get="/models/body" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
+{{template "frag_models" .V}}
  </div>
 </main>
 {{template "foot"}}
 {{end}}
 
+{{define "frag_models"}}{{/* the Models tab's polled region: the read-only aggregates, re-folded each tick. The price form above stays outside it — a poll may never swap editable inputs out from under the operator. */}}
+ <div class="grid sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
+  <div class="card p-4"><div class="lbl">Tokens / run</div><div class="text-2xl font-semibold mono">{{.Tiles.TokensPerRun}}</div><div class="text-xs text-slate-500 mt-1">in + out over keyed runs</div></div>
+  <div class="card p-4"><div class="lbl">Tokens / worker</div><div class="text-2xl font-semibold mono">{{.Tiles.TokensPerWorker}}</div><div class="text-xs text-slate-500 mt-1">in + out over relayed workers</div></div>
+  <div class="card p-4"><div class="lbl">Dev → review</div><div class="text-2xl font-semibold mono">{{.Tiles.DevLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last dev call → first review</div></div>
+  <div class="card p-4"><div class="lbl">Test → review</div><div class="text-2xl font-semibold mono">{{.Tiles.TestLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last test call → first review</div></div>
+  <div class="card p-4"><div class="lbl">Round drift</div><div class="text-2xl font-semibold mono">{{.Tiles.Drift}}</div><div class="text-xs text-slate-500 mt-1">avg input growth within a round</div></div>
+ </div>
+
+ <div class="mb-2 font-medium">Usage by model</div>
+ {{template "usage_table" .ModelTable}}
+
+ <div class="mb-2 font-medium">Usage by worker</div>
+ {{template "usage_table" .WorkerTable}}
+
+ {{if .TokenChart}}<div class="card p-4 mb-4">{{.TokenChart}}</div>{{end}}
+ {{if .WorkerCharts}}
+ <div class="grid lg:grid-cols-2 gap-4 mb-4">
+  {{range .WorkerCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
+ </div>
+ {{end}}
+
+ {{if .CostChart}}<div class="card p-4 mb-4">{{.CostChart}}</div>{{end}}
+ {{if or .WorkerCostCharts .ModelCostCharts}}
+ <div class="grid lg:grid-cols-2 gap-4 mb-4">
+  {{range .WorkerCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
+  {{range .ModelCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
+ </div>
+ {{end}}
+
+ <div class="card p-4 text-sm text-slate-500">
+  Coverage: only relay-served rounds appear — unkeyed rounds attribute at worker level only, and a round dialing its CLI-default upstream bypasses the relay entirely. Loop averages span to the first review only and include non-provider time. Per-round rows: <span class="mono">daedalus dash list</span>.
+ </div>
+{{end}}
+
 {{define "page_metrics"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-6xl px-4 py-6">
+<main class="mx-auto max-w-[86.4rem] px-4 py-6">
  <h1 class="text-lg font-semibold mb-4">Metrics</h1>
+ <div hx-get="/metrics/body" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
+{{template "frag_metrics" .M}}
+ </div>
+</main>
+{{template "foot"}}
+{{end}}
+
+{{define "frag_metrics"}}{{/* the metrics view's polled region: everything below the heading, re-rendered from the same walk the page shell used */}}
  <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
   <div class="card p-4"><div class="lbl">Relay calls</div><div class="text-2xl font-semibold mono">{{.Relay.Calls}}</div><div class="text-xs text-slate-500 mt-1">{{.Relay.Window}} · {{.Relay.Hour}} in the last hour</div></div>
   <div class="card p-4"><div class="lbl">Tokens in</div><div class="text-2xl font-semibold mono">{{.Relay.In}}</div><div class="text-xs text-slate-500 mt-1">relay-served rounds only</div></div>
@@ -687,18 +715,16 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
     </tbody>
    </table>
    {{else}}<p class="text-sm text-slate-500">No relayed calls recorded yet.</p>{{end}}
-   <p class="text-xs text-slate-500 mt-2">Only relay-served rounds appear here — a round dialing its CLI-default upstream directly never passes the relay. Per-round rows: <span class="mono">daedalus metrics list</span>.</p>
+   <p class="text-xs text-slate-500 mt-2">Only relay-served rounds appear here — a round dialing its CLI-default upstream directly never passes the relay. Per-round rows: <span class="mono">daedalus dash list</span>.</p>
   </div>
  </div>
  <div class="card p-4 mt-4 text-sm text-slate-500">
   The GoLens embed is not built into this binary (the golens-metrics module is absent from this build), so this mount has no charts — the aggregates above are the daemon's own.
  </div>
-</main>
-{{template "foot"}}
 {{end}}
 
 {{define "page_new"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-6xl px-4 py-6">
+<main class="mx-auto max-w-[86.4rem] px-4 py-6">
  <h1 class="text-lg font-semibold mb-4">New Task</h1>
  <div class="card p-5 max-w-2xl">
   <form hx-post="/new" hx-target="#res" hx-swap="innerHTML">

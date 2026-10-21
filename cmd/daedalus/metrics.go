@@ -1,4 +1,4 @@
-// The `daedalus metrics` daemon: the host-global host of the metrics relay
+// The `daedalus dash` daemon: the host-global host of the metrics relay
 // (internal/metricsrelay) and the dashboard surface. Lifecycle mirrors the
 // worker daemon's — pid/log/status files in the same daemon dir, keyed
 // "metrics-*" so the worker roster's worker-* globs never match them. Its
@@ -65,16 +65,17 @@ func metricsPaths() (pidFile, logFile, statusFile string) {
 }
 
 // isMetricsRecordRead reports whether args spell one of the record-driven
-// metrics invocations — `metrics status`, `metrics stop`, `metrics list`:
-// they read the daemon's pid file alone and must not depend on whatever the
-// invoking directory resolves to (isWorkerStatus's counterpart). list is
-// among them because the ledger lives in the daemon process; its endpoint
-// is the daemon's published port, never this invocation's config. Trailing
-// flags are tolerated (`metrics list --worker w --page 2`) — flags.go uses
+// dash invocations — `dash status`, `dash stop`, `dash list` (the metrics
+// spelling included): they read the daemon's pid file alone and must not
+// depend on whatever the invoking directory resolves to (isWorkerStatus's
+// counterpart). list is among them because the ledger lives in the daemon
+// process; its endpoint is the daemon's published port, never this
+// invocation's config. Trailing flags are tolerated (`dash list --worker
+// w --page 2`) — flags.go uses
 // this to exempt the form from -c; extra positionals for status and stop
 // are rejected by the dispatch arity guard, unknown flags by their parsers.
 func isMetricsRecordRead(args []string) bool {
-	return len(args) >= 2 && args[0] == "metrics" &&
+	return len(args) >= 2 && (args[0] == "dash" || args[0] == "metrics") &&
 		(args[1] == "status" || args[1] == "stop" || args[1] == "list")
 }
 
@@ -110,21 +111,21 @@ func metricsGateCheck(cfg config.Config) error {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.Metrics.RelayPort))
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		return fmt.Errorf("metrics enabled but the metrics daemon is not reachable on %s — start it with `daedalus metrics start`", addr)
+		return fmt.Errorf("metrics enabled but the metrics daemon is not reachable on %s — start it with `daedalus dash start`", addr)
 	}
 	conn.Close()
 	return nil
 }
 
 // metricsStart launches the metrics daemon as a detached process — the
-// worker daemon's start shape (spawnDaemon): re-exec `metrics foreground`,
+// worker daemon's start shape (spawnDaemon): re-exec `dash foreground`,
 // redirected into the metrics log, write the pid file.
 func metricsStart(cfg config.Config, configPath string) error {
 	pidFile, logFile, _ := metricsPaths()
 	if pid, ok := readLivePid(pidFile); ok {
-		return fmt.Errorf("already running (pid %d) — use 'daedalus metrics restart' or 'stop'", pid)
+		return fmt.Errorf("already running (pid %d) — use 'daedalus dash restart' or 'stop'", pid)
 	}
-	pid, err := spawnDaemon(pidFile, logFile, "metrics", "foreground", "-c", configPath)
+	pid, err := spawnDaemon(pidFile, logFile, "dash", "foreground", "-c", configPath)
 	if err != nil {
 		return err
 	}
@@ -133,7 +134,7 @@ func metricsStart(cfg config.Config, configPath string) error {
 	fmt.Printf("  relay:     127.0.0.1:%d\n", cfg.Metrics.RelayPort)
 	fmt.Printf("  dashboard: :%d\n", cfg.Metrics.Port)
 	fmt.Printf("  log:       %s\n", logFile)
-	fmt.Printf("  stop:      daedalus metrics stop\n")
+	fmt.Printf("  stop:      daedalus dash stop\n")
 	return nil
 }
 
@@ -240,7 +241,7 @@ func runMetricsDaemon(cfg config.Config) error {
 		}
 	}()
 
-	fmt.Printf("daedalus metrics %s starting %s (relay 127.0.0.1:%d, dashboard :%d)\n",
+	fmt.Printf("daedalus dash %s starting %s (relay 127.0.0.1:%d, dashboard :%d)\n",
 		version.String(), time.Now().Format(time.RFC3339), cfg.Metrics.RelayPort, cfg.Metrics.Port)
 	stopPublish := make(chan struct{})
 	defer close(stopPublish)
@@ -329,12 +330,12 @@ func runMetricsList(args []string) error {
 			}
 			page = n
 		default:
-			return fmt.Errorf("unknown metrics list flag %q (--worker, --page, --json, --table)", a)
+			return fmt.Errorf("unknown dash list flag %q (--worker, --page, --json, --table)", a)
 		}
 	}
 	root, ok := metricsRelayEndpoint()
 	if !ok {
-		return fmt.Errorf("the metrics daemon is not running — start it with `daedalus metrics start`")
+		return fmt.Errorf("the metrics daemon is not running — start it with `daedalus dash start`")
 	}
 	resp, err := metricsHTTP.Get(root + fmt.Sprintf("/ledger?worker=%s&page=%d", url.QueryEscape(worker), page))
 	if err != nil {
@@ -467,7 +468,7 @@ func metricsRegister(cfg config.Config, root, token string) error {
 	// the secret in a 200 body — refused: this worker's staged rounds would
 	// present a token that daemon never stored.
 	if resp.StatusCode == http.StatusOK {
-		return fmt.Errorf("the metrics daemon is older than this worker (server-minted registration token) — restart it (`daedalus metrics restart`)")
+		return fmt.Errorf("the metrics daemon is older than this worker (server-minted registration token) — restart it (`daedalus dash restart`)")
 	}
 	if resp.StatusCode == http.StatusConflict {
 		// A live registration holds this name. Either this worker restarted
@@ -476,7 +477,7 @@ func metricsRegister(cfg config.Config, root, token string) error {
 		// squatted the name; neither can be told apart from here, and both
 		// clear the same way, so name the remedy.
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("registration refused (%s): %s — a worker restarted inside the registration TTL hits this; wait for the old registration to lapse (up to a minute) and restart, or clear it now with `daedalus metrics restart`", resp.Status, strings.TrimSpace(string(b)))
+		return fmt.Errorf("registration refused (%s): %s — a worker restarted inside the registration TTL hits this; wait for the old registration to lapse (up to a minute) and restart, or clear it now with `daedalus dash restart`", resp.Status, strings.TrimSpace(string(b)))
 	}
 	if resp.StatusCode != http.StatusNoContent {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))

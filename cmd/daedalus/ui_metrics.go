@@ -1,7 +1,7 @@
 // The metrics view's data layer: the operator-editable model price table,
 // the ledger folds behind the usage tables, derived tiles, and charts, and
 // the server-built SVG line charts. Everything reads the relay ledger the
-// way `metrics list` does — one clamped full-ring query, then plain folds;
+// way `dash list` does — one clamped full-ring query, then plain folds;
 // a 10k-entry pass is microseconds, so no cache layer. Cost is computed at
 // render time from the saved prices and never stored — a retroactive price
 // edit reprices the whole window on the next render, and Entry.CostUSD
@@ -529,6 +529,16 @@ func (s *uiServer) pageModels(w http.ResponseWriter, req *http.Request) {
 		Chrome uiChrome
 		V      uiModelsView
 	}{uiChrome{Nav: "models", Title: "daedalus — models"}, v})
+}
+
+// fragModels is the Models tab's polled region — the tiles, usage tables,
+// and charts, re-folded from the ledger each tick. The price form stays
+// outside the region (the page template wraps only the read-only
+// surfaces): a poll may never swap editable inputs out from under the
+// operator — the runs feed's filter-selects rule.
+func (s *uiServer) fragModels(w http.ResponseWriter, req *http.Request) {
+	v := buildModelsView(time.Now(), s.ledgerEntries(), s.currentPrices())
+	s.renderFrag(w, req, "frag_models", v)
 }
 
 // saveModels upserts the submitted rates and redirects back to the form.

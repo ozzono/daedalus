@@ -730,7 +730,7 @@ func TestUIRunsFeedDownNotesTheWalk(t *testing.T) {
 }
 
 // TestUIPolledFragmentsAnswer204WhenUnchanged pins renderFrag through all
-// three polled endpoints: a fragment whose fresh bytes equal the last bytes
+// five polled endpoints: a fragment whose fresh bytes equal the last bytes
 // sent for that URI answers 204 No Content — htmx counts 204 a successful
 // poll but never swaps it, so stable content leaves the DOM (and a click
 // mid-poll) alone. Changed data re-sends, the cache keys on the full
@@ -793,6 +793,41 @@ func TestUIPolledFragmentsAnswer204WhenUnchanged(t *testing.T) {
 	}
 	if code, _ := h.poll(t, "/runs/listq-live/body"); code != http.StatusNoContent {
 		t.Errorf("unchanged detail poll = %d, want 204", code)
+	}
+
+	// The models body fragment: with an empty ledger the read-only face is
+	// stable, so the repeat dedupes — and a fresh entry rides a 200. No
+	// unchanged-ledger face is pinned past that: with entries the charts
+	// re-derive their bucket grid from the render clock, so byte-stability
+	// between two renders is timing luck, not behavior — the tick simply
+	// keeps the models view current.
+	if code, out := h.poll(t, "/models/body"); code != http.StatusOK || !strings.Contains(out, "Usage by model") {
+		t.Fatalf("first /models/body poll = %d, want 200 with the models view", code)
+	}
+	if code, _ := h.poll(t, "/models/body"); code != http.StatusNoContent {
+		t.Errorf("unchanged empty /models/body poll = %d, want 204", code)
+	}
+	h.led.Append(metricsrelay.Entry{At: time.Now(), Worker: "w-m", Wire: metricsrelay.WireOpenAI, Model: "mz",
+		InputTokens: 5, OutputTokens: 6, Status: 200})
+	if code, out := h.poll(t, "/models/body"); code != http.StatusOK || !strings.Contains(out, "mz") {
+		t.Errorf("changed /models/body poll = %d, want 200 re-sending the new model row", code)
+	}
+
+	// The metrics body fragment: chartless today (the GoLens embed is
+	// absent from this build), so the face is stable between ledger
+	// changes and the dedupe holds. The seeded entry's age stays in the
+	// milliseconds across the two polls, five orders below the window
+	// note's half-second rounding edge, so both renders agree.
+	h.led.Append(metricsrelay.Entry{At: time.Now(), Worker: "w-m", InputTokens: 3, OutputTokens: 4, Status: 200})
+	if code, out := h.poll(t, "/metrics/body"); code != http.StatusOK || !strings.Contains(out, ">w-m</td>") {
+		t.Fatalf("first /metrics/body poll = %d, want 200 with the ledger row", code)
+	}
+	if code, _ := h.poll(t, "/metrics/body"); code != http.StatusNoContent {
+		t.Errorf("unchanged /metrics/body poll = %d, want 204", code)
+	}
+	h.led.Append(metricsrelay.Entry{At: time.Now(), Worker: "w-n", InputTokens: 1, OutputTokens: 2, Status: 200})
+	if code, out := h.poll(t, "/metrics/body"); code != http.StatusOK || !strings.Contains(out, ">w-n</td>") {
+		t.Errorf("changed /metrics/body poll = %d, want 200 re-sending the new row", code)
 	}
 
 	// Pages are not fragments: they render 200 whole on every request, so
@@ -1266,6 +1301,41 @@ func TestUIMetricsPage(t *testing.T) {
 	// Sessions: one running, two waiting (waiting + pending), four listed.
 	if !strings.Contains(out, `>listq</td><td>1</td><td>2</td><td>4</td>`) {
 		t.Errorf("metrics page lacks the session gauges:\n%s", out)
+	}
+}
+
+// TestUIMetricsBodyFragment pins the metrics view's polled body seam: the
+// page shell wraps the fragment region in the poller the header countdown
+// drives with the fragment's initial render inside it, and /metrics/body
+// serves the same aggregates the page embeds — both render through the one
+// metricsView walk, so the shell and its polled region can never
+// disagree — while the page chrome stays out of the fragment.
+func TestUIMetricsBodyFragment(t *testing.T) {
+	h := newUIHarness(t)
+	h.led.Append(metricsrelay.Entry{At: time.Now().Add(-time.Minute), Worker: "w-f", InputTokens: 1, OutputTokens: 2, Status: 200})
+
+	page := h.get(t, "/metrics")
+	if !strings.Contains(page, `hx-get="/metrics/body"`) {
+		t.Errorf("the metrics page lost its polled region wrapper:\n%s", page)
+	}
+	if !strings.Contains(page, ">w-f</td>") {
+		t.Errorf("the metrics page lost the fragment's initial render:\n%s", page)
+	}
+
+	body := h.get(t, "/metrics/body")
+	for _, want := range []string{
+		">w-f</td>",   // the per-worker ledger row
+		"Relay calls", // the tile grid, the fragment's top
+		"The GoLens embed is not built into this binary", // the note closes the region
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the metrics body fragment lacks %q:\n%s", want, body)
+		}
+	}
+	for _, banned := range []string{"<main", "<html"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("the metrics body fragment grew page chrome (%q):\n%s", banned, body)
+		}
 	}
 }
 
