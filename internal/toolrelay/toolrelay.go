@@ -13,7 +13,11 @@
 // the tool's schema and pi receives a synthetic single-delta tool_calls
 // stream. Everything else replays the upstream bytes untouched, and every
 // lift failure degrades to that passthrough — fail-open, no new workflow
-// failure path. The relay is stateless: no metrics store, no persistence;
+// failure path. Request-side, the relay likewise caps what the model
+// sees: a forwarded completions request has every oversized role:"tool"
+// message elided to head + tail + marker, so one unbounded tool result
+// cannot stuff the served model's context window into degenerate replies.
+// The relay is stateless: no metrics store, no persistence;
 // one structured log line per inspected response (tool name only, never
 // argument bodies). When started with a positive per-minute cap the relay
 // also paces its upstream-bound completions traffic through a sliding
@@ -35,11 +39,24 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // parserTimeout bounds one parser-model call; a slower parser fails the
 // lift and the response passes through as inert text.
 const parserTimeout = 60 * time.Second
+
+// maxToolResultChars caps one tool result's model-visible size. A single
+// unbounded command (a recursive listing over the repo root, .git/
+// included) can drop tens of thousands of tokens into the conversation in
+// one step; against a self-hosted window the agent runtime's output clamp
+// (window − prompt − reserve, floored at 1) is then left at one token and
+// the round degenerates — the model emits a fragment, the incomplete
+// tool-call envelope is withheld, the replay guard fails the round, and
+// the retry resumes the same stuffed transcript, so the loop is foregone.
+// Fixed constant, not config: the window it protects (context_tokens) is
+// the configurable part.
+const maxToolResultChars = 16384
 
 // rateLimiter bounds upstream requests to max per sliding window. One
 // Relay owns one limiter, so the window is shared by every round the
@@ -180,9 +197,32 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 		}
+		// Request-side hygiene before forwarding: capToolResults elides
+		// every oversized tool result in the messages, so one unbounded
+		// command's output cannot stuff the served model's context window
+		// into degenerate replies. Stateless per request — pi's local
+		// transcript keeps the full blob as the round's source of truth,
+		// and a session already carrying a bloated result heals on its
+		// next request.
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			http.Error(w, "toolrelay: read request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if capped := capToolResults(body); capped != nil {
+			body = capped
+			// The forwarded Content-Length must describe the rewritten
+			// body: the transport writes the header from the
+			// ContentLength field (the stale header-map entry is
+			// excluded), so the field assignment is what governs —
+			// dropping the stale entry is defensive only.
+			req.ContentLength = int64(len(body))
+			req.Header.Del("Content-Length")
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
 		// Without a parser model the lift path has nothing to call, so the
-		// relay stays a pure forwarder: streamed through unbuffered, paced
-		// only by the window above.
+		// relay stays a pure forwarder: the request is buffered only for
+		// the cap walk above, the response streams through untouched.
 		if r.parserModel == "" {
 			r.proxy.ServeHTTP(w, req)
 			return
@@ -191,6 +231,101 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	r.proxy.ServeHTTP(w, req)
+}
+
+// capToolResults walks the messages of an OpenAI chat-completions request
+// body and returns the body with every role:"tool" message whose text
+// exceeds maxToolResultChars replaced by head + tail + elision marker — or
+// nil when nothing needed capping or the body is not parseable JSON, so
+// the cap is hygiene and never a new failure path. The relay is the one
+// daedalus-owned point every served completion passes through, and the
+// only side of the wire it owns request-wise: pi executes the tools and
+// cannot be capped there, while what a model types into bash cannot be
+// bounded by the prompt — the oversized result is elided as it forwards.
+// ponytail: tool content in parts-array form passes uncapped — pi sends
+// plain strings.
+func capToolResults(body []byte) []byte {
+	var wire struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil
+	}
+	replaced := make(map[int]json.RawMessage, len(wire.Messages))
+	for i, raw := range wire.Messages {
+		var msg struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(raw, &msg); err != nil || msg.Role != "tool" {
+			continue
+		}
+		var text string
+		if err := json.Unmarshal(msg.Content, &text); err != nil || utf8.RuneCountInString(text) <= maxToolResultChars {
+			continue
+		}
+		content, err := json.Marshal(elideToolResult(text))
+		if err != nil { // unreachable: string marshal
+			continue
+		}
+		// Rebuild just this message from its own raw fields so everything
+		// else it carries (tool_call_id and friends) survives untouched.
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil { // unreachable: raw parsed above
+			continue
+		}
+		obj["content"] = content
+		rebuilt, err := json.Marshal(obj)
+		if err != nil { // unreachable: map of valid raw values
+			continue
+		}
+		replaced[i] = rebuilt
+	}
+	if len(replaced) == 0 {
+		return nil
+	}
+	// Reassemble the body around the replaced messages; every other
+	// top-level field rides as raw JSON, byte-exact.
+	msgs := make([]json.RawMessage, len(wire.Messages))
+	for i, raw := range wire.Messages {
+		msgs[i] = raw
+		if r, ok := replaced[i]; ok {
+			msgs[i] = r
+		}
+	}
+	mraw, err := json.Marshal(msgs)
+	if err != nil { // unreachable: slice of valid raw values
+		return nil
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil { // unreachable: body parsed above
+		return nil
+	}
+	top["messages"] = mraw
+	out, err := json.Marshal(top)
+	if err != nil { // unreachable: map of valid raw values
+		return nil
+	}
+	return out
+}
+
+// elideToolResult shortens one oversized tool result to its head and tail
+// around an elision marker naming the way out (re-run the command bounded).
+// Cuts snap to rune boundaries so multi-byte content is never split, and
+// the counts are runes; the 8000+8000 keep leaves the marker its slack
+// inside maxToolResultChars for any digit count.
+func elideToolResult(text string) string {
+	const keepEach = 8000
+	headAt, tailAt := keepEach, len(text)-keepEach
+	for !utf8.RuneStart(text[headAt]) {
+		headAt--
+	}
+	for tailAt < len(text) && !utf8.RuneStart(text[tailAt]) {
+		tailAt++
+	}
+	head, tail := text[:headAt], text[tailAt:]
+	elided := utf8.RuneCountInString(text) - utf8.RuneCountInString(head) - utf8.RuneCountInString(tail)
+	return head + fmt.Sprintf("[output truncated: %d of %d chars elided — re-run with head/tail/grep if needed]", elided, utf8.RuneCountInString(text)) + tail
 }
 
 // chatRequest is the slice of the OpenAI chat-completions request the lift

@@ -271,7 +271,10 @@ func workerStart(cfg config.Config, configPath, workerType string, force ...bool
 }
 
 // workerStop gracefully terminates the daemon: SIGTERM lets Temporal's
-// worker drain, then the pid file is cleared once the process is gone.
+// worker drain, then the pid file is cleared once the process is gone —
+// and only while it still names the pid that was signaled, so a
+// replacement started concurrently (a force swap) keeps its record; a
+// daemon still alive after the grace keeps the file it owns.
 func workerStop(cfg config.Config) error {
 	pidFile, logFile, _ := daemonPaths(cfg.WorkerName())
 	pid, ok := readLivePid(pidFile)
@@ -294,10 +297,10 @@ func workerStop(cfg config.Config) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	if pidAlive(pid) {
-		os.Remove(pidFile)
+		// Still alive after the grace: the daemon owns the pid file — leave it.
 		return fmt.Errorf("pid %d still alive after 30s — it may need SIGKILL; log: %s", pid, logFile)
 	}
-	os.Remove(pidFile)
+	removePidFileFor(pidFile, pid)
 	fmt.Printf("worker stopped (pid %d)\n", pid)
 	return nil
 }
@@ -423,6 +426,15 @@ func workerRestartAll(force ...bool) error {
 		}
 		return fmt.Errorf("no workers on record in %s — start one first", daemonDir)
 	}
+	// The stale-worker sweep is host-wide by nature and rides only this
+	// command's force scope — the one form whose reach is every worker (a
+	// single-worker restart or a plain start never signals a worker it was
+	// not addressed to). Its pid-file guard leaves managed workers to the
+	// cycle below; only pid-file-less orphans running a deleted binary are
+	// reaped here. Best-effort — it never fails the restart.
+	if forceSet(force) {
+		sweepStaleWorkers()
+	}
 	var skipped []error
 	for _, name := range names {
 		if recorded := recordedConfigPath(name); recorded != "" {
@@ -486,11 +498,19 @@ func readLivePid(pidFile string) (int, bool) {
 // exiting daemon delete the file that already names its replacement: the
 // unlink happens only while the record is still ours.
 func removeOwnPidFile(pidFile string) {
+	removePidFileFor(pidFile, os.Getpid())
+}
+
+// removePidFileFor removes pidFile only while its contents still name pid —
+// the stop path's clear, the same guard the daemon exit runs with its own
+// pid: a concurrent force swap rewrites the file to name its replacement,
+// and the waiter must not delete the new daemon's record.
+func removePidFileFor(pidFile string, pid int) {
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		return
 	}
-	if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid == os.Getpid() {
+	if onFile, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && onFile == pid {
 		os.Remove(pidFile)
 	}
 }
@@ -528,20 +548,24 @@ const deletedExeSuffix = " (deleted)"
 // yet it keeps polling its task queue as a live, invisible poller. The pid
 // file no longer names it (a stop removes the file, a restart's start
 // rewrites it), so workerStop addresses nothing and the orphan survives
-// silently. The sweep runs from the worker startup path, where a stale
-// leftover is detectable: a deleted exe can never be the binary now
-// starting. Identification is deliberately precise — deleted exe, the
+// silently. The sweep rides only "worker restart all --force" — the one
+// command whose scope is every worker on the host; a single-worker
+// restart or a plain start signals exactly the worker it addresses, never
+// its siblings. Even there, a candidate a live worker pid file still
+// names is managed — stop and restart reach it — and is skipped, so the
+// sweep's targets are the pid-file-less orphans only. Identification is
+// deliberately precise — deleted exe, the
 // daedalus basename, AND a consecutive "worker foreground" argv (the
 // daemon's re-exec shape) — so a healthy worker of another deployment
 // (binary intact) or any other deleted-binary process of ours is never
-// touched, and the sweep skips its own pid: it runs from the just-starting
-// worker itself. Matched processes get workerStop's own semantics — SIGTERM,
+// touched, and the sweep skips its own pid: it runs from the restart-all
+// process itself. Matched processes get workerStop's own semantics — SIGTERM,
 // then a workerStopGrace drain watched through pidAlive — and the daemon-dir
 // pid file naming a reaped pid is removed. Survivors are named loudly and
 // left alone; nothing here signals a process group (ai-jail/bwrap children
 // live under the worker's pid), only the one stale pid. Best-effort by
 // contract: a candidate whose /proc entries cannot be read is skipped, and
-// a failed sweep never fails the start.
+// a failed sweep never fails the restart.
 func sweepStaleWorkers() {
 	self := os.Getpid()
 	ownExe, err := os.Executable()
@@ -572,6 +596,11 @@ func sweepStaleWorkers() {
 		}
 		args := strings.Split(string(bytes.TrimRight(data, "\x00")), "\x00")
 		if !isWorkerForegroundArgv(args) {
+			continue
+		}
+		if len(workerPidFilesHolding(pid)) > 0 {
+			// A live pid file still names it: a managed worker — stop
+			// and restart reach it. Never sweep fodder.
 			continue
 		}
 		stale = append(stale, pid)
@@ -605,15 +634,17 @@ func isWorkerForegroundArgv(args []string) bool {
 	return false
 }
 
-// removePidFilesFor removes every worker-*.pid file in the daemon dir whose
-// content names pid — daemon files are keyed by worker name (worker_id, else
-// task queue) and the sweep is name-agnostic by design: the stale worker may
-// belong to any of them. Best-effort.
-func removePidFilesFor(pid int) {
+// workerPidFilesHolding lists the worker-*.pid files in the daemon dir
+// whose content names pid — daemon files are keyed by worker name
+// (worker_id, else task queue) and the sweep is name-agnostic by design:
+// the stale worker may belong to any of them. Best-effort: unreadable
+// entries are skipped.
+func workerPidFilesHolding(pid int) []string {
 	entries, err := os.ReadDir(daemonDir)
 	if err != nil {
-		return
+		return nil
 	}
+	var files []string
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasPrefix(name, "worker-") || !strings.HasSuffix(name, ".pid") {
@@ -624,8 +655,17 @@ func removePidFilesFor(pid int) {
 			continue
 		}
 		if content, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && content == pid {
-			os.Remove(filepath.Join(daemonDir, name))
+			files = append(files, filepath.Join(daemonDir, name))
 		}
+	}
+	return files
+}
+
+// removePidFilesFor removes every pid file workerPidFilesHolding names —
+// the sweep's cleanup for a pid it just reaped. Best-effort.
+func removePidFilesFor(pid int) {
+	for _, f := range workerPidFilesHolding(pid) {
+		os.Remove(f)
 	}
 }
 

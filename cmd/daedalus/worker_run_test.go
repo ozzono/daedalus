@@ -204,10 +204,10 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 
 // TestRunWorkerReviewerSplitEnvExports pins the reviewer-split env channel
 // at worker startup: a reviewer.model export travels as
-// DAEDALUS_REVIEWER_MODEL (exported only when set, per the task spec —
-// scrubbed from the daemon spawn via config.ProviderEnvVars; the
-// stale-foreground-export clear is deliberately not asserted, see
-// backlog/bugs/reviewer-model-env-foreground-stale-export.md), and the two
+// DAEDALUS_REVIEWER_MODEL (exported only when set — scrubbed from the
+// daemon spawn via config.ProviderEnvVars, and unset symmetrically on the
+// foreground path, where no spawn scrub runs, so a stale shell export
+// cannot retarget a config that says nothing), and the two
 // wire-level thinking knobs export as DAEDALUS_OPENAI_THINKING=off /
 // DAEDALUS_REVIEWER_THINKING=off — only an explicit disable_thinking: true
 // sends a signal (never-send-a-default), and like the toggle family they
@@ -221,10 +221,11 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	restoreProcessEnv(t, config.ReviewerModelEnv, config.OpenAIThinkingEnv, config.ReviewerThinkingEnv,
 		"DAEDALUS_AGENT", "DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", "DAEDALUS_MAX_CONCURRENT_TESTS", "DAEDALUS_WORKER_NAME")
 
-	// Stale thinking exports must not outlive a config that says nothing —
-	// the toggles' set-or-unset symmetry.
+	// Stale exports must not outlive a config that says nothing — the
+	// set-or-unset symmetry, the reviewer model included.
 	t.Setenv(config.OpenAIThinkingEnv, "off")
 	t.Setenv(config.ReviewerThinkingEnv, "off")
+	t.Setenv(config.ReviewerModelEnv, "stale-review-model")
 	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -233,6 +234,9 @@ func TestRunWorkerReviewerSplitEnvExports(t *testing.T) {
 	}
 	if got := os.Getenv(config.ReviewerThinkingEnv); got != "" {
 		t.Errorf("%s = %q after an unconfigured config, want the stale export cleared", config.ReviewerThinkingEnv, got)
+	}
+	if got := os.Getenv(config.ReviewerModelEnv); got != "" {
+		t.Errorf("%s = %q after an unconfigured config, want the stale export cleared", config.ReviewerModelEnv, got)
 	}
 
 	// The set branches: a reviewer model rides its own var, each knob arms

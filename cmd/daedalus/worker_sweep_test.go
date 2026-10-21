@@ -136,29 +136,35 @@ func TestRemovePidFilesFor(t *testing.T) {
 }
 
 // TestSweepStaleWorkers pins the sweep's identification and action end to
-// end, against real processes: a worker-foreground argv under a deleted
-// copy of this binary is reaped — SIGTERM, the daemon pid file naming it
-// removed, the reap announced by pid — while a deleted-binary lookalike
-// with a different argv and a same-argv sibling with an intact binary are
-// both left alone. Those two exclusions are the sweep's safety property:
-// it signals processes it found by scanning /proc, so a too-broad match
-// would kill whatever it mistook for a stale worker.
+// end, against real processes. The sweep rides only the restart-all force
+// scope, so its reach is the pin's core: a deleted-binary worker-foreground
+// ORPHAN — no pid file naming it, so no stop or restart can address it — is
+// reaped, while a deleted-binary lookalike with a different argv, a
+// same-argv sibling with an intact binary, and a managed worker whose live
+// pid file names it are all left alone. Those three exclusions are the
+// sweep's safety property: it signals processes it found by scanning /proc,
+// so a too-broad match would kill whatever it mistook for a stale worker —
+// exactly the mass-reap incident the pid-file guard closes (a rebuilt
+// binary turns every running daemon's exe "(deleted)", and the pre-guard
+// sweep reaped all of a host's healthy siblings).
 func TestSweepStaleWorkers(t *testing.T) {
 	dir := useDaemonDir(t)
 
-	stale, staleCopy := spawnSweepChild(t, dir, "stale", "worker", "foreground")
+	orphan, orphanCopy := spawnSweepChild(t, dir, "orphan", "worker", "foreground")
+	managed, managedCopy := spawnSweepChild(t, dir, "managed", "worker", "foreground")
 	wrongArgv, wrongArgvCopy := spawnSweepChild(t, dir, "wrongargv", "daemon", "helper")
 	healthy, _ := spawnSweepChild(t, dir, "healthy", "worker", "foreground")
 
-	// Both copies die on disk; the running children keep their inodes with
-	// the kernel's "(deleted)" marker — the exact condition the sweep keys
-	// on. Verified before sweeping: if the marker never appears, the sweep
-	// below is pinning nothing.
+	// Three of the copies die on disk; the running children keep their
+	// inodes with the kernel's "(deleted)" marker — the exact condition
+	// the sweep keys on. Verified before sweeping: if the marker never
+	// appears, the sweep below is pinning nothing. The healthy lookalike
+	// keeps its binary — the intact-exe exclusion needs it.
 	for _, c := range []struct {
 		name     string
 		copyPath string
 		pid      int
-	}{{"stale", staleCopy, stale.Process.Pid}, {"wrongargv", wrongArgvCopy, wrongArgv.Process.Pid}} {
+	}{{"orphan", orphanCopy, orphan.Process.Pid}, {"managed", managedCopy, managed.Process.Pid}, {"wrongargv", wrongArgvCopy, wrongArgv.Process.Pid}} {
 		if err := os.Remove(c.copyPath); err != nil {
 			t.Fatalf("unlink %s copy: %v", c.name, err)
 		}
@@ -171,50 +177,40 @@ func TestSweepStaleWorkers(t *testing.T) {
 		}
 	}
 
-	// The daemon-dir pid file names the stale worker; a second names this
-	// test process and must survive.
-	pidFile := filepath.Join(dir, "worker-daedalus.pid")
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(stale.Process.Pid)), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	ownPidFile := filepath.Join(dir, "worker-other.pid")
-	if err := os.WriteFile(ownPidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+	// The managed worker's live pid file names it — stop and restart reach
+	// it, so the sweep must never touch it even under a deleted binary.
+	managedPidFile := filepath.Join(dir, "worker-managed.pid")
+	if err := os.WriteFile(managedPidFile, []byte(strconv.Itoa(managed.Process.Pid)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	out := captureStdout(t, func() { sweepStaleWorkers() })
 
-	// The stale worker is gone — dead and reaped, pidAlive no longer
-	// answering.
+	// The orphan is gone — dead and reaped, pidAlive no longer answering.
 	deadline := time.Now().Add(workerStopGrace)
-	for pidAlive(stale.Process.Pid) {
+	for pidAlive(orphan.Process.Pid) {
 		if time.Now().After(deadline) {
-			t.Fatalf("stale worker pid %d survived the sweep's SIGTERM", stale.Process.Pid)
+			t.Fatalf("stale orphan pid %d survived the sweep's SIGTERM", orphan.Process.Pid)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err := stale.Wait(); err != nil {
+	if err := orphan.Wait(); err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) || ee.ExitCode() != -1 {
-			t.Errorf("stale child Wait = %v, want a signal death", err)
+			t.Errorf("orphan child Wait = %v, want a signal death", err)
 		}
 	}
-	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
-		t.Errorf("the stale worker's pid file should be removed (stat err = %v)", err)
-	}
-	if _, err := os.Stat(ownPidFile); err != nil {
-		t.Errorf("the pid file naming this test process should survive: %v", err)
-	}
-	if !strings.Contains(out, fmt.Sprintf("reaped stale worker pid %d", stale.Process.Pid)) {
+	if !strings.Contains(out, fmt.Sprintf("reaped stale worker pid %d", orphan.Process.Pid)) {
 		t.Errorf("sweep output %q should announce the reaped pid", out)
 	}
 
-	// The lookalikes are untouched: same deleted binary but a different
-	// argv, and same argv but an intact binary.
+	// The exclusions are untouched: the managed worker (a live pid file
+	// names it), the deleted-binary non-worker (a different argv), and the
+	// healthy worker lookalike (an intact binary).
 	for _, c := range []struct {
 		name string
 		pid  int
-	}{{"the deleted-binary non-worker", wrongArgv.Process.Pid}, {"the healthy worker lookalike", healthy.Process.Pid}} {
+	}{{"the managed worker", managed.Process.Pid}, {"the deleted-binary non-worker", wrongArgv.Process.Pid}, {"the healthy worker lookalike", healthy.Process.Pid}} {
 		if !pidAlive(c.pid) {
 			t.Errorf("%s (pid %d) was killed — the sweep's identification is too broad", c.name, c.pid)
 		}
@@ -222,25 +218,28 @@ func TestSweepStaleWorkers(t *testing.T) {
 			t.Errorf("sweep output %q should not name untouched pid %d", out, c.pid)
 		}
 	}
+	if _, err := os.Stat(managedPidFile); err != nil {
+		t.Errorf("the managed worker's pid file should survive the sweep: %v", err)
+	}
 }
 
-// TestRunWorkerSweepsStaleWorkers pins the sweep's production wiring:
-// runWorker sweeps first, before anything else it does — an empty-config
-// start that dies at worktree preflight still reaps a stale deleted-binary
-// worker on the way in, pruning the daemon pid file naming it. The direct
-// call TestSweepStaleWorkers pins cannot catch the call site dying: deleting
-// it from runWorker (or moving it behind the first error return) strands
-// the stale poller again, and this fails.
-func TestRunWorkerSweepsStaleWorkers(t *testing.T) {
+// TestRunWorkerSparesStaleWorkers pins the blast-radius ruling's plain-start
+// half: a worker start signals exactly the worker it addresses — never a
+// sibling. The startup sweep the old runWorker ran reaped every
+// deleted-binary worker-foreground process on the host after any rebuild
+// (the mass-reap incident); it is gone from the startup path, so even the
+// maximally sweepable shape — a deleted-binary orphan running the daemon's
+// own argv with no pid file naming it — survives an empty-config start that
+// dies at worktree preflight.
+func TestRunWorkerSparesStaleWorkers(t *testing.T) {
 	dir := useDaemonDir(t)
 
-	stale, staleCopy := spawnSweepChild(t, dir, "wiring", "worker", "foreground")
-	if err := os.Remove(staleCopy); err != nil {
-		t.Fatalf("unlink the stale copy: %v", err)
+	orphan, orphanCopy := spawnSweepChild(t, dir, "spare", "worker", "foreground")
+	if err := os.Remove(orphanCopy); err != nil {
+		t.Fatalf("unlink the orphan copy: %v", err)
 	}
-	pidFile := filepath.Join(dir, "worker-daedalus.pid")
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(stale.Process.Pid)), 0o644); err != nil {
-		t.Fatal(err)
+	if link, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", orphan.Process.Pid)); err != nil || !strings.HasSuffix(link, deletedExeSuffix) {
+		t.Fatalf("orphan exe link = %q (%v), want the %q marker — the pin below would hold vacuously", link, err, deletedExeSuffix)
 	}
 
 	out := captureStdout(t, func() {
@@ -249,24 +248,83 @@ func TestRunWorkerSweepsStaleWorkers(t *testing.T) {
 		}
 	})
 
-	// The stale worker did not survive the startup it now competes with.
-	deadline := time.Now().Add(workerStopGrace)
-	for pidAlive(stale.Process.Pid) {
-		if time.Now().After(deadline) {
-			t.Fatalf("stale worker pid %d survived runWorker's sweep", stale.Process.Pid)
+	if !pidAlive(orphan.Process.Pid) {
+		t.Fatal("the orphan was killed by a plain worker start — the startup sweep is back")
+	}
+	if strings.Contains(out, "reaped stale worker") {
+		t.Errorf("a plain start's output %q must never announce a sweep reap", out)
+	}
+}
+
+// TestRestartAllForceSweeps pins the ruling's restart-all half: the stale
+// sweep rides only the force scope of `worker restart all` — the one form
+// whose reach is every worker on the host — and the plain restart-all (the
+// drain default) never signals a worker it was not addressing. The orphan
+// here is the only shape the force sweep may reap: deleted binary, the
+// daemon's own argv, no pid file.
+func TestRestartAllForceSweeps(t *testing.T) {
+	spawnOrphan := func(t *testing.T, dir, markerName string) (pid int, gone func() error) {
+		t.Helper()
+		child, copyPath := spawnSweepChild(t, dir, markerName, "worker", "foreground")
+		if err := os.Remove(copyPath); err != nil {
+			t.Fatalf("unlink the orphan copy: %v", err)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err := stale.Wait(); err != nil {
-		var ee *exec.ExitError
-		if !errors.As(err, &ee) || ee.ExitCode() != -1 {
-			t.Errorf("stale child Wait = %v, want a signal death", err)
+		if link, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", child.Process.Pid)); err != nil || !strings.HasSuffix(link, deletedExeSuffix) {
+			t.Fatalf("orphan exe link = %q (%v), want the %q marker — the pin below would hold vacuously", link, err, deletedExeSuffix)
 		}
+		return child.Process.Pid, func() error { return child.Wait() }
 	}
-	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
-		t.Errorf("the stale worker's pid file should be removed (stat err = %v)", err)
-	}
-	if !strings.Contains(out, fmt.Sprintf("reaped stale worker pid %d", stale.Process.Pid)) {
-		t.Errorf("runWorker's sweep output %q should announce the reaped pid", out)
-	}
+
+	t.Run("the force scope reaps the pid-file-less orphan", func(t *testing.T) {
+		dir := useDaemonDir(t)
+		noDaemonSpawn(t)
+		cfgPath := writeQueueConfig(t, "daedalus")
+		writeRecord(t, "daedalus", cfgPath)
+		orphan, wait := spawnOrphan(t, dir, "force-sweep")
+
+		out := captureStdout(t, func() {
+			if err := workerRestartAll(true); err != nil {
+				t.Errorf("workerRestartAll(force): %v", err)
+			}
+		})
+		deadline := time.Now().Add(workerStopGrace)
+		for pidAlive(orphan) {
+			if time.Now().After(deadline) {
+				t.Fatalf("orphan pid %d survived the force restart-all's sweep", orphan)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := wait(); err != nil {
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) || ee.ExitCode() != -1 {
+				t.Errorf("orphan child Wait = %v, want a signal death", err)
+			}
+		}
+		if !strings.Contains(out, fmt.Sprintf("reaped stale worker pid %d", orphan)) {
+			t.Errorf("force restart-all output %q should announce the reap", out)
+		}
+		if !strings.Contains(out, "== worker daedalus (") {
+			t.Errorf("force restart-all output %q should still cycle the recorded worker", out)
+		}
+	})
+
+	t.Run("the plain restart-all never sweeps", func(t *testing.T) {
+		dir := useDaemonDir(t)
+		noDaemonSpawn(t)
+		cfgPath := writeQueueConfig(t, "daedalus")
+		writeRecord(t, "daedalus", cfgPath)
+		orphan, _ := spawnOrphan(t, dir, "plain-sweep")
+
+		out := captureStdout(t, func() {
+			if err := workerRestartAll(); err != nil {
+				t.Errorf("workerRestartAll: %v", err)
+			}
+		})
+		if !pidAlive(orphan) {
+			t.Fatal("the orphan was killed by a plain restart-all — the sweep escaped the force scope")
+		}
+		if strings.Contains(out, "reaped stale worker") {
+			t.Errorf("plain restart-all output %q must never announce a sweep reap", out)
+		}
+	})
 }

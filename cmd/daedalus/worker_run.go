@@ -91,11 +91,6 @@ func runWorker(cfg config.Config, workerType string) error {
 			}
 		}()
 	}
-	// Reap leftover workers first: a stale worker running a deleted binary
-	// polls the same task queue this start is about to join, and once the
-	// pollers below register, two live workers are indistinguishable from
-	// the outside. Best-effort — it never fails the start.
-	sweepStaleWorkers()
 	// Export provider settings into the worker's environment — but only the
 	// ones actually set in the config. A missing key is not an error: the
 	// jailed agent may authenticate through the worker's inherited
@@ -113,12 +108,16 @@ func runWorker(cfg config.Config, workerType string) error {
 	// than an AgentEnv key family: AgentEnv's key-site scan is a pinned
 	// exact count, so a new family would fail it. Set only when configured
 	// — absent means reviewers request the serving section's model — and
-	// scrubbed from the daemon spawn (config.ProviderEnvVars), so a stale
-	// shell export can never retarget a config that says nothing.
+	// unset symmetrically (the thinking toggles' shape below), so a stale
+	// shell export cannot retarget a config that says nothing even on the
+	// foreground path, where no daemon spawn scrub
+	// (config.ProviderEnvVars) runs.
 	if m := cfg.Reviewer.Model; m != "" {
 		if err := os.Setenv("DAEDALUS_REVIEWER_MODEL", m); err != nil {
 			return fmt.Errorf("set DAEDALUS_REVIEWER_MODEL: %w", err)
 		}
+	} else if err := os.Unsetenv("DAEDALUS_REVIEWER_MODEL"); err != nil {
+		return fmt.Errorf("unset DAEDALUS_REVIEWER_MODEL: %w", err)
 	}
 	// The jailed agent selection travels the same channel: activities read
 	// DAEDALUS_AGENT when building the ai-jail command line.
@@ -188,7 +187,12 @@ func runWorker(cfg config.Config, workerType string) error {
 		if err := os.Setenv(config.MetricsRelayOpenAIEnv, metricsRoot); err != nil {
 			return fmt.Errorf("set %s: %w", config.MetricsRelayOpenAIEnv, err)
 		}
-		if err := metricsRegister(cfg, metricsRoot, metricsToken); err != nil {
+		// Boot retries a name conflict instead of exiting: a restart inside
+		// the registration TTL hits the relay's refusal while the dead
+		// process's entry lingers, and the retry budget outlives that window
+		// (metricsRegisterBootRetry). A failed boot registration is otherwise
+		// fatal here, the wedge the restart-TTL incident rode.
+		if err := metricsRegisterBootRetry(cfg, metricsRoot, metricsToken); err != nil {
 			return fmt.Errorf("register with the metrics relay: %w", err)
 		}
 		stopReg := make(chan struct{})

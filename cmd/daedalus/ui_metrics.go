@@ -173,6 +173,17 @@ type metricsUsageRow struct {
 	last              time.Time
 }
 
+// latencyDur renders a per-call latency for the usage tables' P50/P95:
+// millisecond rounding under a second — whole-second rounding collapses
+// fast calls into fabricated zeros (a 400ms p50 reading "0s") — deferring
+// to the runs-table humanizer dur above it.
+func latencyDur(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return dur(d)
+}
+
 // foldUsage reduces the ascending ledger into one row per key: the token
 // sums, the distinct keyed runs, the dev/test/review call split, the
 // wire-aware cache-hit ratio (the anthropic wire reports cache reads
@@ -244,8 +255,8 @@ func foldUsage(entries []metricsrelay.Entry, now time.Time, prices map[string]mo
 		r.Runs = len(runs[k])
 		sorted := durs[k]
 		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-		r.P50 = dur(time.Duration(percentile(sorted, 50)) * time.Millisecond)
-		r.P95 = dur(time.Duration(percentile(sorted, 95)) * time.Millisecond)
+		r.P50 = latencyDur(time.Duration(percentile(sorted, 50)) * time.Millisecond)
+		r.P95 = latencyDur(time.Duration(percentile(sorted, 95)) * time.Millisecond)
 		r.HitPct = "—"
 		if r.hitDenom > 0 {
 			r.HitPct = fmt.Sprintf("%.1f%%", 100*float64(r.hitRead)/float64(r.hitDenom))

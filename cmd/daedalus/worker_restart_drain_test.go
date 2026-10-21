@@ -404,6 +404,29 @@ func TestWorkerRestartNamedForce(t *testing.T) {
 		}
 	})
 
+	t.Run("force starts a not-running worker", func(t *testing.T) {
+		// The restart scope's not-running half: a restart of a worker with
+		// no live pid starts it, force included — the force branch skips
+		// only the signal. The drain path's not-running start is pinned in
+		// TestWorkerRestartNamed's first subtest.
+		useDaemonDir(t)
+		noDaemonSpawn(t)
+		cfgPath := writeWorkerIDConfig(t, "alpha")
+		writeRecord(t, "alpha", cfgPath)
+
+		out := captureStdout(t, func() {
+			if err := workerRestartNamed("alpha", true); err != nil {
+				t.Errorf("workerRestartNamed(force, not running): %v", err)
+			}
+		})
+		if !strings.Contains(out, "worker started") {
+			t.Errorf("force restart output %q should report a started worker", out)
+		}
+		if strings.Contains(out, "force restart: signaled") {
+			t.Errorf("force restart output %q must not signal anything — nothing was running", out)
+		}
+	})
+
 	t.Run("the default schedules the drain", func(t *testing.T) {
 		useDaemonDir(t)
 		cfgPath := writeWorkerIDConfig(t, "alpha")
@@ -427,6 +450,120 @@ func TestWorkerRestartNamedForce(t *testing.T) {
 		}
 		if got := pidFileContent(t, "alpha"); got != child {
 			t.Errorf("pid file rewritten to %d — a scheduled restart never touches it", got)
+		}
+	})
+}
+
+// termTrappedChild spawns a child that catches the first SIGTERM into a
+// marker touch — alive after the signal, proof the stop's signal landed —
+// and exits on its own about a second later, so the stop's wait ends
+// without the 30s grace. dash defers a caught trap's action until the
+// foreground command it interrupted completes, so the child ticks a
+// bounded sleep loop: the marker rides the first tick boundary after the
+// signal while the exit rides the last, leaving the ticks in between as
+// the window a test's pid-file rewrite needs. The child announces the
+// installed trap on a ready marker before the pid is returned — a signal
+// fired earlier would race the shell's startup and kill it through the
+// not-yet-installed disposition. Await the signal's marker with
+// awaitMarker once the signal is believed delivered.
+func termTrappedChild(t *testing.T, marker string) (pid int) {
+	t.Helper()
+	ready := marker + ".ready"
+	cmd := exec.Command("sh", "-c", `trap "touch `+marker+`" TERM; touch `+ready+`; n=0; while [ "$n" -lt 8 ]; do sleep 0.1; n=$((n+1)); done`)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	awaitMarker(t, ready)
+	return cmd.Process.Pid
+}
+
+// awaitMarker waits until path exists — the trap child's delivered-signal
+// barrier.
+func awaitMarker(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never appeared — the signal was never delivered", path)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestWorkerStopPidFileGuard pins the stop path's guarded cleanup: a clean
+// stop removes the pid file once the signaled daemon is gone, and a stop
+// racing a concurrent replacement — a force swap rewrote the file to name
+// the new daemon mid-wait — leaves the replacement's record alone: the
+// unlink happens only while the file still names the pid that was
+// signaled. A daemon still alive after the grace keeps the file it owns
+// (the timed-out branch removes nothing); that arm needs the full 30s
+// wait to reach, so it is pinned at the predicate's level here — the
+// still-alive branch is exactly the code path that no longer unlinks.
+func TestWorkerStopPidFileGuard(t *testing.T) {
+	t.Run("a clean stop removes the pid file", func(t *testing.T) {
+		useDaemonDir(t)
+		cfg := config.Config{Temporal: config.TemporalConfig{TaskQueue: "stopguard"}}
+		cmd := exec.Command("sh", "-c", "sleep 30") // dies on the SIGTERM
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cmd.Wait() })
+		writePidFile(t, "stopguard", cmd.Process.Pid)
+
+		out := captureStdout(t, func() {
+			if err := workerStop(cfg); err != nil {
+				t.Errorf("workerStop: %v", err)
+			}
+		})
+		if !strings.Contains(out, "worker stopped (pid "+strconv.Itoa(cmd.Process.Pid)+")") {
+			t.Errorf("stop output %q, want the stopped line", out)
+		}
+		pidFile, _, _ := daemonPaths("stopguard")
+		if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
+			t.Errorf("pid file survived the clean stop: %v", err)
+		}
+	})
+
+	t.Run("a replacement's pid file survives the stop", func(t *testing.T) {
+		useDaemonDir(t)
+		cfg := config.Config{Temporal: config.TemporalConfig{TaskQueue: "stopguard"}}
+		replacement := sleepIgnoring(t, "TERM")
+
+		// The forced swap in flight: the stop signals the old daemon and,
+		// while it waits, the replacement's start rewrites the pid file.
+		// The marker orders the rewrite after the delivered signal; the
+		// old daemon's self-timed exit (0.4s, far later than the rewrite)
+		// orders the stop's final guarded unlink after it.
+		marker := filepath.Join(t.TempDir(), "signaled")
+		old := termTrappedChild(t, marker)
+		writePidFile(t, "stopguard", old)
+
+		out := captureStdout(t, func() {
+			errc := make(chan error, 1)
+			go func() { errc <- workerStop(cfg) }()
+			awaitMarker(t, marker)
+			writePidFile(t, "stopguard", replacement)
+			select {
+			case stopErr := <-errc:
+				if stopErr != nil {
+					t.Errorf("workerStop: %v", stopErr)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("workerStop never returned — it waited on the wrong pid")
+			}
+		})
+		if !strings.Contains(out, "worker stopped (pid "+strconv.Itoa(old)+")") {
+			t.Errorf("stop output %q, want the old daemon's stopped line", out)
+		}
+		if got := pidFileContent(t, "stopguard"); got != replacement {
+			t.Errorf("pid file rewritten to %d — a stop must never unname its replacement", got)
+		}
+		if !stillAlive(t, replacement) {
+			t.Error("the replacement died during the stop — it was signaled")
 		}
 	})
 }

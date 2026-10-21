@@ -224,16 +224,16 @@ func TestRegistryTokenLifecycle(t *testing.T) {
 	if tok == "" || len(tok) != 32 || strings.Trim(tok, "0123456789abcdef") != "" {
 		t.Fatalf("NewToken = %q, want 128 bits of hex", tok)
 	}
-	if err := reg.Register("w", "q", up, nil, tok); err != nil {
+	if err := reg.Register("w", "q", up, nil, nil, tok); err != nil {
 		t.Fatalf("Register with the worker's own secret: %v", err)
 	}
-	if err := reg.Register("w", "q", up, nil, tok); err != nil {
+	if err := reg.Register("w", "q", up, nil, nil, tok); err != nil {
 		t.Errorf("live re-registration with the presented secret: %v, want accepted (heartbeat)", err)
 	}
-	if err := reg.Register("w", "q", up, nil, tok+"0"); err == nil {
+	if err := reg.Register("w", "q", up, nil, nil, tok+"0"); err == nil {
 		t.Error("live collision with a wrong token accepted")
 	}
-	if err := reg.Register("w", "q", up, nil, ""); err == nil {
+	if err := reg.Register("w", "q", up, nil, nil, ""); err == nil {
 		t.Error("live collision with no token accepted")
 	}
 
@@ -242,10 +242,10 @@ func TestRegistryTokenLifecycle(t *testing.T) {
 	// dead registration.
 	base := time.Now()
 	reg.now = func() time.Time { return base.Add(2 * time.Minute) }
-	if err := reg.Register("w", "q", up, nil, "fresh-secret"); err != nil {
+	if err := reg.Register("w", "q", up, nil, nil, "fresh-secret"); err != nil {
 		t.Errorf("lapsed re-registration: %v, want accepted", err)
 	}
-	if _, _, _, got, ok := reg.Resolve("w", "openai"); !ok || got != "fresh-secret" {
+	if _, _, _, _, got, ok := reg.Resolve("w", "openai"); !ok || got != "fresh-secret" {
 		t.Errorf("Resolve after the lapsed re-registration = (ok %v, token %q), want the fresh secret stored", ok, got)
 	}
 }
@@ -258,30 +258,31 @@ func TestRegistryRegisterPrunesExpired(t *testing.T) {
 	base := time.Now()
 	reg.now = func() time.Time { return base }
 	up := map[string]*url.URL{"openai": {Scheme: "https", Host: "u.example"}}
-	reg.Register("a", "q", up, nil, NewToken())
-	reg.Register("b", "q", up, nil, NewToken())
+	reg.Register("a", "q", up, nil, nil, NewToken())
+	reg.Register("b", "q", up, nil, nil, NewToken())
 	if reg.Live() != 2 {
 		t.Fatalf("Live = %d, want 2", reg.Live())
 	}
 
 	base = base.Add(2 * time.Minute)
-	reg.Register("c", "q", up, nil, NewToken())
+	reg.Register("c", "q", up, nil, nil, NewToken())
 	if got := reg.Live(); got != 1 {
 		t.Errorf("Live = %d after the sweep, want 1 (only the fresh registration)", got)
 	}
-	if _, _, _, _, ok := reg.Resolve("a", "openai"); ok {
+	if _, _, _, _, _, ok := reg.Resolve("a", "openai"); ok {
 		t.Error("expired worker a still resolves an upstream")
 	}
-	if _, _, _, _, ok := reg.Resolve("c", "openai"); !ok {
+	if _, _, _, _, _, ok := reg.Resolve("c", "openai"); !ok {
 		t.Error("survivor lost its upstream")
 	}
 }
 
 // TestRegistryResolveAndTokenGate pins the atomic read and the constant-time
 // match: Resolve hands back the registration's upstream, queue, per-wire
-// key, and restoration token in one answer — a keyless wire resolves an
-// empty key (OAuth pass-through) — expiry kills the whole entry, and
-// tokenPresented matches only a non-empty exact presented secret.
+// alias, per-wire key, and restoration token in one answer — a keyless wire
+// resolves an empty key (OAuth pass-through), an unaliased wire an empty
+// alias — expiry kills the whole entry, and tokenPresented matches only a
+// non-empty exact presented secret.
 func TestRegistryResolveAndTokenGate(t *testing.T) {
 	reg := NewRegistry(time.Minute)
 	base := time.Now()
@@ -291,21 +292,21 @@ func TestRegistryResolveAndTokenGate(t *testing.T) {
 		"openai":    {Scheme: "https", Host: "o.example"},
 	}
 	tok := "abcdef0123456789abcdef0123456789"
-	reg.Register("w", "q", up, map[string]string{"anthropic": "sk-real"}, tok)
+	reg.Register("w", "q", up, map[string]string{"anthropic": "sk-real"}, nil, tok)
 
-	gotUp, gotQueue, gotKey, gotTok, ok := reg.Resolve("w", "anthropic")
-	if !ok || gotUp.Host != "a.example" || gotQueue != "q" || gotKey != "sk-real" || gotTok != tok {
-		t.Errorf("Resolve(anthropic) = (%v, %q, %q, %q, %v), want the full registration", gotUp, gotQueue, gotKey, gotTok, ok)
+	gotUp, gotQueue, gotAlias, gotKey, gotTok, ok := reg.Resolve("w", "anthropic")
+	if !ok || gotUp.Host != "a.example" || gotQueue != "q" || gotAlias != "" || gotKey != "sk-real" || gotTok != tok {
+		t.Errorf("Resolve(anthropic) = (%v, %q, alias %q, %q, %q, %v), want the full registration", gotUp, gotQueue, gotAlias, gotKey, gotTok, ok)
 	}
-	if _, _, gotKey, _, ok := reg.Resolve("w", "openai"); !ok || gotKey != "" {
-		t.Errorf("Resolve(keyless openai) key = %q (ok %v), want empty (pass-through)", gotKey, ok)
+	if _, _, gotAlias, gotKey, _, ok := reg.Resolve("w", "openai"); !ok || gotKey != "" || gotAlias != "" {
+		t.Errorf("Resolve(keyless openai) = (alias %q, key %q, ok %v), want both empty (pass-through)", gotAlias, gotKey, ok)
 	}
-	if _, _, _, _, ok := reg.Resolve("other", "anthropic"); ok {
+	if _, _, _, _, _, ok := reg.Resolve("other", "anthropic"); ok {
 		t.Error("an unregistered worker resolved")
 	}
 
 	base = base.Add(2 * time.Minute)
-	if _, _, _, _, ok := reg.Resolve("w", "anthropic"); ok {
+	if _, _, _, _, _, ok := reg.Resolve("w", "anthropic"); ok {
 		t.Error("an expired registration still resolves")
 	}
 
@@ -339,9 +340,9 @@ const testToken = "abcdef0123456789abcdef0123456789"
 // registerRelay registers worker w with the relay over the /register
 // endpoint — the worker-side path, presenting its own secret. The relay
 // stores the secret and returns no body: the secret never travels back.
-func registerRelay(t *testing.T, root, worker string, upstreams, keys map[string]string) {
+func registerRelay(t *testing.T, root, worker string, upstreams, keys, aliases map[string]string) {
 	t.Helper()
-	body, err := json.Marshal(registerRequest{Worker: worker, Queue: "q7", Upstreams: upstreams, Keys: keys, Token: testToken})
+	body, err := json.Marshal(registerRequest{Worker: worker, Queue: "q7", Upstreams: upstreams, Keys: keys, Aliases: aliases, Token: testToken})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +375,7 @@ func TestProxyForwardsVerbatim(t *testing.T) {
 	defer up.Close()
 
 	_, root := startRelay(t, &Ledger{}, NewRegistry(time.Minute))
-	registerRelay(t, root, "w", map[string]string{"openai": up.URL + "/v1"}, nil)
+	registerRelay(t, root, "w", map[string]string{"openai": up.URL + "/v1"}, nil, nil)
 
 	stagedURL := staged(root, "w", WireOpenAI, up.URL+"/v1")
 	if stagedURL == "" {
@@ -417,7 +418,7 @@ func TestProxyPathShapes(t *testing.T) {
 	defer up.Close()
 
 	_, root := startRelay(t, &Ledger{}, NewRegistry(time.Minute))
-	registerRelay(t, root, "w", map[string]string{"openai": up.URL + "/v1"}, nil)
+	registerRelay(t, root, "w", map[string]string{"openai": up.URL + "/v1"}, nil, nil)
 
 	for _, c := range []struct {
 		name, path string
@@ -457,7 +458,7 @@ func TestProxyTokenGate(t *testing.T) {
 	registry.Register("w", "q7", map[string]*url.URL{
 		"openai":    mustURL(t, up.URL+"/v1"),
 		"anthropic": mustURL(t, up.URL),
-	}, map[string]string{"openai": "sk-real-openai", "anthropic": "sk-real-anthropic"}, tok)
+	}, map[string]string{"openai": "sk-real-openai", "anthropic": "sk-real-anthropic"}, nil, tok)
 
 	stagedOpenAI := staged(root, "w", WireOpenAI, up.URL+"/v1")
 
@@ -500,7 +501,7 @@ func TestProxyTokenGate(t *testing.T) {
 	})
 
 	t.Run("token expired with the registration is refused", func(t *testing.T) {
-		registry.Register("gone", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")}, map[string]string{"openai": "sk-gone"}, testToken)
+		registry.Register("gone", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")}, map[string]string{"openai": "sk-gone"}, nil, testToken)
 		stagedGone := staged(root, "gone", WireOpenAI, up.URL+"/v1")
 		h := http.Header{}
 		h.Set("Authorization", "Bearer task-g1-role-dev-round-1-rk-"+testToken)
@@ -521,7 +522,7 @@ func TestProxyTokenGateAnthropicSlot(t *testing.T) {
 
 	registry := NewRegistry(time.Minute)
 	_, root := startRelay(t, &Ledger{}, registry)
-	registry.Register("w", "q7", map[string]*url.URL{"anthropic": mustURL(t, up.URL)}, map[string]string{"anthropic": "sk-real-anthropic"}, testToken)
+	registry.Register("w", "q7", map[string]*url.URL{"anthropic": mustURL(t, up.URL)}, map[string]string{"anthropic": "sk-real-anthropic"}, nil, testToken)
 
 	stagedAnthropic := staged(root, "w", WireAnthropic, up.URL)
 	h := http.Header{}
@@ -552,7 +553,7 @@ func TestProxyUnkeyedAndKeylessRounds(t *testing.T) {
 	ledger := &Ledger{}
 	registry := NewRegistry(time.Minute)
 	_, root := startRelay(t, ledger, registry)
-	registry.Register("w", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")}, nil, testToken) // keyless wire
+	registry.Register("w", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")}, nil, nil, testToken) // keyless wire
 
 	stagedOpenAI := staged(root, "w", WireOpenAI, up.URL+"/v1")
 
@@ -637,7 +638,7 @@ func TestProxyLedgerShapes(t *testing.T) {
 	registry.Register("w", "q7", map[string]*url.URL{
 		"openai":    mustURL(t, up.URL+"/v1"),
 		"anthropic": mustURL(t, fail.URL),
-	}, nil, testToken)
+	}, nil, nil, testToken)
 
 	stagedOpenAI := staged(root, "w", WireOpenAI, up.URL+"/v1")
 	stagedAnthropic := staged(root, "w", WireAnthropic, fail.URL)
@@ -685,6 +686,59 @@ func TestProxyLedgerShapes(t *testing.T) {
 	}
 }
 
+// TestAliasRidesRegistrationToLedger pins the alias dimension end to end:
+// a worker registered with a key_alias resolves it beside the key, and
+// every ledger entry its wire produces carries the label — an unkeyed
+// round included (the label describes the credential, not the round's
+// attribution); a worker registered without one produces unlabeled
+// entries, and the ledger JSON omits the alias field for them.
+func TestAliasRidesRegistrationToLedger(t *testing.T) {
+	rec := &recorder{}
+	up := stubUpstream(rec, http.StatusOK, openaiCompletionReply())
+	defer up.Close()
+
+	ledger := &Ledger{}
+	registry := NewRegistry(time.Minute)
+	_, root := startRelay(t, ledger, registry)
+	registry.Register("labeled", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")},
+		map[string]string{"openai": "sk-real"}, map[string]string{"openai": "quota-a"}, testToken)
+	registry.Register("plain", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")},
+		nil, nil, testToken)
+
+	for _, worker := range []string{"labeled", "plain"} {
+		stagedURL := staged(root, worker, WireOpenAI, up.URL+"/v1")
+		if status, _ := postRelay(t, stagedURL+"/chat/completions", http.Header{}, []byte(`{}`)); status != http.StatusOK {
+			t.Fatalf("%s: status = %d, want the forward through", worker, status)
+		}
+	}
+	entries, total, _ := ledger.Query("", 1, 10)
+	if total != 2 || len(entries) != 2 {
+		t.Fatalf("ledger = %d entries (total %d), want one per worker", len(entries), total)
+	}
+	// Newest first: plain proxied last, so it opens the page.
+	if got := entries[0].Worker + "/" + entries[0].Alias; got != "plain/" {
+		t.Errorf("newest entry = %q, want the unaliased worker unlabeled", got)
+	}
+	if got := entries[1].Worker + "/" + entries[1].Alias; got != "labeled/quota-a" {
+		t.Errorf("older entry = %q, want the registered alias stamped", got)
+	}
+
+	// The wire shape: an unaliased entry omits the alias field entirely —
+	// a metrics surface grouping on it must see absence, not an empty
+	// string.
+	raw, err := json.Marshal(entries[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := doc["alias"]; present {
+		t.Errorf("unaliased entry JSON = %s, want no alias key (omitempty)", raw)
+	}
+}
+
 // TestProxyUpstreamUnreachable pins the dial-failure face: a 502 with the
 // diagnostic, and no ledger entry — nothing was forwarded, so there is no
 // usage to record.
@@ -696,7 +750,7 @@ func TestProxyUpstreamUnreachable(t *testing.T) {
 	ledger := &Ledger{}
 	registry := NewRegistry(time.Minute)
 	_, root := startRelay(t, ledger, registry)
-	registry.Register("w", "q7", map[string]*url.URL{"openai": mustURL(t, deadURL+"/v1")}, nil, testToken)
+	registry.Register("w", "q7", map[string]*url.URL{"openai": mustURL(t, deadURL+"/v1")}, nil, nil, testToken)
 
 	stagedOpenAI := staged(root, "w", WireOpenAI, deadURL+"/v1")
 	status, body := postRelay(t, stagedOpenAI+"/chat/completions", http.Header{}, []byte(`{}`))
@@ -727,7 +781,7 @@ func TestProxyStreamPassthrough(t *testing.T) {
 	ledger := &Ledger{}
 	registry := NewRegistry(time.Minute)
 	_, root := startRelay(t, ledger, registry)
-	registry.Register("w", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")}, nil, testToken)
+	registry.Register("w", "q7", map[string]*url.URL{"openai": mustURL(t, up.URL+"/v1")}, nil, nil, testToken)
 
 	stagedOpenAI := staged(root, "w", WireOpenAI, up.URL+"/v1")
 	status, body := postRelay(t, stagedOpenAI+"/chat/completions", http.Header{}, []byte(`{}`))
@@ -745,8 +799,9 @@ func TestProxyStreamPassthrough(t *testing.T) {
 // with no body — the secret came from the caller and goes nowhere; a bad
 // body, a missing worker or upstreams, a missing token, an unknown wire,
 // or a scheme-less upstream is a 400 naming the problem; a live name
-// collision without the current secret is a 409; keys for unstaged wires
-// are dropped rather than stored (they can never be looked up).
+// collision without the current secret is a 409; keys and aliases for
+// unstaged wires are dropped rather than stored (they can never be looked
+// up).
 func TestServeRegister(t *testing.T) {
 	registry := NewRegistry(time.Minute)
 	_, root := startRelay(t, &Ledger{}, registry)
@@ -766,7 +821,7 @@ func TestServeRegister(t *testing.T) {
 	if status != http.StatusNoContent || body != "" {
 		t.Fatalf("valid registration = (%d) %q, want 204 with no body — the secret is never echoed", status, body)
 	}
-	up, _, key, storedTok, ok := registry.Resolve("w", "openai")
+	up, _, _, key, storedTok, ok := registry.Resolve("w", "openai")
 	if !ok || up.Host != "u.example" || key != "sk" || storedTok != tok {
 		t.Errorf("stored registration = (%v, key %q, token %q, ok %v), want the mapping under the presented secret", up, key, storedTok, ok)
 	}
@@ -793,18 +848,30 @@ func TestServeRegister(t *testing.T) {
 	if status, body := post(`{"worker":"w","upstreams":{"openai":"https://evil.example/v1"},"token":"not-the-secret"}`); status != http.StatusConflict || !strings.Contains(body, "already registered") {
 		t.Errorf("live collision = (%d) %s, want 409 naming the held name", status, body)
 	}
-	up, _, _, _, _ = registry.Resolve("w", "openai")
+	up, _, _, _, _, _ = registry.Resolve("w", "openai")
 	if up.Host != "u.example" {
 		t.Errorf("collision overwrote the upstream: %v", up)
 	}
 
-	// Keys on unstaged wires are dropped, not an error.
+	// Keys and aliases on unstaged wires are dropped, not an error — and
+	// the alias drop matches the key drop wire for wire: a label for a
+	// wire this worker never staged is stored nowhere.
 	status, _ = post(`{"worker":"w2","upstreams":{"anthropic":"https://a.example"},"keys":{"openai":"sk-oa"},"token":"t"}`)
 	if status != http.StatusNoContent {
 		t.Fatalf("unstaged-key registration = %d, want 204", status)
 	}
-	if _, _, key, _, ok := registry.Resolve("w2", "anthropic"); !ok || key != "" {
+	if _, _, _, key, _, ok := registry.Resolve("w2", "anthropic"); !ok || key != "" {
 		t.Errorf("w2 = (key %q, ok %v), want the keyless anthropic wire", key, ok)
+	}
+	status, _ = post(`{"worker":"w3","upstreams":{"anthropic":"https://a.example"},"keys":{"anthropic":"sk-a"},"aliases":{"anthropic":"quota-a","openai":"ghost-label"},"token":"t"}`)
+	if status != http.StatusNoContent {
+		t.Fatalf("aliased registration = %d, want 204", status)
+	}
+	if _, _, alias, key, _, ok := registry.Resolve("w3", "anthropic"); !ok || alias != "quota-a" || key != "sk-a" {
+		t.Errorf("w3 = (alias %q, key %q, ok %v), want the labeled keyed anthropic wire", alias, key, ok)
+	}
+	if got := registry.m["w3"].Aliases; len(got) != 1 || got["openai"] != "" {
+		t.Errorf("w3 stored aliases = %v, want only the staged wire's label (the unstaged openai label dropped)", got)
 	}
 
 	// Wrong method or unknown endpoints fail loudly.
@@ -833,7 +900,7 @@ func TestStatusAndLedgerEndpoints(t *testing.T) {
 	ledger := &Ledger{}
 	ledger.Append(Entry{Worker: "w", Wire: "openai", InputTokens: 3})
 	registry := NewRegistry(time.Minute)
-	registry.Register("w", "q7", map[string]*url.URL{"openai": {Scheme: "https", Host: "u.example"}}, nil, testToken)
+	registry.Register("w", "q7", map[string]*url.URL{"openai": {Scheme: "https", Host: "u.example"}}, nil, nil, testToken)
 	r, root := startRelay(t, ledger, registry)
 
 	resp, err := http.Get(root + "/status")

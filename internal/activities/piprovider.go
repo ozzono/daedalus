@@ -270,7 +270,7 @@ func piRoundToken() (string, error) {
 // means the staged model omits samplingParams entirely, so the backend's
 // own sampler values stand (never a sent default overriding them).
 func anySampler(s aiderSampler) bool {
-	return s.TopP != nil || s.PresencePenalty != nil || s.TopK != nil ||
+	return s.TopP != nil || s.Temperature != nil || s.PresencePenalty != nil || s.TopK != nil ||
 		s.MinP != nil || s.RepetitionPenalty != nil
 }
 

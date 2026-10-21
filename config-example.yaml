@@ -488,6 +488,12 @@ provider:
   url: ""
   key: ""
   model: ""
+  # Free-form label for this section's key — the name metrics surfaces group
+  # that key's usage and failures under (useful when several workers dial
+  # the same model through different keys/accounts/quotas). Never exported
+  # to the jailed agent: it reaches the metrics ledger through the worker's
+  # registration. Unset, the key's usage buckets by model as before.
+  key_alias: ""
   # Small/fast model for tiny prompts, exported as
   # ANTHROPIC_DEFAULT_HAIKU_MODEL and probed by "worker status" — an
   # anthropic-wire knob (claude's var is its only consumer), so an
