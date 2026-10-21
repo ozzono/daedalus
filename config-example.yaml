@@ -790,7 +790,7 @@ dependency:
 # The metrics subsystem: a local LLM relay every provider-bound round
 # dials, the per-request usage ledger it keeps (tokens in/out, cache
 # tokens, latency — parsed from the provider responses), and the
-# host-global "daedalus metrics" daemon that hosts both plus the
+# host-global "daedalus dash" daemon that hosts both plus the
 # dashboard. Usage capture is wire-shaped, not CLI-shaped: an anthropic
 # stream always carries usage, but an openai-wire stream carries it only
 # when the client asks for it (stream_options.include_usage — most CLIs
@@ -803,7 +803,7 @@ dependency:
 # acceptable for a self-hosted relay you own, and it is your call to make.
 # What enabling does: "daedalus worker start" and "restart" then require
 # the metrics daemon (the worker probes the relay listener and fails fast
-# with the "daedalus metrics start" remedy when it is down), and the
+# with the "daedalus dash start" remedy when it is down), and the
 # worker stages the relay's URL into each round's provider environment,
 # so rounds that would dial the provider dial the relay instead and their
 # usage lands in the ledger. A CLI dialing its provider directly (no
@@ -813,11 +813,11 @@ dependency:
 # invisible to the ledger. The daemon is host-global — one process
 # serving every worker on the host — while this per-project toggle gates
 # only this project's staging; the daemon's own serving config is read
-# from the host context at "daedalus metrics start". One lifecycle note: a
+# from the host context at "daedalus dash start". One lifecycle note: a
 # worker restarted inside a minute of stopping fails its boot registration
 # (the dead process's registration lingers for the TTL, and a live name is
 # only ever replaced by its own secret) — wait the minute out and restart,
-# or clear it immediately with "daedalus metrics restart".
+# or clear it immediately with "daedalus dash restart".
 metrics:
   # false opts this project's rounds out of the subsystem entirely — no
   # relay staging, no boot-time daemon requirement. Unset (delete this

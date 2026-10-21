@@ -967,6 +967,41 @@ func TestUIModelsTab(t *testing.T) {
 	})
 }
 
+// TestUIModelsBodyFragmentKeepsTheFormOut pins the polled region's
+// boundary: the page renders the price form above the wrapper and the
+// read-only surfaces inside it, and the polled /models/body serves only
+// the latter — a poll may never swap the form's editable inputs out from
+// under the operator, so no editable input or page chrome may ride the
+// fragment.
+func TestUIModelsBodyFragmentKeepsTheFormOut(t *testing.T) {
+	h := newUIHarness(t)
+	seedLedger(h, []metricsrelay.Entry{
+		{At: time.Now().Add(-time.Minute), Worker: "w-a", Wire: metricsrelay.WireOpenAI, Model: "mA",
+			Task: "t1", Role: string(activities.RoleDev), Round: "1",
+			InputTokens: 1000, OutputTokens: 2000, DurationMS: 100, Status: 200},
+	})
+
+	page := h.get(t, "/models")
+	if !strings.Contains(page, `hx-get="/models/body"`) {
+		t.Errorf("the models page lost its polled region wrapper:\n%s", page)
+	}
+	if !strings.Contains(page, `name="in[mA]"`) {
+		t.Errorf("the models page lost the price form:\n%s", page)
+	}
+
+	body := h.get(t, "/models/body")
+	for _, want := range []string{"Tokens / run", "Usage by model", "Usage by worker", ">mA</td>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the models body fragment lacks %q:\n%s", want, body)
+		}
+	}
+	for _, banned := range []string{`name="in[`, "<form", "<main"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("the models body fragment grew editable inputs or page chrome (%q):\n%s", banned, body)
+		}
+	}
+}
+
 // TestUIRunDetailLedgerCost pins the run-detail page's ledger cost section:
 // the dash while nothing is priced, per-model rows and the total once the
 // operator saves rates — the run's own keyed calls only, unpriced models

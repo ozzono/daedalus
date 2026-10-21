@@ -54,8 +54,10 @@ func reapedChild(t *testing.T) int {
 // TestIsMetricsRecordRead pins the record-driven invocation grammar: the
 // three reads work from the daemon files alone (and tolerate a flag tail —
 // list parses its own), while the actions that need a config do not
-// qualify and neither does anything that is not the metrics subcommand.
-// A -c-leading invocation is not the grammar either — flags.go applies
+// qualify and neither does anything that is not the dash subcommand. Both
+// spellings qualify alike — the pre-dash "metrics" name is the hidden
+// compatibility alias, accepted everywhere the dash spelling is. A
+// -c-leading invocation is not the grammar either — flags.go applies
 // this predicate to the positional tail after global flags are stripped.
 func TestIsMetricsRecordRead(t *testing.T) {
 	for _, c := range []struct {
@@ -72,6 +74,13 @@ func TestIsMetricsRecordRead(t *testing.T) {
 		{[]string{"metrics", "foreground"}, false},
 		{[]string{"metrics"}, false},
 		{[]string{"metrics", "frobnicate"}, false},
+		{[]string{"dash", "status"}, true},
+		{[]string{"dash", "stop"}, true},
+		{[]string{"dash", "list", "--worker", "w", "--page", "2"}, true},
+		{[]string{"dash", "start"}, false},
+		{[]string{"dash", "restart"}, false},
+		{[]string{"dash"}, false},
+		{[]string{"dash", "frobnicate"}, false},
 		{[]string{"worker", "status"}, false},
 		{[]string{"report"}, false},
 	} {
@@ -261,7 +270,7 @@ func TestMetricsGateCheck(t *testing.T) {
 		}
 		for _, want := range []string{
 			"metrics enabled but the metrics daemon is not reachable on 127.0.0.1:" + strconv.Itoa(port),
-			"daedalus metrics start",
+			"daedalus dash start",
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("gate error %q should contain %q", err, want)
@@ -414,7 +423,7 @@ func TestMetricsRegister(t *testing.T) {
 		defer srv.Close()
 		err := metricsRegister(config.Config{WorkerID: "w1"}, srv.URL, "worker-minted-tok")
 		if err == nil || !strings.Contains(err.Error(), "older than this worker") ||
-			!strings.Contains(err.Error(), "daedalus metrics restart") {
+			!strings.Contains(err.Error(), "daedalus dash restart") {
 			t.Errorf("metricsRegister = %v, want the server-minted daemon named with the restart remedy", err)
 		}
 		if got := os.Getenv(config.MetricsRelayTokenEnv); got != "" {
@@ -554,7 +563,7 @@ func TestRunMetricsList(t *testing.T) {
 			{[]string{"--page"}, "--page requires a value"},
 			{[]string{"--page", "0"}, "wants a positive page number"},
 			{[]string{"--page=abc"}, "wants a positive page number"},
-			{[]string{"--csv"}, `unknown metrics list flag "--csv"`},
+			{[]string{"--csv"}, `unknown dash list flag "--csv"`},
 		} {
 			if err := runMetricsList(c.args); err == nil || !strings.Contains(err.Error(), c.wantErr) {
 				t.Errorf("runMetricsList(%v) = %v, want it to contain %q", c.args, err, c.wantErr)
@@ -566,7 +575,7 @@ func TestRunMetricsList(t *testing.T) {
 		useDaemonDir(t)
 		err := runMetricsList(nil)
 		if err == nil || !strings.Contains(err.Error(), "the metrics daemon is not running") ||
-			!strings.Contains(err.Error(), "daedalus metrics start") {
+			!strings.Contains(err.Error(), "daedalus dash start") {
 			t.Errorf("runMetricsList without a daemon = %v, want the remedy named", err)
 		}
 	})
@@ -586,44 +595,54 @@ func TestRunMetricsList(t *testing.T) {
 }
 
 // TestFlagsRejectConfigOnMetricsRecordRead pins the -c gate: the
-// record-driven metrics reads work from the daemon files alone, so an
+// record-driven dash reads work from the daemon files alone, so an
 // explicit config there is rejected rather than silently ignored — its own
 // wording, since the worker-status message is pinned verbatim elsewhere.
+// Both spellings ride the same grammar, so the same rejection greets the
+// pre-dash metrics alias.
 func TestFlagsRejectConfigOnMetricsRecordRead(t *testing.T) {
-	const rejection = "-c/--config does not apply to metrics status, stop, or list"
+	const rejection = "-c/--config does not apply to dash status, stop, or list"
 	for _, args := range [][]string{
+		{"-c", "cfg.yaml", "dash", "status"},
+		{"dash", "stop", "--config=cfg.yaml"},
+		{"--config=cfg.yaml", "dash", "list", "--json"},
 		{"-c", "cfg.yaml", "metrics", "status"},
-		{"metrics", "stop", "--config=cfg.yaml"},
 		{"--config=cfg.yaml", "metrics", "list", "--json"},
 	} {
 		if _, _, err := parseFlags(args); err == nil || err.Error() != rejection {
 			t.Errorf("parseFlags(%v) err = %v, want %q", args, err, rejection)
 		}
 	}
-	// The actions that need a config keep taking one.
-	if _, _, err := parseFlags([]string{"-c", "cfg.yaml", "metrics", "start"}); err != nil {
-		t.Errorf("parseFlags(metrics start with -c): %v", err)
+	// The actions that need a config keep taking one, either spelling.
+	for _, cmd := range []string{"dash", "metrics"} {
+		if _, _, err := parseFlags([]string{"-c", "cfg.yaml", cmd, "start"}); err != nil {
+			t.Errorf("parseFlags(%s start with -c): %v", cmd, err)
+		}
 	}
 }
 
-// TestCompleteMetricsActions pins the metrics action completion: every
-// action on the action position, nothing after one is typed.
+// TestCompleteMetricsActions pins the dash command's action completion:
+// every action on the action position, nothing after one is typed — both
+// spellings alike, since the pre-dash metrics name is the hidden
+// compatibility alias accepted everywhere.
 func TestCompleteMetricsActions(t *testing.T) {
-	if got := complete([]string{"metrics", ""}); !reflect.DeepEqual(got,
-		[]string{"foreground", "list", "restart", "start", "status", "stop"}) {
-		t.Errorf("complete(metrics \"\") = %q, want every action (sorted, like every completion)", got)
-	}
-	if got := complete([]string{"metrics", "st"}); !reflect.DeepEqual(got, []string{"start", "status", "stop"}) {
-		t.Errorf("complete(metrics st) = %q, want the st-prefixed actions", got)
-	}
-	if got := complete([]string{"metrics", "list", ""}); got != nil {
-		t.Errorf("complete(metrics list \"\") = %q, want nothing after an action", got)
+	for _, cmd := range []string{"dash", "metrics"} {
+		if got := complete([]string{cmd, ""}); !reflect.DeepEqual(got,
+			[]string{"foreground", "list", "restart", "start", "status", "stop"}) {
+			t.Errorf("complete(%s \"\") = %q, want every action (sorted, like every completion)", cmd, got)
+		}
+		if got := complete([]string{cmd, "st"}); !reflect.DeepEqual(got, []string{"start", "status", "stop"}) {
+			t.Errorf("complete(%s st) = %q, want the st-prefixed actions", cmd, got)
+		}
+		if got := complete([]string{cmd, "list", ""}); got != nil {
+			t.Errorf("complete(%s list \"\") = %q, want nothing after an action", cmd, got)
+		}
 	}
 }
 
-// TestMetricsStartReexecArgv pins the daemon spawn: `metrics start`
-// re-executes `metrics foreground -c <path>` — the ports re-read from disk
-// on every restart — writes the child's pid file, and reports the ports it
+// TestMetricsStartReexecArgv pins the daemon spawn: `dash start` re-executes
+// `dash foreground -c <path>` — the ports re-read from disk on every
+// restart — writes the child's pid file, and reports the ports it
 // will serve. The observable argv is the child's real one, printed into
 // the daemon log by the reexecDumpArgsEnv branch of TestMain (the child is
 // this test binary; its stdout is the daemon log).
@@ -661,7 +680,7 @@ func TestMetricsStartReexecArgv(t *testing.T) {
 		t.Errorf("pid file = %q, want a positive pid", data)
 	}
 	argv := daemonArgv(t, logFile)
-	want := []string{"metrics", "foreground", "-c", cfgPath}
+	want := []string{"dash", "foreground", "-c", cfgPath}
 	if !reflect.DeepEqual(argv, want) {
 		t.Errorf("daemon argv = %v, want %v", argv, want)
 	}
@@ -681,7 +700,7 @@ func TestMainMetricsDispatch(t *testing.T) {
 		t.Setenv("HOME", t.TempDir()) // no ~/.config/daedalus/config.yaml fallback
 		t.Chdir(t.TempDir())          // no ./config.yaml
 
-		for _, args := range [][]string{{"metrics", "status"}, {"metrics", "stop"}} {
+		for _, args := range [][]string{{"dash", "status"}, {"metrics", "stop"}} {
 			swap := os.Args
 			os.Args = append([]string{"daedalus"}, args...)
 			out := captureStdout(t, main)
@@ -708,7 +727,7 @@ func TestMainMetricsDispatch(t *testing.T) {
 		t.Chdir(t.TempDir())
 
 		swap := os.Args
-		os.Args = []string{"daedalus", "metrics", "list", "--worker", "w1"}
+		os.Args = []string{"daedalus", "dash", "list", "--worker", "w1"}
 		out := captureStdout(t, main)
 		os.Args = swap
 
@@ -749,14 +768,17 @@ func TestMainMetricsDispatch(t *testing.T) {
 		t.Setenv("HOME", t.TempDir())
 		cfgPath := writeQueueConfig(t, "daedalus")
 		dir := filepath.Dir(cfgPath) // the child's ./config.yaml
+		// The diagnostics use the canonical name however the command was
+		// spelled — the alias changes what is accepted, never what is
+		// printed.
 		for _, c := range []struct {
 			args    []string
 			wantErr string
 		}{
-			{[]string{"metrics", "frobnicate"}, "unknown metrics action"},
-			{[]string{"metrics", "start", "extra"}, "metrics start takes no arguments"},
-			{[]string{"metrics", "stop", "extra"}, "metrics stop takes no arguments"},
-			{[]string{"metrics", "list", "--csv"}, "unknown metrics list flag"},
+			{[]string{"dash", "frobnicate"}, "unknown dash action"},
+			{[]string{"dash", "start", "extra"}, "dash start takes no arguments"},
+			{[]string{"metrics", "stop", "extra"}, "dash stop takes no arguments"},
+			{[]string{"metrics", "list", "--csv"}, "unknown dash list flag"},
 		} {
 			_, stderr, code := runMainIn(t, dir, c.args...)
 			if code != 1 {
@@ -770,14 +792,37 @@ func TestMainMetricsDispatch(t *testing.T) {
 
 	t.Run("no config anywhere fails the config-needing default", func(t *testing.T) {
 		t.Setenv("HOME", t.TempDir()) // no ~/.config/daedalus/config.yaml fallback — the subtest's premise, established not assumed
-		_, stderr, code := runMainIn(t, t.TempDir(), "metrics")
+		_, stderr, code := runMainIn(t, t.TempDir(), "dash")
 		if code != 1 {
-			t.Errorf("daedalus metrics with no config exit = %d, want 1", code)
+			t.Errorf("daedalus dash with no config exit = %d, want 1", code)
 		}
 		if !strings.Contains(stderr, "no config found") {
-			t.Errorf("stderr = %q, want the config resolution failure (bare metrics is start, which needs one)", stderr)
+			t.Errorf("stderr = %q, want the config resolution failure (bare dash is start, which needs one)", stderr)
 		}
 	})
+}
+
+// TestDashHelpIsTheMetricsAliasScreen pins the help face of the rename:
+// "dash" is the dispatch name with its own screen, and the pre-dash
+// "metrics" spelling serves the exact same text — one value in
+// commandHelp, so the two spellings cannot drift apart, and both answer
+// --help with it, configless like every command screen.
+func TestDashHelpIsTheMetricsAliasScreen(t *testing.T) {
+	if commandHelp["dash"] == "" || commandHelp["dash"] != commandHelp["metrics"] {
+		t.Fatalf("dash and metrics carry different help screens — the hidden alias must print the dash screen verbatim")
+	}
+	if !strings.Contains(commandHelp["dash"], "hidden compatibility alias") {
+		t.Errorf("the dash screen should name the metrics spelling's alias status:\n%s", commandHelp["dash"])
+	}
+	for _, cmd := range []string{"dash", "metrics"} {
+		stdout, stderr, code := runMainIn(t, "", cmd, "--help")
+		if code != 0 || stderr != "" {
+			t.Errorf("daedalus %s --help = (exit %d) stderr %q, want the screen configless", cmd, code, stderr)
+		}
+		if stdout != commandHelp["dash"] {
+			t.Errorf("daedalus %s --help stdout = %q, want the shared dash screen", cmd, stdout)
+		}
+	}
 }
 
 // TestRunWorkerMetricsEnvExports pins the worker's metrics env channel:
@@ -816,7 +861,7 @@ func TestRunWorkerMetricsEnvExports(t *testing.T) {
 	// An unreachable daemon fails the start with the remedy before any
 	// export.
 	err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(true), RelayPort: 1}}, "")
-	if err == nil || !strings.Contains(err.Error(), "daedalus metrics start") {
+	if err == nil || !strings.Contains(err.Error(), "daedalus dash start") {
 		t.Fatalf("runWorker with metrics on a dead daemon = %v, want the boot gate", err)
 	}
 	if got := os.Getenv(config.MetricsRelayAnthropicEnv); got != "" {

@@ -26,7 +26,7 @@ WORKFLOW COMMANDS
 WORKER COMMANDS
   worker      Manage the Temporal worker daemon (start, stop, status, restart, foreground, wakeup, report)
               flags: -c -t --all -f per sub-action; "worker <action> --help" is exhaustive
-  metrics     Manage the host metrics daemon — the usage relay, ledger, and dashboard
+  dash        Manage the host metrics daemon — the usage relay, ledger, and dashboard
               (start, stop, restart, status, list, foreground)
 
 UTILITY COMMANDS
@@ -43,7 +43,7 @@ UTILITY COMMANDS
 GLOBAL FLAGS
   -c, --config <path>   Path to config file (./config.yaml, ./.daedalus/config.yaml, or ~/.config/daedalus/config.yaml);
                         rejected by log and the record-driven daemon commands (worker status, worker restart <worker>|all,
-                        metrics status, metrics stop, metrics list)
+                        dash status, dash stop, dash list)
   -v, --version         Print version and exit
   -h, --help            Show this help message
 
@@ -56,6 +56,72 @@ EXAMPLES
 
 Use "daedalus <command> --help" for detailed information about a command,
 and "daedalus worker <action> --help" for a worker sub-action's flag rules.
+`
+
+// dashHelp is the dash subcommand's detailed screen — the host metrics
+// daemon's management surface. The pre-dash "metrics" spelling maps to the
+// same text: it still dispatches and prints help identically as a hidden
+// compatibility alias, but is never offered by completion or the root
+// usage screen.
+var dashHelp = `daedalus dash — manage the host metrics daemon: the usage relay, the
+ledger, and the dashboard listener. The pre-dash "metrics" spelling
+remains accepted as a hidden compatibility alias.
+
+USAGE
+  daedalus [-c config.yaml] dash [start|stop|restart|status|list|foreground]
+
+The daemon hosts two listeners. The relay binds 127.0.0.1:<relay_port>
+(default 7778): the reverse proxy every metrics-enabled worker's provider
+rounds stage their calls onto, where the usage ledger is written. The
+dashboard binds :<port> (default 7777) and serves the browser UI's routes
+(/, /workers, /runs, /runs/<id>, /new, /metrics). The daemon is
+host-global — one per machine, its ports read from the config of the start
+(or restart) that launched it — while per-project configs only decide
+whether their workers participate (metrics.enabled).
+
+ACTIONS
+  start         (default) Run the daemon detached: logs append to
+                /tmp/daedalus/metrics.log, the pid lives in
+                /tmp/daedalus/metrics.pid.
+  stop          Terminate the daemon (SIGTERM) and clear its pid file. The
+                ledger is in-memory only: stopping the daemon discards every
+                recorded entry.
+  restart       Stop + start with the config the restart is invoked with
+                (the ports re-read from disk).
+  status        Print the daemon's pid, its two ports, its version, and how
+                fresh its published status file is. Record-driven: works
+                from any directory, no config.
+  list          Query the live ledger: recent provider calls, newest first,
+                with per-call token counts and round attribution.
+                Record-driven too — the endpoint is the daemon's published
+                relay port, so it works from any directory, no config.
+  foreground    Run attached to this terminal — the daemon child's mode, and
+                the way to debug a daemon that will not start.
+
+LIST FLAGS
+  --worker <name>   Only this worker's entries.
+  --page <n>        The page to print (default 1; 50 entries per page).
+  --json            Emit the page as JSON instead of a table.
+
+SERVING POSTURE
+The relay binds 127.0.0.1 — its listener is unreachable off-host — while
+its forwards go wherever the registered upstreams point: a cloud provider
+receives the rounds' traffic from the daemon instead of the rounds.
+Restoring a round's real API key requires the registration's secret token
+— a loopback caller cannot spend a worker's key with a forged attribution
+key. The dashboard binds all interfaces with no authentication — any LAN
+peer can read every run's data and start runs. That is the accepted
+posture for a local tool on a trusted LAN; do not expose the port further.
+
+Workers with metrics on — the default; only an explicit enabled: false
+opts out — gate their start on the relay (an unreachable daemon fails the
+worker start, naming the port and the remedy) and register their provider
+upstreams with it, so their rounds' token usage lands in the ledger
+attributed per round.
+
+EXAMPLES
+  $ daedalus dash start
+  $ daedalus dash list --worker my-worker --page 2
 `
 
 // commandHelp holds the per-command help screens behind
@@ -581,7 +647,7 @@ CONFIGURATION REFERENCE
   metrics               Host metrics participation: on unless the config
                         opts out (enabled: false). The worker's start is
                         gated on the host metrics daemon ("daedalus
-                        metrics start"), every provider round is staged
+                        dash start"), every provider round is staged
                         through its loopback relay, and per-round token
                         usage lands in its ledger. port (default 7777) is
                         the daemon's dashboard listener (LAN-wide, no
@@ -725,65 +791,8 @@ config is not a working one.
 EXAMPLE
   $ daedalus config
 `,
-	"metrics": `daedalus metrics — manage the host metrics daemon: the usage relay, the
-ledger, and the dashboard listener.
-
-USAGE
-  daedalus [-c config.yaml] metrics [start|stop|restart|status|list|foreground]
-
-The daemon hosts two listeners. The relay binds 127.0.0.1:<relay_port>
-(default 7778): the reverse proxy every metrics-enabled worker's provider
-rounds stage their calls onto, where the usage ledger is written. The
-dashboard binds :<port> (default 7777) and serves the browser UI's routes
-(/, /workers, /runs, /runs/<id>, /new, /metrics). The daemon is
-host-global — one per machine, its ports read from the config of the start
-(or restart) that launched it — while per-project configs only decide
-whether their workers participate (metrics.enabled).
-
-ACTIONS
-  start         (default) Run the daemon detached: logs append to
-                /tmp/daedalus/metrics.log, the pid lives in
-                /tmp/daedalus/metrics.pid.
-  stop          Terminate the daemon (SIGTERM) and clear its pid file. The
-                ledger is in-memory only: stopping the daemon discards every
-                recorded entry.
-  restart       Stop + start with the config the restart is invoked with
-                (the ports re-read from disk).
-  status        Print the daemon's pid, its two ports, its version, and how
-                fresh its published status file is. Record-driven: works
-                from any directory, no config.
-  list          Query the live ledger: recent provider calls, newest first,
-                with per-call token counts and round attribution.
-                Record-driven too — the endpoint is the daemon's published
-                relay port, so it works from any directory, no config.
-  foreground    Run attached to this terminal — the daemon child's mode, and
-                the way to debug a daemon that will not start.
-
-LIST FLAGS
-  --worker <name>   Only this worker's entries.
-  --page <n>        The page to print (default 1; 50 entries per page).
-  --json            Emit the page as JSON instead of a table.
-
-SERVING POSTURE
-The relay binds 127.0.0.1 — its listener is unreachable off-host — while
-its forwards go wherever the registered upstreams point: a cloud provider
-receives the rounds' traffic from the daemon instead of the rounds.
-Restoring a round's real API key requires the registration's secret token
-— a loopback caller cannot spend a worker's key with a forged attribution
-key. The dashboard binds all interfaces with no authentication — any LAN
-peer can read every run's data and start runs. That is the accepted
-posture for a local tool on a trusted LAN; do not expose the port further.
-
-Workers with metrics on — the default; only an explicit enabled: false
-opts out — gate their start on the relay (an unreachable daemon fails the
-worker start, naming the port and the remedy) and register their provider
-upstreams with it, so their rounds' token usage lands in the ledger
-attributed per round.
-
-EXAMPLES
-  $ daedalus metrics start
-  $ daedalus metrics list --worker my-worker --page 2
-`,
+	"dash":    dashHelp,
+	"metrics": dashHelp,
 	"wipe": `daedalus wipe — erase a session's work on disk entirely.
 
 USAGE

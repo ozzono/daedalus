@@ -77,9 +77,9 @@ func main() {
 	}
 
 	// Every subcommand except the no-config ones (help, version, init,
-	// completion, the record-driven worker and metrics commands — `worker
-	// restart all`, `worker restart <name>`, `worker status`, `metrics
-	// status`, `metrics stop`, and `metrics list` (flag tail included),
+	// completion, the record-driven worker and dash commands — `worker
+	// restart all`, `worker restart <name>`, `worker status`, `dash
+	// status`, `dash stop`, and `dash list` (flag tail included),
 	// which read only the recorded daemon files — and `log`, which reads a
 	// file by name alone) loads a configuration; resolve its location once,
 	// up front, so the subcommand — and the daemon `worker start`
@@ -382,11 +382,12 @@ func main() {
 			usageFail("completion takes bash or zsh")
 		}
 		fmt.Print(completionScript(args[1]))
-	case "metrics":
-		// daedalus metrics [start|stop|restart|status|list|foreground] —
+	case "metrics", "dash":
+		// daedalus dash [start|stop|restart|status|list|foreground] —
 		// the host-global metrics daemon. start (the default) launches it
 		// detached; stop, status, and list are record-driven, reading the
-		// daemon's pid and status files alone.
+		// daemon's pid and status files alone. "metrics" is the pre-dash
+		// spelling, kept as a hidden compatibility alias.
 		action := "start"
 		if len(args) >= 2 {
 			action = args[1]
@@ -394,7 +395,7 @@ func main() {
 		// list parses its own flags below; every other action takes none,
 		// and an extra word is a typo to fail on, not something to drop.
 		if action != "list" && len(args) > 2 {
-			usageFail("metrics %s takes no arguments", action)
+			usageFail("dash %s takes no arguments", action)
 		}
 		var cfg config.Config
 		if action != "status" && action != "stop" && action != "list" {
@@ -403,36 +404,36 @@ func main() {
 		switch action {
 		case "start":
 			if err := metricsStart(cfg, configPath.configPath); err != nil {
-				fail("metrics start", err)
+				fail("dash start", err)
 			}
 		case "stop":
 			if err := metricsStop(); err != nil {
-				fail("metrics stop", err)
+				fail("dash stop", err)
 			}
 		case "restart":
 			if err := metricsRestart(cfg, configPath.configPath); err != nil {
-				fail("metrics restart", err)
+				fail("dash restart", err)
 			}
 		case "status":
 			if err := metricsStatus(); err != nil {
-				fail("metrics status", err)
+				fail("dash status", err)
 			}
 		case "list":
 			if err := runMetricsList(args[2:]); err != nil {
-				fail("metrics list", err)
+				fail("dash list", err)
 			}
 		case "foreground":
 			// Run attached to this terminal — the daemon child's mode, and
 			// the way to debug a daemon that will not start.
 			if err := runMetricsDaemon(cfg); err != nil {
-				fail("metrics", err)
+				fail("dash", err)
 			}
 			if os.Getenv(daemonEnv) == "1" {
 				pidFile, _, _ := metricsPaths()
 				os.Remove(pidFile)
 			}
 		default:
-			usageFail("unknown metrics action %q (%s)", action, strings.Join(metricsActions, ", "))
+			usageFail("unknown dash action %q (%s)", action, strings.Join(metricsActions, ", "))
 		}
 	default:
 		usageFail("unknown subcommand %q", args[0])

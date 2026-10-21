@@ -876,7 +876,7 @@ func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 // MetricsConfig gates the metrics subsystem: the local LLM relay, its
-// per-request usage ledger, and the `daedalus metrics` daemon that hosts
+// per-request usage ledger, and the `daedalus dash` daemon that hosts
 // them (plus the dashboard served on the same process — see the htmx-ui
 // pt1 design). On by default (an unset enabled is on): the dashboard is
 // the operator's window into runs, and the relay is what makes its usage

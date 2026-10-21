@@ -144,6 +144,9 @@ func TestRootHelpDispatch(t *testing.T) {
 	for _, claim := range []string{
 		"rejected by log and the record-driven daemon commands",
 		`"daedalus worker <action> --help"`,
+		// The -c rejection names the record-driven reads by their dispatch
+		// name — the dash command's, not its hidden metrics alias's.
+		"dash status, dash stop, dash list",
 	} {
 		if !strings.Contains(usage, claim) {
 			t.Errorf("the root usage should carry the claim %q — the behavior it documents is pinned elsewhere", claim)

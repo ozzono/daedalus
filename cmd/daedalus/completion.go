@@ -244,10 +244,11 @@ func complete(words []string) []string {
 			}
 			return prefixed(left, toComplete)
 		}
-	case "metrics":
+	case "metrics", "dash":
 		// The action argument; the actions take no further positionals
 		// (list's flags complete no differently than worker's — not at
-		// all).
+		// all). Both spellings complete identically — metrics is the
+		// dash command's hidden compatibility alias.
 		rest := positionalWords(typed[pos+1:])
 		if len(rest) == 0 {
 			return prefixed(metricsActions, toComplete)
@@ -293,10 +294,14 @@ func typedConfigPath(typed []string) string {
 // commandCandidates lists the completable top-level commands: commandHelp
 // holds a detailed help screen for every dispatch command and doubles as
 // the completion's command list (the __complete probe stays hidden — it is
-// the one command with neither).
+// the one command with neither). The metrics key is the dash command's
+// hidden compatibility alias — accepted everywhere, offered nowhere.
 func commandCandidates() []string {
 	names := make([]string, 0, len(commandHelp))
 	for name := range commandHelp {
+		if name == "metrics" {
+			continue
+		}
 		names = append(names, name)
 	}
 	return names
