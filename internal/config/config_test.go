@@ -2660,13 +2660,14 @@ func TestLoadReviewSkillList(t *testing.T) {
 	}
 }
 
-// TestLoadProviderSection pins the provider section's type gate and
-// defaults: type is required (a missing value is a load error, never a
+// TestLoadProviderSection pins the provider section's type gate and load
+// shape: type is required (a missing value is a load error, never a
 // silently defaulted wire), an unknown style is rejected naming the
-// choices, both accepted styles load through verbatim, the strict decode
-// reaches into the section, and the request ceiling follows the legacy
-// sections' rule — unset defaults at load, an explicit value loads
-// verbatim.
+// choices, both accepted styles load through verbatim, and the strict
+// decode reaches into the section. The section loads exactly as the file
+// names it — an unset timeout_ms stays zero on the loaded config (the
+// default lands at resolution time, ProviderChannels), an explicit value
+// loads verbatim.
 func TestLoadProviderSection(t *testing.T) {
 	_, err := Load(writeConfig(t, "provider:\n  url: https://p.example\n"))
 	if err == nil || !strings.Contains(err.Error(), "provider: type is required") {
@@ -2687,8 +2688,12 @@ func TestLoadProviderSection(t *testing.T) {
 		if cfg.Provider == nil || cfg.Provider.Type != typ {
 			t.Fatalf("Provider = %v, want a section typed %q", cfg.Provider, typ)
 		}
-		if cfg.Provider.TimeoutMS != DefaultAnthropicTimeoutMS {
-			t.Errorf("type %s: unset timeout_ms = %d, want the default %d", typ, cfg.Provider.TimeoutMS, DefaultAnthropicTimeoutMS)
+		if cfg.Provider.TimeoutMS != 0 {
+			t.Errorf("type %s: unset timeout_ms = %d, want the file's own 0 (no default is stamped at load)", typ, cfg.Provider.TimeoutMS)
+		}
+		// ...while resolution still always exports a ceiling.
+		if anth, _ := cfg.ProviderChannels(); anth.TimeoutMS != DefaultAnthropicTimeoutMS {
+			t.Errorf("type %s: resolved ceiling = %d, want the default %d", typ, anth.TimeoutMS, DefaultAnthropicTimeoutMS)
 		}
 	}
 
@@ -2802,37 +2807,82 @@ func TestLoadProviderFieldValidation(t *testing.T) {
 	})
 }
 
-// TestLoadProviderMixingRules pins the one-channel-one-source-of-truth rule:
-// the provider section plus the same-wire legacy section is a load error
-// naming both — a legacy section naming nothing but its timeout included,
-// whose only tell is the defaulted-field sentinel — while the other wire's
-// legacy section stays legal, the incremental migration path. The
-// wire-agnostic sizing pair and the request ceiling may not be set on both
-// sides of a cross-wire mix either: AgentEnv's legacy ordering would
-// otherwise silently pick between two values the file's own sections
-// disagree on. The gate's acceptance boundary is pinned on the other side:
-// an explicit-default-only legacy section reads as absent (zero-ness cannot
-// see a timeout equal to the default), loading and exporting exactly the
-// number the provider channel carries anyway.
-func TestLoadProviderMixingRules(t *testing.T) {
-	t.Run("same-wire legacy section is a load error", func(t *testing.T) {
-		_, err := Load(writeConfig(t, "anthropic:\n  key: k\nprovider:\n  type: anthropic\n"))
-		if err == nil || !strings.Contains(err.Error(), "provider (type anthropic)") ||
-			!strings.Contains(err.Error(), "both configure the anthropic channel") {
-			t.Errorf("Load(anthropic + anthropic provider) error = %v, want the same-wire rejection", err)
+// TestLoadProviderPrecedence pins the per-field precedence rule that
+// replaced the mixing gates: every provider+legacy mix is legal, same wire
+// or across, and each field has a defined winner. A field the provider
+// section sets beats the legacy sections' — the same-wire legacy section
+// simply loses every contested field — and a field it leaves unset falls
+// through to the legacy value. The wire-agnostic knobs are one channel
+// whichever wire serves: a set provider ceiling is stamped on both
+// channels, so AgentEnv's legacy ordering can never pick a legacy ceiling
+// over it, and a set provider sizing value wins over the legacy
+// anthropic-side pair per field; an unset provider knob leaves the legacy
+// values standing.
+func TestLoadProviderPrecedence(t *testing.T) {
+	t.Run("same-wire mix is legal and the provider section wins per field", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "anthropic:\n"+
+			"  url: https://legacy.example\n"+
+			"  key: legacy-key\n"+
+			"  model: claude-legacy\n"+
+			"  heartbeat_model: legacy-hb\n"+
+			"provider:\n"+
+			"  type: anthropic\n"+
+			"  key: sk-provider\n"))
+		if err != nil {
+			t.Fatalf("Load(anthropic legacy + anthropic provider): %v", err)
 		}
-		_, err = Load(writeConfig(t, "openai:\n  key: k\nprovider:\n  type: openai\n"))
-		if err == nil || !strings.Contains(err.Error(), "provider (type openai)") ||
-			!strings.Contains(err.Error(), "both configure the openai channel") {
-			t.Errorf("Load(openai + openai provider) error = %v, want the same-wire rejection", err)
+		anth, open := cfg.ProviderChannels()
+		want := AnthropicConfig{
+			URL:            "https://legacy.example",
+			Key:            "sk-provider",
+			Model:          "claude-legacy",
+			HeartbeatModel: "legacy-hb",
+			TimeoutMS:      DefaultAnthropicTimeoutMS,
 		}
-		// A legacy section naming nothing but a non-default timeout is the
-		// same both-set case: the sentinel compare (against the defaulted
-		// zero section) must trip it, never silently drop the value in
-		// favor of the provider section's.
-		_, err = Load(writeConfig(t, "anthropic:\n  timeout_ms: 123\nprovider:\n  type: anthropic\n  key: k\n"))
-		if err == nil || !strings.Contains(err.Error(), "both configure the anthropic channel") {
-			t.Errorf("Load(anthropic timeout-only + anthropic provider) error = %v, want the same-wire rejection", err)
+		if anth != want {
+			t.Errorf("anthropic channel = %+v, want the provider's key over the legacy section's remaining fields %+v", anth, want)
+		}
+		if open != (OpenAIConfig{}) {
+			t.Errorf("openai channel = %+v, want untouched (nothing configures it)", open)
+		}
+
+		cfg, err = Load(writeConfig(t, "openai:\n"+
+			"  url: https://oa-legacy.example/v1\n"+
+			"  key: legacy-k\n"+
+			"  model: gpt-legacy\n"+
+			"provider:\n"+
+			"  type: openai\n"+
+			"  url: https://oa-provider.example/v1\n"))
+		if err != nil {
+			t.Fatalf("Load(openai legacy + openai provider): %v", err)
+		}
+		_, open = cfg.ProviderChannels()
+		if open.URL != "https://oa-provider.example/v1" || open.Key != "legacy-k" || open.Model != "gpt-legacy" {
+			t.Errorf("openai channel = %+v, want the provider's url with the legacy key and model falling through", open)
+		}
+	})
+
+	t.Run("samplers and disable_thinking follow the same per-field rule", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "openai:\n"+
+			"  top_p: 0.9\n"+
+			"  temperature: 0.2\n"+
+			"  disable_thinking: true\n"+
+			"provider:\n"+
+			"  type: openai\n"+
+			"  key: k\n"+
+			"  top_p: 0.95\n"))
+		if err != nil {
+			t.Fatalf("Load(openai legacy + openai provider samplers): %v", err)
+		}
+		_, open := cfg.ProviderChannels()
+		if open.TopP != 0.95 {
+			t.Errorf("open.TopP = %v, want the provider's 0.95 over the legacy 0.9", open.TopP)
+		}
+		if open.Temperature != 0.2 {
+			t.Errorf("open.Temperature = %v, want the legacy 0.2 (the provider leaves it unset)", open.Temperature)
+		}
+		if !open.DisableThinking {
+			t.Error("open.DisableThinking = false, want the legacy true (false and unset are the same no-signal, so the legacy true stands)")
 		}
 	})
 
@@ -2862,60 +2912,79 @@ func TestLoadProviderMixingRules(t *testing.T) {
 		}
 	})
 
-	t.Run("sizing may not be set on both sides of a cross-wire mix", func(t *testing.T) {
-		for _, key := range []string{"context_tokens", "max_output_tokens"} {
-			_, err := Load(writeConfig(t, "anthropic:\n  key: k\n  "+key+": 1\nprovider:\n  type: openai\n  "+key+": 2\n"))
-			if err == nil || !strings.Contains(err.Error(), "provider."+key) ||
-				!strings.Contains(err.Error(), "anthropic."+key) {
-				t.Errorf("Load(both sides set %s) error = %v, want the sizing-clash rejection", key, err)
-			}
+	t.Run("sizing: the provider value wins per field over the legacy pair", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "anthropic:\n"+
+			"  key: k\n"+
+			"  context_tokens: 4096\n"+
+			"  max_output_tokens: 512\n"+
+			"provider:\n"+
+			"  type: openai\n"+
+			"  url: https://oa.example/v1\n"+
+			"  key: k\n"+
+			"  context_tokens: 131072\n"))
+		if err != nil {
+			t.Fatalf("Load(both sides sizing): %v", err)
+		}
+		anth, _ := cfg.ProviderChannels()
+		if anth.ContextTokens != 131072 || anth.MaxOutputTokens != 512 {
+			t.Errorf("anthropic channel sizing = %d/%d, want the provider's 131072 over the legacy context and the legacy 512 falling through for output", anth.ContextTokens, anth.MaxOutputTokens)
+		}
+		env := cfg.AgentEnv()
+		if got := agentEnvValue(t, env, ContextTokensEnv); got != "131072" {
+			t.Errorf("%s = %q, want 131072 (the provider value)", ContextTokensEnv, got)
+		}
+		if got := agentEnvValue(t, env, MaxOutputTokensEnv); got != "512" {
+			t.Errorf("%s = %q, want 512 (the legacy fall-through)", MaxOutputTokensEnv, got)
 		}
 	})
 
-	t.Run("ceiling may not be set on both sides of a cross-wire mix", func(t *testing.T) {
-		const want = "provider.timeout_ms and openai.timeout_ms are both set"
-		const wantAnth = "provider.timeout_ms and anthropic.timeout_ms are both set"
-		for _, c := range []struct {
-			name, yaml, want string
-		}{
-			// The provider section always carries a post-default ceiling, so
-			// the legacy openai side alone decides the anthropic-typed clash
-			// — the provider's own timeout need not be explicit.
-			{"provider anthropic + openai ceiling", "openai:\n  timeout_ms: 900000\nprovider:\n  type: anthropic\n  key: k\n", want},
-			{"provider anthropic defaulted + openai ceiling", "openai:\n  timeout_ms: 900000\nprovider:\n  type: anthropic\n", want},
-			// The legacy anthropic side decides the openai-typed clash: an
-			// explicit non-default ceiling would race the provider channel's
-			// under AgentEnv's openai-url-wins ordering.
-			{"provider openai + anthropic ceiling", "anthropic:\n  timeout_ms: 60000\nprovider:\n  type: openai\n  key: k\n", wantAnth},
-		} {
-			_, err := Load(writeConfig(t, c.yaml))
-			if err == nil || !strings.Contains(err.Error(), c.want) {
-				t.Errorf("%s: Load error = %v, want one containing %q", c.name, err, c.want)
-			}
-		}
-	})
-
-	t.Run("explicit-default-only legacy section stays legal", func(t *testing.T) {
-		// The sentinel's blind spot is the acceptance boundary: a legacy
-		// section naming only timeout_ms equal to the default reads as
-		// absent, and the value survives because it is the number the
-		// provider channel exports anyway.
-		cfg, err := Load(writeConfig(t, "anthropic:\n  timeout_ms: 3000000\nprovider:\n  type: anthropic\n  key: k\n"))
+	t.Run("ceiling: a set provider timeout wins over either legacy section's", func(t *testing.T) {
+		// The provider ceiling is stamped on both channels, so AgentEnv's
+		// legacy ordering (the openai channel's timeout wins when its URL
+		// is set) can never pick a legacy ceiling over it.
+		cfg, err := Load(writeConfig(t, "openai:\n"+
+			"  url: https://oa.example/v1\n"+
+			"  timeout_ms: 900000\n"+
+			"provider:\n"+
+			"  type: anthropic\n"+
+			"  key: k\n"+
+			"  timeout_ms: 60000\n"))
 		if err != nil {
-			t.Fatalf("Load(anthropic default-only + anthropic provider): %v", err)
+			t.Fatalf("Load(openai legacy ceiling + anthropic provider ceiling): %v", err)
 		}
-		if got := agentEnvValue(t, cfg.AgentEnv(), "API_TIMEOUT_MS"); got != "3000000" {
-			t.Errorf("API_TIMEOUT_MS = %q, want 3000000 (the legacy value equals what the provider channel exports)", got)
-		}
-
-		// The same acceptance on the openai-typed side, with the provider
-		// channel's own explicit ceiling winning the export.
-		cfg, err = Load(writeConfig(t, "anthropic:\n  timeout_ms: 3000000\nprovider:\n  type: openai\n  url: https://oa.example/v1\n  key: k\n  timeout_ms: 60000\n"))
-		if err != nil {
-			t.Fatalf("Load(anthropic default-only + openai provider): %v", err)
+		anth, open := cfg.ProviderChannels()
+		if anth.TimeoutMS != 60000 || open.TimeoutMS != 60000 {
+			t.Errorf("channels' ceilings = %d/%d, want the provider's 60000 stamped on both", anth.TimeoutMS, open.TimeoutMS)
 		}
 		if got := agentEnvValue(t, cfg.AgentEnv(), "API_TIMEOUT_MS"); got != "60000" {
-			t.Errorf("API_TIMEOUT_MS = %q, want 60000 (the openai channel serves, so its ceiling wins)", got)
+			t.Errorf("API_TIMEOUT_MS = %q, want 60000 (the provider ceiling, never the legacy openai 900000)", got)
+		}
+
+		cfg, err = Load(writeConfig(t, "anthropic:\n"+
+			"  timeout_ms: 60000\n"+
+			"provider:\n"+
+			"  type: openai\n"+
+			"  url: https://oa.example/v1\n"+
+			"  key: k\n"+
+			"  timeout_ms: 900000\n"))
+		if err != nil {
+			t.Fatalf("Load(anthropic legacy ceiling + openai provider ceiling): %v", err)
+		}
+		anth, open = cfg.ProviderChannels()
+		if anth.TimeoutMS != 900000 || open.TimeoutMS != 900000 {
+			t.Errorf("channels' ceilings = %d/%d, want the provider's 900000 stamped on both", anth.TimeoutMS, open.TimeoutMS)
+		}
+	})
+
+	t.Run("an unset provider ceiling falls through to the legacy value", func(t *testing.T) {
+		// The formerly rejected timeout-only legacy section: legal now, and
+		// its value stands wherever the provider leaves the ceiling unset.
+		cfg, err := Load(writeConfig(t, "anthropic:\n  timeout_ms: 123\nprovider:\n  type: anthropic\n  key: k\n"))
+		if err != nil {
+			t.Fatalf("Load(anthropic timeout-only + anthropic provider): %v", err)
+		}
+		if got := agentEnvValue(t, cfg.AgentEnv(), "API_TIMEOUT_MS"); got != "123" {
+			t.Errorf("API_TIMEOUT_MS = %q, want 123 (the legacy value survives the unset provider ceiling)", got)
 		}
 	})
 }
@@ -2923,10 +2992,11 @@ func TestLoadProviderMixingRules(t *testing.T) {
 // TestProviderChannels pins the channel resolution every consumer keys on
 // (AgentEnv's exports and the status probe's spec): a legacy-only config
 // resolves to its own sections verbatim; a provider section owns the
-// channel its type names and the other wire's legacy section passes
-// through; the wire-agnostic sizing pair rides the anthropic-side struct
-// whichever wire serves, with the provider's values landing only where the
-// legacy section is silent.
+// channel its type names while the other wire's legacy section passes
+// through; the wire-agnostic knobs are one channel whichever wire serves —
+// the sizing pair rides the anthropic-side struct and the request ceiling
+// is stamped on both — with the provider's set values landing
+// preferentially and its unset fields falling through to the legacy ones.
 func TestProviderChannels(t *testing.T) {
 	t.Run("legacy-only resolves verbatim", func(t *testing.T) {
 		cfg := Config{
@@ -2968,8 +3038,13 @@ func TestProviderChannels(t *testing.T) {
 		if anth != want {
 			t.Errorf("anthropic channel = %+v, want the provider section's projection %+v", anth, want)
 		}
-		if open != cfg.OpenAI {
-			t.Errorf("openai channel = %+v, want the legacy section verbatim %+v", open, cfg.OpenAI)
+		// The legacy openai section passes through with one exception: the
+		// request ceiling is one channel whichever wire serves, so the
+		// provider's stamps it here too.
+		wantOpen := cfg.OpenAI
+		wantOpen.TimeoutMS = 60000
+		if open != wantOpen {
+			t.Errorf("openai channel = %+v, want the legacy section with the provider's ceiling %+v", open, wantOpen)
 		}
 	})
 
@@ -3001,9 +3076,11 @@ func TestProviderChannels(t *testing.T) {
 			t.Errorf("openai channel = %+v, want the provider section's projection %+v", open, wantOpen)
 		}
 		// The legacy anthropic section passes through verbatim except the
-		// sizing pair, which the provider section owns — the exports read
-		// this side of the struct whichever wire serves.
+		// wire-agnostic knobs the provider section owns: the sizing pair
+		// rides this side of the struct whichever wire serves, and the
+		// provider's ceiling is stamped here too.
 		wantAnth := cfg.Anthropic
+		wantAnth.TimeoutMS = 60000
 		wantAnth.ContextTokens = 131072
 		wantAnth.MaxOutputTokens = 16384
 		if anth != wantAnth {
@@ -3137,10 +3214,11 @@ func TestAgentEnvProviderSection(t *testing.T) {
 	})
 }
 
-// TestLoadRawProviderRawView pins the deep-copy half of LoadRaw's split for
-// the one pointer field applyDefaults writes through: the returned raw view
-// keeps the file's own unset timeout_ms at zero even though validation —
-// which runs on the defaults-applied copy — required the default to pass.
+// TestLoadRawProviderRawView pins LoadRaw's raw view for the config's one
+// pointer field: the provider section is only ever read (ProviderChannels
+// merges from it at resolution time) and applyDefaults writes no pointer
+// fields, so the returned raw view keeps the file's own unset timeout_ms
+// at zero even though Load's serving channels resolve a default from it.
 func TestLoadRawProviderRawView(t *testing.T) {
 	raw, err := LoadRaw(writeConfig(t, "provider:\n  type: anthropic\n  key: k\n"))
 	if err != nil {

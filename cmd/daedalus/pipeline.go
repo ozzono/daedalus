@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -20,6 +23,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
+	"golang.org/x/sys/unix"
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
@@ -337,6 +341,7 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 		return err
 	}
 	defer c.Close()
+	fmt.Printf("Press d to detach (the run keeps executing); reattach later with: daedalus attach %s\n", run.WorkflowID)
 	return awaitPipeline(c.GetWorkflow(context.Background(), run.WorkflowID, run.RunID))
 }
 
@@ -759,6 +764,7 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		fmt.Printf("Detached — reattach with: daedalus attach %s\n", run.GetID())
 		return nil
 	}
+	fmt.Printf("Press d to detach (the run keeps executing); reattach later with: daedalus attach %s\n", run.GetID())
 	return awaitPipeline(run)
 }
 
@@ -918,15 +924,105 @@ func attachPipeline(cfg config.Config, workflowID string) error {
 // hint by the time it returns this; the error only labels the outcome.
 var errRunParked = errors.New("run parked awaiting maintainer input")
 
-// awaitPipeline blocks until the run finishes (bounded by runWaitTimeout) and
-// reports the outcome: the preserved branch on success, a parked run's
+// detachKey is the keystroke that ends an attached wait without touching
+// the run: the server-side workflow keeps executing and `daedalus attach`
+// reconnects to it.
+const detachKey = 'd'
+
+// makeRawStdin switches stdin to a minimal raw mode so a single detachKey
+// press is readable the instant it lands: canonical mode would hold it
+// until Enter, and echo would print it back. Only ICANON and ECHO are
+// cleared — ISIG stays on, so Ctrl-C keeps killing the process, and the
+// output flags stay untouched, so the run's own output renders normally.
+// The returned closure restores the saved termios; ok is false when the
+// switch was impossible (no terminal, no ioctl) and the wait simply runs
+// without a detach key. Package var so the suite can stub the tty seam.
+var makeRawStdin = func() (restore func(), ok bool) {
+	fd := int(os.Stdin.Fd())
+	termios, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return nil, false
+	}
+	saved := *termios
+	termios.Lflag &^= unix.ICANON | unix.ECHO
+	termios.Cc[unix.VMIN] = 1
+	termios.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, termios); err != nil {
+		return nil, false
+	}
+	return func() { _ = unix.IoctlSetTermios(fd, unix.TCSETS, &saved) }, true
+}
+
+// watchDetachKeys reads r byte-wise until a detachKey lands, then signals
+// the detach and cancels the wait context. Read errors (a closed stdin,
+// a vanished tty) end the watch: losing the detach key must never lose
+// the wait.
+func watchDetachKeys(r io.Reader, cancel context.CancelFunc, detached chan struct{}) {
+	buf := make([]byte, 1)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 && buf[0] == detachKey {
+			select {
+			case <-detached:
+			default:
+				close(detached)
+			}
+			cancel()
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// awaitPipeline blocks until the run finishes (bounded by runWaitTimeout)
+// and reports the outcome: the preserved branch on success, a parked run's
 // resume hint (as errRunParked, so callers gating on the exit code see a
-// non-zero one), or the execution error.
+// non-zero one), or the execution error. While it waits, a detachKey press
+// ends the wait cleanly — exit 0, the run untouched server-side — unless
+// the run finished first, which wins.
 func awaitPipeline(run client.WorkflowRun) error {
 	waitCtx, cancel := context.WithTimeout(context.Background(), runWaitTimeout)
 	defer cancel()
+	ctx, detachCancel := context.WithCancel(waitCtx)
+	defer detachCancel()
+	detached := make(chan struct{})
+	restore, isTerm := makeRawStdin()
+	if isTerm {
+		defer restore()
+		// Ctrl-C's default disposition kills without running defers — the
+		// terminal would keep the raw mode this wait armed (echo and line
+		// editing dead until reset). Catch the death signals, put the
+		// termios back, reset the dispositions, and re-raise, so the
+		// process dies exactly as it would have — exit status 130 under a
+		// shell's Ctrl-C — with a usable terminal left behind.
+		death := make(chan os.Signal, 1)
+		signal.Notify(death, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			s, ok := <-death
+			if !ok {
+				return
+			}
+			restore()
+			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+			_ = syscall.Kill(os.Getpid(), s.(syscall.Signal))
+		}()
+		go watchDetachKeys(os.Stdin, detachCancel, detached)
+	}
 	var preservedBranch string
-	if err := run.Get(waitCtx, &preservedBranch); err != nil {
+	if err := run.Get(ctx, &preservedBranch); err != nil {
+		// The detach outcome: the wait was cancelled by the keypress, not
+		// by the run failing — report the way back and leave with the run
+		// still executing. A run that finished before the press arrives
+		// through the success path below instead.
+		select {
+		case <-detached:
+			fmt.Printf("Detached — the run keeps executing; reattach with: daedalus attach %s\n", run.GetID())
+			return nil
+		default:
+		}
 		// A park of an older worker (before parked runs completed green)
 		// arrives here as a workflow failure carrying
 		// ErrAwaitingMaintainer — API exhausted past every heartbeat, or a

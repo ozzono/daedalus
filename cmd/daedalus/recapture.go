@@ -292,7 +292,10 @@ func recaptureQueue(c client.Client, q string, recs []statusRecord, stuck []stuc
 		if pid, ok := readLivePid(pidFile); ok {
 			alertRecapture(r.name, "restarting worker %s (pid %d, config %s) to recapture stuck task(s): %s",
 				r.name, pid, r.confPath, attemptSummary(stuck))
-			if err := workerRestartNamed(r.name); err != nil {
+			// Forced: the default restart now only schedules a drain, and
+			// this queue has no live poller to drain into — the ghosts
+			// need a serving daemon now, not after the stuck one drains.
+			if err := workerRestartNamed(r.name, true); err != nil {
 				// The old worker may still be draining and about to resolve
 				// the attempts itself; failing them now could duplicate
 				// rescheduled rounds with no poller to serve them. Leave

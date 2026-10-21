@@ -407,3 +407,163 @@ func TestParseFlagsDepends(t *testing.T) {
 		t.Errorf("parseFlags(run -a -dep) err = %v, want a fresh-run-only rejection", err)
 	}
 }
+
+// TestRestartForceScoping pins the restart scope's force flag surface:
+// -f/--force parse as force — in either spelling, anywhere after the
+// `worker restart` prefix, consuming no value — while everywhere else -f
+// keeps its global --file meaning and --force is not a flag at all. The
+// record-driven rejections (-c, -t) still fire with force flags on the
+// line, since those flags never reach rest.
+func TestRestartForceScoping(t *testing.T) {
+	t.Run("accepted in the restart scope in either spelling", func(t *testing.T) {
+		for _, c := range []struct {
+			args     []string
+			wantRest []string
+		}{
+			{[]string{"worker", "restart", "-f"}, []string{"worker", "restart"}},
+			{[]string{"worker", "restart", "--force"}, []string{"worker", "restart"}},
+			{[]string{"worker", "restart", "alpha", "--force"}, []string{"worker", "restart", "alpha"}},
+			{[]string{"worker", "restart", "all", "-f"}, []string{"worker", "restart", "all"}},
+			// Force rides alongside the bare restart's -t, and the flag
+			// may precede the command like any global one.
+			{[]string{"worker", "restart", "-f", "-t", "dev"}, []string{"worker", "restart"}},
+			{[]string{"-c", "cfg.yaml", "worker", "restart", "-f"}, []string{"worker", "restart"}},
+		} {
+			f, rest, err := parseFlags(c.args)
+			if err != nil {
+				t.Errorf("parseFlags(%v): %v", c.args, err)
+				continue
+			}
+			if !f.force {
+				t.Errorf("parseFlags(%v) force = false, want true", c.args)
+			}
+			if f.taskFile != "" {
+				t.Errorf("parseFlags(%v) taskFile = %q — -f must not keep its file meaning in the restart scope", c.args, f.taskFile)
+			}
+			if !reflect.DeepEqual(rest, c.wantRest) {
+				t.Errorf("parseFlags(%v) rest = %v, want %v", c.args, rest, c.wantRest)
+			}
+		}
+	})
+
+	// -f at the line's end must not demand a value there: in the restart
+	// scope it is the boolean force, not run's value-taking --file.
+	if _, _, err := parseFlags([]string{"worker", "restart", "-f"}); err != nil {
+		t.Errorf("parseFlags(worker restart -f): %v, want the boolean force parsed", err)
+	}
+
+	t.Run("outside the scope -f stays the global file", func(t *testing.T) {
+		f, _, err := parseFlags([]string{"-f", "notes.md", "run", "/repo", "42", "do it"})
+		if err != nil {
+			t.Fatalf("parseFlags(-f before run): %v", err)
+		}
+		if f.taskFile != "notes.md" || f.force {
+			t.Errorf("parseFlags(-f notes.md run …) = (taskFile %q, force %v), want (notes.md, false)", f.taskFile, f.force)
+		}
+		// A value-taking -f elsewhere is its old self, rejection included.
+		if _, _, err := parseFlags([]string{"worker", "start", "--file", "x"}); err == nil ||
+			!strings.Contains(err.Error(), "-f/--file only applies to run") {
+			t.Errorf("parseFlags(worker start --file) err = %v, want the run-only rejection", err)
+		}
+	})
+
+	t.Run("--force is unknown outside the restart scope", func(t *testing.T) {
+		f, rest, err := parseFlags([]string{"run", "--force"})
+		if err != nil {
+			t.Fatalf("parseFlags(run --force): %v", err)
+		}
+		if f.force {
+			t.Error("parseFlags(run --force) force = true, want false — --force lives outside flagTable")
+		}
+		if len(rest) != 2 || rest[1] != "--force" {
+			t.Errorf("parseFlags(run --force) rest = %v, want --force left as an unparsed positional", rest)
+		}
+	})
+
+	t.Run("the record-driven rejections still fire with force present", func(t *testing.T) {
+		const configRejection = "-c/--config does not apply to worker restart all, restart <worker>, or worker status"
+		if _, _, err := parseFlags([]string{"worker", "restart", "all", "-f", "-c", "cfg.yaml"}); err == nil ||
+			err.Error() != configRejection {
+			t.Errorf("parseFlags(restart all -f -c) err = %v, want %q", err, configRejection)
+		}
+		const typeRejection = "-t/--type does not apply to worker restart all, restart <worker>, or worker status"
+		if _, _, err := parseFlags([]string{"worker", "restart", "all", "-f", "-t", "dev"}); err == nil ||
+			err.Error() != typeRejection {
+			t.Errorf("parseFlags(restart all -f -t) err = %v, want %q", err, typeRejection)
+		}
+	})
+}
+
+// TestRestartForceHelpers pins the positional scoping machinery the force
+// flag, its matcher bypass, and the arity guard share: the command
+// position behind the global-flag grammar, the `worker restart` prefix
+// from which force re-scopes, and the strip that leaves the positional
+// shape the matchers compare.
+func TestRestartForceHelpers(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		want int
+	}{
+		{nil, -1},
+		{[]string{"run"}, 0},
+		{[]string{"-d", "run"}, 1},
+		{[]string{"-c", "cfg.yaml", "worker"}, 2},
+		{[]string{"--config=cfg.yaml", "worker"}, 1},
+		// A trailing value flag consumes past the end: no command word.
+		{[]string{"-c", "-t"}, -1},
+	} {
+		if got := commandPos(c.args); got != c.want {
+			t.Errorf("commandPos(%v) = %d, want %d", c.args, got, c.want)
+		}
+	}
+
+	for _, c := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"worker", "restart"}, 2},
+		{[]string{"worker", "restart", "all"}, 2},
+		{[]string{"-c", "cfg.yaml", "worker", "restart", "alpha"}, 4},
+		// Anything else leaves no force scope: the length is the sentinel.
+		{[]string{"worker", "start"}, 2},
+		{[]string{"worker"}, 1},
+		{[]string{"run"}, 1},
+		{nil, 0},
+	} {
+		if got := restartForceFrom(c.args); got != c.want {
+			t.Errorf("restartForceFrom(%v) = %d, want %d", c.args, got, c.want)
+		}
+	}
+
+	for _, c := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"worker", "restart", "-f", "all"}, []string{"worker", "restart", "all"}},
+		{[]string{"worker", "restart", "--force", "alpha", "-f"}, []string{"worker", "restart", "alpha"}},
+		// Before the prefix -f is run's --file: untouched.
+		{[]string{"-f", "x", "worker", "restart"}, []string{"-f", "x", "worker", "restart"}},
+		{[]string{"worker", "restart"}, []string{"worker", "restart"}},
+	} {
+		if got := stripRestartForce(c.args); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("stripRestartForce(%v) = %v, want %v", c.args, got, c.want)
+		}
+	}
+
+	// The matchers see through the force flags wherever they sit among the
+	// restart arguments.
+	if !isRestartAll([]string{"worker", "restart", "all", "-f"}) ||
+		!isRestartAll([]string{"worker", "restart", "-f", "all"}) ||
+		!isRestartAll([]string{"worker", "restart", "all"}) {
+		t.Error("isRestartAll should match the all shape with the force flags anywhere in the scope")
+	}
+	if name, ok := isRestartNamed([]string{"worker", "restart", "alpha", "--force"}); !ok || name != "alpha" {
+		t.Errorf("isRestartNamed(trailing --force) = (%q, %v), want (alpha, true)", name, ok)
+	}
+	if name, ok := isRestartNamed([]string{"worker", "restart", "--force", "alpha"}); !ok || name != "alpha" {
+		t.Errorf("isRestartNamed(leading --force) = (%q, %v), want (alpha, true)", name, ok)
+	}
+	if _, ok := isRestartNamed([]string{"worker", "restart", "-f"}); ok {
+		t.Error("isRestartNamed(force flags alone) should not match — there is no worker name")
+	}
+}

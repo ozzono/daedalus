@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/workflow"
 
 	"github.com/ozzono/daedalus/internal/activities"
 )
@@ -42,12 +43,18 @@ func stubSlimRun(t *testing.T) (*testsuite.TestWorkflowEnvironment, *agentRecord
 // round owns the wire format outright); an empty array, a reply without an
 // array, malformed JSON, and a sub-task missing its description or
 // acceptance criteria are all rejected too, because the atomic loop cannot
-// run without them. The one absorbed syntax class is trailing commas: a
-// comma directly before a closing bracket is stripped and the parse
-// retried before the reply costs its re-ask — string content is never
-// touched, a truncated reply (no closing bracket) is deliberately left
-// failing, and a failure after repair still reports the error for the
-// reply as written.
+// run without them. Two syntax classes are repaired deterministically
+// before the reply costs its re-ask: a comma directly before a closing
+// bracket is stripped, and a reply whose every element was already
+// complete but whose final closers were dropped is closed — accepted only
+// when the closed text re-parses in full and passes the per-field
+// validation, and reported through the repaired flag so the caller can
+// stamp the run (the comma strip is never reported; only the closure rides
+// the run memo). String content is untouched by both, a reply cut off
+// mid-value is never closed (inventing the quote would fabricate content),
+// the two repairs are never composed, and a failure after repair still
+// reports the error for the reply as written. The flag's gate side is
+// pinned in TestParseSlimPlanRepairGate.
 func TestParseSlimPlan(t *testing.T) {
 	valid := twoSubtaskPlan
 	for _, c := range []struct {
@@ -56,6 +63,7 @@ func TestParseSlimPlan(t *testing.T) {
 		wantN    int
 		wantErr  string
 		wantDesc string
+		repaired bool
 	}{{
 		name:  "raw array",
 		text:  valid,
@@ -122,11 +130,66 @@ func TestParseSlimPlan(t *testing.T) {
 		wantN:    1,
 		wantDesc: `say "a,] ok`,
 	}, {
-		// Deliberately not a truncation repair: a reply cut off mid-array
-		// has no closing bracket for the strip to act on, and auto-closing
-		// one would unmarshal a truncated plan as a complete queue with
-		// subtasks silently missing. Truncated replies keep failing and
-		// spend the re-ask.
+		// The deterministic bracket-closure repair: a reply whose every
+		// element was complete but whose final closers were dropped is
+		// closed and accepted on the full re-parse, with repaired
+		// reporting the rescue (the caller warns and stamps the run
+		// memo). The motivating shape: the whole queue present, only the
+		// array's final "]" missing.
+		name:     "missing final bracket closes",
+		text:     valid[:len(valid)-1],
+		wantN:    2,
+		repaired: true,
+	}, {
+		// Closers append in reverse opening order: an element cut right
+		// after its last field's array still needs "}" and then "]".
+		name:     "missing closers after the last field close",
+		text:     `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]`,
+		wantN:    1,
+		repaired: true,
+	}, {
+		// Brackets inside string literals are content and are never
+		// balanced against — the walk is string-aware exactly like the
+		// comma strip, so a description full of brackets closes to a
+		// queue carrying it byte-exact.
+		name:     "brackets inside a string never balance the walk",
+		text:     `[{"id":1,"type":"implement","target_files":["a.go"],"description":"fix {the} [bug]","acceptance_criteria":["a.go exists"]`,
+		wantN:    1,
+		wantDesc: "fix {the} [bug]",
+		repaired: true,
+	}, {
+		// A walk that ends inside an unterminated string closes nothing:
+		// a reply cut off mid-value is genuine truncation, and inventing
+		// the quote that ends it would fabricate content — the one thing
+		// the closure may not do.
+		name:    "unterminated string closes nothing",
+		text:    `[{"id":1,"type":"implement","target_files":["a.go"],"description":"cut off`,
+		wantErr: "reply is not the required raw JSON array",
+	}, {
+		// The repairs are never composed: this element was cut off right
+		// after a dangling field comma, so its closure only parses
+		// together with the comma strip — closing AND stripping one text
+		// would silently accept a complete-looking queue, the
+		// truncation-masking outcome the strict parse exists to prevent.
+		// The reply keeps failing and spends the re-ask.
+		name:    "closure and comma strip are never composed",
+		text:    `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"],`,
+		wantErr: "reply is not the required raw JSON array",
+	}, {
+		// The closure never bypasses validation: closed text is held to
+		// the same per-field contract, so an element whose criteria
+		// array closes empty is rejected like any other.
+		name:    "closed subtask still validated",
+		text:    `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":[`,
+		wantErr: "carries no acceptance criteria",
+	}, {
+		// Deliberately not a truncation repair, from either direction:
+		// this reply was cut off right after a complete element plus a
+		// comma. The closure walk finds the array still open and appends
+		// its "]", but the closed text (",]") fails the full re-parse —
+		// and the repairs never compose — so the reply still fails and
+		// spends the re-ask instead of unmarshaling a shortened queue as
+		// complete.
 		name:    "truncated reply is not auto-closed",
 		text:    `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]},`,
 		wantErr: "reply is not the required raw JSON array",
@@ -172,7 +235,7 @@ func TestParseSlimPlan(t *testing.T) {
 		wantErr: "carries no acceptance criteria",
 	}} {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := parseSlimPlan(c.text)
+			got, repaired, err := parseSlimPlan(c.text, true)
 			if c.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 					t.Fatalf("parseSlimPlan(%q) err = %v, want it to contain %q", c.text, err, c.wantErr)
@@ -182,6 +245,9 @@ func TestParseSlimPlan(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseSlimPlan(%q): %v", c.text, err)
 			}
+			if repaired != c.repaired {
+				t.Fatalf("parsed with repaired = %v, want %v (only the bracket closure reports a repair, never the comma strip)", repaired, c.repaired)
+			}
 			if len(got) != c.wantN {
 				t.Fatalf("parsed %d subtasks, want %d", len(got), c.wantN)
 			}
@@ -190,9 +256,27 @@ func TestParseSlimPlan(t *testing.T) {
 			}
 		})
 	}
-	if got, err := parseSlimPlan(valid); err != nil || got[1].Description != "multiply the adder" ||
+	if got, _, err := parseSlimPlan(valid, true); err != nil || got[1].Description != "multiply the adder" ||
 		len(got[1].AcceptanceCriteria) != 2 || got[1].TargetFiles[0] != "mul.go" {
 		t.Errorf("parseSlimPlan fields = %+v (err %v), want the wire schema's named fields carried through", got, err)
+	}
+}
+
+// TestParseSlimPlanRepairGate pins the replay gate around the closure
+// repair: the workflow passes its GetVersion marker as parseSlimPlan's
+// repair flag, so the false side must decide exactly as the code that
+// recorded pre-marker history did — the closure is off (a missing-closer
+// reply fails and spends the re-ask), while the comma strip predates the
+// marker and stays on, repairing without reporting a repair (only the
+// closure is ever reported; the run memo rides that report alone).
+func TestParseSlimPlanRepairGate(t *testing.T) {
+	closable := twoSubtaskPlan[:len(twoSubtaskPlan)-1] // every element complete, the final "]" dropped
+	if _, repaired, err := parseSlimPlan(closable, false); err == nil || repaired {
+		t.Errorf("parseSlimPlan(closable reply, repair=false) = repaired %v, err %v, want the gated-off closure to reject the reply", repaired, err)
+	}
+	got, repaired, err := parseSlimPlan(closable+",]", false)
+	if err != nil || repaired || len(got) != 2 {
+		t.Errorf("parseSlimPlan(trailing-comma reply, repair=false) = (%d subtasks, repaired %v, err %v), want the ungated comma strip to repair without reporting", len(got), repaired, err)
 	}
 }
 
@@ -404,6 +488,103 @@ func TestSlimWorkflowParseRetry(t *testing.T) {
 		if len(suites.runs) != 1 {
 			t.Errorf("suite ran %d times, want 1 (preflight only)", len(suites.runs))
 		}
+	})
+}
+
+// TestSlimWorkflowParseRepair pins the closure repair's run-level surface:
+// a parse reply whose every element was complete but whose final closers
+// were dropped is closed, the queue runs to finalize, and the rescue is
+// stamped on the run memo (ParseQueueRepaired) — durable and run-visible,
+// not just logged. The routine comma strip is not a repair and stamps
+// nothing, and a pre-marker replay (GetVersion pinned to the default)
+// parses with the strip alone: the same closable reply fails there and
+// spends the parse round's re-ask, exactly as the history that recorded it
+// did.
+func TestSlimWorkflowParseRepair(t *testing.T) {
+	// oneClosableQueue is the complete one-subtask queue missing only its
+	// final closers — the shape the closure repair exists for.
+	oneClosableQueue := `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]`
+
+	t.Run("closed queue finalizes and stamps the run memo", func(t *testing.T) {
+		env, agents, reviews, _ := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"ParseQueueRepaired": true}).Return(nil).Once()
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
+			{result: activities.AgentRunResult{Text: oneClosableQueue, SessionID: "dev-2"}},
+			{result: activities.AgentRunResult{Text: "step one done", SessionID: "dev-3"}},
+		}
+		reviews.stub = []activities.ReviewResult{{Approved: true}}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+
+		branch, err := runSlim(t, env)
+		if err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if branch != "daedalus/issue-42-1" {
+			t.Errorf("branch = %q, want the finalize deliverable", branch)
+		}
+		if len(agents.inputs) != 3 {
+			t.Fatalf("agent ran %d times, want 3 (plan, parse, step — the closed queue needed no re-ask)", len(agents.inputs))
+		}
+		// The memo assertion rides AssertExpectations: exactly one stamp,
+		// exactly the ParseQueueRepaired map.
+		env.AssertExpectations(t)
+	})
+
+	t.Run("the comma strip is not a repair", func(t *testing.T) {
+		env, agents, reviews, _ := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"ParseQueueRepaired": true}).Never()
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
+			{result: activities.AgentRunResult{Text: oneClosableQueue + "},]", SessionID: "dev-2"}},
+			{result: activities.AgentRunResult{Text: "step one done", SessionID: "dev-3"}},
+		}
+		reviews.stub = []activities.ReviewResult{{Approved: true}}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+
+		if _, err := runSlim(t, env); err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if len(agents.inputs) != 3 {
+			t.Fatalf("agent ran %d times, want 3 (plan, parse, step — the comma strip absorbed the reply without a re-ask)", len(agents.inputs))
+		}
+		env.AssertExpectations(t)
+	})
+
+	t.Run("a pre-marker replay spends the re-ask", func(t *testing.T) {
+		env, agents, reviews, _ := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"ParseQueueRepaired": true}).Never()
+		env.OnGetVersion(slimParseRepairChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
+			// The closable reply fails the gated-off parse...
+			{result: activities.AgentRunResult{Text: oneClosableQueue, SessionID: "dev-2"}},
+			// ...and the correction carries the closers.
+			{result: activities.AgentRunResult{Text: oneClosableQueue + "}]", SessionID: "dev-3"}},
+			{result: activities.AgentRunResult{Text: "step one done", SessionID: "dev-4"}},
+		}
+		reviews.stub = []activities.ReviewResult{{Approved: true}}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+
+		if _, err := runSlim(t, env); err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if len(agents.inputs) != 4 {
+			t.Fatalf("agent ran %d times, want 4 (plan, parse, re-ask, step — the closure must not fire on a pre-marker replay)", len(agents.inputs))
+		}
+		if got := agents.inputs[2].SessionID; got != "dev-2" {
+			t.Errorf("re-ask SessionID = %q, want %q (resumed in the parse round's own conversation)", got, "dev-2")
+		}
+		if retry := agents.inputs[2].Prompt; !strings.Contains(retry, "could not be parsed as the required JSON array") {
+			t.Errorf("re-ask prompt should carry the parse failure, got:\n%s", retry)
+		}
+		if got := agents.inputs[3].SessionID; got != "dev-3" {
+			t.Errorf("worker step SessionID = %q, want %q (the dev conversation chains through the re-ask)", got, "dev-3")
+		}
+		env.AssertExpectations(t)
 	})
 }
 

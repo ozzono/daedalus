@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"go.temporal.io/sdk/activity"
@@ -48,6 +51,46 @@ func wantsTestWorker(workerType string) bool { return workerType != workerTypeDe
 // before this runs, so a bad override fails the start before any poller
 // registers.
 func runWorker(cfg config.Config, workerType string) error {
+	// The self-managed interrupt channel the Runs and the signal
+	// forwarders share, declared before anything that fires halt:
+	// whichever Run exits first halts the others, so an asymmetric failure
+	// (say, the test worker dying alone on an untyped daemon) stops the
+	// survivors too instead of leaving a half-dead daemon with a live pid
+	// file and an error nobody reports. Each Run only returns after its
+	// in-flight activity outcomes have been reported, and returning on
+	// whichever finishes first without halting the others would exit
+	// mid-drain — the orphaned-round wedge this shutdown path exists to
+	// prevent.
+	interrupt := make(chan interface{})
+	var haltOnce sync.Once
+	halt := func() { haltOnce.Do(func() { close(interrupt) }) }
+	// The daemon's drain-restart lever (`worker restart` on a live
+	// daemon): SIGHUP sets the restart intent and fires the same halt, so
+	// every Run drains its in-flight activities first — the join at the
+	// bottom returns only when the worker is idle by construction — and
+	// the intent then re-execs the daemon on its config record instead of
+	// returning. Armed before the client dial so the whole multi-second
+	// boot is covered, and gated on the daemon marker, so a foreground run
+	// keeps SIGHUP's default disposition (terminate) — a closed terminal
+	// still takes the process down. ponytail: two windows remain where a
+	// SIGHUP still kills at default disposition or is dropped — this
+	// dispatch's config load before runWorker is entered (covering it
+	// means arming in the dispatch and threading the intent down, not
+	// worth the plumbing), and after the restart-intent check below but
+	// before the process exits (the scheduling CLI has already reported
+	// the restart; inherent to check-and-exit, and closing it means
+	// blocking the exit on a grace period).
+	var restartPending atomic.Bool
+	if os.Getenv(daemonEnv) == "1" {
+		sighup := make(chan os.Signal, 1)
+		signal.Notify(sighup, syscall.SIGHUP)
+		go func() {
+			for range sighup {
+				restartPending.Store(true)
+				halt()
+			}
+		}()
+	}
 	// Reap leftover workers first: a stale worker running a deleted binary
 	// polls the same task queue this start is about to join, and once the
 	// pollers below register, two live workers are indistinguishable from
@@ -453,20 +496,9 @@ func runWorker(cfg config.Config, workerType string) error {
 	fmt.Printf("daedalus worker %s starting %s on task queue %q (temporal %s, UI %s)\n",
 		version.String(), time.Now().Format(time.RFC3339),
 		cfg.Temporal.TaskQueue, cfg.Temporal.Host, cfg.UIURL())
-	// The selected workers run against a self-managed interrupt channel:
-	// whichever Run exits first halts the others, so an asymmetric failure
-	// (say, the test worker dying alone on an untyped daemon) stops the
-	// survivors too instead of leaving a half-dead daemon with a live pid
-	// file and an error nobody reports.
-	// Each Run only returns after its in-flight activity outcomes have been
-	// reported, and returning on whichever finishes first without halting
-	// the others would exit mid-drain — the orphaned-round wedge this
-	// shutdown path exists to prevent.
-	interrupt := make(chan interface{})
-	var haltOnce sync.Once
-	halt := func() { haltOnce.Do(func() { close(interrupt) }) }
 	// SIGINT/SIGTERM still reach the workers: the forwarder drains the
-	// signal channel and halts the shared channel, whose close every Run
+	// signal channel and halts the shared channel declared (with the
+	// SIGHUP lever) at the top of runWorker — its close every Run
 	// receives — no send, so a signal racing halt's close cannot panic the
 	// forwarder on a closed channel.
 	go func() { <-worker.InterruptCh(); halt() }()
@@ -478,7 +510,54 @@ func runWorker(cfg config.Config, workerType string) error {
 	for range workers {
 		joined = append(joined, <-errs)
 	}
+	// Restart intent wins over returning: every poller has joined, every
+	// in-flight activity outcome is reported — the worker is idle, and the
+	// re-exec brings it back on the (possibly just re-recorded) config,
+	// same pid, same log. Only an Exec failure adds to the joined errors.
+	if restartPending.Load() {
+		if err := restartSelf(cfg.WorkerName()); err != nil {
+			return errors.Join(append(joined, err)...)
+		}
+	}
 	return errors.Join(joined...)
+}
+
+// restartSelf re-executes this binary as a fresh daemon from the worker's
+// config record (restartArgv) — the second half of the drain restart,
+// reached only after every poller has joined. Same pid (exec replaces the
+// image in place), so the pid file stays valid; stdin/stdout/stderr still
+// point at the daemon log, so the new start's banner continues the same
+// file; the environment still carries the daemon marker, so a later real
+// exit still clears the pid file. The defers above (client close, relay
+// and status goroutines) do not run — exec never returns on success — and
+// need not: the drains they guard have completed, and the kernel closes
+// what is left.
+func restartSelf(name string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+	argv := restartArgv(self, name)
+	fmt.Printf("drain restart: re-executing %q\n", strings.Join(argv[1:], " "))
+	return syscall.Exec(self, argv, os.Environ())
+}
+
+// restartArgv builds the re-exec argv from the worker's config record —
+// the config path and run type the scheduling `worker restart` just wrote,
+// not this process's original invocation (config is re-read at startup, so
+// both a CLI re-record and a hand edit take effect). A worker with no
+// readable record — started before records existed — re-execs as what it
+// is: its own invocation.
+func restartArgv(self, name string) []string {
+	path, typ := readConfigRecord(name)
+	if path == "" {
+		return append([]string{self}, os.Args[1:]...)
+	}
+	argv := []string{self, "worker", "foreground", "-c", path}
+	if typ != "" {
+		argv = append(argv, "-t", typ)
+	}
+	return argv
 }
 
 // statusPublishInterval is how often the worker rewrites its status file.

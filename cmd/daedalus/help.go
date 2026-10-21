@@ -25,7 +25,7 @@ WORKFLOW COMMANDS
 
 WORKER COMMANDS
   worker      Manage the Temporal worker daemon (start, stop, status, restart, foreground, wakeup, report)
-              flags: -c -t --all per sub-action; "worker <action> --help" is exhaustive
+              flags: -c -t --all -f per sub-action; "worker <action> --help" is exhaustive
   metrics     Manage the host metrics daemon — the usage relay, ledger, and dashboard
               (start, stop, restart, status, list, foreground)
 
@@ -105,6 +105,8 @@ FLAGS
   -d, --detach            Start the pipeline and return immediately instead of
                           blocking until it finishes; "daedalus attach" reconnects.
                           Fresh runs and continue only — rejected in append mode.
+                          Without it, pressing d while the run waits detaches the
+                          same way — the run keeps executing server-side.
   -p, --prefix <prefix>   Name this run's preserved branch
                           <prefix>/issue-<id>-<timestamp>, overriding the config's
                           branch_prefix (the issue part of the name stays as given).
@@ -215,7 +217,8 @@ branch, becomes the new run's starting point, and that attempt's last
 review feedback is folded into the opening prompt.
 
 FLAGS
-  -d, --detach   Start the continued run and return immediately.
+  -d, --detach   Start the continued run and return immediately; without it,
+                 pressing d while the wait blocks detaches the same way.
 
 -p/--prefix does not apply: the continued run keeps the original run's
 branch prefix.
@@ -240,7 +243,8 @@ USAGE
   daedalus [-c config.yaml] attach <workflow-id>
 
 Reattach to a running (or already finished) pipeline, block until it
-finishes, and report the outcome — the other half of "run -d".
+finishes, and report the outcome — the other half of "run -d". While
+attached, pressing d detaches again without touching the run.
 <workflow-id> is the identifier printed by "run" (also visible in
 "temporal workflow list").
 
@@ -386,9 +390,16 @@ ACTIONS
                 pid lives in /tmp/daedalus/worker-<name>.pid — one daemon per
                 worker name (the config's worker_id, else its task_queue).
   stop          Drain the daemon gracefully (SIGTERM).
-  restart       Stop + start with the config the restart is invoked with, re-read
-                from disk, so values changed since the worker was started (a
-                rotated API key, a new model) take effect on every restart.
+  restart       Schedule a drain-restart: the config the restart is invoked with
+                is re-read from disk and recorded, the running daemon is
+                signalled, and the command returns immediately — the daemon
+                drains its current tasks, then re-executes itself in place
+                (same pid, same log) on the new config, so values changed
+                since the worker was started (a rotated API key, a new model)
+                take effect. A worker that is not running is simply started.
+                --force (also -f after "worker restart") skips the drain: the
+                old daemon is stopped and a replacement starts immediately,
+                both pids reported, without blocking.
   status        List every worker on record — plus any live stray running without
                 one, shown as "(no config record)" — with worker name, running
                 pid, the binary version that worker is executing (so a daemon
@@ -449,6 +460,11 @@ FLAGS
                         pass -t again on a bare restart.
   --all                 Restart target: every worker on record (same as the
                         "all" argument).
+  -f, --force           Immediate-swap restart: accepted after "worker restart"
+                        only, in either spelling, where it stops the old
+                        daemon and starts the replacement right away instead
+                        of scheduling a drain. Anywhere else -f stays the
+                        global --file.
 
 The untyped daemon (no -t) also serves the deployment's suite task queue —
 the Temporal-wide shared "test" queue with shared_test_queue true (the
@@ -651,19 +667,21 @@ CONFIGURATION REFERENCE
                         environment; aider and codex rounds consume the
                         section directly (aider via --model openai/<model>,
                         codex via per-invocation -c overrides)
-  provider              Wire-agnostic primary provider: type (required —
-                        anthropic or openai; missing or unknown is a load
-                        error) selects the wire format and the env channel
-                        the values export on, so one section fully serves a
-                        model: url/key/model and timeout_ms on both wires,
-                        the sizing pair on both (it rides the wire-agnostic
-                        exports), heartbeat_model on anthropic only, and
-                        the sampler knobs on openai only — a knob on the
-                        wire without a consumer is a load error, never
-                        inert. Setting it and the same-wire legacy section
-                        together is a load error (one channel, one source
-                        of truth); the other wire's legacy section stays
-                        legal. Legacy-only configs behave byte-identically
+  provider              Wire-agnostic primary provider (the preferred
+                        section): type (required — anthropic or openai;
+                        missing or unknown is a load error) selects the wire
+                        format and the env channel the values export on, so
+                        one section fully serves a model: url/key/model and
+                        timeout_ms on both wires, the sizing pair on both
+                        (it rides the wire-agnostic exports), heartbeat_model
+                        on anthropic only, and the sampler knobs on openai
+                        only — a knob on the wire without a consumer is a
+                        load error, never inert. Per-field precedence (role
+                        overrides > provider > legacy): a field the provider
+                        section sets wins over the legacy sections', an
+                        unset one falls through to the legacy value; the
+                        legacy anthropic:/openai: sections are compatibility
+                        and keep working unchanged
   fallback.enabled/url/key/model/heartbeat_model
                         Independent secondary provider: when a jailed round
                         fails with the primary's quota exhausted, the worker
@@ -829,9 +847,10 @@ is one eval in a shell rc (daedalus writes no files):
 
 On every tab press the script asks the hidden "daedalus __complete" probe
 what can come next — commands, worker actions, worker restart targets,
-init's profiles, completion's shells, and flags — and falls back to the
-shell's own file completion when the probe answers nothing (which serves
--f/--file values and paths). The candidate
+live workflow ids (one bounded Temporal query per tab press; a dead
+Temporal answers empty), init's profiles, completion's shells, and
+flags — and falls back to the shell's own file completion when the probe
+answers nothing (which serves -f/--file values and paths). The candidate
 logic lives in the binary the script calls, so an installed script
 self-updates with it: a command or flag added to daedalus is completed
 without reinstalling anything.
@@ -917,27 +936,40 @@ FLAGS
 
 "daedalus worker --help" has the full worker reference.
 `,
-	"restart": `daedalus worker restart — stop + start a worker with the config
-re-read from disk, so values changed since the worker was started (a
-rotated API key, a new model) take effect.
+	"restart": `daedalus worker restart — move a worker onto the config re-read
+from disk, so values changed since the worker was started (a rotated API
+key, a new model) take effect.
 
 USAGE
   daedalus [-c config.yaml] worker restart [-t dev|test]   (bare: this config's worker)
   daedalus worker restart <worker>                         (from any directory)
   daedalus worker restart all | --all                      (every worker on record)
 
+The default restart is scheduled, not blocking: the new config is written
+to the worker's record, the running daemon is signalled, and the command
+returns immediately — "restart scheduled (drains current tasks)". The
+daemon drains its current tasks, then re-executes itself in place (same
+pid, same log) on the recorded config and worker type. A worker that is
+not running is simply started, as before.
+
 FLAGS
   -c, --config <path>   Bare form only: the config the restart runs with
-                        (the start that follows rewrites the worker's
-                        record with it). Rejected by "restart <worker>"
-                        and "restart all" — those act from the recorded
+                        (the re-execution rewrites the worker's record
+                        with it). Rejected by "restart <worker>" and
+                        "restart all" — those act from the recorded
                         configs alone.
   -t, --type <type>     Bare form only: dev, test, or omitted for both
                         pollers. Rejected by the record-driven forms — a
-                        run config is never persisted, so they revive the
-                        daemon untyped; pass -t again on a bare restart to
-                        keep a typed daemon.
+                        run config is never persisted, so they re-execute
+                        untyped; pass -t again on a bare restart to keep
+                        a typed daemon.
   --all                 Restart-target spelling of the "all" argument.
+  -f, --force           Skip the drain: SIGTERM the old daemon and start
+                        the replacement immediately — old and new pids
+                        reported, never blocking (the old daemon's own
+                        drain is its own). Accepted after "worker restart"
+                        only, in either spelling; anywhere else -f is the
+                        global --file.
 
 "daedalus worker --help" has the full worker reference.
 `,

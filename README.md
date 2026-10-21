@@ -155,10 +155,12 @@ up.
   installed CLIs, 2026-09-25):
   - `aider` — fully wired: daedalus stages a model-metadata file
     (`max_input_tokens` / `max_output_tokens`, 64k/8k defaults) for
-    configured openai-style models automatically; `anthropic.context_tokens`
+    configured openai-style models automatically; `provider.context_tokens`
+    (the preferred section) or the legacy `anthropic.context_tokens`
     overrides the input side when set
-  - `claude` — daedalus exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS` when
-    `anthropic.context_tokens` is set in config.yaml (a settings-file
+  - `claude` — daedalus exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS` when the
+    context window is set in config.yaml (`provider.context_tokens`,
+    preferred, or the legacy `anthropic.context_tokens`; a settings-file
     `env` block would not reach jailed rounds — masked, above; the `[1m]`
     model-name suffix for the 1M window is expressible today via the
     configured `model`)
