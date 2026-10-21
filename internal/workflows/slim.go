@@ -33,12 +33,15 @@ const maxSlimStepRounds = 8
 //     rather than on the wire shape — and a parse round transcribes that
 //     plan into a strictly ordered queue of sub-tasks, each at most 1–2
 //     target files, each verifiable against its own acceptance criteria,
-//     emitted as a raw JSON array (template.SlimSubtask). A deterministic
-//     trailing-comma strip absorbs that one purely decorative syntax class
-//     before anything costs budget, and one strict re-ask of the parse
-//     round absorbs any other malformed reply (resumed in the parse
-//     round's own conversation, so the model sees and corrects its
-//     previous reply); an unparseable second reply parks the run.
+//     emitted as a raw JSON array (template.SlimSubtask). Two
+//     deterministic repairs — a trailing-comma strip and a bracket
+//     closure of a reply whose every element was complete but whose final
+//     closers were dropped (the run memo is stamped ParseQueueRepaired
+//     when it fires) — absorb those routine syntax classes before
+//     anything costs budget, and one strict re-ask of the parse round
+//     absorbs any other malformed reply (resumed in the parse round's own
+//     conversation, so the model sees and corrects its previous reply);
+//     an unparseable second reply parks the run.
 //
 //  2. Atomic loops: each sub-task in order runs implement ↔ review on
 //     the shared pipelineRun machinery, with the native suite executed
@@ -103,7 +106,8 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse round: %w", err)
 	}
-	subtasks, perr := parseSlimPlan(parseReply.Text)
+	repairOK := slimParseRepairEnabled(ctx)
+	subtasks, repaired, perr := parseSlimPlan(parseReply.Text, repairOK)
 	if perr != nil {
 		// One strict re-ask, resumed in the parse round's own
 		// conversation: the model sees its previous reply and corrects it
@@ -120,9 +124,17 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parse retry round: %w", err)
 		}
-		if subtasks, perr = parseSlimPlan(parseReply.Text); perr != nil {
+		if subtasks, repaired, perr = parseSlimPlan(parseReply.Text, repairOK); perr != nil {
 			return "", run.park(fmt.Sprintf("parse round could not produce a parseable subtask queue: %v", perr))
 		}
+	}
+	if repaired {
+		// The repair's firing is durable and run-visible, not just
+		// logged: a short-looking queue that went green must answer "did
+		// the parser close this?" where a maintainer actually looks. The
+		// memo renders with the run; no search-attribute registration.
+		run.logger.Warn("Parse reply closed by repair", "Subtasks", len(subtasks))
+		workflow.UpsertMemo(run.ctx, map[string]interface{}{"ParseQueueRepaired": true})
 	}
 	run.logger.Info("Plan atomized", "Subtasks", len(subtasks))
 
@@ -242,6 +254,22 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 	}
 }
 
+// slimParseRepairChangeID gates the parse round's bracket-closure repair
+// behind its own version marker, for the same replay reason as the
+// pipeline.go markers (visibilityChangeID and friends): the repair changes
+// whether the parse round's re-ask activity is scheduled, so a run whose
+// history was recorded before the repair and replayed by an upgraded
+// worker would issue commands that history does not hold and wedge at the
+// next worker upgrade. Pre-marker replays parse with the comma strip only,
+// exactly as their history recorded. The memo stamp (ParseQueueRepaired)
+// needs no gate of its own — repaired can only fire when the gated repair
+// did.
+const slimParseRepairChangeID = "slim-parse-closer-repair"
+
+func slimParseRepairEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, slimParseRepairChangeID, workflow.DefaultVersion, 1) == 1
+}
+
 // parseSlimPlan extracts the parse round's subtask queue from its reply.
 // The parse round's output contract is the raw JSON array and nothing
 // else, so the parse is strict: the whole reply — whitespace trimmed, one
@@ -252,39 +280,113 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 // broke an otherwise valid queue; under the two-phase planner the parse
 // round owns the wire format outright, so a full-string unmarshal is both
 // available and stricter. Validated for the fields the loop cannot run
-// without. On a failed unmarshal, one deterministic repair is attempted
-// before the error is returned: trailing commas are stripped
-// (stripTrailingCommas) and the parse retried — the syntax class small
-// self-hosted models emit routinely, and repeat on correction, so it is
+// without. On a failed unmarshal, two deterministic repairs are attempted
+// before the error is returned — each absorbs a syntax class small
+// self-hosted models emit routinely and repeat on correction, so it is
 // absorbed for free and the parse round's single re-ask stays available
 // for damage that actually needs the model (prose, truncation, wrong
-// shape). Pure string/JSON work — deterministic, so it is safe to call
-// from workflow code.
-func parseSlimPlan(text string) ([]template.SlimSubtask, error) {
+// shape): appendImpliedClosers completes a reply whose every element was
+// already fully written but whose final closing brackets were dropped,
+// accepted only when the closed text re-parses in full and passes the
+// validation below, and never silently — repaired reports the rescue so
+// the caller warns and stamps the run memo; then stripTrailingCommas. The
+// two are never composed: each runs on the original text alone, so a reply
+// cut off right after a complete element plus a comma gains neither repair
+// and keeps spending the re-ask (appendImpliedClosers carries the full
+// rationale). repair gates the closure for replay — a history predating
+// slimParseRepairChangeID must decide the parse exactly as the code that
+// recorded it did. Pure string/JSON work — deterministic, so it is safe to
+// call from workflow code.
+func parseSlimPlan(text string, repair bool) ([]template.SlimSubtask, bool, error) {
 	if s := stripCodeFence(strings.TrimSpace(text)); s != "" {
 		text = s
 	}
 	var out []template.SlimSubtask
+	closed := false
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		// Only a full parse of the stripped text is accepted; anything
+		// Only a full parse of the repaired text is accepted; anything
 		// still broken keeps the original error — the re-ask quotes it,
 		// so it must describe the reply the model actually wrote.
-		if repaired := stripTrailingCommas([]byte(text)); json.Unmarshal(repaired, &out) != nil {
-			return nil, fmt.Errorf("reply is not the required raw JSON array: %w", err)
+		if repair {
+			if fixed := appendImpliedClosers([]byte(text)); fixed != nil && json.Unmarshal(fixed, &out) == nil {
+				closed = true
+			}
+		}
+		if !closed {
+			out = nil
+			if fixed := stripTrailingCommas([]byte(text)); json.Unmarshal(fixed, &out) != nil {
+				return nil, false, fmt.Errorf("reply is not the required raw JSON array: %w", err)
+			}
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("the JSON array is empty")
+		return nil, false, fmt.Errorf("the JSON array is empty")
 	}
 	for i, st := range out {
 		if st.Description == "" {
-			return nil, fmt.Errorf("subtask %d (id %d) carries no description", i+1, st.ID)
+			return nil, false, fmt.Errorf("subtask %d (id %d) carries no description", i+1, st.ID)
 		}
 		if len(st.AcceptanceCriteria) == 0 {
-			return nil, fmt.Errorf("subtask %d (id %d) carries no acceptance criteria", i+1, st.ID)
+			return nil, false, fmt.Errorf("subtask %d (id %d) carries no acceptance criteria", i+1, st.ID)
 		}
 	}
-	return out, nil
+	return out, closed, nil
+}
+
+// appendImpliedClosers returns b with the closing brackets its open-bracket
+// depth still implies appended — "]" and "}" in reverse opening order — or
+// nil when nothing may be closed. The walk is string-aware exactly like
+// stripTrailingCommas: a bracket inside a string literal (escapes
+// included) is content and is never balanced against, and a walk that ends
+// inside an unterminated string closes nothing — a reply cut off mid-value
+// is a genuine truncation, and inventing the quote that ends it would
+// fabricate content, the one thing this repair may not do. Mismatched
+// brackets pop whatever is innermost on purpose: the closed text is
+// accepted only on a full re-parse plus the caller's per-field validation,
+// so wrongly nested text has no route through this repair. Deliberately
+// not composed with the comma strip: the strip runs its own path on the
+// original text, so a reply cut off right after a complete element plus a
+// comma gains neither repair and keeps spending the re-ask — closing AND
+// stripping one text would silently accept a shortened queue, the
+// truncation-masking outcome the strict parse exists to prevent.
+// Deterministic string/JSON work — safe to call from workflow code.
+func appendImpliedClosers(b []byte) []byte {
+	var open []byte
+	inString := false
+	for i := 0; i < len(b); i++ {
+		if inString {
+			switch b[i] {
+			case '\\': // escape: the next byte is content too
+				i++
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch b[i] {
+		case '"':
+			inString = true
+		case '[', '{':
+			open = append(open, b[i])
+		case ']', '}':
+			if len(open) > 0 {
+				open = open[:len(open)-1]
+			}
+		}
+	}
+	if inString || len(open) == 0 {
+		return nil
+	}
+	closed := make([]byte, len(b), len(b)+len(open))
+	copy(closed, b)
+	for i := len(open) - 1; i >= 0; i-- {
+		c := byte('}')
+		if open[i] == '[' {
+			c = ']'
+		}
+		closed = append(closed, c)
+	}
+	return closed
 }
 
 // stripTrailingCommas removes commas directly preceding a closing brace
@@ -293,12 +395,16 @@ func parseSlimPlan(text string) ([]template.SlimSubtask, error) {
 // included) is content and is never touched, so the repair cannot corrupt
 // a value on its way to fixing the syntax. Multi-byte UTF-8 never carries
 // ASCII bytes, so the byte walk is encoding-safe. Deliberately not a
-// truncation repair: a reply cut off mid-array has no closing bracket for
-// the strip to act on, and auto-closing one would unmarshal a truncated
-// plan as a complete queue with subtasks silently missing — truncated
-// replies keep failing and spend the re-ask. Single pass, in place (w
-// never passes i), no parse: deterministic, so it is safe to call from
-// workflow code.
+// truncation repair, and the truncation-masking hole (a truncated plan
+// unmarshaled as a complete queue with subtasks silently missing) stays
+// closed two ways: this strip and the bracket closure (appendImpliedClosers)
+// are never composed — each runs on the original text alone, so a reply
+// cut off right after a complete element plus a comma ends in a comma the
+// strip cannot drop (no closing bracket follows it) and gains neither
+// repair — and the closure is accepted only on a full re-parse of the
+// closed text plus the per-field validation, with the run memo stamped
+// when it fires. Single pass, in place (w never passes i), no parse:
+// deterministic, so it is safe to call from workflow code.
 func stripTrailingCommas(b []byte) []byte {
 	w, inString := 0, false
 	for i := 0; i < len(b); i++ {
