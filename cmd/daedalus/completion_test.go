@@ -161,9 +161,9 @@ func TestCompleteFlags(t *testing.T) {
 		// long spelling is.
 		{[]string{"wipe", "wf-1", "-c", "cfg.yaml", "--"}, longNoConfig},
 		// The new dependency flag completes like any value-taking flag: by
-		// prefix, and its value position answers with nothing.
+		// prefix. Its VALUE position offers live workflow ids now — the
+		// id-source pins live in completion_ids_test.go.
 		{[]string{"run", "--dep"}, []string{"--depends"}},
-		{[]string{"run", "-dep", ""}, nil},
 		// -dep already used: neither spelling is offered again.
 		{[]string{"run", "-dep", "wf-1", "-"}, withoutNames(allFlags, "depends")},
 		// The word after a value-taking flag is being completed as that

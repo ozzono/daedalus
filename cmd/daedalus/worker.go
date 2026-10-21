@@ -36,28 +36,54 @@ const logRetention = 7 * 24 * time.Hour
 // queue). One daemon per name: a second `worker start` under a live name
 // refuses rather than doubles up. The config record holds the absolute path
 // of the config the worker was started with — the worker's own copy, so
-// `restart <name>` and `restart all` bring it back from any directory.
+// `restart <name>` and `restart all` bring it back from any directory —
+// plus, on an optional second line, the run type the daemon was started
+// with (writeConfigRecord).
 func daemonPaths(name string) (pidFile, logFile, confFile string) {
 	return filepath.Join(daemonDir, "worker-"+name+".pid"),
 		filepath.Join(daemonDir, "worker-"+name+".log"),
 		filepath.Join(daemonDir, "worker-"+name+".conf")
 }
 
-// recordedConfigPath returns the config file the worker named name was
-// started with, or "" when no record exists (the worker predates records,
-// or the record was wiped). An empty or unreadable record counts as no
-// record.
-func recordedConfigPath(name string) string {
+// readConfigRecord returns the config path and run type recorded for the
+// worker named name: line 1 is the config path, the optional line 2 the
+// run type (writeConfigRecord appends it only for a typed start). Both are
+// "" when no record exists (the worker predates records, or the record was
+// wiped); an empty or unreadable record counts as no record.
+func readConfigRecord(name string) (path, workerType string) {
 	_, _, confFile := daemonPaths(name)
 	data, err := os.ReadFile(confFile)
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	path := strings.TrimSpace(string(data))
-	if path == "" {
-		return ""
-	}
+	path, workerType, _ = strings.Cut(strings.TrimSpace(string(data)), "\n")
+	return path, workerType
+}
+
+// recordedConfigPath returns the config file the worker named name was
+// started with — readConfigRecord's first line — or "" when no record
+// exists.
+func recordedConfigPath(name string) string {
+	path, _ := readConfigRecord(name)
 	return path
+}
+
+// writeConfigRecord records the config a worker is started (or restarted)
+// with: line 1 the absolute config path, line 2 the run type when one is
+// given. The drain-restart re-exec and the record-driven restarters both
+// read the record back, so a run type survives it only when written here —
+// which is why the record-driven paths pass "": a run config is never
+// persisted, and their revival is untyped, exactly as their spawn always
+// was.
+func writeConfigRecord(confFile, configPath, workerType string) error {
+	record := configPath
+	if workerType != "" {
+		record += "\n" + workerType
+	}
+	if err := os.WriteFile(confFile, []byte(record), 0o644); err != nil {
+		return fmt.Errorf("write config record %s: %w", confFile, err)
+	}
+	return nil
 }
 
 // workerActions lists the `worker` subcommands, in the order the unknown-
@@ -69,15 +95,20 @@ var workerActions = []string{"start", "stop", "status", "restart", "wakeup", "re
 // isRestartAll reports whether args spell out `worker restart all` (or its
 // --all spelling; -a is taken by run's --append) — one of the invocations
 // whose behavior is record-driven end to end, needing no config of its own.
+// The restart scope's force flag (-f/--force after the `worker restart`
+// prefix) is ignored wherever it sits.
 func isRestartAll(args []string) bool {
+	args = stripRestartForce(args)
 	return len(args) == 3 && args[0] == "worker" && args[1] == "restart" &&
 		(args[2] == "all" || args[2] == "--all")
 }
 
 // isRestartNamed reports the worker name in `worker restart <name>` — the
 // single-worker counterpart of `restart all`: record-driven, so it needs no
-// config of its own and works from any directory.
+// config of its own and works from any directory. Force flags are ignored
+// like isRestartAll's.
 func isRestartNamed(args []string) (string, bool) {
+	args = stripRestartForce(args)
 	if len(args) == 3 && args[0] == "worker" && args[1] == "restart" && !isRestartAll(args) {
 		return args[2], true
 	}
@@ -188,11 +219,16 @@ func spawnDaemon(pidFile, logFile string, args ...string) (int, error) {
 // itself with `worker foreground`, redirected into the per-queue log, in
 // its own session so the terminal is released immediately. workerType is
 // the invoking command's run config (-t/--type): when set it travels with
-// the re-exec so the daemon starts with the same poller selection.
-func workerStart(cfg config.Config, configPath, workerType string) error {
+// the re-exec — and onto the config record's second line, so the daemon's
+// drain-restart re-exec comes back typed. The optional trailing force
+// skips only the live-pid refusal — the --force restart's immediate swap
+// onto a live name; every other check (the metrics gate included) stays.
+func workerStart(cfg config.Config, configPath, workerType string, force ...bool) error {
 	pidFile, logFile, confFile := daemonPaths(cfg.WorkerName())
-	if pid, ok := readLivePid(pidFile); ok {
-		return fmt.Errorf("already running (pid %d) — use 'daedalus worker restart' or 'stop'", pid)
+	if !forceSet(force) {
+		if pid, ok := readLivePid(pidFile); ok {
+			return fmt.Errorf("already running (pid %d) — use 'daedalus worker restart' or 'stop'", pid)
+		}
 	}
 	// The metrics gate (Q12): with metrics enabled, this worker's rounds
 	// stage their provider calls onto the host metrics relay. A relay that
@@ -213,13 +249,14 @@ func workerStart(cfg config.Config, configPath, workerType string) error {
 	if workerType != "" {
 		childArgs = append(childArgs, "-t", workerType)
 	}
-	// Record the config this worker will be started with so restarts —
-	// here or via `restart --all` — reuse it rather than whatever the
-	// invoking directory resolves to. Written before the spawn: a failed
-	// write leaves only a harmlessly-updated record, instead of a running
-	// daemon the record no longer describes.
-	if err := os.WriteFile(confFile, []byte(configPath), 0o644); err != nil {
-		return fmt.Errorf("write config record %s: %w", confFile, err)
+	// Record the config this worker will be started with — path, and the
+	// run type when given — so restarts, here or via `restart --all` or
+	// the daemon's own drain-restart re-exec, reuse it rather than
+	// whatever the invoking directory resolves to. Written before the
+	// spawn: a failed write leaves only a harmlessly-updated record,
+	// instead of a running daemon the record no longer describes.
+	if err := writeConfigRecord(confFile, configPath, workerType); err != nil {
+		return err
 	}
 	pid, err := spawnDaemon(pidFile, logFile, childArgs...)
 	if err != nil {
@@ -265,23 +302,74 @@ func workerStop(cfg config.Config) error {
 	return nil
 }
 
-// workerRestart stops and restarts the worker cfg names with the invoking
-// command's config, whatever it now contains. The config is re-read from
-// disk at every invocation, so values changed since the worker was started
+// workerRestart restarts the worker cfg names with the invoking command's
+// config, whatever it now contains. The config is re-read from disk at
+// every invocation, so values changed since the worker was started
 // — a rotated API key, a new model — take effect on every restart, and the
-// start that follows rewrites the record to this config. The record is not
-// consulted: the config the restart is invoked with is the worker's new
-// settings, and its worker name (worker_id, else task queue) picks the
-// worker. To restart a worker with its recorded config instead, from any
-// directory, address it by name: `worker restart <id>`. workerType is the
-// invoking command's run config (-t/--type); the record-driven paths
+// restart rewrites the record to this config. The record is not consulted:
+// the config the restart is invoked with is the worker's new settings, and
+// its worker name (worker_id, else task queue) picks the worker. To
+// restart a worker with its recorded config instead, from any directory,
+// address it by name: `worker restart <id>`. workerType is the invoking
+// command's run config (-t/--type); the record-driven paths
 // (workerRestartNamed, workerRestartAll) pass "" — they bring the daemon
 // back untyped, since a run config is not on record.
-func workerRestart(cfg config.Config, cliConfigPath, workerType string) error {
-	if err := workerStop(cfg); err != nil {
-		return err
+//
+// On a live daemon the restart is non-blocking: the config is validated
+// (the metrics gate included) and re-recorded, then a SIGHUP schedules the
+// daemon to drain every active task and re-exec itself on the fresh record
+// — the command returns as soon as the signal is delivered, with no
+// 30s wait and no pid-file change. The optional trailing force swaps
+// immediately instead: SIGTERM to the old daemon and a replacement started
+// on the spot (workerStart's live-pid refusal skipped), never blocking on
+// the old process's drain. A worker that is not running starts exactly as
+// `worker start` would.
+func workerRestart(cfg config.Config, cliConfigPath, workerType string, force ...bool) error {
+	pidFile, _, confFile := daemonPaths(cfg.WorkerName())
+	if forceSet(force) {
+		// Force keeps the two checks that would otherwise leave nothing
+		// running. The config load happened in the caller; the metrics gate
+		// fires here, before anything is signaled — a forced restart onto a
+		// config that cannot boot must not trade a working worker for a
+		// dead one. (workerStart probes the gate again: a second
+		// worst-case two-second localhost dial, never a correctness
+		// problem.)
+		if cfg.MetricsEnabled() {
+			if err := metricsGateCheck(cfg); err != nil {
+				return err
+			}
+		}
+		if old, ok := readLivePid(pidFile); ok {
+			if err := syscall.Kill(old, syscall.SIGTERM); err != nil {
+				return fmt.Errorf("signal pid %d: %w", old, err)
+			}
+			fmt.Printf("force restart: signaled the old daemon (pid %d) — its drain is its own; starting the replacement now\n", old)
+		}
+		return workerStart(cfg, cliConfigPath, workerType, true)
+	}
+	if pid, ok := readLivePid(pidFile); ok {
+		if cfg.MetricsEnabled() {
+			if err := metricsGateCheck(cfg); err != nil {
+				return err
+			}
+		}
+		if err := writeConfigRecord(confFile, cliConfigPath, workerType); err != nil {
+			return err
+		}
+		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
+			return fmt.Errorf("signal pid %d: %w", pid, err)
+		}
+		fmt.Printf("restart scheduled (drains current tasks) for worker %s (pid %d)\n", cfg.WorkerName(), pid)
+		return nil
 	}
 	return workerStart(cfg, cliConfigPath, workerType)
+}
+
+// forceSet reports the optional trailing force flag's value — the
+// start/restart family takes force as a variadic so existing callers keep
+// their call shape; the first value wins.
+func forceSet(force []bool) bool {
+	return len(force) > 0 && force[0]
 }
 
 // workerRestartNamed restarts the worker on record under name — the
@@ -291,7 +379,8 @@ func workerRestart(cfg config.Config, cliConfigPath, workerType string) error {
 // record that no longer loads, or one whose config now names a different
 // worker (its worker_id or task_queue was edited) is an error, not a
 // best-effort fallback: the named restart must target the named worker.
-func workerRestartNamed(name string) error {
+// The optional trailing force passes through to workerRestart.
+func workerRestartNamed(name string, force ...bool) error {
 	if err := config.ValidateWorkerID(name); err != nil {
 		return err
 	}
@@ -308,14 +397,15 @@ func workerRestartNamed(name string) error {
 	}
 	// Named restarts always come back untyped: a run config is not on
 	// record, and parseFlags rejects -t on this invocation outright.
-	return workerRestart(cfg, recorded, "")
+	return workerRestart(cfg, recorded, "", force...)
 }
 
 // workerRestartAll restarts every worker with a config record on file — the
 // single call that cycles a multi-worker deployment, each worker with its
 // own recorded config. A worker whose config no longer loads is reported and
-// skipped; the rest still get restarted.
-func workerRestartAll() error {
+// skipped; the rest still get restarted. The optional trailing force passes
+// through to every named restart.
+func workerRestartAll(force ...bool) error {
 	names, err := recordedWorkers()
 	if err != nil {
 		return err
@@ -338,7 +428,7 @@ func workerRestartAll() error {
 		if recorded := recordedConfigPath(name); recorded != "" {
 			fmt.Printf("== worker %s (%s)\n", name, recorded)
 		}
-		if err := workerRestartNamed(name); err != nil {
+		if err := workerRestartNamed(name, force...); err != nil {
 			skipped = append(skipped, fmt.Errorf("worker %s: %w", name, err))
 		}
 	}
@@ -389,6 +479,20 @@ func readLivePid(pidFile string) (int, bool) {
 		return 0, false
 	}
 	return pid, true
+}
+
+// removeOwnPidFile removes pidFile when its contents name this process —
+// the daemon's exit cleanup, guarded so a --force swap cannot have the
+// exiting daemon delete the file that already names its replacement: the
+// unlink happens only while the record is still ours.
+func removeOwnPidFile(pidFile string) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return
+	}
+	if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid == os.Getpid() {
+		os.Remove(pidFile)
+	}
 }
 
 // pidAlive reports whether the process exists and is live. Signal 0

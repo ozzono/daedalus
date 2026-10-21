@@ -28,8 +28,11 @@ var initProfiles = []string{"prompt", "slim"}
 func main() {
 	// The hidden completion probe is answered before anything else: its
 	// words are not real arguments (flags among them are candidates, not
-	// options to parse), and it must never load a config or print anything
-	// but its candidates — one per line, exit 0.
+	// options to parse), and it prints nothing but its candidates — one
+	// per line, exit 0. Only the workflow-id positions may reach past
+	// that (completion.go's id sources: a config resolution and a bounded
+	// Temporal query), and every failure there degrades to an empty
+	// reply, never an error or a hang past their timeout.
 	if len(os.Args) > 1 && os.Args[1] == "__complete" {
 		for _, c := range complete(os.Args[2:]) {
 			fmt.Println(c)
@@ -177,8 +180,10 @@ func main() {
 			if len(args) != 3 {
 				usageFail("wakeup takes <workflow-id>")
 			}
-		} else if action != "report" && len(args) > 2 {
+		} else if action != "report" && len(stripRestartForce(args)) > 2 {
 			// report forwards its own flags (--json, --table) to its parse.
+			// The restart scope's force flags do not count toward the
+			// action's argument budget.
 			usageFail("worker takes at most one action")
 		}
 		// The record-driven worker commands (`restart all`, `restart
@@ -206,17 +211,17 @@ func main() {
 		case "restart":
 			switch {
 			case all:
-				if err := workerRestartAll(); err != nil {
+				if err := workerRestartAll(configPath.force); err != nil {
 					fail("worker restart", err)
 				}
 			case restartName != "":
-				if err := workerRestartNamed(restartName); err != nil {
+				if err := workerRestartNamed(restartName, configPath.force); err != nil {
 					fail("worker restart", err)
 				}
 			default:
 				// The bare restart forwards the invoking command's run type;
 				// the record-driven paths above pass none (untyped revival).
-				if err := workerRestart(cfg, configPath.configPath, configPath.workerType); err != nil {
+				if err := workerRestart(cfg, configPath.configPath, configPath.workerType, configPath.force); err != nil {
 					fail("worker restart", err)
 				}
 			}
@@ -250,7 +255,7 @@ func main() {
 			}
 			if os.Getenv(daemonEnv) == "1" {
 				pidFile, _, _ := daemonPaths(cfg.WorkerName())
-				os.Remove(pidFile)
+				removeOwnPidFile(pidFile)
 			}
 		default:
 			usageFail("unknown worker action %q (%s)", action, strings.Join(workerActions, ", "))

@@ -100,14 +100,26 @@ type flags struct {
 	// yes, set via --yes on `wipe`, skips the interactive confirmation for
 	// the destructive erase (scripted use).
 	yes bool
+	// force, set via -f/--force on `worker restart`, swaps a live daemon
+	// immediately instead of scheduling its drain-and-re-exec (and skips
+	// workerStart's live-pid refusal). Only the restart scope parses it:
+	// there -f re-scopes from run's --file to force; everywhere else -f
+	// keeps its global meaning and --force is unknown.
+	force bool
 }
 
 // flagSpec is one command-line flag: its semantic name (value-taking flags
 // switch on it in set below, booleans map to their field directly) and
-// whether it takes a value.
+// whether it takes a value. The optional candidates source is the
+// completion probe's candidates for the flag's value position
+// (completion.go) — it takes the config path typed so far, since the
+// candidates (workflow ids) depend on which config's queue is addressed;
+// nil means the probe answers nothing there and the shell's file
+// completion serves the value.
 type flagSpec struct {
-	name  string
-	value bool
+	name       string
+	value      bool
+	candidates func(configPath string) []string
 }
 
 // flagTable maps every accepted flag spelling to its spec — the single
@@ -121,16 +133,16 @@ var flagTable = map[string]flagSpec{
 	"--workflow":       {name: "workflow", value: true},
 	"-f":               {name: "file", value: true},
 	"--file":           {name: "file", value: true},
-	"-a":               {name: "append", value: true},
-	"--append":         {name: "append", value: true},
+	"-a":               {name: "append", value: true, candidates: liveWorkflowIDs},
+	"--append":         {name: "append", value: true, candidates: liveWorkflowIDs},
 	"-p":               {name: "prefix", value: true},
 	"--prefix":         {name: "prefix", value: true},
 	"-cli":             {name: "cli", value: true},
 	"--cli":            {name: "cli", value: true},
 	"-folder":          {name: "folder", value: true},
 	"--folder":         {name: "folder", value: true},
-	"-dep":             {name: "depends", value: true},
-	"--depends":        {name: "depends", value: true},
+	"-dep":             {name: "depends", value: true, candidates: liveWorkflowIDs},
+	"--depends":        {name: "depends", value: true, candidates: liveWorkflowIDs},
 	"-t":               {name: "type", value: true},
 	"--type":           {name: "type", value: true},
 	"-d":               {name: "detach"},
@@ -192,6 +204,9 @@ func parseFlags(args []string) (f flags, rest []string, err error) {
 		}
 		return nil
 	}
+	// The restart force scope: -f/--force mean force only after the
+	// `worker restart` prefix (see restartForceFrom).
+	forceFrom := restartForceFrom(args)
 parse:
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -203,8 +218,16 @@ parse:
 		}
 		// Every accepted spelling is in flagTable: an exact match first,
 		// then the "--name=" value form of a long value flag. Anything
-		// else is positional.
+		// else is positional — except the restart scope's force pair,
+		// which overrides the table only after the `worker restart`
+		// prefix (--force lives outside flagTable entirely, so it never
+		// surfaces as a global flag candidate, and -f's global spelling
+		// is --file, which the scope re-scopes to force in both
+		// spellings).
 		spec, known := flagTable[a]
+		if i >= forceFrom && (a == "-f" || a == "--force") {
+			spec, known = flagSpec{name: "force"}, true
+		}
 		hasEq, eqValue := false, ""
 		if !known && strings.HasPrefix(a, "--") {
 			if eq := strings.IndexByte(a, '='); eq > 0 {
@@ -239,6 +262,8 @@ parse:
 			f.skipPreflight = true
 		case "yes":
 			f.yes = true
+		case "force":
+			f.force = true
 		case "status":
 			f.status = true
 		case "cot":
@@ -404,6 +429,58 @@ func isTypedWorker(rest []string) bool {
 	}
 	return len(rest) == 2 && rest[0] == "worker" &&
 		(rest[1] == "start" || rest[1] == "restart" || rest[1] == "foreground")
+}
+
+// commandPos returns the index of args' first non-flag word — the position
+// parseFlags treats as the subcommand — skipping global flags and the
+// values value-taking ones consume, the same grammar completion.go's scan
+// follows. -1 when args carry no positional word.
+func commandPos(args []string) int {
+	pos := 0
+	for pos < len(args) {
+		if s, ok := flagTable[args[pos]]; ok {
+			pos++
+			if s.value && pos < len(args) {
+				pos++
+			}
+			continue
+		}
+		if strings.HasPrefix(args[pos], "-") && strings.Contains(args[pos], "=") {
+			pos++
+			continue
+		}
+		return pos
+	}
+	return -1
+}
+
+// restartForceFrom reports the first args index at which -f/--force mean
+// force: after the `worker restart` command prefix. The re-scope is
+// positional, not global — flags parse from anywhere, so a -f before the
+// prefix is still run's --file (rejected outside run by the rule below),
+// and only a token after `worker restart` re-scopes.
+func restartForceFrom(args []string) int {
+	if p := commandPos(args); p >= 0 && p+1 < len(args) && args[p] == "worker" && args[p+1] == "restart" {
+		return p + 2
+	}
+	return len(args)
+}
+
+// stripRestartForce drops the restart scope's force flags from a copy of
+// args, leaving the positional shape the restart matchers (worker.go) and
+// the dispatch's arity guard compare. On parseFlags' rest — where an
+// accepted force flag is already consumed — it is a no-op; the raw
+// invocation words are where it does its work.
+func stripRestartForce(args []string) []string {
+	from := restartForceFrom(args)
+	out := make([]string, 0, len(args))
+	for i, a := range args {
+		if i >= from && (a == "-f" || a == "--force") {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // resolveConfigPath locates the configuration when -c/--config is absent:

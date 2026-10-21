@@ -384,6 +384,36 @@ func TestRecaptureQueueAlerts(t *testing.T) {
 			t.Errorf("recaptureQueue failed %d attempts after the start, want act-1", len(fake.service.failed))
 		}
 	})
+
+	t.Run("the auto-restart is forced — the swap happens now, not after a drain", func(t *testing.T) {
+		useDaemonDir(t)
+		noDaemonSpawn(t)
+		// A live worker whose queue has no poller left: a scheduled
+		// drain-restart would leave the ghosts waiting on a daemon that
+		// only comes back after draining into nothing — the recapture
+		// restart must be the forced immediate swap.
+		cfgPath := writeQueueConfig(t, "w")
+		writeRecord(t, "w", cfgPath)
+		child := sleepIgnoring(t, "TERM")
+		writePidFile(t, "w", child)
+
+		fake := &fakeRecaptureClient{}
+		stuck := []stuckAttempt{{workflowID: "wf-1", runID: "run-1", activityID: "act-1", queue: "w", identity: "dead@h@2", noLivePoller: true}}
+		out := captureStdout(t, func() {
+			recaptureQueue(fake, "w", []statusRecord{{name: "w", confPath: cfgPath}}, stuck)
+		})
+
+		if !strings.Contains(out, "force restart: signaled the old daemon") || strings.Contains(out, "restart scheduled") {
+			t.Errorf("recaptureQueue output %q must force the swap (SIGTERM now), never schedule a drain", out)
+		}
+		// SIGTERM, not SIGHUP: the TERM-immune child lives on.
+		if !stillAlive(t, child) {
+			t.Error("the live pid died — the recapture swap must deliver SIGTERM")
+		}
+		if len(fake.service.failed) != 1 || fake.service.failed[0].GetActivityId() != "act-1" {
+			t.Errorf("recaptureQueue failed %d attempts after the forced swap, want act-1", len(fake.service.failed))
+		}
+	})
 }
 
 // TestAlertRecapture pins the two-channel alert: the [DAEDALUS-ALERT] line
