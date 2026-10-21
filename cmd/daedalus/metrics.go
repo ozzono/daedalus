@@ -420,12 +420,16 @@ func workerFilterNote(worker string) string {
 // process's life. Upstreams and keys are read from this process's
 // environment — the same values the per-round staging
 // (activities.metricsRelayEnv) reads, so what the relay restores is
-// exactly what staging displaced. Called once at boot (fail the start
-// when the working listener refuses the endpoint) and refreshed on the
-// heartbeat ticker.
+// exactly what staging displaced. The alias map (cfg's provider key_alias
+// — a display label for metrics grouping, never an env export) rides the
+// same registration on the wire the provider type names, keyed wires only:
+// a keyless section's pass-through usage labels as nothing. Called once at
+// boot (fail the start when the working listener refuses the endpoint) and
+// refreshed on the heartbeat ticker.
 func metricsRegister(cfg config.Config, root, token string) error {
 	upstreams := map[string]string{}
 	keys := map[string]string{}
+	aliases := map[string]string{}
 	if v := os.Getenv("ANTHROPIC_BASE_URL"); v != "" {
 		upstreams["anthropic"] = v
 		if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
@@ -443,6 +447,17 @@ func metricsRegister(cfg config.Config, root, token string) error {
 			keys["openai"] = k
 		}
 	}
+	if cfg.Provider != nil && cfg.Provider.KeyAlias != "" {
+		// The alias labels this section's key, so it rides only a wire
+		// carrying a registered key: a keyless section (unset-means-inherit)
+		// makes every entry on the wire pass-through usage of ambient
+		// credentials, and stamping those with the label would attribute
+		// usage to a key that was never dialed. Implies staged — keys only
+		// fill for staged wires.
+		if keys[cfg.Provider.Type] != "" {
+			aliases[cfg.Provider.Type] = cfg.Provider.KeyAlias
+		}
+	}
 	if len(upstreams) == 0 {
 		// No provider base URL configured: the per-round staging rewrites
 		// nothing (rounds dial their CLI defaults) and the relay has
@@ -455,6 +470,7 @@ func metricsRegister(cfg config.Config, root, token string) error {
 		"queue":     cfg.Temporal.TaskQueue,
 		"upstreams": upstreams,
 		"keys":      keys,
+		"aliases":   aliases,
 		"token":     token,
 	})
 	if err != nil { // unreachable: map of marshalable values

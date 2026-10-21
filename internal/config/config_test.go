@@ -906,6 +906,10 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	cases := []struct{ name, doc, want string }{
 		{"unknown top-level key", "tests_timeot: 5m\n", "tests_timeot"},
 		{"misplaced section key", "openai:\n  thinking: false\n", "thinking"},
+		// key_alias is a provider-section field only: a misplaced one (the
+		// legacy sections and role overrides carry no alias) must fail the
+		// load, never load as a silent no-op.
+		{"key_alias under a legacy section", "anthropic:\n  key_alias: x\n", "key_alias"},
 		{"plain scalar document", "just a scalar\n", "cannot unmarshal"},
 	}
 	for _, c := range cases {
@@ -1150,7 +1154,7 @@ func TestExampleYAML(t *testing.T) {
 		cfg.Provider.ContextTokens != 0 || cfg.Provider.MaxOutputTokens != 0 ||
 		cfg.Provider.TopP != 0 || cfg.Provider.Temperature != 0 || cfg.Provider.PresencePenalty != 0 ||
 		cfg.Provider.TopK != 0 || cfg.Provider.MinP != 0 || cfg.Provider.RepetitionPenalty != 0 ||
-		cfg.Provider.DisableThinking {
+		cfg.Provider.KeyAlias != "" || cfg.Provider.DisableThinking {
 		t.Errorf("ExampleYAML provider section = %+v, want the typed-but-inert defaults", cfg.Provider)
 	}
 	// The per-role provider override groups document every field but ship
@@ -2710,6 +2714,21 @@ func TestLoadProviderSection(t *testing.T) {
 	_, err = Load(writeConfig(t, "provider:\n  type: openai\n  heartbeat_mdodel: typo\n"))
 	if err == nil || !strings.Contains(err.Error(), "heartbeat_mdodel") {
 		t.Errorf("Load(typo'd provider key) error = %v, want the field-not-found rejection", err)
+	}
+
+	// key_alias — the metrics grouping label — loads verbatim: free-form,
+	// no format or uniqueness rule (it is metadata about the credential,
+	// stamped onto the ledger through the worker's registration), and a
+	// section naming none stays empty.
+	cfg, err = Load(writeConfig(t, "provider:\n  type: openai\n  key: sk\n  key_alias: team-a/big quota\n"))
+	if err != nil {
+		t.Fatalf("Load(key_alias): %v", err)
+	}
+	if cfg.Provider.KeyAlias != "team-a/big quota" {
+		t.Errorf("Provider.KeyAlias = %q, want the file's own label verbatim", cfg.Provider.KeyAlias)
+	}
+	if cfg, err = Load(writeConfig(t, "provider:\n  type: openai\n")); err != nil || cfg.Provider.KeyAlias != "" {
+		t.Errorf("unset key_alias = %q (err %v), want empty (usage buckets by model as before)", cfg.Provider.KeyAlias, err)
 	}
 }
 

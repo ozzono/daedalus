@@ -76,11 +76,15 @@ const ledgerCap = 10_000
 
 // Entry is one relayed provider request's record. Task/Role/Round are
 // parsed from the synthetic attribution key when the round carried one;
-// empty means an unkeyed round attributed at worker level.
+// empty means an unkeyed round attributed at worker level. Alias is the
+// worker's registered display label for the key the wire dialed
+// (key_alias on the provider section) — the per-key dimension metrics
+// group by; empty for an unaliased wire.
 type Entry struct {
 	At               time.Time `json:"at"`
 	Worker           string    `json:"worker"`
 	Queue            string    `json:"queue,omitempty"`
+	Alias            string    `json:"alias,omitempty"`
 	Wire             string    `json:"wire"`
 	Task             string    `json:"task,omitempty"`
 	Role             string    `json:"role,omitempty"`
@@ -167,13 +171,16 @@ func (l *Ledger) Query(worker string, page, pageSize int) (entries []Entry, tota
 // should reach. Keys are the real API keys per wire — what a keyed
 // round's synthetic attribution key displaced from the credential slot;
 // a wire registered without one forwards the inbound credential
-// untouched (OAuth pass-through). Token is the worker's
+// untouched (OAuth pass-through). Aliases are the per-wire display labels
+// (the config's key_alias) stamped onto ledger entries beside Queue —
+// metadata about the credential, not a credential. Token is the worker's
 // credential-restoration secret, minted worker-side (NewToken) and
 // presented at every registration and by every keyed round.
 type registration struct {
 	Queue     string
 	Upstreams map[string]*url.URL
 	Keys      map[string]string
+	Aliases   map[string]string
 	Token     string
 	Expires   time.Time
 }
@@ -207,7 +214,7 @@ func NewRegistry(ttl time.Duration) *Registry {
 // squatter's secret. Expired entries are pruned in the same pass, so a
 // worker that stopped heartbeating is dropped by the next registration
 // from anywhere and the map cannot grow without bound.
-func (r *Registry) Register(worker, queue string, upstreams map[string]*url.URL, keys map[string]string, token string) error {
+func (r *Registry) Register(worker, queue string, upstreams map[string]*url.URL, keys, aliases map[string]string, token string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
@@ -219,7 +226,7 @@ func (r *Registry) Register(worker, queue string, upstreams map[string]*url.URL,
 	if reg, live := r.m[worker]; live && !tokenPresented(token, reg.Token) {
 		return fmt.Errorf("worker %q is already registered", worker)
 	}
-	r.m[worker] = registration{Queue: queue, Upstreams: upstreams, Keys: keys, Token: token, Expires: now.Add(r.ttl)}
+	r.m[worker] = registration{Queue: queue, Upstreams: upstreams, Keys: keys, Aliases: aliases, Token: token, Expires: now.Add(r.ttl)}
 	return nil
 }
 
@@ -243,22 +250,23 @@ func tokenPresented(presented, registered string) bool {
 }
 
 // Resolve is the forward path's one atomic read: the worker's live
-// registration resolves to its upstream, queue, registered key, and
+// registration resolves to its upstream, queue, registered alias, key, and
 // restoration token in a single lock, so a concurrent re-registration can
 // never pair one entry's upstream with another entry's credential. ok is
 // false when the worker has no live registration (never registered, or
 // its heartbeat lapsed past the TTL) or no upstream for that wire; key is
 // "" for a wire registered keyless (OAuth pass-through — the inbound
-// credential, the round's own, forwards untouched).
-func (r *Registry) Resolve(worker, wire string) (upstream *url.URL, queue, key, token string, ok bool) {
+// credential, the round's own, forwards untouched); alias is "" for a wire
+// registered without a label.
+func (r *Registry) Resolve(worker, wire string) (upstream *url.URL, queue, alias, key, token string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	reg, known := r.m[worker]
 	if !known || r.now().After(reg.Expires) {
-		return nil, "", "", "", false
+		return nil, "", "", "", "", false
 	}
 	u, known := reg.Upstreams[wire]
-	return u, reg.Queue, reg.Keys[wire], reg.Token, known
+	return u, reg.Queue, reg.Aliases[wire], reg.Keys[wire], reg.Token, known
 }
 
 // Live reports how many workers currently hold an unexpired registration.
@@ -343,6 +351,11 @@ type registerRequest struct {
 	// without a key forwards the inbound credential untouched (OAuth
 	// pass-through).
 	Keys map[string]string `json:"keys,omitempty"`
+	// Aliases are the per-wire display labels (the config's key_alias)
+	// stamped onto ledger entries beside Queue — metadata about the
+	// credential, not a credential, carried here because the registration
+	// is the one worker→relay channel.
+	Aliases map[string]string `json:"aliases,omitempty"`
 	// Token is the worker's own restoration secret (worker-minted — see
 	// Register). Stored, compared, never returned: the response carries no
 	// body.
@@ -384,7 +397,14 @@ func (r *Relay) serveRegister(w http.ResponseWriter, req *http.Request) {
 			keys[wire] = key
 		}
 	}
-	if err := r.registry.Register(rr.Worker, rr.Queue, upstreams, keys, rr.Token); err != nil {
+	aliases := map[string]string{}
+	for wire, alias := range rr.Aliases {
+		// Same drop rule as keys: unstaged wires are never looked up.
+		if _, staged := upstreams[wire]; staged {
+			aliases[wire] = alias
+		}
+	}
+	if err := r.registry.Register(rr.Worker, rr.Queue, upstreams, keys, aliases, rr.Token); err != nil {
 		http.Error(w, "metricsrelay: "+err.Error(), http.StatusConflict)
 		return
 	}
@@ -448,7 +468,7 @@ func (r *Relay) serveProxy(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "metricsrelay: unknown wire "+wire, http.StatusNotFound)
 		return
 	}
-	upstream, queue, cred, regToken, ok := r.registry.Resolve(worker, wire)
+	upstream, queue, alias, cred, regToken, ok := r.registry.Resolve(worker, wire)
 	if !ok {
 		http.Error(w, "metricsrelay: no live registration for worker "+worker+" on wire "+wire, http.StatusBadGateway)
 		return
@@ -545,6 +565,7 @@ func (r *Relay) serveProxy(w http.ResponseWriter, req *http.Request) {
 			At:         start,
 			Worker:     worker,
 			Queue:      queue,
+			Alias:      alias,
 			Wire:       wire,
 			DurationMS: time.Since(start).Milliseconds(),
 			Status:     resp.StatusCode,

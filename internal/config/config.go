@@ -564,6 +564,17 @@ type ProviderConfig struct {
 	URL   string `yaml:"url"`
 	Key   string `yaml:"key"`
 	Model string `yaml:"model"`
+	// KeyAlias is a free-form label for the key this section carries — the
+	// name metrics surfaces group that key's usage under when several
+	// workers dial the same model through different keys (different
+	// accounts, quotas, rate-limit pools). Metadata about the credential,
+	// never itself one: it is not exported into the jailed agent's
+	// environment like the fields above — it travels to the metrics relay
+	// through the worker's registration. Stored verbatim (no uniqueness or
+	// format rule); unset, usage buckets by model as before. The legacy
+	// sections and role overrides carry no alias, so a key_alias misplaced
+	// there is a load error, not a silent no-op.
+	KeyAlias string `yaml:"key_alias"`
 	// HeartbeatModel is AnthropicConfig.HeartbeatModel's counterpart:
 	// exported as ANTHROPIC_DEFAULT_HAIKU_MODEL and probed by `worker
 	// status`. It is an anthropic-wire knob (claude's small/fast-model var

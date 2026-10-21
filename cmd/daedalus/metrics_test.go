@@ -331,18 +331,24 @@ func TestMetricsGateCheck(t *testing.T) {
 // what staging displaced), the returned token is exported onto the token
 // env, a config with no provider base URL registers nothing and stays
 // successful, and a refusal (or an empty token — a pre-token daemon) fails
-// with the remedy named.
+// with the remedy named. The provider key_alias rides the body as the
+// per-wire alias map — only onto a wire whose key this process actually
+// registered: a keyless section (unset-means-inherit) makes every entry
+// pass-through usage of ambient credentials, and a label on it would
+// attribute usage to a key that was never dialed.
 func TestMetricsRegister(t *testing.T) {
 	for _, k := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_KEY"} {
 		t.Setenv(k, "") // restoreProcessEnv-style scrub: no ambient provider env on the host leaks in
 	}
 	type registerCase struct {
-		name       string
-		env        map[string]string
-		wantWorker string
-		wantQueue  string
-		wantUp     map[string]string
-		wantKeys   map[string]string
+		name        string
+		env         map[string]string
+		provider    *config.ProviderConfig
+		wantWorker  string
+		wantQueue   string
+		wantUp      map[string]string
+		wantKeys    map[string]string
+		wantAliases map[string]string
 	}
 	for _, c := range []registerCase{
 		{
@@ -354,8 +360,9 @@ func TestMetricsRegister(t *testing.T) {
 				"OPENAI_API_KEY":     "sk-o",
 			},
 			wantWorker: "w1", wantQueue: "q7",
-			wantUp:   map[string]string{"anthropic": "https://a.example", "openai": "https://o.example/v1"},
-			wantKeys: map[string]string{"anthropic": "sk-a", "openai": "sk-o"},
+			wantUp:      map[string]string{"anthropic": "https://a.example", "openai": "https://o.example/v1"},
+			wantKeys:    map[string]string{"anthropic": "sk-a", "openai": "sk-o"},
+			wantAliases: map[string]string{},
 		},
 		{
 			name: "legacy API_BASE names the openai upstream",
@@ -364,8 +371,9 @@ func TestMetricsRegister(t *testing.T) {
 				"OPENAI_API_KEY":  "sk-legacy",
 			},
 			wantWorker: "w1", wantQueue: "q7",
-			wantUp:   map[string]string{"openai": "https://legacy.example/v1"},
-			wantKeys: map[string]string{"openai": "sk-legacy"},
+			wantUp:      map[string]string{"openai": "https://legacy.example/v1"},
+			wantKeys:    map[string]string{"openai": "sk-legacy"},
+			wantAliases: map[string]string{},
 		},
 		{
 			name: "keyless wires register keyless",
@@ -373,8 +381,44 @@ func TestMetricsRegister(t *testing.T) {
 				"ANTHROPIC_BASE_URL": "https://a.example",
 			},
 			wantWorker: "w1", wantQueue: "q7",
-			wantUp:   map[string]string{"anthropic": "https://a.example"},
-			wantKeys: map[string]string{},
+			wantUp:      map[string]string{"anthropic": "https://a.example"},
+			wantKeys:    map[string]string{},
+			wantAliases: map[string]string{},
+		},
+		{
+			name: "key_alias labels the keyed provider wire",
+			env: map[string]string{
+				"ANTHROPIC_BASE_URL": "https://a.example",
+				"ANTHROPIC_API_KEY":  "sk-a",
+			},
+			provider:   &config.ProviderConfig{Type: "anthropic", KeyAlias: "quota-a"},
+			wantWorker: "w1", wantQueue: "q7",
+			wantUp:      map[string]string{"anthropic": "https://a.example"},
+			wantKeys:    map[string]string{"anthropic": "sk-a"},
+			wantAliases: map[string]string{"anthropic": "quota-a"},
+		},
+		{
+			name: "key_alias on a keyless section stays silent",
+			env: map[string]string{
+				"ANTHROPIC_BASE_URL": "https://a.example",
+			},
+			provider:   &config.ProviderConfig{Type: "anthropic", KeyAlias: "quota-a"},
+			wantWorker: "w1", wantQueue: "q7",
+			wantUp:      map[string]string{"anthropic": "https://a.example"},
+			wantKeys:    map[string]string{},
+			wantAliases: map[string]string{},
+		},
+		{
+			name: "key_alias naming an unstaged wire stays silent",
+			env: map[string]string{
+				"ANTHROPIC_BASE_URL": "https://a.example",
+				"ANTHROPIC_API_KEY":  "sk-a",
+			},
+			provider:   &config.ProviderConfig{Type: "openai", KeyAlias: "quota-o"},
+			wantWorker: "w1", wantQueue: "q7",
+			wantUp:      map[string]string{"anthropic": "https://a.example"},
+			wantKeys:    map[string]string{"anthropic": "sk-a"},
+			wantAliases: map[string]string{},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -394,7 +438,7 @@ func TestMetricsRegister(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			cfg := config.Config{WorkerID: c.wantWorker, Temporal: config.TemporalConfig{TaskQueue: c.wantQueue}}
+			cfg := config.Config{WorkerID: c.wantWorker, Temporal: config.TemporalConfig{TaskQueue: c.wantQueue}, Provider: c.provider}
 			if err := metricsRegister(cfg, srv.URL, "worker-minted-tok"); err != nil {
 				t.Fatalf("metricsRegister: %v", err)
 			}
@@ -426,6 +470,15 @@ func TestMetricsRegister(t *testing.T) {
 			for wire, key := range c.wantKeys {
 				if got := keys[wire]; got != key {
 					t.Errorf("registration key %s = %v, want %q", wire, got, key)
+				}
+			}
+			aliases, _ := gotBody["aliases"].(map[string]any)
+			if len(aliases) != len(c.wantAliases) {
+				t.Errorf("registration aliases = %v, want %v", aliases, c.wantAliases)
+			}
+			for wire, alias := range c.wantAliases {
+				if got := aliases[wire]; got != alias {
+					t.Errorf("registration alias %s = %v, want %q", wire, got, alias)
 				}
 			}
 		})
