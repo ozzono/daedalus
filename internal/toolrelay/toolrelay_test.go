@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // recordedRequest is one request a stub upstream received: path, headers,
@@ -24,6 +25,9 @@ type recordedRequest struct {
 	Path   string
 	Header http.Header
 	Body   []byte
+	// ContentLength is the length the wire claimed, as the server parsed
+	// it: the number a body reader trusts to know when the request ends.
+	ContentLength int64
 }
 
 // recorder collects stub-upstream requests; the relay serves them
@@ -36,7 +40,9 @@ type recorder struct {
 func (rec *recorder) add(r *http.Request, body []byte) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	rec.reqs = append(rec.reqs, recordedRequest{Path: r.URL.Path, Header: r.Header.Clone(), Body: body})
+	rec.reqs = append(rec.reqs, recordedRequest{
+		Path: r.URL.Path, Header: r.Header.Clone(), Body: body, ContentLength: r.ContentLength,
+	})
 }
 
 func (rec *recorder) all() []recordedRequest {
@@ -784,6 +790,292 @@ func TestStripFence(t *testing.T) {
 		if got != c.want {
 			t.Errorf("stripFence(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// completionsWithMessages marshals a chat-completions request carrying the
+// given messages — the wire shape pi sends, and the messages array
+// capToolResults walks.
+func completionsWithMessages(t *testing.T, messages ...map[string]any) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"model":    "qwen2.5-coder:3b",
+		"stream":   false,
+		"messages": messages,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	return b
+}
+
+// TestCapToolResults pins the request-side cap's walk: every role:"tool"
+// message whose plain-string content exceeds maxToolResultChars is elided
+// to head + marker + tail; everything else — other roles, results at or
+// under the cap, parts-array content, bodies that are not chat completions
+// at all — leaves the body untouched, so the cap is hygiene and never a new
+// failure path.
+func TestCapToolResults(t *testing.T) {
+	oversized := strings.Repeat("a", 8000) + strings.Repeat("x", 4000) + strings.Repeat("b", 8000)
+	for _, c := range []struct {
+		name    string
+		body    []byte
+		wantNil bool
+		check   func(t *testing.T, out []byte)
+	}{
+		{
+			name:    "body is not JSON",
+			body:    []byte("not a chat completion"),
+			wantNil: true,
+		},
+		{
+			name:    "body carries no messages",
+			body:    []byte(`{"model":"m","stream":false}`),
+			wantNil: true,
+		},
+		{
+			name: "tool result under the cap",
+			body: completionsWithMessages(t,
+				map[string]any{"role": "user", "content": "run the thing"},
+				map[string]any{"role": "tool", "tool_call_id": "c1", "content": strings.Repeat("a", 1000)},
+			),
+			wantNil: true,
+		},
+		{
+			name: "tool result exactly at the cap",
+			body: completionsWithMessages(t,
+				map[string]any{"role": "tool", "tool_call_id": "c1", "content": strings.Repeat("a", maxToolResultChars)},
+			),
+			wantNil: true,
+		},
+		{
+			name: "oversized assistant content is not capped",
+			body: completionsWithMessages(t,
+				map[string]any{"role": "assistant", "content": oversized},
+			),
+			wantNil: true,
+		},
+		{
+			// ponytail: only the plain-string shape pi sends is capped;
+			// content in parts-array form rides untouched.
+			name:    "tool content in parts-array form is not capped",
+			body:    []byte(`{"model":"m","messages":[{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"` + strings.Repeat("a", maxToolResultChars+1) + `"}]}]}`),
+			wantNil: true,
+		},
+		{
+			name: "oversized tool result is elided and the rest rides",
+			body: completionsWithMessages(t,
+				map[string]any{"role": "system", "content": "sys"},
+				map[string]any{"role": "user", "content": "run the thing"},
+				map[string]any{"role": "tool", "tool_call_id": "c1", "content": oversized},
+				map[string]any{"role": "assistant", "content": "done"},
+			),
+			check: func(t *testing.T, out []byte) {
+				var wire struct {
+					Model    string            `json:"model"`
+					Messages []json.RawMessage `json:"messages"`
+				}
+				if err := json.Unmarshal(out, &wire); err != nil {
+					t.Fatalf("parse capped body: %v", err)
+				}
+				if wire.Model != "qwen2.5-coder:3b" {
+					t.Errorf("model = %q, want the untouched top-level fields preserved through the rewrite", wire.Model)
+				}
+				if len(wire.Messages) != 4 {
+					t.Fatalf("messages = %d, want 4", len(wire.Messages))
+				}
+				var tool struct {
+					Role       string `json:"role"`
+					Content    string `json:"content"`
+					ToolCallID string `json:"tool_call_id"`
+				}
+				if err := json.Unmarshal(wire.Messages[2], &tool); err != nil {
+					t.Fatalf("parse capped tool message: %v", err)
+				}
+				if tool.Role != "tool" || tool.ToolCallID != "c1" {
+					t.Errorf("capped message role/id = %q/%q, want them preserved through the rewrite", tool.Role, tool.ToolCallID)
+				}
+				if tool.Content != elideToolResult(oversized) {
+					t.Errorf("capped content is not head + marker + tail of the original (got %d runes, want %d)",
+						utf8.RuneCountInString(tool.Content), utf8.RuneCountInString(elideToolResult(oversized)))
+				}
+				if n := utf8.RuneCountInString(tool.Content); n > maxToolResultChars {
+					t.Errorf("capped content carries %d runes, want it inside the cap", n)
+				}
+				for i, wantRole := range []string{"system", "user", "tool", "assistant"} {
+					var msg struct {
+						Role string `json:"role"`
+					}
+					if err := json.Unmarshal(wire.Messages[i], &msg); err != nil {
+						t.Fatalf("parse message %d: %v", i, err)
+					}
+					if msg.Role != wantRole {
+						t.Errorf("message %d role = %q, want %q (only the oversized tool message may change)", i, msg.Role, wantRole)
+					}
+				}
+				var user struct {
+					Content string `json:"content"`
+				}
+				if err := json.Unmarshal(wire.Messages[1], &user); err != nil || user.Content != "run the thing" {
+					t.Errorf("message 1 = %s, want the under-cap messages byte-exact", wire.Messages[1])
+				}
+			},
+		},
+		{
+			name: "several oversized results are all elided",
+			body: completionsWithMessages(t,
+				map[string]any{"role": "tool", "tool_call_id": "c1", "content": oversized},
+				map[string]any{"role": "tool", "tool_call_id": "c2", "content": oversized},
+			),
+			check: func(t *testing.T, out []byte) {
+				var wire struct {
+					Messages []json.RawMessage `json:"messages"`
+				}
+				if err := json.Unmarshal(out, &wire); err != nil {
+					t.Fatalf("parse capped body: %v", err)
+				}
+				if len(wire.Messages) != 2 {
+					t.Fatalf("messages = %d, want 2", len(wire.Messages))
+				}
+				for i := range wire.Messages {
+					var msg struct {
+						Content    string `json:"content"`
+						ToolCallID string `json:"tool_call_id"`
+					}
+					if err := json.Unmarshal(wire.Messages[i], &msg); err != nil {
+						t.Fatalf("parse message %d: %v", i, err)
+					}
+					if msg.Content != elideToolResult(oversized) || msg.ToolCallID == "" {
+						t.Errorf("message %d = %d runes (id %q), want it elided with its id preserved",
+							i, utf8.RuneCountInString(msg.Content), msg.ToolCallID)
+					}
+				}
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := capToolResults(c.body)
+			if c.wantNil {
+				if got != nil {
+					t.Fatalf("capToolResults rewrote the body:\n%s", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("capToolResults = nil, want the body rewritten")
+			}
+			c.check(t, got)
+		})
+	}
+}
+
+// TestElideToolResult pins the elision arithmetic: head and tail keep 8000
+// runes each around a marker naming the elided and original counts, the
+// output fits inside maxToolResultChars, and the byte-offset cuts snap to
+// rune boundaries so multi-byte content is never split mid-rune.
+func TestElideToolResult(t *testing.T) {
+	t.Run("ascii keeps head and tail around the marker", func(t *testing.T) {
+		text := strings.Repeat("a", 8000) + strings.Repeat("x", 4000) + strings.Repeat("b", 8000)
+		got := elideToolResult(text)
+		want := strings.Repeat("a", 8000) +
+			"[output truncated: 4000 of 20000 chars elided — re-run with head/tail/grep if needed]" +
+			strings.Repeat("b", 8000)
+		if got != want {
+			t.Errorf("elideToolResult output is not head + marker + tail (got %d runes, want %d)",
+				utf8.RuneCountInString(got), utf8.RuneCountInString(want))
+		}
+		if n := utf8.RuneCountInString(got); n > maxToolResultChars {
+			t.Errorf("output carries %d runes, want it to fit inside maxToolResultChars (%d) for any digit count", n, maxToolResultChars)
+		}
+	})
+	t.Run("cuts snap to rune boundaries", func(t *testing.T) {
+		// 3-byte runes: both 8000-byte cut offsets land mid-rune.
+		text := strings.Repeat("漢", 16385)
+		got := elideToolResult(text)
+		if !utf8.ValidString(got) {
+			t.Fatal("output is not valid UTF-8 — a cut split a multi-byte rune")
+		}
+		// 8000 bytes cannot hold 2667 of the 3-byte runes, so each side
+		// keeps the 2666 whole runes that fit inside it.
+		edge := strings.Repeat("漢", 2666)
+		if !strings.HasPrefix(got, edge) || !strings.HasSuffix(got, edge) {
+			t.Error("output does not keep whole runes at both edges")
+		}
+		// The counts are runes, not bytes: the middle carries 11053
+		// elided runes of 16385 total, where a byte count would read
+		// 33159 of 49155.
+		if mid := got[len(edge) : len(got)-len(edge)]; !strings.Contains(mid, "[output truncated: 11053 of 16385 chars elided") {
+			t.Errorf("marker = %q, want the elided and total counts in runes", mid)
+		}
+	})
+}
+
+// TestRelayElidesOversizedToolResultOnForward pins the cap end to end on
+// the pure-forwarder path (no parser model — the rate-cap configuration the
+// cap shares): a completions request whose tool result exceeds
+// maxToolResultChars is forwarded with that message elided to head +
+// marker + tail and a Content-Length describing the rewritten body — the
+// pre-cap value would corrupt the upstream's read — while the client still
+// sees the upstream's reply bytes verbatim.
+func TestRelayElidesOversizedToolResultOnForward(t *testing.T) {
+	rec := &recorder{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		rec.add(r, body)
+		w.Write([]byte(`{"upstream":"reply"}`))
+	}))
+	defer up.Close()
+	relay := startStubRelay(t, up, "")
+
+	toolResult := strings.Repeat("a", 8000) + strings.Repeat("x", 4000) + strings.Repeat("b", 8000)
+	status, body := postCompletions(t, relay.URL(), completionsWithMessages(t,
+		map[string]any{"role": "user", "content": "list the repo"},
+		map[string]any{"role": "tool", "tool_call_id": "call_1", "content": toolResult},
+	))
+	if status != http.StatusOK || string(body) != `{"upstream":"reply"}` {
+		t.Fatalf("relay reply = %d/%q, want the upstream's bytes verbatim", status, body)
+	}
+
+	reqs := rec.all()
+	if len(reqs) != 1 {
+		t.Fatalf("upstream got %d requests, want 1", len(reqs))
+	}
+	var wire struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(reqs[0].Body, &wire); err != nil {
+		t.Fatalf("parse forwarded body %s: %v", reqs[0].Body, err)
+	}
+	if len(wire.Messages) != 2 {
+		t.Fatalf("forwarded %d messages, want 2", len(wire.Messages))
+	}
+	var user struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(wire.Messages[0], &user); err != nil || user.Role != "user" || user.Content != "list the repo" {
+		t.Errorf("forwarded message 0 = %s, want the small message untouched", wire.Messages[0])
+	}
+	var tool struct {
+		Role       string `json:"role"`
+		Content    string `json:"content"`
+		ToolCallID string `json:"tool_call_id"`
+	}
+	if err := json.Unmarshal(wire.Messages[1], &tool); err != nil {
+		t.Fatalf("parse forwarded tool message: %v", err)
+	}
+	if !strings.Contains(tool.Content, "[output truncated: 4000 of 20000 chars elided") {
+		t.Errorf("forwarded tool result (%d runes) was not elided with the elision marker", utf8.RuneCountInString(tool.Content))
+	}
+	if strings.Contains(tool.Content, strings.Repeat("x", 4000)) {
+		t.Error("forwarded tool result still carries the elided middle")
+	}
+	if tool.ToolCallID != "call_1" {
+		t.Errorf("tool_call_id = %q, want it preserved through the rewrite", tool.ToolCallID)
+	}
+	if reqs[0].ContentLength != int64(len(reqs[0].Body)) {
+		t.Errorf("forwarded Content-Length = %d, want %d (the rewritten body's length — the pre-cap value would hang or truncate the upstream's read)",
+			reqs[0].ContentLength, len(reqs[0].Body))
 	}
 }
 

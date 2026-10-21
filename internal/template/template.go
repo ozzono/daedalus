@@ -845,8 +845,10 @@ type slimParseData struct{ Plan string }
 
 // SlimParse builds the slim flow's parse round: the planner's prose plan,
 // transcribed into the raw SlimSubtask JSON array the loop executes. The
-// round runs in the planner's conversation, so its reply joins the plan in
-// the worker's progressive context.
+// round runs in a fresh session of its own — the plan text rides in the
+// prompt verbatim, so the planner's exploration never inflates the parse
+// prompt — and the re-ask (SlimParseReask) resumes this round's own
+// conversation.
 func SlimParse(plan string) (string, error) {
 	return render("slim_parse", slimParseData{plan})
 }

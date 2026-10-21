@@ -52,6 +52,8 @@ func stubSlimRun(t *testing.T) (*testsuite.TestWorkflowEnvironment, *agentRecord
 // stamp the run (the comma strip is never reported; only the closure rides
 // the run memo). String content is untouched by both, a reply cut off
 // mid-value is never closed (inventing the quote would fabricate content),
+// an element-less reply is never closed either (a bracket-only fragment
+// keeps its parse error instead of closing into a fabricated empty queue),
 // the two repairs are never composed, and a failure after repair still
 // reports the error for the reply as written. The flag's gate side is
 // pinned in TestParseSlimPlanRepairGate.
@@ -164,6 +166,15 @@ func TestParseSlimPlan(t *testing.T) {
 		// the closure may not do.
 		name:    "unterminated string closes nothing",
 		text:    `[{"id":1,"type":"implement","target_files":["a.go"],"description":"cut off`,
+		wantErr: "reply is not the required raw JSON array",
+	}, {
+		// The element gate on the closure: a reply carrying no subtask
+		// object — the degenerate one-token "[" a starved round emits —
+		// is never closed into a fabricated "[]", whose "empty array"
+		// failure would misdescribe a queue the model never wrote. The
+		// original parse error stands and the re-ask is spent instead.
+		name:    "bracket-only fragment closes nothing",
+		text:    "[",
 		wantErr: "reply is not the required raw JSON array",
 	}, {
 		// The repairs are never composed: this element was cut off right
@@ -281,9 +292,11 @@ func TestParseSlimPlanRepairGate(t *testing.T) {
 }
 
 // TestSlimWorkflowHappyPath pins the slim flow's shape end to end: the plan
-// round opens the dev conversation and the parse round resumes it (plan and
-// queue both land in the worker's progressive context), each sub-task
-// implements in the chained worker conversation while every review is a
+// round opens the dev conversation, the parse round opens a fresh session of
+// its own (the plan text rides its prompt verbatim, so the planner's
+// exploration never inflates the parse prompt) and stays out of that
+// conversation for good, each sub-task implements in the chained worker
+// conversation while every review is a
 // fresh session judged against exactly that sub-task's acceptance criteria,
 // a red suite blocks approval even under an approving review (its logs ride
 // the fix prompt, green logs stay out of the review prompt), and an
@@ -329,8 +342,9 @@ func TestSlimWorkflowHappyPath(t *testing.T) {
 		t.Errorf("branch = %q, want the finalize deliverable", branch)
 	}
 
-	// Worker rounds: plan, parse, step 1, fix 1, fix 2, step 2 — one chained
-	// dev conversation across the whole run.
+	// Worker rounds: plan, parse, step 1, fix 1, fix 2, step 2 — the
+	// implementation rounds chain the plan's dev conversation, while the
+	// parse round's fresh session stays out of the chain entirely.
 	if len(agents.inputs) != 6 {
 		t.Fatalf("agent ran %d times, want 6 (plan, parse, step, fix, fix, step)", len(agents.inputs))
 	}
@@ -340,16 +354,16 @@ func TestSlimWorkflowHappyPath(t *testing.T) {
 	if p := agents.inputs[0].Prompt; !strings.Contains(p, "implement the feature") || !strings.Contains(p, "PLANNER") {
 		t.Errorf("planner prompt should carry the task through the slim plan template, got:\n%s", p)
 	}
-	if got := agents.inputs[1].SessionID; got != "dev-1" {
-		t.Errorf("parse round SessionID = %q, want %q (the parse round resumes the plan's conversation)", got, "dev-1")
+	if got := agents.inputs[1].SessionID; got != "" {
+		t.Errorf("parse round SessionID = %q, want empty (the parse round opens a fresh session — the planner's exploration must not inflate the parse prompt)", got)
 	}
 	if p := agents.inputs[1].Prompt; !strings.Contains(p, twoSubtaskProsePlan) ||
 		!strings.Contains(p, "raw JSON array") || !strings.Contains(p, `"acceptance_criteria"`) {
 		t.Errorf("parse prompt should carry the plan it transcribes and the JSON array contract, got:\n%s", p)
 	}
-	for i, wantSession := range []string{"dev-2", "dev-3", "dev-4", "dev-5"} {
+	for i, wantSession := range []string{"dev-1", "dev-3", "dev-4", "dev-5"} {
 		if got := agents.inputs[i+2].SessionID; got != wantSession {
-			t.Errorf("worker round %d SessionID = %q, want %q (the conversation chains)", i+2, got, wantSession)
+			t.Errorf("worker round %d SessionID = %q, want %q (the implementation rounds chain the plan's dev conversation)", i+2, got, wantSession)
 		}
 	}
 	if p := agents.inputs[2].Prompt; !strings.Contains(p, "sub-tasks 1 of 2") || !strings.Contains(p, "add the adder") ||
@@ -462,8 +476,8 @@ func TestSlimWorkflowParseRetry(t *testing.T) {
 		if strings.Contains(retry, "PLANNER") {
 			t.Errorf("re-ask prompt = the parse round's conversation, never a planner re-run, got:\n%s", retry)
 		}
-		if got := agents.inputs[3].SessionID; got != "dev-3" {
-			t.Errorf("worker step SessionID = %q, want %q (the dev conversation chains through the re-ask)", got, "dev-3")
+		if got := agents.inputs[3].SessionID; got != "dev-1" {
+			t.Errorf("worker step SessionID = %q, want %q (the step resumes the plan's dev conversation — the parse round's session is abandoned once the queue parses)", got, "dev-1")
 		}
 	})
 	t.Run("second reply parks", func(t *testing.T) {
@@ -581,8 +595,8 @@ func TestSlimWorkflowParseRepair(t *testing.T) {
 		if retry := agents.inputs[2].Prompt; !strings.Contains(retry, "could not be parsed as the required JSON array") {
 			t.Errorf("re-ask prompt should carry the parse failure, got:\n%s", retry)
 		}
-		if got := agents.inputs[3].SessionID; got != "dev-3" {
-			t.Errorf("worker step SessionID = %q, want %q (the dev conversation chains through the re-ask)", got, "dev-3")
+		if got := agents.inputs[3].SessionID; got != "dev-1" {
+			t.Errorf("worker step SessionID = %q, want %q (the step resumes the plan's dev conversation — the parse round's session is abandoned once the queue parses)", got, "dev-1")
 		}
 		env.AssertExpectations(t)
 	})

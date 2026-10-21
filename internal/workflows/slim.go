@@ -1,6 +1,7 @@
 package workflows
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -27,17 +28,18 @@ const maxSlimStepRounds = 8
 // share, so every verdict, cap, park, and the finalize contract are
 // inherited unchanged:
 //
-//  1. Planner: two rounds on the run's dev conversation. A
-//     pure-generation round writes the plan in prose — no format
-//     pressure, so the planning model spends its budget on the plan
-//     rather than on the wire shape — and a parse round transcribes that
-//     plan into a strictly ordered queue of sub-tasks, each at most 1–2
-//     target files, each verifiable against its own acceptance criteria,
-//     emitted as a raw JSON array (template.SlimSubtask). Two
-//     deterministic repairs — a trailing-comma strip and a bracket
-//     closure of a reply whose every element was complete but whose final
-//     closers were dropped (the run memo is stamped ParseQueueRepaired
-//     when it fires) — absorb those routine syntax classes before
+//  1. Planner: a plan round on the run's dev conversation and a parse
+//     round in a fresh session of its own. The pure-generation plan round
+//     writes the plan in prose — no format pressure, so the planning
+//     model spends its budget on the plan rather than on the wire shape —
+//     and the parse round transcribes that plan into a strictly ordered
+//     queue of sub-tasks, each at most 1–2 target files, each verifiable
+//     against its own acceptance criteria, emitted as a raw JSON array
+//     (template.SlimSubtask). Two deterministic repairs — a
+//     trailing-comma strip and a bracket closure of a reply with at
+//     least one complete element whose final closers were dropped (the
+//     run memo is stamped ParseQueueRepaired when it fires) — absorb
+//     those routine syntax classes before
 //     anything costs budget, and one strict re-ask of the parse round
 //     absorbs any other malformed reply (resumed in the parse round's own
 //     conversation, so the model sees and corrects its previous reply);
@@ -94,15 +96,19 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 		return "", fmt.Errorf("planner round: %w", err)
 	}
 
-	// Phase 1b — parse. The plan is transcribed into the machine queue in
-	// the same dev conversation: the model sees the plan it is
-	// transcribing, and the queue joins it in the worker's progressive
-	// context.
+	// Phase 1b — parse. The parse round is pure transcription — the plan
+	// text rides in its prompt verbatim — so it opens a fresh session
+	// instead of resuming the plan conversation: none of the planner's
+	// exploration may inflate the parse prompt against the worker's
+	// window, where one unbounded tool result alone can squeeze the
+	// output clamp down to a one-token reply. The re-ask below still
+	// resumes the parse round's own, now-small conversation.
+	var parseSession string
 	parsePrompt, err := template.SlimParse(planReply.Text)
 	if err != nil {
 		return "", fmt.Errorf("build slim parse prompt: %w", err)
 	}
-	parseReply, err := run.runAgent(parsePrompt, "slim-parse", activities.RoleDev, &run.devSession)
+	parseReply, err := run.runAgent(parsePrompt, "slim-parse", activities.RoleDev, &parseSession)
 	if err != nil {
 		return "", fmt.Errorf("parse round: %w", err)
 	}
@@ -120,7 +126,7 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("build slim parse re-ask prompt: %w", err)
 		}
-		parseReply, err = run.runAgent(parsePrompt+"\n\n"+reask, "slim-parse", activities.RoleDev, &run.devSession)
+		parseReply, err = run.runAgent(parsePrompt+"\n\n"+reask, "slim-parse", activities.RoleDev, &parseSession)
 		if err != nil {
 			return "", fmt.Errorf("parse retry round: %w", err)
 		}
@@ -335,7 +341,12 @@ func parseSlimPlan(text string, repair bool) ([]template.SlimSubtask, bool, erro
 
 // appendImpliedClosers returns b with the closing brackets its open-bracket
 // depth still implies appended — "]" and "}" in reverse opening order — or
-// nil when nothing may be closed. The walk is string-aware exactly like
+// nil when nothing may be closed. An element-less reply may never be
+// closed: the gate demands at least one "{" in the reply, so a degenerate
+// bracket-only fragment (the one-token "[") keeps the original parse error
+// and spends the re-ask instead of closing into a fabricated empty queue
+// whose failure would be misdescribed as an array the model wrote. The
+// walk is string-aware exactly like
 // stripTrailingCommas: a bracket inside a string literal (escapes
 // included) is content and is never balanced against, and a walk that ends
 // inside an unterminated string closes nothing — a reply cut off mid-value
@@ -351,6 +362,11 @@ func parseSlimPlan(text string, repair bool) ([]template.SlimSubtask, bool, erro
 // truncation-masking outcome the strict parse exists to prevent.
 // Deterministic string/JSON work — safe to call from workflow code.
 func appendImpliedClosers(b []byte) []byte {
+	// Element gate: a reply with no "{" carries no subtask object to
+	// complete, whatever brackets it opened — see the doc comment.
+	if bytes.IndexByte(b, '{') < 0 {
+		return nil
+	}
 	var open []byte
 	inString := false
 	for i := 0; i < len(b); i++ {
