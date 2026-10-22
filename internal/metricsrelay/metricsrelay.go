@@ -10,15 +10,21 @@
 // wire) or /v1/messages (anthropic wire) are streamed through a tee that
 // buffers the body while it forwards, so the client keeps its SSE stream
 // and the ledger reads the usage block at EOF — structurally uniform
-// across both wires, whatever CLI produced the round. Every other request
+// across both wires, whatever CLI produced the round. A keyed round's
+// inspected call additionally tees its request body and the response's
+// assistant text into the in-memory per-round capture (capture.go) — the
+// primary source `daedalus log <wf> -cot` renders. Every other request
 // proxies verbatim. The relay reads no request or response content beyond
-// the usage blocks and the attribution encoding the worker attached (the
+// that capture, the usage blocks, and the attribution encoding the worker
+// attached (the
 // synthetic per-round key in the credential slot —
 // task-<id>-role-<role>-round-<n>, staged with the registration's secret
 // token as its -rk- tail; the token gates key restoration, anything else
 // attributes at worker level). ponytail: the ledger is in-memory only — a daemon restart drops
-// history, and a 10k-entry ring bounds memory; durable roll-ups wait on
-// the GoLens embed (SQLite). Cost stays render-time: the operator's price
+// its rows, and a 10k-entry ring bounds memory; the durable roll-ups are
+// the golens-metrics embed's sqlite store (cmd/daedalus/golens.go), fed
+// per append, not this package's concern. Cost stays render-time: the
+// operator's price
 // table (the dashboard's models tab) prices entries when the dashboard
 // reads them, and CostUSD is never written.
 package metricsrelay
@@ -99,22 +105,49 @@ type Entry struct {
 	CostUSD    float64 `json:"cost_usd"`
 	DurationMS int64   `json:"duration_ms"`
 	Status     int     `json:"status"`
+	// Source stamps the capture path: "" is the relay's own observation
+	// (the ordinary shape), SourceOtel/SourceOtelExternal mark usage
+	// folded from an OTLP export by the receiver (otel.go) — those rows
+	// carry no per-request status or duration.
+	Source string `json:"source,omitempty"`
 }
 
 // Ledger is the relay's in-memory usage record. Safe for concurrent
 // append and query; the daemon process is its only writer and reader.
 type Ledger struct {
-	mu      sync.Mutex
-	entries []Entry
+	mu       sync.Mutex
+	entries  []Entry
+	onAppend func(Entry)
+}
+
+// SetOnAppend installs fn as the ledger's append observer — the daemon
+// feeds its golens-metrics registry this way. fn runs after the entry is
+// stored, once per Append, on the relay's serving goroutine; the invoke
+// happens outside the ledger lock, so fn may call back into the ledger
+// (Query, Len) without deadlocking, though two concurrent appends may
+// deliver out of order. Unset is the ordinary shape — the CLI reads the
+// ledger by polling, no observer.
+func (l *Ledger) SetOnAppend(fn func(Entry)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onAppend = fn
 }
 
 // Append records one entry, dropping the oldest past the cap.
 func (l *Ledger) Append(e Entry) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.entries = append(l.entries, e)
 	if len(l.entries) > ledgerCap {
 		l.entries = l.entries[len(l.entries)-ledgerCap:]
+	}
+	fn := l.onAppend
+	l.mu.Unlock()
+	// Observed outside the lock, so an observer that reads the ledger
+	// cannot deadlock against the append it belongs to; two concurrent
+	// appends may deliver to the observer out of order, which no fold of
+	// the samples cares about.
+	if fn != nil {
+		fn(e)
 	}
 }
 
@@ -287,6 +320,7 @@ func (r *Registry) Live() int {
 type Relay struct {
 	ledger   *Ledger
 	registry *Registry
+	captures Captures
 	started  time.Time
 	srv      *http.Server
 	listener net.Listener
@@ -331,6 +365,15 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.serveStatus(w)
 	case req.URL.Path == "/ledger" && req.Method == http.MethodGet:
 		r.serveLedger(w, req)
+	case req.URL.Path == "/v1/metrics" && req.Method == http.MethodPost:
+		r.serveOTLP(w, req)
+	// The exporters pointed at this listener deliver traces and logs to
+	// stubs: acknowledged and discarded (see otel.go's package comment).
+	case (req.URL.Path == "/v1/traces" || req.URL.Path == "/v1/logs") && req.Method == http.MethodPost:
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("{}"))
+	case req.URL.Path == "/capture" && req.Method == http.MethodGet:
+		r.serveCapture(w, req)
 	case strings.HasPrefix(req.URL.Path, prefix):
 		r.serveProxy(w, req)
 	default:
@@ -481,7 +524,26 @@ func (r *Relay) serveProxy(w http.ResponseWriter, req *http.Request) {
 	if req.URL.RawQuery != "" {
 		forward += "?" + req.URL.RawQuery
 	}
-	up, err := http.NewRequestWithContext(req.Context(), req.Method, forward, req.Body)
+	// The attribution encoding rides the credential slot; parsed once here
+	// — it decides the credential handling, the ledger entry, and whether
+	// the request side joins the content capture. Parsed before the
+	// upstream request is built, so the tee below can consult it.
+	task, role, round, token, keyed := parseAttribution(attributionKey(req, wire))
+	// Inspect exactly the two provider-call shapes, whichever upstream
+	// path prefix the staged URL carried.
+	inspect := req.Method == http.MethodPost &&
+		(strings.HasSuffix("/"+upstreamPath, "/chat/completions") ||
+			strings.HasSuffix("/"+upstreamPath, "/v1/messages"))
+	// A keyed, inspected round's request body tees into the capture on its
+	// way upstream — the prompt side -cot renders. The tee never errors
+	// the forward: cappedBuffer discards past its bound.
+	var reqCap *cappedBuffer
+	var body io.Reader = req.Body
+	if inspect && keyed {
+		reqCap = newCappedBuffer(contentCap)
+		body = io.TeeReader(req.Body, reqCap)
+	}
+	up, err := http.NewRequestWithContext(req.Context(), req.Method, forward, body)
 	if err != nil {
 		http.Error(w, "metricsrelay: build upstream request: "+err.Error(), http.StatusBadGateway)
 		return
@@ -495,9 +557,6 @@ func (r *Relay) serveProxy(w http.ResponseWriter, req *http.Request) {
 	// pin identity so the bytes tee'd into the ledger are the client's
 	// bytes (same invariant as the tool relay's roundTrip).
 	up.Header.Set("Accept-Encoding", "identity")
-	// The attribution encoding rides the credential slot; parsed once here
-	// — it decides both the credential handling and the ledger entry.
-	task, role, round, token, keyed := parseAttribution(attributionKey(req, wire))
 	// Restore-only and token-gated: the registration's real key goes back
 	// into the credential slot exactly when the request presents the
 	// registration's secret alongside the synthetic attribution key. The
@@ -526,11 +585,6 @@ func (r *Relay) serveProxy(w http.ResponseWriter, req *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Inspect exactly the two provider-call shapes, whichever upstream
-	// path prefix the staged URL carried.
-	inspect := req.Method == http.MethodPost &&
-		(strings.HasSuffix("/"+upstreamPath, "/chat/completions") ||
-			strings.HasSuffix("/"+upstreamPath, "/v1/messages"))
 	hdr := w.Header()
 	for k, vv := range resp.Header {
 		if inspect && (k == "Content-Length" || k == "Connection") {
@@ -580,6 +634,15 @@ func (r *Relay) serveProxy(w http.ResponseWriter, req *http.Request) {
 		r.ledger.Append(e)
 		log.Printf("metricsrelay: recorded worker=%s wire=%s model=%s in=%d out=%d status=%d",
 			e.Worker, e.Wire, e.Model, e.InputTokens, e.OutputTokens, e.Status)
+		// Keyed rounds capture content beside usage: the round's last
+		// provider call carries the whole conversation its -cot renders.
+		if keyed {
+			r.captures.Put(task, role, round, CapturedRound{
+				At:       start,
+				Prompt:   reqCap.String(),
+				Response: assistantText(buf.Bytes()),
+			})
+		}
 	}
 }
 

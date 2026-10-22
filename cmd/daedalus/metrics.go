@@ -8,10 +8,11 @@
 // off-host — and the UI mux on metrics.port bound to the LAN with no auth
 // (an accepted posture: any LAN peer can read all run data and start
 // runs). The dashboard views (ui.go — htmx-ui pt2) serve the decided
-// route map (Q14) off that mux; /metrics is GoLens's mount, unbuilt here
-// (the golens-metrics module is absent from this build), so it renders
-// the daemon's own aggregates — the relay ledger's counters and the live
-// session counts — where the embed's charts would, and says so.
+// route map (Q14) off that mux: /metrics is the daemon's own aggregates
+// view over the relay ledger, and the golens-metrics embed (golens.go)
+// mounts its dashboard at /full-metrics — its HTML's absolute /metrics/*
+// paths serve beside the daemon's exact routes — fed per append from the
+// ledger.
 package main
 
 import (
@@ -220,6 +221,23 @@ func metricsStatus() error {
 // requests are not drained — the lifecycle contract is the worker's.
 func runMetricsDaemon(cfg config.Config) error {
 	ledger := &metricsrelay.Ledger{} // zero value ready: mutex plus empty ring
+
+	// The golens-metrics embed: the /full-metrics dashboard and the sqlite
+	// retention behind it. Boot fails loudly when it cannot start — a
+	// daemon serving the dashboards but not the feed half would lie by
+	// omission (an unwritable db is the ordinary failure). Started before
+	// the relay so the observer below is installed before the first
+	// Append can land.
+	gl, err := startGolens(cfg)
+	if err != nil {
+		return fmt.Errorf("start golens metrics: %w", err)
+	}
+	defer gl.Close()
+	// The feed: every request lands in the registry as it lands in the
+	// ledger — same goroutine, non-blocking — so a mount without data
+	// cannot exist.
+	ledger.SetOnAppend(func(e metricsrelay.Entry) { feedGolensEntry(gl, e) })
+
 	registry := metricsrelay.NewRegistry(metricsRegistrationTTL)
 	relay, err := metricsrelay.Start(cfg.Metrics.RelayPort, ledger, registry)
 	if err != nil {
@@ -235,7 +253,8 @@ func runMetricsDaemon(cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("listen on :%d: %w (the metrics.port knob names this port)", cfg.Metrics.Port, err)
 	}
-	srv := &http.Server{Handler: newUIServer(cfg, ledger).routes(), ReadHeaderTimeout: 30 * time.Second}
+	uiSrv := newUIServer(cfg, ledger, gl)
+	srv := &http.Server{Handler: uiSrv.routes(), ReadHeaderTimeout: 30 * time.Second}
 	go func() {
 		if err := srv.Serve(ui); err != http.ErrServerClosed {
 			fmt.Printf("metrics: dashboard serve: %v\n", err)
@@ -367,10 +386,10 @@ func runMetricsList(args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(w, "METRICS LEDGER — %d entr%s, page %d (page size %d)%s\n\n",
 		doc.Total, pluralY(doc.Total), doc.Page, doc.PageSize, workerFilterNote(worker))
-	fmt.Fprintln(w, "TIME\tWORKER\tTASK\tROLE\tROUND\tMODEL\tIN\tOUT\tCACHE R/W\tMS\tSTATUS")
+	fmt.Fprintln(w, "TIME\tWORKER\tTASK\tROLE\tROUND\tMODEL\tSRC\tIN\tOUT\tCACHE R/W\tMS\tSTATUS")
 	for _, e := range doc.Entries {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d/%d\t%d\t%d\n",
-			e.At.Local().Format("15:04:05"), cellText(e.Worker), cellText(e.Task), cellText(e.Role), cellText(e.Round), cellText(e.Model),
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d/%d\t%d\t%d\n",
+			e.At.Local().Format("15:04:05"), cellText(e.Worker), cellText(e.Task), cellText(e.Role), cellText(e.Round), cellText(e.Model), cellText(e.Source),
 			e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens,
 			e.DurationMS, e.Status)
 	}

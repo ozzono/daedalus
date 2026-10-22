@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/metricsrelay"
 )
 
 // claudeProjectsDir returns claude's transcript directory for a worktree.
@@ -124,7 +127,15 @@ func runTaskLogCot(workflowID string, cotN int) {
 		// backend lagging behind): fall back to the latest run's history.
 		runs = []string{""}
 	}
-	sections, err := cotSections(c, workflowID, runs)
+	// The live daemon is the dump's primary source (the relay capture's
+	// content, the otel ledger's usage stamps); an unreachable one
+	// degrades the whole dump to the Temporal walk, unstamped, never an
+	// error.
+	src := ""
+	if root, ok := metricsRelayEndpoint(); ok {
+		src = root
+	}
+	sections, err := cotSectionsWith(c, workflowID, runs, src)
 	if err != nil {
 		exitf("%v", err)
 	}
@@ -157,21 +168,30 @@ func runTaskLogCot(workflowID string, cotN int) {
 	fmt.Print(logTail(workflowID, cotTailState(c, workflowID)))
 }
 
-// cotSections walks each run's history like the usage report does: pair
+// cotSectionsWith walks each run's history like the usage report does: pair
 // every jailed round's completed result with its scheduled input, which
 // carries the round's role and (when the run pinned one) its agent, and
 // render one section per completed round, oldest first. Each section is
 // its header line then its body — the round's CoT, or the no-CoT note —
 // without the ===== divider; the printers add their own. Shared by the
 // CLI's -cot dump and the run detail's last-round box.
-func cotSections(c client.Client, workflowID string, runs []string) ([]string, error) {
+//
+// src names the live metrics daemon's relay root and turns on the source
+// precedence: a keyed round's relay capture (content, stamped relay), else
+// its otel ledger entries (usage stamp over the Temporal CoT, stamped
+// otel), else the Temporal walk itself (stamped temporal). An empty src —
+// no daemon — is today's walk, unstamped: a capture-absent dump and a
+// daemon-less one render byte-identically to the pre-capture shape.
+func cotSectionsWith(c client.Client, workflowID string, runs []string, src string) ([]string, error) {
 	dc := converter.GetDefaultDataConverter()
 	type scheduledRound struct {
-		typ      string
-		role     activities.SessionRole
-		agent    string
-		worktree string
+		typ        string
+		role       activities.SessionRole
+		agent      string
+		worktree   string
+		activityID string
 	}
+	otel, live := cotOtelUsage(src)
 	var sections []string
 	for _, runID := range runs {
 		scheduled := map[int64]scheduledRound{}
@@ -187,7 +207,7 @@ func cotSections(c client.Client, workflowID string, runs []string) ([]string, e
 				if !agentActivityTypes[typ] {
 					continue
 				}
-				sr := scheduledRound{typ: typ}
+				sr := scheduledRound{typ: typ, activityID: s.GetActivityId()}
 				if ps := s.GetInput().GetPayloads(); len(ps) > 0 {
 					// Same shape-vs-type dispatch as the result decode below:
 					// each activity type carries its own input struct.
@@ -274,15 +294,169 @@ func cotSections(c client.Client, workflowID string, runs []string) ([]string, e
 			header += fmt.Sprintf(" @ %s ===", ev.GetEventTime().AsTime().Format("2006-01-02 15:04:05 MST"))
 			var b strings.Builder
 			b.WriteString(header + "\n")
-			if cot == "" {
-				b.WriteString("no CoT captured for this round\n")
-			} else {
-				b.WriteString(cot + "\n")
+			roleName := string(sr.role)
+			if roleName == "" {
+				roleName = "none"
 			}
+			b.WriteString(cotRoundBody(src, &live, otel, ledgerTaskID(workflowID), roleName, sr.activityID, cot))
 			sections = append(sections, b.String())
 		}
 	}
 	return sections, nil
+}
+
+// otelUsage is one round's folded otel ledger counters — the usage stamp
+// -cot renders when the relay never saw the round's wire traffic (otel
+// carries no content, only these counts and the attribution).
+type otelUsage struct {
+	in, out, cacheRead, cacheWrite int64
+}
+
+func roundKey(task, role, round string) string {
+	return task + "\x00" + role + "\x00" + round
+}
+
+// cotOtelUsage folds the daemon ledger's otel entries into per-round usage
+// stamps for cotRoundBody's precedence. live is false when root is empty
+// or the daemon is unreachable — the caller renders every round from the
+// unstamped Temporal walk, never an error.
+func cotOtelUsage(root string) (map[string]otelUsage, bool) {
+	if root == "" {
+		return nil, false
+	}
+	resp, err := metricsHTTP.Get(root + "/ledger?page=1&page_size=1000000")
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var page struct {
+		Entries []metricsrelay.Entry `json:"entries"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&page) != nil {
+		return nil, false
+	}
+	otel := map[string]otelUsage{}
+	for _, e := range page.Entries {
+		if e.Source != metricsrelay.SourceOtel || e.Task == "" {
+			continue
+		}
+		k := roundKey(e.Task, e.Role, e.Round)
+		u := otel[k]
+		u.in += e.InputTokens
+		u.out += e.OutputTokens
+		u.cacheRead += e.CacheReadTokens
+		u.cacheWrite += e.CacheWriteTokens
+		otel[k] = u
+	}
+	return otel, true
+}
+
+// fetchCotCapture fetches one round's relay-captured content from the
+// daemon's /capture endpoint. found is false for a capture the daemon
+// does not hold (404 — a toggle-off era round, content aged out of the
+// ring, an otel-staged round) and for any other answered-but-not-served
+// status, which degrades this round to the next source rather than
+// failing the dump; up is false only when the daemon is unreachable,
+// which flips the whole dump's liveness off.
+func fetchCotCapture(root, task, role, round string) (cr metricsrelay.CapturedRound, found, up bool) {
+	resp, err := metricsHTTP.Get(root + "/capture?task=" + url.QueryEscape(task) +
+		"&role=" + url.QueryEscape(role) + "&round=" + url.QueryEscape(round))
+	if err != nil {
+		return cr, false, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return cr, false, true
+	}
+	if json.NewDecoder(resp.Body).Decode(&cr) != nil {
+		return cr, false, true
+	}
+	return cr, true, true
+}
+
+// cotRoundBody renders one completed round's body from the source
+// precedence: the relay capture (the round's real prompt and response,
+// stamped relay), else the otel ledger's usage stamp over the Temporal
+// walk's CoT (stamped otel — otel carries the counts, Temporal the text),
+// else the Temporal walk itself (stamped temporal). The unstamped shape —
+// !*live, or a daemon that died mid-dump, which flips *live off — is the
+// pre-capture body byte-for-byte, so a daemon-less dump renders exactly
+// today's walk.
+func cotRoundBody(src string, live *bool, otel map[string]otelUsage, task, role, round, temporal string) string {
+	unstamped := func() string {
+		if temporal == "" {
+			return "no CoT captured for this round\n"
+		}
+		return temporal + "\n"
+	}
+	if !*live {
+		return unstamped()
+	}
+	cr, found, up := fetchCotCapture(src, task, role, round)
+	if !up {
+		*live = false
+		return unstamped()
+	}
+	if found {
+		var b strings.Builder
+		b.WriteString("source: relay\n")
+		if cr.Prompt != "" {
+			b.WriteString("--- prompt ---\n" + cr.Prompt + "\n")
+		}
+		if cr.Response != "" {
+			b.WriteString("--- response ---\n" + cr.Response + "\n")
+		}
+		return b.String()
+	}
+	if u, ok := otel[roundKey(task, role, round)]; ok {
+		b := fmt.Sprintf("source: otel\nusage: in %d, out %d, cache read %d/write %d\n",
+			u.in, u.out, u.cacheRead, u.cacheWrite)
+		// The otel stamp is metadata, not a replacement: the Temporal
+		// result still carries the round's real CoT, and the toggle must
+		// never downgrade the diagnostic surface to four numbers.
+		if temporal != "" {
+			b += temporal + "\n"
+		}
+		return b
+	}
+	if temporal == "" {
+		return "source: temporal\nno CoT captured for this round\n"
+	}
+	return "source: temporal\n" + temporal + "\n"
+}
+
+// lastRoundExit parses the newest "jailed … round exited" header timestamp
+// from a task log — the runs-feed Last-CoT column's anchor, the moment a
+// round's log material last landed. Zero when the log carries no exited
+// round (nothing started, or a round in flight with no completed one).
+func lastRoundExit(log string) time.Time {
+	var newest time.Time
+	for line := range strings.SplitSeq(log, "\n") {
+		header, ok := strings.CutPrefix(line, "=== ")
+		if !ok {
+			continue
+		}
+		header, ok = strings.CutSuffix(header, " ===")
+		if !ok {
+			continue
+		}
+		stamp, rest, ok := strings.Cut(header, " ")
+		if !ok {
+			continue
+		}
+		event, _, _ := strings.Cut(rest, " (run ")
+		if !strings.HasPrefix(event, "jailed ") || !strings.Contains(event, " round exited ") {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, stamp)
+		if err == nil && t.After(newest) {
+			newest = t
+		}
+	}
+	return newest
 }
 
 // claudeTranscriptCoT renders a completed claude round's CoT from its

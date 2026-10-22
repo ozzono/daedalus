@@ -49,11 +49,11 @@ details>summary::-webkit-details-marker{display:none}
 
 {{define "header"}}
 <header class="sticky top-0 z-10 border-b border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/70 backdrop-blur" style="top:env(safe-area-inset-top,0px)">
- <div class="mx-auto max-w-[86.4rem] px-4 py-2.5 flex items-center gap-3 flex-wrap">
+ <div class="mx-auto max-w-[103.7rem] px-4 py-2.5 flex items-center gap-3 flex-wrap">
   <a class="font-semibold tracking-tight mr-2 flex items-center gap-2" href="/"><span class="h-2 w-2 rounded-full bg-emerald-500"></span>daedalus</a>
   <nav class="flex gap-1 flex-wrap">
-   <a class="tab {{if eq .Nav "workers"}}on{{end}}" href="/workers">Workers</a>
    <a class="tab {{if eq .Nav "runs"}}on{{end}}" href="/runs">Runs</a>
+   <a class="tab {{if eq .Nav "workers"}}on{{end}}" href="/workers">Workers</a>
    <a class="tab {{if eq .Nav "new"}}on{{end}}" href="/new">New Task</a>
    <a class="tab {{if eq .Nav "models"}}on{{end}}" href="/models">Models</a>
    <a class="tab {{if eq .Nav "metrics"}}on{{end}}" href="/metrics">Metrics</a>
@@ -82,6 +82,7 @@ details>summary::-webkit-details-marker{display:none}
      <label class="lbl" for="dd-interval">Refresh interval (seconds)</label>
      <input id="dd-interval" type="number" min="2" max="120" step="1" class="inp !py-1.5 mono" value="5">
      <p class="text-slate-500 mt-2">Applies to this browser only; saved locally. Click the ring to pause.</p>
+     <p class="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800"><a class="text-sm text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">Full metrics ↗</a></p>
     </div>
    </details>
   </div>
@@ -268,6 +269,17 @@ if(!window.__ddWired){
   var pre=t.querySelector('pre');
   if(pre)pre.scrollTop=ddScroll;
  });
+ /* the Models tab's what-if modal: every fetch into #preview-body opens
+    the dialog, so the shell is up at once and the fold fills it — and a
+    re-submit inside the modal (same target) lands harmlessly, since
+    showModal throws on an already-open dialog. */
+ document.body.addEventListener('htmx:beforeRequest',function(ev){
+  var t=ev.detail.target;
+  if(t&&t.id==='preview-body'){
+   var d=document.getElementById('preview-dlg');
+   if(d&&!d.open)d.showModal();
+  }
+ });
 }
 /* the runs filters re-render the rows immediately (the poll region's
    change trigger) and sync the location so a filtered view survives a
@@ -301,7 +313,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_workers"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-[86.4rem] px-4 py-6">
+<main class="mx-auto max-w-[103.7rem] px-4 py-6">
  <h1 class="text-lg font-semibold mb-1">Workers on this host</h1>
  <p class="text-sm text-slate-500 mb-4">Per-host scope · polled every 5s</p>
 <div id="wlist" hx-get="/workers/rows" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
@@ -356,7 +368,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_runs"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-[86.4rem] px-4 py-6">
+<main class="mx-auto max-w-[103.7rem] px-4 py-6">
  <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
   <h1 class="text-lg font-semibold">Runs</h1>
   <div class="flex gap-2">
@@ -375,7 +387,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 <div class="overflow-x-auto" hx-get="/runs/rows" hx-trigger="every 5s [!document.hidden], change from:#fq, change from:#fs" hx-include="#fq,#fs" hx-target="#rtbody" hx-swap="innerHTML">
 <table class="card w-full text-sm min-w-[820px]">
  <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
-  <tr><th scope="col" class="p-3">Workflow id</th><th scope="col">Status</th><th scope="col">Issue</th><th scope="col">Repo</th><th scope="col">Queue</th><th scope="col">Started</th><th scope="col">Last interaction</th></tr>
+  <tr><th scope="col" class="p-3">Workflow id</th><th scope="col">Status</th><th scope="col">Issue</th><th scope="col">Repo</th><th scope="col">Queue</th><th scope="col">Started</th><th scope="col">Last interaction</th><th scope="col">Last CoT</th></tr>
  </thead>
  <tbody id="rtbody">
 {{template "frag_runs" .}}
@@ -397,14 +409,15 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
   <td class="mono">{{.Queue}}</td>
   <td class="text-slate-500 mono">{{.Started}}</td>
   <td class="text-slate-500">{{.LastAt}}</td>
+  <td class="text-slate-500">{{.LastCoT}}</td>
  </tr>
 {{else}}
- <tr><td colspan="7" class="p-6 text-center text-slate-500">{{if .WalkErr}}Run feed unavailable: {{.WalkErr}}{{else}}No runs match.{{end}}</td></tr>
+ <tr><td colspan="8" class="p-6 text-center text-slate-500">{{if .WalkErr}}Run feed unavailable: {{.WalkErr}}{{else}}No runs match.{{end}}</td></tr>
 {{end}}
 {{end}}
 
 {{define "page_run"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-[86.4rem] px-4 py-6">
+<main class="mx-auto max-w-[103.7rem] px-4 py-6">
 <div hx-get="/runs/{{.D.WorkflowID}}/body" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
 {{template "frag_run" .D}}
 </div>
@@ -550,7 +563,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_error"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-[86.4rem] px-4 py-6">
+<main class="mx-auto max-w-[103.7rem] px-4 py-6">
 {{template "frag_error" .Err}}
 <p class="text-xs text-slate-500 mt-3">The page shell renders even when its content fails — a refresh on this URL retries the content, and the navigation above stays live.</p>
 </main>
@@ -566,7 +579,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
   <tbody>
   {{range .Rows}}
    <tr class="border-b last:border-0 border-slate-100 dark:border-slate-800/70">
-    <td class="p-3 mono">{{.Key}}</td>
+    <td class="p-3 mono">{{if .Src}}otel-{{end}}{{.Key}}</td>
     <td>{{.Calls}}</td>
     <td class="mono">{{tok .In}}</td>
     <td class="mono">{{tok .Out}}</td>
@@ -574,10 +587,10 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
     <td class="mono">{{tok .CacheWrite}}</td>
     <td>{{.Runs}}</td>
     <td>{{.Dev}}</td><td>{{.Test}}</td><td>{{.Review}}</td>
-    <td class="mono">{{.HitPct}}</td>
-    <td>{{.OK2xx}}</td><td>{{.R429}}</td><td>{{.R4xx}}</td><td{{if gt .R5xx 0}} class="text-red-600 dark:text-red-400"{{end}}>{{.R5xx}}</td>
-    <td class="mono">{{.P50}}</td><td class="mono">{{.P95}}</td>
-    <td class="mono">{{.RPM}}</td>
+    <td class="mono">{{if .Src}}—{{else}}{{.HitPct}}{{end}}</td>
+    <td>{{if .Src}}—{{else}}{{.OK2xx}}{{end}}</td><td>{{if .Src}}—{{else}}{{.R429}}{{end}}</td><td>{{if .Src}}—{{else}}{{.R4xx}}{{end}}</td><td{{if gt .R5xx 0}} class="text-red-600 dark:text-red-400"{{end}}>{{if .Src}}—{{else}}{{.R5xx}}{{end}}</td>
+    <td class="mono">{{if .Src}}—{{else}}{{.P50}}{{end}}</td><td class="mono">{{if .Src}}—{{else}}{{.P95}}{{end}}</td>
+    <td class="mono">{{if .Src}}—{{else}}{{.RPM}}{{end}}</td>
     <td class="text-slate-500">{{.Last}}</td>
     <td class="mono">{{if .Priced}}{{usd .Cost}}{{else}}—{{end}}</td>
    </tr>
@@ -590,17 +603,20 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "page_models"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-[86.4rem] px-4 py-6">
+<main class="mx-auto max-w-[103.7rem] px-4 py-6">
  <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
   <h1 class="text-lg font-semibold">Models</h1>
-  <span class="text-xs text-slate-500">{{.V.Window}}</span>
+  <div class="flex items-center gap-3">
+   <span class="text-xs text-slate-500">{{.V.Window}}</span>
+   <button class="btn" hx-get="/models/preview" hx-target="#preview-body" hx-swap="innerHTML">What-if preview</button>
+  </div>
  </div>
 
  {{if .V.FormRows}}
  <div class="card p-4 mb-4 overflow-x-auto">
   <form method="post" action="/models">
-   <table class="w-full text-sm min-w-[680px]">
-    <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+   <table class="w-full text-sm text-center min-w-[680px]">
+    <thead class="text-center text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
      <tr><th scope="col" class="p-3">Model</th><th scope="col">Calls</th><th scope="col">Last seen</th><th scope="col">In $/1M</th><th scope="col">Out $/1M</th><th scope="col">Cached $/1M</th></tr>
     </thead>
     <tbody>
@@ -633,6 +649,17 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  <div hx-get="/models/body" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
 {{template "frag_models" .V}}
  </div>
+
+ {{/* the what-if modal: native <dialog>, kept outside the polled region like the price form — a poll may never clobber an open modal. The first fetch into #preview-body opens it (the document-level htmx listener in the foot script); re-submitting the name inside refetches the fragment. Nothing it shows is ever stored. */}}
+ <dialog id="preview-dlg" class="card backdrop:bg-slate-950/70 w-[min(34rem,92vw)]">
+  <div class="p-5">
+   <div class="flex items-center justify-between gap-3 mb-3">
+    <div class="font-medium">What-if cost preview</div>
+    <form method="dialog" hx-boost="false"><button class="btn !px-2 !py-1" aria-label="close preview">✕</button></form>
+   </div>
+   <div id="preview-body"><p class="text-sm text-slate-500">Loading…</p></div>
+  </div>
+ </dialog>
 </main>
 {{template "foot"}}
 {{end}}
@@ -652,28 +679,47 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  <div class="mb-2 font-medium">Usage by worker</div>
  {{template "usage_table" .WorkerTable}}
 
- {{if .TokenChart}}<div class="card p-4 mb-4">{{.TokenChart}}</div>{{end}}
- {{if .WorkerCharts}}
- <div class="grid lg:grid-cols-2 gap-4 mb-4">
-  {{range .WorkerCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
- </div>
- {{end}}
-
- {{if .CostChart}}<div class="card p-4 mb-4">{{.CostChart}}</div>{{end}}
- {{if or .WorkerCostCharts .ModelCostCharts}}
- <div class="grid lg:grid-cols-2 gap-4 mb-4">
-  {{range .WorkerCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
-  {{range .ModelCostCharts}}<div class="card p-4">{{.Chart}}</div>{{end}}
- </div>
- {{end}}
-
  <div class="card p-4 text-sm text-slate-500">
-  Coverage: only relay-served rounds appear — unkeyed rounds attribute at worker level only, and a round dialing its CLI-default upstream bypasses the relay entirely. Loop averages span to the first review only and include non-provider time. Per-round rows: <span class="mono">daedalus dash list</span>.
+  Coverage: the ledger's daedalus rounds — relay-captured and otel-staged (<span class="mono">otel-</span> rows are export batches, so their per-request columns read —) alike; a round dialing its CLI-default upstream with the toggle off bypasses both. External telemetry renders only on <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>. Loop averages span to the first review only and include non-provider time; the loop, drift, and Tokens/worker tiles read the relay face only — otel batches are minute-deltas, not request records. Per-round rows: <span class="mono">daedalus dash list</span>. Charts: <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>.
  </div>
 {{end}}
 
+{{define "frag_preview"}}{{/* the what-if modal's body: the name form plus the read-only fold. No hx-trigger anywhere — the modal never joins the poll rotation. Money figures arrive preformatted; the dash is the no-signal face. */}}
+ <form hx-get="/models/preview" hx-target="#preview-body" hx-swap="innerHTML" class="flex gap-2 mb-4">
+  <input name="model" value="{{if .WhatIf}}{{.WhatIf.Name}}{{end}}" class="inp mono" placeholder="model name (optional)" autofocus>
+  <button type="submit" class="btn-p whitespace-nowrap">Recalculate</button>
+ </form>
+ <div class="text-xs text-slate-500 mb-2">{{.Window}}</div>
+ <table class="w-full text-sm">
+  <tbody>
+   <tr><td class="py-1 text-slate-500">Calls</td><td class="mono text-right">{{.Calls}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Tokens in</td><td class="mono text-right">{{tok .In}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Tokens out</td><td class="mono text-right">{{tok .Out}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Cache reads</td><td class="mono text-right">{{tok .CacheRead}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Cache writes</td><td class="mono text-right">{{tok .CacheWrite}}</td></tr>
+   <tr class="border-t border-slate-200 dark:border-slate-800"><td class="py-1 font-medium">Current total (saved rates)</td><td class="mono text-right">{{.Current}}</td></tr>
+  </tbody>
+ </table>
+ {{if .WhatIf}}
+ <div class="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800">
+  <div class="mb-1 font-medium">What-if: whole window at <span class="mono">{{.WhatIf.Name}}</span>'s rates</div>
+  <table class="w-full text-sm">
+   <tbody>
+    <tr><td class="py-1 text-slate-500">In $/1M</td><td class="mono text-right">{{.WhatIf.In}}</td></tr>
+    <tr><td class="py-1 text-slate-500">Out $/1M</td><td class="mono text-right">{{.WhatIf.Out}}</td></tr>
+    <tr><td class="py-1 text-slate-500">Cached $/1M</td><td class="mono text-right">{{.WhatIf.Cached}}</td></tr>
+    <tr class="border-t border-slate-200 dark:border-slate-800"><td class="py-1 font-medium">What-if total</td><td class="mono text-right">{{.WhatIf.Total}}</td></tr>
+    <tr><td class="py-1 text-slate-500">Δ vs current</td><td class="mono text-right">{{.WhatIf.Delta}}</td></tr>
+   </tbody>
+  </table>
+  {{if .WhatIf.Note}}<p class="text-xs text-amber-700 dark:text-amber-400 mt-2">{{.WhatIf.Note}}</p>{{end}}
+ </div>
+ {{end}}
+ <p class="text-xs text-slate-500 mt-3">Preview only — nothing is stored. Storage still happens only when Save rates is hit.</p>
+{{end}}
+
 {{define "page_metrics"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-[86.4rem] px-4 py-6">
+<main class="mx-auto max-w-[103.7rem] px-4 py-6">
  <h1 class="text-lg font-semibold mb-4">Metrics</h1>
  <div hx-get="/metrics/body" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
 {{template "frag_metrics" .M}}
@@ -718,13 +764,14 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
    <p class="text-xs text-slate-500 mt-2">Only relay-served rounds appear here — a round dialing its CLI-default upstream directly never passes the relay. Per-round rows: <span class="mono">daedalus dash list</span>.</p>
   </div>
  </div>
- <div class="card p-4 mt-4 text-sm text-slate-500">
-  The GoLens embed is not built into this binary (the golens-metrics module is absent from this build), so this mount has no charts — the aggregates above are the daemon's own.
+ <div class="card p-4 mt-4 text-sm text-slate-500 flex items-center justify-between flex-wrap gap-3">
+  <p class="m-0">These aggregates are the daemon's own folds over the relay ledger — the same records <span class="mono">daedalus dash list</span> pages through. The embedded golens-metrics dashboard charts the same ledger, fed per append, over at <span class="mono">/full-metrics</span>.</p>
+  <a class="btn whitespace-nowrap" href="/full-metrics" hx-boost="false">Check full-metrics</a>
  </div>
 {{end}}
 
 {{define "page_new"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}
-<main class="mx-auto max-w-[86.4rem] px-4 py-6">
+<main class="mx-auto max-w-[103.7rem] px-4 py-6">
  <h1 class="text-lg font-semibold mb-4">New Task</h1>
  <div class="card p-5 max-w-2xl">
   <form hx-post="/new" hx-target="#res" hx-swap="innerHTML">

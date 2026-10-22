@@ -289,8 +289,10 @@ func TestWatchTranscriptsStopsWhenClosed(t *testing.T) {
 // TestBrokenResume pins the fresh-start classification: a plain failure is
 // worth one fresh start, while everything that says nothing about the
 // conversation — a killed round (including the ceiling kill), an exhausted
-// provider, a busy slot, a round that never launched, a cancelled or
-// expired context — keeps the round as it is.
+// provider, a busy slot, a round that never launched, a round the window
+// preflight refused (its prompt size is session-independent, so no fresh
+// start shrinks it), a cancelled or expired context — keeps the round as
+// it is.
 func TestBrokenResume(t *testing.T) {
 	cases := []struct {
 		name string
@@ -303,6 +305,7 @@ func TestBrokenResume(t *testing.T) {
 		{"api exhausted", fmt.Errorf("wrap: %w", ErrAPIExhausted), false},
 		{"slots busy", fmt.Errorf("wrap: %w", ErrAgentSlotsBusy), false},
 		{"agent never launched", fmt.Errorf("%w: exec: not found", errAgentStart), false},
+		{"window preflight refusal", fmt.Errorf("run jailed: %w: pi round refused before launch", ErrPromptOverWindow), false},
 		{"cancelled", fmt.Errorf("wrap: %w", context.Canceled), false},
 		{"deadline exceeded", context.DeadlineExceeded, false},
 	}
@@ -1785,5 +1788,204 @@ func TestCodexNewestRollout(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	if _, _, ok := CodexNewestRollout(wt); ok {
 		t.Error("CodexNewestRollout under an empty CODEX_HOME = ok, want not-ok")
+	}
+}
+
+// piFreshSuccessStubBody plays a successful pi round: the session id and
+// reply print to stdout, and the session file pi itself keeps lands in the
+// worktree's session dir (what the transcript watcher records).
+func piFreshSuccessStubBody(t *testing.T, wt, id, text string) string {
+	t.Helper()
+	dir, err := piSessionsDir(wt)
+	if err != nil {
+		t.Fatalf("piSessionsDir: %v", err)
+	}
+	return `printf '%s\n' '{"type":"session","id":"` + id + `"}' '{"type":"message_end","message":{"content":[{"type":"text","text":"` + text + `"}]}}'
+printf '%s\n' '{"type":"session"}' > '` + dir + `/20260920_000001_` + id + `.jsonl'
+exit 0`
+}
+
+// TestRunJailedClaudeActivityFreshRetryPiStartsNewSession pins the
+// api-error fresh start: a pi round retried after a provider api error
+// (FreshRetry) starts a NEW session — a workflow-provided session id for
+// the dead conversation is dropped, and the recorded-session fallback is
+// skipped too, since the conversation it would resolve is the dead one —
+// and the prompt carries the fresh-session hand-off that replaces the lost
+// context. A round that is not an api-error retry keeps today's resume
+// behavior untouched and carries no hand-off.
+func TestRunJailedClaudeActivityFreshRetryPiStartsNewSession(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		sessionID  string
+		freshRetry bool
+		plantLive  bool
+		wantResume bool
+	}{
+		{"provided session id is dropped", "sess-pi-dead", true, false, false},
+		{"recorded fallback is skipped", "", true, true, false},
+		{"non-retry round keeps resuming", "sess-pi-live", false, false, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			scrubBugFilingEnv(t)
+			fakeHome(t)
+			wt := t.TempDir()
+			log := newStubLog(t)
+			stubBin(t, "ai-jail", piFreshSuccessStubBody(t, wt, "sess-fresh", "fresh"))
+			if c.plantLive {
+				recordSession(context.Background(), wt, RoleDev, "sess-pi-old")
+				plantPiSession(t, wt, "sess-pi-old")
+			}
+
+			res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+				WorktreePath: wt,
+				Prompt:       "continue the work",
+				Role:         RoleDev,
+				Agent:        "pi",
+				SessionID:    c.sessionID,
+				FreshRetry:   c.freshRetry,
+			})
+			if err != nil {
+				t.Fatalf("RunJailedClaudeActivity: %v", err)
+			}
+			if res.Text != "fresh" {
+				t.Errorf("res.Text = %q, want %q", res.Text, "fresh")
+			}
+
+			calls := readCalls(t, log)
+			if len(calls) != 1 {
+				t.Fatalf("ai-jail called %d times, want 1", len(calls))
+			}
+			if c.wantResume {
+				if !contains(calls[0].Args, "--session") || !contains(calls[0].Args, "sess-pi-live") {
+					t.Errorf("round args %v should resume sess-pi-live via --session", calls[0].Args)
+				}
+				if strings.Contains(calls[0].Stdin, piFreshSessionHandoff) {
+					t.Error("a non-retry round's prompt carries the fresh-session hand-off")
+				}
+				return
+			}
+			if contains(calls[0].Args, "--session") || contains(calls[0].Args, "sess-pi-dead") || contains(calls[0].Args, "sess-pi-old") {
+				t.Errorf("fresh-retry args %v must start a new session, not resume the dead conversation", calls[0].Args)
+			}
+			if !strings.Contains(calls[0].Stdin, piFreshSessionHandoff) {
+				t.Errorf("fresh-retry prompt %q lacks the fresh-session hand-off", calls[0].Stdin)
+			}
+			if !strings.Contains(calls[0].Stdin, "continue the work") {
+				t.Errorf("fresh-retry prompt %q lacks the round's own prompt", calls[0].Stdin)
+			}
+		})
+	}
+}
+
+// TestRunJailedClaudeActivityFreshRetryIgnoredWithoutPi pins the other
+// half of the flag's contract: an api-error retry of a non-pi round ignores
+// FreshRetry entirely and keeps today's resume behavior — the session id
+// rides, and no hand-off is appended.
+func TestRunJailedClaudeActivityFreshRetryIgnoredWithoutPi(t *testing.T) {
+	fakeHome(t)
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"resumed","session_id":"sess-next"}'; exit 0`)
+
+	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		WorktreePath: t.TempDir(),
+		Prompt:       "retry the work",
+		Role:         RoleDev,
+		Agent:        "claude",
+		SessionID:    "sess-dead",
+		FreshRetry:   true,
+	})
+	if err != nil {
+		t.Fatalf("RunJailedClaudeActivity: %v", err)
+	}
+	if res.Text != "resumed" {
+		t.Errorf("res.Text = %q, want %q", res.Text, "resumed")
+	}
+
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("ai-jail called %d times, want 1", len(calls))
+	}
+	if !contains(calls[0].Args, "--resume") || !contains(calls[0].Args, "sess-dead") {
+		t.Errorf("claude retry args %v should resume sess-dead — FreshRetry is pi-only", calls[0].Args)
+	}
+	if strings.Contains(calls[0].Stdin, piFreshSessionHandoff) {
+		t.Error("a claude retry's prompt carries the pi fresh-session hand-off")
+	}
+}
+
+// TestRunJailedReviewerActivityFreshRetryPiStartsNewSession pins the
+// reviewer side of the api-error fresh start: a pi review retried after a
+// provider api error starts a NEW session — the dead conversation's id is
+// dropped — and, the review prompt being self-contained (focus, diff, and
+// logs ride in it), no fresh-session hand-off is appended. A non-pi
+// reviewer ignores the flag and keeps resuming.
+func TestRunJailedReviewerActivityFreshRetryPiStartsNewSession(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		agent      string
+		freshRetry bool
+		wantResume bool
+	}{
+		{"pi reviewer drops the dead session", "pi", true, false},
+		{"claude reviewer ignores the flag", "claude", true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			scrubBugFilingEnv(t)
+			fakeHome(t)
+			wt := t.TempDir()
+			log := newStubLog(t)
+			stubBin(t, "git", `if [ "$3" = "diff" ]; then printf 'M foo.go\n'; fi
+exit 0`)
+			if c.agent == "pi" {
+				// The \n stays literal here: it rides into the stub script
+				// as a JSON escape inside a one-line message_end event, and
+				// pi's parser hands back a two-line reply whose last line
+				// is the verdict.
+				stubBin(t, "ai-jail", piFreshSuccessStubBody(t, wt, "sess-rev-fresh", `Looks fine.\nAPPROVED`))
+			} else {
+				stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"Fine.\nAPPROVED","session_id":"rev-next"}'; exit 0`)
+			}
+
+			res, err := RunJailedReviewerActivity(context.Background(), ReviewInput{
+				WorktreePath: wt,
+				Focus:        "subtask 1 (add the adder)",
+				Role:         RoleDevReview,
+				Agent:        c.agent,
+				SessionID:    "sess-rev-dead",
+				FreshRetry:   c.freshRetry,
+			})
+			if err != nil {
+				t.Fatalf("RunJailedReviewerActivity: %v", err)
+			}
+			if !res.Approved {
+				t.Error("Approved = false, want true")
+			}
+
+			calls := readCalls(t, log)
+			var jail *stubCall
+			for i, call := range calls {
+				if len(call.Args) > 0 && call.Args[0] == "--worktree" {
+					jail = &calls[i]
+				}
+			}
+			if jail == nil {
+				t.Fatal("no ai-jail call recorded")
+			}
+			if c.wantResume {
+				if !contains(jail.Args, "--resume") || !contains(jail.Args, "sess-rev-dead") {
+					t.Errorf("%s review args %v should resume sess-rev-dead — FreshRetry is pi-only", c.agent, jail.Args)
+				}
+				return
+			}
+			if contains(jail.Args, "--session") || contains(jail.Args, "sess-rev-dead") {
+				t.Errorf("fresh-retry review args %v must start a new session, not resume the dead conversation", jail.Args)
+			}
+			if strings.Contains(jail.Stdin, piFreshSessionHandoff) {
+				t.Error("the self-contained review prompt carries the fresh-session hand-off")
+			}
+			if !strings.Contains(jail.Stdin, "subtask 1 (add the adder)") {
+				t.Errorf("review prompt %q lacks the focus", jail.Stdin)
+			}
+		})
 	}
 }

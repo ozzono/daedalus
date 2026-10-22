@@ -773,6 +773,63 @@ func TestRunMetricsList(t *testing.T) {
 	})
 }
 
+// TestRunMetricsListSourceColumn pins the table's SRC column: an otel-fold
+// entry names its source in the cell, a relay entry's stays blank — the
+// ordinary shape reads as no stamp, never a fabricated one — and the
+// external label rides through too.
+func TestRunMetricsListSourceColumn(t *testing.T) {
+	now := time.Now()
+	entries := []metricsrelay.Entry{
+		{At: now, Worker: "w1", Task: "task-1", Role: "dev", Round: "3", Model: "glm-4",
+			InputTokens: 10, OutputTokens: 5, DurationMS: 4200, Status: 200},
+		{At: now, Source: metricsrelay.SourceOtel, Task: "task-2", Role: "dev", Round: "4", Model: "glm-4",
+			InputTokens: 20},
+		{At: now, Source: metricsrelay.SourceOtelExternal, Task: "foreign-round", Model: "glm-4", InputTokens: 30},
+	}
+	doc, err := json.Marshal(map[string]any{"total": len(entries), "page": 1, "page_size": 50, "entries": entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(doc)
+	}))
+	t.Cleanup(srv.Close)
+	useMetricsDaemonDir(t, metricsStatusDoc{
+		PID: os.Getpid(), Updated: time.Now().UTC(),
+		RelayPort: srv.Listener.Addr().(*net.TCPAddr).Port,
+	})
+
+	out := captureStdout(t, func() {
+		if err := runMetricsList(nil); err != nil {
+			t.Errorf("runMetricsList: %v", err)
+		}
+	})
+	if !strings.Contains(out, "SRC") {
+		t.Errorf("table header lost the SRC column:\n%s", out)
+	}
+	// Rows leave the tabwriter space-aligned, so each row is pinned by
+	// its task cell: the otel row names its source, the external one
+	// rides its full label through, and the relay row's SRC stays
+	// blank — never a fabricated stamp.
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.Contains(line, "task-1"):
+			if strings.Contains(line, "otel") {
+				t.Errorf("relay row grew a source stamp: %q", line)
+			}
+		case strings.Contains(line, "task-2"):
+			if !strings.Contains(line, "otel") || strings.Contains(line, "otel-external") {
+				t.Errorf("otel row SRC = %q, want exactly otel", line)
+			}
+		case strings.Contains(line, "foreign-round"):
+			if !strings.Contains(line, "otel-external") {
+				t.Errorf("external row lost its label: %q", line)
+			}
+		}
+	}
+}
+
 // TestFlagsRejectConfigOnMetricsRecordRead pins the -c gate: the
 // record-driven dash reads work from the daemon files alone, so an
 // explicit config there is rejected rather than silently ignored — its own

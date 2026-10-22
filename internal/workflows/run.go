@@ -511,6 +511,13 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 	// round fresh rather than failing the whole run over a lost
 	// conversation.
 	freshFallback := false
+	// Latched once an api-exhausted round has been retried: from then on
+	// every attempt of this phase runs fresh (AgentRunInput.FreshRetry —
+	// pi only, other agents ignore it). The latch cannot be undone by a
+	// later failure: a fresh attempt that dies before completing records
+	// no session id back, so *session still names the dead conversation,
+	// and un-latching would send the next retry straight back into it.
+	freshRetry := false
 	for {
 		var result activities.AgentRunResult
 		err := workflow.ExecuteActivity(r.agentCtx, activities.RunJailedClaudeActivity, activities.AgentRunInput{
@@ -520,6 +527,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			SessionID:    *session,
 			Role:         role,
 			Folders:      r.input.Folders,
+			FreshRetry:   freshRetry,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.consecutiveTimeouts = 0
@@ -543,6 +551,12 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			if herr := r.heartbeat(err, stage); herr != nil {
 				return activities.AgentRunResult{}, herr
 			}
+			// The heartbeat retries the round after the quota pause; the
+			// conversation it died in is the phase-stacked overload behind
+			// the exhaustion (the live incident: a 27k-token prompt
+			// re-read to 30k on a 32k window, clamping pi to one-token
+			// replies). The retry starts fresh instead of resuming it.
+			freshRetry = true
 			continue
 		}
 		if !killed && isSlotWait(err) {
@@ -557,6 +571,18 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			}
 			r.setStatus(StatusRunning)
 			continue
+		}
+		// A round the window preflight refused never launched, and the
+		// refusal is static — the estimate is session-independent
+		// (windowPreflight's own note), so the fresh-session fallback
+		// below cannot shrink it and is not spent on it. Terminal on the
+		// sentinel ALONE, deliberately narrower than the review loop's
+		// isPromptOverflow: a provider-side overflow text on a resumed
+		// agent round is exactly the case the fresh fallback rescues (a
+		// fresh session drops the transcript projection from the wire
+		// prompt), so that wider check must not move here.
+		if !killed && strings.Contains(err.Error(), activities.ErrPromptOverWindow.Error()) {
+			return activities.AgentRunResult{}, fmt.Errorf("agent prompt cannot fit the serving model's context window (stage %q); the prompt size is static, so no retry can succeed: %w", stage, err)
 		}
 		// An abruptly killed round is as recoverable as a timed-out
 		// one — the worktree keeps whatever the agent finished before
@@ -633,6 +659,12 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 	focus, role, session := opts.focus, opts.role, opts.session
 	// Same lost-session fallback as the agent rounds: one fresh retry.
 	freshFallback := false
+	// Same api-error latch as the agent rounds (runAgent): once an
+	// exhausted review has been retried, every further attempt runs fresh
+	// (ReviewInput.FreshRetry — pi only) — a fresh attempt that dies
+	// records no session id back, so *opts.session still names the dead
+	// conversation.
+	freshRetry := false
 	for {
 		var result activities.ReviewResult
 		err := workflow.ExecuteActivity(r.reviewCtx, activities.RunJailedReviewerActivity, activities.ReviewInput{
@@ -663,6 +695,8 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 			// The worktree's starting sha — the empty-diff detector's
 			// anchor (ReviewInput.BaseHead); empty when unrecorded.
 			BaseHead: r.worktree.BaseHead,
+			// Api-error fresh start, latched by the exhaustion branch below.
+			FreshRetry: freshRetry,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.reviewTimeouts = 0
@@ -738,6 +772,10 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 			if herr := r.heartbeat(err, "review"); herr != nil {
 				return result, herr
 			}
+			// The retried review runs fresh for pi (the conversation it
+			// died in is the one the exhaustion saturated); other agents
+			// ignore the flag and keep resuming.
+			freshRetry = true
 			continue
 		}
 		if !killed && isSlotWait(err) {

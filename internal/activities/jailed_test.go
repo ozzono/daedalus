@@ -1582,3 +1582,105 @@ func TestCodexRoundAPIErrorText(t *testing.T) {
 		t.Errorf("error = %q, want the exit-0 marker classification", err)
 	}
 }
+
+// TestWindowPreflight pins the round-start gate's arithmetic and its
+// gate-off edges: no staged window (absent, unparseable, or non-positive)
+// means no arithmetic to refuse on and the gate stays closed; the boundary
+// is the biased-high chars/4 estimate against window minus the 4096-token
+// output reserve, with an estimate exactly at the budget passing and the
+// first estimate step over refused — the refusal wrapping the
+// ErrPromptOverWindow sentinel and naming the numbers the operator needs
+// (agent, estimate, window, reserve).
+func TestWindowPreflight(t *testing.T) {
+	// Estimate is ceil(len/4): a 16384-char prompt estimates 4096, a
+	// 16388-char prompt 4097.
+	const atBudget = 16384
+	const oneOver = 16388
+	for _, c := range []struct {
+		name    string
+		env     []string
+		prompt  string
+		wantErr bool
+	}{
+		{"no window staged", nil, strings.Repeat("x", oneOver), false},
+		{"unparseable window", []string{config.ContextTokensEnv + "=big"}, strings.Repeat("x", oneOver), false},
+		{"zero window", []string{config.ContextTokensEnv + "=0"}, strings.Repeat("x", oneOver), false},
+		{"negative window", []string{config.ContextTokensEnv + "=-5"}, strings.Repeat("x", oneOver), false},
+		{"estimate at the budget passes", []string{config.ContextTokensEnv + "=8192"}, strings.Repeat("x", atBudget), false},
+		{"surrounding whitespace parsed", []string{config.ContextTokensEnv + "  =  8192  "}, strings.Repeat("x", atBudget), false},
+		{"one estimate step over refused", []string{config.ContextTokensEnv + "=8192"}, strings.Repeat("x", oneOver), true},
+	} {
+		err := windowPreflight(c.prompt, c.env, "pi")
+		if got := err != nil; got != c.wantErr {
+			t.Errorf("%s: windowPreflight = %v, wantErr %v", c.name, err, c.wantErr)
+		}
+		if !c.wantErr {
+			continue
+		}
+		if !errors.Is(err, ErrPromptOverWindow) {
+			t.Errorf("%s: error does not wrap the sentinel: %v", c.name, err)
+		}
+		for _, want := range []string{
+			"pi round refused before launch",
+			"~4097 tokens",
+			"window 8192",
+			"reserve 4096",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: error %q should contain %q", c.name, err, want)
+			}
+		}
+	}
+}
+
+// TestRunJailedClaudeActivityWindowPreflightRefusesBeforeLaunch pins the
+// gate at the activity boundary: a round whose prompt cannot fit the
+// staged window is refused with ErrPromptOverWindow before ai-jail ever
+// spawns (no launch, no slot wait — the stub log stays empty), while the
+// same round with the gate off (no window staged) or with room in the
+// budget launches normally.
+func TestRunJailedClaudeActivityWindowPreflightRefusesBeforeLaunch(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		window  string
+		wantErr bool
+	}{
+		{"window one over the reserve refuses the tiny prompt", "4097", true},
+		{"no window staged, gate off", "", false},
+		{"window with room launches", "131072", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fakeHome(t)
+			log := newStubLog(t)
+			stubBin(t, "ai-jail", `printf '%s\n' '{"type":"session","id":"sess-ok"}' '{"type":"message_end","message":{"content":[{"type":"text","text":"done"}]}}'
+exit 0`)
+			t.Setenv("DAEDALUS_AGENT", "pi")
+			if c.window != "" {
+				t.Setenv(config.ContextTokensEnv, c.window)
+			}
+
+			_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+				WorktreePath: t.TempDir(),
+				Prompt:       "fix the bug",
+				Role:         RoleDev,
+			})
+			if c.wantErr {
+				if !errors.Is(err, ErrPromptOverWindow) {
+					t.Fatalf("error = %v, want ErrPromptOverWindow", err)
+				}
+				if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+					calls := readCalls(t, log)
+					t.Errorf("ai-jail called %d times, want the round refused before launch (%v)", len(calls), calls)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RunJailedClaudeActivity: %v", err)
+			}
+			calls := readCalls(t, log)
+			if len(calls) != 1 {
+				t.Fatalf("ai-jail called %d times, want 1", len(calls))
+			}
+		})
+	}
+}

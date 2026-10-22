@@ -187,6 +187,21 @@ func runWorker(cfg config.Config, workerType string) error {
 		if err := os.Setenv(config.MetricsRelayOpenAIEnv, metricsRoot); err != nil {
 			return fmt.Errorf("set %s: %w", config.MetricsRelayOpenAIEnv, err)
 		}
+		// Toggle-on otel staging: the OTLP endpoint rides its own var, one
+		// the override paths never strip — an otel-staged round dials the
+		// daemon directly and needs no relay URL, so fallback and override
+		// rounds keep telemetry coverage (see the var's config comment).
+		if cfg.Metrics.Otel {
+			if err := os.Setenv(config.MetricsOtelEndpointEnv, metricsRoot+"/v1/metrics"); err != nil {
+				return fmt.Errorf("set %s: %w", config.MetricsOtelEndpointEnv, err)
+			}
+		} else if err := os.Unsetenv(config.MetricsOtelEndpointEnv); err != nil {
+			// Symmetric with the disabled branch below: an inherited value
+			// must not survive an otel true→false flip, or the worker keeps
+			// staging otel with the toggle off (the same stale-export hazard
+			// the relay roots' unset path exists to prevent).
+			return fmt.Errorf("unset %s: %w", config.MetricsOtelEndpointEnv, err)
+		}
 		// Boot retries a name conflict instead of exiting: a restart inside
 		// the registration TTL hits the relay's refusal while the dead
 		// process's entry lingers, and the retry budget outlives that window
@@ -214,7 +229,7 @@ func runWorker(cfg config.Config, workerType string) error {
 			}
 		}()
 	} else {
-		for _, name := range []string{config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv, config.MetricsRelayTokenEnv} {
+		for _, name := range []string{config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv, config.MetricsRelayTokenEnv, config.MetricsOtelEndpointEnv} {
 			if err := os.Unsetenv(name); err != nil {
 				return fmt.Errorf("unset %s: %w", name, err)
 			}

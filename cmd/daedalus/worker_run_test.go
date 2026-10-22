@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,10 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ozzono/daedalus/internal/version"
 
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/metricsrelay"
 )
 
 // pkgSources is this package's own production source, embedded at
@@ -571,6 +574,7 @@ func TestRunWorkerExportsAreScrubbed(t *testing.T) {
 		"MetricsRelayAnthropicEnv": config.MetricsRelayAnthropicEnv,
 		"MetricsRelayOpenAIEnv":    config.MetricsRelayOpenAIEnv,
 		"MetricsRelayTokenEnv":     config.MetricsRelayTokenEnv,
+		"MetricsOtelEndpointEnv":   config.MetricsOtelEndpointEnv,
 		"ToolRelayURLEnv":          config.ToolRelayURLEnv,
 		"BugDirEnv":                config.BugDirEnv,
 		"BugMirrorEnv":             config.BugMirrorEnv,
@@ -738,5 +742,76 @@ func TestRunWorkerExportsAreScrubbed(t *testing.T) {
 	}
 	if dynamics != 2 {
 		t.Errorf("scanned package sources carry %d dynamic os.Setenv sites, want exactly the two pinned export loops (AgentEnv, RoleOverrideEnv) in %s", dynamics, dynamicFunc)
+	}
+}
+
+// TestRunWorkerOtelEndpointExport pins the toggle-on otel staging's boot
+// export seam: with metrics on and the toggle on, the OTLP endpoint rides
+// its own var, pointed at the live relay's /v1/metrics — one the override
+// paths never strip, so fallback and override rounds keep telemetry
+// coverage. With the toggle off, an inherited value is unset symmetrically
+// (the worker would otherwise keep staging otel with the toggle off — the
+// stale-export hazard the relay roots' unset path exists to prevent), and
+// metrics off whole unsets it too. runWorker is driven only to observe the
+// boot exports: all three land at the boot seam, before registration. The
+// config deliberately names no worker (no WorkerID, no task queue), so
+// registration posts an empty worker name and the relay refuses it with a
+// 400 — a non-conflict error the boot retry returns immediately, ending
+// runWorker before preflight. A constant worker name here would instead
+// make the second call collide with the first's still-live registration
+// and stall in the 409 boot-retry wedge for the retry budget.
+func TestRunWorkerOtelEndpointExport(t *testing.T) {
+	restoreProcessEnv(t,
+		config.MetricsOtelEndpointEnv,
+		config.MetricsRelayAnthropicEnv, config.MetricsRelayOpenAIEnv, config.MetricsRelayTokenEnv,
+		"OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY")
+
+	// A real relay on a real port: the boot gate probes the port and the
+	// boot registration posts to it — the exports under test sit between.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	port := lis.Addr().(*net.TCPAddr).Port
+	lis.Close()
+	relay, err := metricsrelay.Start(port, &metricsrelay.Ledger{}, metricsrelay.NewRegistry(time.Minute))
+	if err != nil {
+		t.Fatalf("start the relay: %v", err)
+	}
+	t.Cleanup(func() { relay.Close() })
+
+	// The registration names an upstream off the env's provider base URL;
+	// a dead one is fine — the relay stores it, it never dials it here.
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
+	t.Setenv("OPENAI_API_KEY", "sk-reg")
+
+	cfg := config.Config{
+		Provider: &config.ProviderConfig{Type: config.FallbackTypeOpenAI, URL: "http://127.0.0.1:1/v1", Key: "k"},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(true), RelayPort: port, Otel: true},
+	}
+	if err := runWorker(cfg, ""); err == nil {
+		t.Fatal("runWorker with no worker name should fail boot registration, got nil")
+	}
+	want := "http://127.0.0.1:" + strconv.Itoa(port) + "/v1/metrics"
+	if got := os.Getenv(config.MetricsOtelEndpointEnv); got != want {
+		t.Errorf("%s = %q, want %q", config.MetricsOtelEndpointEnv, got, want)
+	}
+
+	// The toggle off: the stale value must not survive the flip.
+	t.Setenv(config.MetricsOtelEndpointEnv, "http://stale.example/v1/metrics")
+	cfg.Metrics.Otel = false
+	if err := runWorker(cfg, ""); err == nil {
+		t.Fatal("runWorker with no worker name should fail boot registration, got nil")
+	}
+	if got := os.Getenv(config.MetricsOtelEndpointEnv); got != "" {
+		t.Errorf("%s = %q after an otel true→false flip, want it unset", config.MetricsOtelEndpointEnv, got)
+	}
+
+	// Metrics off whole: the same symmetry on the disabled branch.
+	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
+		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
+	}
+	if got := os.Getenv(config.MetricsOtelEndpointEnv); got != "" {
+		t.Errorf("%s = %q with metrics disabled, want it unset", config.MetricsOtelEndpointEnv, got)
 	}
 }

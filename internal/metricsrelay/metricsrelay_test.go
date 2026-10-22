@@ -210,6 +210,75 @@ func TestLedgerQuery(t *testing.T) {
 	}
 }
 
+// TestLedgerAppendObserver pins the append observer — the daemon's
+// golens-metrics feed hangs off it: each Append delivers its entry exactly
+// once, to an observer installed mid-stream (earlier appends stay
+// unobserved — the unset observer is the ordinary shape), a capped append
+// still delivers its own entry, and the invoke happens outside the ledger
+// lock, so an observer that reads the ledger back (Query, Len) cannot
+// deadlock against the append it belongs to.
+func TestLedgerAppendObserver(t *testing.T) {
+	t.Run("delivers each append once, outside the lock", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			l := &Ledger{}
+			var seen []Entry
+			// observe reads the ledger back on every delivery — as the
+			// golens feed's neighbors do — which must not deadlock against
+			// the append in flight; only the installed-late observer
+			// records, so the pre-install append stays unobserved.
+			observe := func(record bool) func(Entry) {
+				return func(e Entry) {
+					_, _, _ = l.Query("", 1, 10)
+					l.Len()
+					if record {
+						seen = append(seen, e)
+					}
+				}
+			}
+			l.SetOnAppend(observe(false))
+			l.Append(Entry{Task: "pre"})
+			l.SetOnAppend(observe(true))
+
+			l.Append(Entry{Task: "a"})
+			l.Append(Entry{Task: "b"})
+			if len(seen) != 2 || seen[0].Task != "a" || seen[1].Task != "b" {
+				t.Errorf("observed %d entries (%v), want a then b, once each", len(seen), seen)
+			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the observed append deadlocked — the observer ran inside the ledger lock")
+		}
+	})
+
+	t.Run("a capped append still delivers its entry", func(t *testing.T) {
+		l := &Ledger{}
+		var mu sync.Mutex
+		delivered := 0
+		var last Entry
+		l.SetOnAppend(func(e Entry) {
+			mu.Lock()
+			defer mu.Unlock()
+			delivered++
+			last = e
+		})
+		for i := 0; i < ledgerCap+1; i++ {
+			l.Append(Entry{Task: "t" + strconv.Itoa(i)})
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if delivered != ledgerCap+1 {
+			t.Errorf("delivered %d appends, want every one past the cap too", delivered)
+		}
+		if last.Task != "t"+strconv.Itoa(ledgerCap) {
+			t.Errorf("last delivered entry = %q, want the append that wrapped the ring", last.Task)
+		}
+	})
+}
+
 // TestRegistryTokenLifecycle pins the registration's secret economy, which
 // is worker-minted: the worker presents its own secret (NewToken's shape is
 // pinned here too), a live heartbeat presenting that same secret is

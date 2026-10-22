@@ -1591,6 +1591,13 @@ func TestFeatureDevWorkflowAgentKilledRecovers(t *testing.T) {
 	if !strings.Contains(inputs[1].Prompt, "killed mid-round") {
 		t.Errorf("retry prompt does not explain the abrupt cutoff: %q", inputs[1].Prompt)
 	}
+	// A kill says nothing about the conversation: no attempt of a
+	// kill-recovered phase may carry the api-error fresh-start latch.
+	for i, in := range inputs {
+		if in.FreshRetry {
+			t.Errorf("inputs[%d].FreshRetry = true, want false — kills never latch the fresh start", i)
+		}
+	}
 	env.AssertExpectations(t)
 }
 
@@ -2038,6 +2045,23 @@ func TestFeatureDevWorkflowQuotaHeartbeatRecovers(t *testing.T) {
 	if inputs[7].Prompt != inputs[2].Prompt {
 		t.Errorf("heartbeat retry changed the tests-round prompt")
 	}
+	// The api-error fresh-start latch: the first attempt runs resumed,
+	// every post-exhaustion attempt of the same phase runs fresh, and the
+	// latch is per phase — the tests round starts resumed again.
+	if inputs[0].FreshRetry {
+		t.Error("first attempt carries FreshRetry; only a retried exhaustion may latch it")
+	}
+	if !inputs[1].FreshRetry {
+		t.Error("the implement retry must run fresh (AgentRunInput.FreshRetry)")
+	}
+	if inputs[2].FreshRetry {
+		t.Error("the tests round's first attempt carries FreshRetry; the latch must not cross phases")
+	}
+	for i := 3; i <= 7; i++ {
+		if !inputs[i].FreshRetry {
+			t.Errorf("inputs[%d].FreshRetry = false, want true — every post-exhaustion attempt of the phase runs fresh", i)
+		}
+	}
 	env.AssertExpectations(t)
 }
 
@@ -2171,6 +2195,124 @@ func TestFeatureDevWorkflowWakeupInterruptsQuotaHeartbeat(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// errOverWindowStub is a round the activities' window preflight refused
+// before launch, as the workflow sees it: the ErrPromptOverWindow sentinel
+// wrapped the way runJailedRoundFolders returns it.
+var errOverWindowStub = fmt.Errorf("run jailed: %w: pi round refused before launch: initial prompt ~30000 tokens against the staged window arithmetic", activities.ErrPromptOverWindow)
+
+// TestFeatureDevWorkflowAgentWindowPreflightTerminal pins the implement
+// call site's terminal classification: a round the window preflight
+// refused never launched and its prompt size is static — session
+// independent — so the run fails naming the static size instead of
+// spending the fresh-session fallback or a quota heartbeat on it, and the
+// fresh-start latch never engages on the refusal.
+func TestFeatureDevWorkflowAgentWindowPreflightTerminal(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env, script: []agentStep{{err: errOverWindowStub}}}
+	rec.record()
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil || !strings.Contains(err.Error(), "cannot fit the serving model's context window") {
+		t.Fatalf("want the terminal window-refusal failure, got %v", err)
+	}
+	if !strings.Contains(err.Error(), `stage "implement"`) {
+		t.Errorf("error %q should name the stage", err)
+	}
+	if len(rec.inputs) != 1 {
+		t.Fatalf("agent ran %d times, want 1 (the size is static, so no retry can succeed)", len(rec.inputs))
+	}
+	if rec.inputs[0].FreshRetry {
+		t.Error("the refused round carries FreshRetry; nothing may latch on a refusal")
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowAgentKillBeatsWindowRefusalText pins the kill
+// precedence on the same classification: a killed round whose error text
+// happens to embed the preflight sentinel is a retryable death, not a
+// terminal refusal — the kill is classified first, and a kill wrap carries
+// no agent output by design.
+func TestFeatureDevWorkflowAgentKillBeatsWindowRefusalText(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	killed := fmt.Errorf("%w: %s", activities.ErrAgentKilled, activities.ErrPromptOverWindow)
+	rec := &agentRecorder{env: env, script: []agentStep{{err: killed}}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(rec.inputs) != 3 {
+		t.Fatalf("agent ran %d times, want 3 (killed round, continuation, tests round)", len(rec.inputs))
+	}
+	if rec.inputs[1].FreshRetry {
+		t.Error("the continuation carries FreshRetry; kills never latch the fresh start")
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowQuotaRetryLatchesFresh pins the latch's
+// persistence: once an exhausted round has been retried, every further
+// attempt of the phase carries the fresh-start flag — including attempts
+// after a later non-quota failure — because a fresh attempt that dies
+// records no session id back, and un-latching would send the next retry
+// straight back into the dead conversation.
+func TestFeatureDevWorkflowQuotaRetryLatchesFresh(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	// Exhausted once, then the retry is killed mid-round, then through.
+	rec := &agentRecorder{env: env, script: []agentStep{
+		{err: errQuotaStub},
+		{err: errKilledStub},
+	}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if len(rec.inputs) != 4 {
+		t.Fatalf("agent ran %d times, want 4 (exhausted, killed retry, continuation, tests round)", len(rec.inputs))
+	}
+	if rec.inputs[0].FreshRetry {
+		t.Error("the first attempt carries FreshRetry")
+	}
+	if !rec.inputs[1].FreshRetry || !rec.inputs[2].FreshRetry {
+		t.Errorf("post-exhaustion attempts carry FreshRetry = %v/%v, want true/true — the latch survives the killed retry",
+			rec.inputs[1].FreshRetry, rec.inputs[2].FreshRetry)
+	}
+	if rec.inputs[3].FreshRetry {
+		t.Error("the tests round carries FreshRetry; the latch must not cross phases")
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowReviewerQuotaHeartbeatRecovers pins the review
 // call site: an exhausted reviewer round heartbeats and retries, and the
 // verdict then flows normally.
@@ -2182,8 +2324,16 @@ func TestFeatureDevWorkflowReviewerQuotaHeartbeatRecovers(t *testing.T) {
 	rec := &agentRecorder{env: env}
 	rec.record()
 
+	var reviewInputs []activities.ReviewInput
 	var reviewCalls int
 	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.ReviewInput); ok {
+					reviewInputs = append(reviewInputs, in)
+				}
+			}
+		}).
 		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
 			reviewCalls++
 			if reviewCalls == 1 {
@@ -2204,6 +2354,17 @@ func TestFeatureDevWorkflowReviewerQuotaHeartbeatRecovers(t *testing.T) {
 	}
 	if reviewCalls != 3 {
 		t.Fatalf("review calls = %d, want 3 (exhausted code review, retry, test review)", reviewCalls)
+	}
+	// The exhausted review's retry carries the api-error fresh-start flag;
+	// the later test review is a new phase and starts resumed again.
+	if reviewInputs[0].FreshRetry {
+		t.Error("first review carries FreshRetry; only a retried exhaustion may latch it")
+	}
+	if !reviewInputs[1].FreshRetry {
+		t.Error("the review retry must run fresh (ReviewInput.FreshRetry)")
+	}
+	if reviewInputs[2].FreshRetry {
+		t.Error("the test review carries FreshRetry; the latch must not cross phases")
 	}
 	env.AssertExpectations(t)
 }
@@ -3575,6 +3736,7 @@ func TestIsPromptOverflow(t *testing.T) {
 		{"claude result marker", errors.New(`run jailed: result: {"subtype":"error_during_execution"} Prompt is too long: 250000 tokens > 200000 limit`), true},
 		{"openai wire marker", errors.New(`error: {"error":{"code":"context_length_exceeded"}}`), true},
 		{"anthropic wire marker", errors.New("invalid_request_error: prompt exceeds the maximum context length"), true},
+		{"activities window preflight refusal", fmt.Errorf("run jailed: %w: pi round refused before launch: initial prompt ~30000 tokens", activities.ErrPromptOverWindow), true},
 		{"wrapped", fmt.Errorf("review %q: %w", "the implementation", errors.New("Prompt is too long")), true},
 		{"quota exhaustion", errQuotaStub, false},
 		{"killed round", errors.New("agent killed by SIGKILL"), false},

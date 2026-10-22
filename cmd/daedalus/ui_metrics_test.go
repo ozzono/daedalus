@@ -233,7 +233,7 @@ func TestLedgerEntriesReadAscending(t *testing.T) {
 	led.Append(metricsrelay.Entry{At: t0, Worker: "w"})
 	led.Append(metricsrelay.Entry{At: t0.Add(time.Minute), Worker: "w"})
 
-	got := newUIServer(config.Config{}, led).ledgerEntries()
+	got := newUIServer(config.Config{}, led, nil).ledgerEntries()
 	if len(got) != 3 {
 		t.Fatalf("ledgerEntries = %d entries, want 3", len(got))
 	}
@@ -242,7 +242,7 @@ func TestLedgerEntriesReadAscending(t *testing.T) {
 			t.Errorf("ledgerEntries[%d].At = %v, want %v (ascending)", i, got[i].At, want)
 		}
 	}
-	if e := newUIServer(config.Config{}, nil).ledgerEntries(); e != nil {
+	if e := newUIServer(config.Config{}, nil, nil).ledgerEntries(); e != nil {
 		t.Errorf("ledgerEntries(nil ledger) = %v, want nil", e)
 	}
 }
@@ -620,12 +620,13 @@ func TestBuildFormRowsGatesTheUnknownBucket(t *testing.T) {
 	}
 }
 
-// TestBuildModelsViewChartsGateOnData pins the Models tab's assembly: the
-// token charts render once the ledger has entries (global plus one per
-// worker), the cost charts only when at least one model is priced — the
-// global one, one per worker, and one per priced model only — and the
-// empty window renders none of them.
-func TestBuildModelsViewChartsGateOnData(t *testing.T) {
+// TestBuildModelsViewAssemblesTheSurfaces pins the Models tab's assembly:
+// one fold over one ledger window feeds both tables, the price form's
+// rows, and the derived tiles — the empty window renders its no-calls
+// note with nothing else. The charts are the golens-metrics mount's
+// (/full-metrics, golens.go), fed per append from the same ledger — the
+// view carries no chart of its own to gate on data.
+func TestBuildModelsViewAssemblesTheSurfaces(t *testing.T) {
 	now := time.Now()
 	entries := []metricsrelay.Entry{
 		{At: now.Add(-2 * time.Minute), Worker: "w-a", Wire: metricsrelay.WireAnthropic, Model: "mA",
@@ -636,161 +637,34 @@ func TestBuildModelsViewChartsGateOnData(t *testing.T) {
 	}
 
 	empty := buildModelsView(now, nil, nil)
-	if empty.Window != "no relayed calls yet" || empty.TokenChart != "" || len(empty.WorkerCharts) != 0 ||
-		empty.CostChart != "" || len(empty.ModelCostCharts) != 0 || len(empty.WorkerCostCharts) != 0 || len(empty.FormRows) != 0 {
-		t.Errorf("empty view = %+v, want no charts and no form rows", empty)
+	if empty.Window != "no relayed calls yet" || len(empty.FormRows) != 0 ||
+		len(empty.ModelTable.Rows) != 0 || len(empty.WorkerTable.Rows) != 0 {
+		t.Errorf("empty view = %+v, want the no-calls window and no rows", empty)
 	}
 
-	unpriced := buildModelsView(now, entries, nil)
-	if unpriced.TokenChart == "" || !strings.Contains(string(unpriced.TokenChart), "Tokens — the whole ledger window") {
-		t.Errorf("unpriced view lost the global token chart:\n%s", unpriced.TokenChart)
+	v := buildModelsView(now, entries, map[string]modelPrice{"mA": {In: 1}})
+	if v.Window == "no relayed calls yet" || strings.HasPrefix(v.Window, "no ") {
+		t.Errorf("window = %q, want the ledger's own span", v.Window)
 	}
-	if len(unpriced.WorkerCharts) != 2 {
-		t.Errorf("worker token charts = %d, want one per worker", len(unpriced.WorkerCharts))
+	if len(v.FormRows) != 3 {
+		t.Errorf("form rows = %d, want one per ledger-known model", len(v.FormRows))
 	}
-	if unpriced.CostChart != "" || unpriced.ModelCostCharts != nil || unpriced.WorkerCostCharts != nil {
-		t.Errorf("unpriced view grew cost charts (%q, %d, %d), want none",
-			unpriced.CostChart, len(unpriced.ModelCostCharts), len(unpriced.WorkerCostCharts))
+	if v.ModelTable.Head != "Model" || len(v.ModelTable.Rows) != 3 {
+		t.Errorf("model table = %q with %d rows, want Model with 3 (mA, mB, unknown)",
+			v.ModelTable.Head, len(v.ModelTable.Rows))
 	}
-	if len(unpriced.FormRows) != 3 {
-		t.Errorf("form rows = %d, want one per ledger-known model", len(unpriced.FormRows))
+	if v.WorkerTable.Head != "Worker" || len(v.WorkerTable.Rows) != 2 {
+		t.Errorf("worker table = %q with %d rows, want Worker with 2 (w-a, w-b)",
+			v.WorkerTable.Head, len(v.WorkerTable.Rows))
 	}
-	if unpriced.ModelTable.Head != "Model" || unpriced.WorkerTable.Head != "Worker" {
-		t.Errorf("table heads = %q / %q, want Model / Worker", unpriced.ModelTable.Head, unpriced.WorkerTable.Head)
+	// The priced model's fold carries its render-time cost into the table
+	// the page renders — the one place cost shows on this tab now that the
+	// charts serve at /full-metrics.
+	if got := v.ModelTable.Rows[0]; got.Key != "mA" || !got.Priced || math.Abs(got.Cost-0.001) > 1e-12 {
+		t.Errorf("first model row = %+v, want mA priced at 0.001 (1M in at $1/1M)", got)
 	}
-
-	priced := buildModelsView(now, entries, map[string]modelPrice{"mA": {In: 1}})
-	if priced.CostChart == "" || !strings.Contains(string(priced.CostChart), "Cost — priced models only") {
-		t.Errorf("priced view lost the global cost chart:\n%s", priced.CostChart)
-	}
-	if len(priced.ModelCostCharts) != 1 || !strings.Contains(string(priced.ModelCostCharts[0].Chart), "mA — cost (priced models only)") {
-		t.Errorf("model cost charts = %+v, want one captioning the priced model only", priced.ModelCostCharts)
-	}
-	if len(priced.WorkerCostCharts) != 2 {
-		t.Errorf("worker cost charts = %d, want one per worker", len(priced.WorkerCostCharts))
-	}
-}
-
-// TestChartGridBucketsAndClamps pins the shared chart geometry: an empty
-// window has no grid, the step divides the window into 24 buckets, a
-// single instant still buckets (the step never divides by zero), and both
-// edges clamp — an entry at or past now lands in the last bucket, one
-// before the window opens in the first.
-func TestChartGridBucketsAndClamps(t *testing.T) {
-	now := time.Now()
-	if _, ok := newChartGrid(nil, now); ok {
-		t.Errorf("newChartGrid(empty) ok = true, want no grid without entries")
-	}
-
-	start := now.Add(-24 * time.Hour)
-	g, ok := newChartGrid([]metricsrelay.Entry{{At: start}}, now)
-	if !ok || g.start != start || g.now != now || g.step != time.Hour {
-		t.Errorf("grid = %+v ok=%v, want start %v, step 1h", g, ok, start)
-	}
-	if b := g.bucketOf(start); b != 0 {
-		t.Errorf("bucketOf(start) = %d, want 0", b)
-	}
-	if b := g.bucketOf(start.Add(47 * time.Hour)); b != chartBuckets-1 {
-		t.Errorf("bucketOf(past now) = %d, want the last bucket", b)
-	}
-	if b := g.bucketOf(start.Add(-time.Hour)); b != 0 {
-		t.Errorf("bucketOf(before start) = %d, want 0", b)
-	}
-
-	g2, ok := newChartGrid([]metricsrelay.Entry{{At: now}}, now)
-	if !ok || g2.step != time.Millisecond {
-		t.Errorf("instant grid step = %v, want the 1ms fallback", g2.step)
-	}
-	if b := g2.bucketOf(now); b != 0 {
-		t.Errorf("bucketOf(instant) = %d, want 0", b)
-	}
-}
-
-// TestChartSeriesBuckets pins the bucketing folds: token sums land in the
-// bucket of the entry's time, split in and out; the cost series sums the
-// render-time cost of priced models only — an unpriced model contributes
-// nothing, wherever it sits in the window.
-func TestChartSeriesBuckets(t *testing.T) {
-	now := time.Now()
-	start := now.Add(-24 * time.Hour)
-	g, _ := newChartGrid([]metricsrelay.Entry{{At: start}}, now)
-	entries := []metricsrelay.Entry{
-		{At: start, Model: "mA", InputTokens: 10, OutputTokens: 4},
-		{At: start.Add(2 * time.Hour), Model: "mB", InputTokens: 7, OutputTokens: 9},
-		{At: now, Model: "mA", InputTokens: 1},
-	}
-
-	series := bucketTokens(g, entries)
-	if len(series) != 2 || series[0].Label != "in" || series[1].Label != "out" {
-		t.Fatalf("token series = %+v, want in and out", series)
-	}
-	if series[0].Points[0] != 10 || series[0].Points[2] != 7 || series[0].Points[chartBuckets-1] != 1 {
-		t.Errorf("in points = %v, want the three entries bucketed by time", series[0].Points)
-	}
-	if series[1].Points[0] != 4 || series[1].Points[2] != 9 {
-		t.Errorf("out points = %v, want the two outputs bucketed", series[1].Points)
-	}
-
-	cost := bucketCost(g, entries, map[string]modelPrice{"mA": {In: 1}})
-	if len(cost) != 1 || cost[0].Label != "cost" {
-		t.Fatalf("cost series = %+v, want one cost line", cost)
-	}
-	if math.Abs(cost[0].Points[0]-1e-5) > 1e-12 || math.Abs(cost[0].Points[chartBuckets-1]-1e-6) > 1e-12 {
-		t.Errorf("cost points = %v, want only mA's entries priced", cost[0].Points)
-	}
-	if cost[0].Points[2] != 0 {
-		t.Errorf("cost point at mB = %v, want the unpriced model contributing nothing", cost[0].Points[2])
-	}
-}
-
-// TestBuildLineChartMarkup pins the server-built SVG: one polyline per
-// series in its validated colors, a <title> hover point per bucket naming
-// the series and its formatted value (the dashboard's tooltip idiom), the
-// legend carrying each series' last-bucket value, an aria-label on the
-// chart, every interpolated string escaped, and no NaN anywhere when a
-// series is all zero.
-func TestBuildLineChartMarkup(t *testing.T) {
-	now := time.Now()
-	g, _ := newChartGrid([]metricsrelay.Entry{{At: now}}, now)
-	in := chartSeries{Label: "in", Color: colorIn, Format: chartTokens}
-	in.Points[3] = 2500
-	in.Points[chartBuckets-1] = 1500
-	out := chartSeries{Label: "out", Color: colorOut, Format: chartTokens}
-	out.Points[3] = 700
-
-	markup := string(buildLineChart(g, "tokens", []chartSeries{in, out}))
-	if !strings.Contains(markup, `<svg viewBox="0 0 560 148" class="w-full h-auto" role="img" aria-label="tokens">`) {
-		t.Errorf("chart lost the svg shell:\n%s", markup)
-	}
-	if n := strings.Count(markup, "<polyline"); n != 2 {
-		t.Errorf("chart draws %d polylines, want one per series", n)
-	}
-	if !strings.Contains(markup, `class="stroke-[#2a78d6] dark:stroke-[#3987e5]"`) {
-		t.Errorf("chart lost the in series' color pair:\n%s", markup)
-	}
-	for _, want := range []string{"<title>", "· in 2.5k", `>out <span class="mono">0</span>`} {
-		if !strings.Contains(markup, want) {
-			t.Errorf("chart lacks %q:\n%s", want, markup)
-		}
-	}
-	if !strings.Contains(markup, `>in <span class="mono">1.5k</span>`) {
-		t.Errorf("legend lost the last-bucket value:\n%s", markup)
-	}
-
-	// A hostile caption and label cannot smuggle markup through
-	// template.HTML.
-	hostile := string(buildLineChart(g, `<script>x</script>`, []chartSeries{{Label: `<b>`, Color: colorIn, Format: chartTokens}}))
-	if strings.Contains(hostile, "<script>") || strings.Contains(hostile, "<b>") {
-		t.Errorf("chart interpolated raw markup:\n%s", hostile)
-	}
-	if !strings.Contains(hostile, "&lt;script&gt;") || !strings.Contains(hostile, "&lt;b&gt;") {
-		t.Errorf("chart lost the escaped caption/label:\n%s", hostile)
-	}
-
-	// All-zero series sit on the baseline, never at NaN.
-	zero := string(buildLineChart(g, "flat", []chartSeries{{Label: "in", Color: colorIn, Format: chartTokens}}))
-	if strings.Contains(zero, "NaN") {
-		t.Errorf("an all-zero series rendered NaN:\n%s", zero)
+	if v.Tiles.TokensPerRun == "—" {
+		t.Errorf("tiles = %+v, want the keyed run's denominator", v.Tiles)
 	}
 }
 
@@ -825,7 +699,7 @@ func TestRunLedgerCostRowsAndDashes(t *testing.T) {
 	led.Append(metricsrelay.Entry{At: base.Add(4 * time.Minute), Worker: "w", Task: "listq-other",
 		Model: "mA", InputTokens: 9_000_000, Status: 200})
 
-	s := newUIServer(config.Config{}, led)
+	s := newUIServer(config.Config{}, led, nil)
 	if rows, total := s.runLedgerCost(wid); rows != nil || total != "—" {
 		t.Errorf("runLedgerCost(unpriced) = (%v, %q), want the dash", rows, total)
 	}
@@ -943,14 +817,18 @@ func TestUIModelsTab(t *testing.T) {
 			`disabled value="" title="failed calls carry no model name`,
 			"Usage by model", "Usage by worker",
 			`>1.00M</td>`, `>2.00M</td>`,
-			`<svg viewBox="0 0 560 148"`, "Tokens — the whole ledger window", "w-a — tokens",
+			// The charts serve at the golens-metrics mount now; the tab's
+			// coverage card is where the tab points at them.
+			`href="/full-metrics"`,
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the models page lacks %q:\n%s", want, out)
 			}
 		}
-		if strings.Contains(out, "Cost — priced models only") {
-			t.Errorf("the page grew a cost chart with no prices saved:\n%s", out)
+		for _, banned := range []string{"Tokens — the whole ledger window", "Cost — priced models only"} {
+			if strings.Contains(out, banned) {
+				t.Errorf("the page still renders the removed server-built chart %q:\n%s", banned, out)
+			}
 		}
 	})
 
@@ -969,9 +847,9 @@ func TestUIModelsTab(t *testing.T) {
 		out := h.get(t, "/models")
 		for _, want := range []string{
 			`name="in[mA]" value="3"`, `name="out[mA]" value="2"`, `name="cached[mA]" value="1.5"`,
-			// 1M in at $3 + 2M out at $2 = $7.
+			// 1M in at $3 + 2M out at $2 = $7 — the usage table's cost cell,
+			// the tab's one priced face since the charts moved to the mount.
 			`$7.0000`,
-			"Cost — priced models only",
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the repriced page lacks %q:\n%s", want, out)
@@ -1146,4 +1024,184 @@ func TestUIRunDetailLedgerCost(t *testing.T) {
 			t.Errorf("the anchored run id did not match its scrubbed Task:\n%s", out)
 		}
 	})
+}
+
+// TestLedgerEntriesDropsExternalOtel pins the main dashboard's ledger face
+// (D6): external otel batches — any other exporter on the host — never
+// enter a main-dashboard fold; they render only on the golens-served
+// full-metrics page. Relay rows and daedalus otel rows both stay.
+func TestLedgerEntriesDropsExternalOtel(t *testing.T) {
+	useDaemonDir(t)
+	led := &metricsrelay.Ledger{}
+	t0 := time.Now().Add(-time.Hour)
+	led.Append(metricsrelay.Entry{At: t0, Worker: "w"})
+	led.Append(metricsrelay.Entry{At: t0.Add(time.Minute), Source: metricsrelay.SourceOtelExternal, Task: "foreign", InputTokens: 5})
+	led.Append(metricsrelay.Entry{At: t0.Add(2 * time.Minute), Source: metricsrelay.SourceOtel, Task: "t1", InputTokens: 7})
+
+	got := newUIServer(config.Config{}, led, nil).ledgerEntries()
+	if len(got) != 2 {
+		t.Fatalf("ledgerEntries = %d entries, want the external batch dropped", len(got))
+	}
+	if got[0].Worker != "w" || got[1].Source != metricsrelay.SourceOtel {
+		t.Errorf("ledgerEntries = %+v, want the relay row then the daedalus otel row, ascending", got)
+	}
+}
+
+// TestFoldUsageSplitsOtelEraRows pins the fold's era split: a relay row
+// and an otel row of the same model stay separate rows — pre-toggle relay
+// history sits beside post-toggle otel data, never summed — the otel row
+// stamps Src so the template renders the otel- prefix and its em-dash
+// set, same-key-same-calls ties order relay before otel, and the worker
+// fold drops otel entries whole (they carry no worker to fold under).
+func TestFoldUsageSplitsOtelEraRows(t *testing.T) {
+	now := time.Now()
+	entries := []metricsrelay.Entry{
+		{At: now.Add(-time.Hour), Worker: "w-a", Wire: metricsrelay.WireOpenAI, Model: "mA",
+			InputTokens: 100, OutputTokens: 50, DurationMS: 1000, Status: 200},
+		{At: now.Add(-time.Minute), Source: metricsrelay.SourceOtel, Task: "t1", Role: "dev", Round: "1",
+			Model: "mA", InputTokens: 200, OutputTokens: 100},
+	}
+	rows := foldUsage(entries, now, nil, usageModelKey)
+	if len(rows) != 2 {
+		t.Fatalf("model fold = %d rows, want the eras separate", len(rows))
+	}
+	relay, otel := rows[0], rows[1]
+	if relay.Key != "mA" || relay.Src != "" || relay.Calls != 1 || relay.In != 100 {
+		t.Errorf("relay row = %+v, want mA's relay era unstamped", relay)
+	}
+	if otel.Key != "mA" || otel.Src != metricsrelay.SourceOtel || otel.Calls != 1 || otel.In != 200 {
+		t.Errorf("otel row = %+v, want mA's otel era stamped and separate", otel)
+	}
+
+	// Same key, same calls: the relay row precedes its otel twin so the
+	// order is stable across renders despite the map walk.
+	tie := []metricsrelay.Entry{
+		{At: now.Add(-time.Hour), Source: metricsrelay.SourceOtel, Task: "t1", Model: "mB", InputTokens: 1},
+		{At: now.Add(-time.Minute), Worker: "w", Model: "mB", InputTokens: 2},
+	}
+	rows = foldUsage(tie, now, nil, usageModelKey)
+	if len(rows) != 2 || rows[0].Src != "" || rows[1].Src != metricsrelay.SourceOtel {
+		t.Errorf("tied rows = %+v, want the relay row before its otel twin", rows)
+	}
+
+	// The worker fold has no otel row to show: otel usage carries no
+	// worker attribution, and pooling it under a nameless key would read
+	// as a literal "otel-" worker.
+	wrows := foldUsage(entries, now, nil, usageWorkerKey)
+	if len(wrows) != 1 || wrows[0].Key != "w-a" {
+		t.Errorf("worker fold = %+v, want only the relay worker", wrows)
+	}
+}
+
+// TestFoldLoopsDriftAndTotalsIgnoreOtel pins the tiles' relay-only faces:
+// an otel batch's stamps are export-batch arrivals, not round-end proxies,
+// so the loop, drift, and relay-totals folds skip otel entries whole — a
+// multi-batch toggle-on round would otherwise read the loop through the
+// export interval and invert the drift tile's sign.
+func TestFoldLoopsDriftAndTotalsIgnoreOtel(t *testing.T) {
+	base := time.Now().Truncate(time.Second)
+	at := func(min int) time.Time { return base.Add(time.Duration(min) * time.Minute) }
+	dev := string(activities.RoleDev)
+
+	entries := []metricsrelay.Entry{
+		// The relay face: one dev loop of 10 minutes, one drift group of +100.
+		{At: at(0), Worker: "w", Task: "t1", Role: dev, Round: "1", InputTokens: 100, Status: 200},
+		{At: at(10), Worker: "w", Task: "t1", Role: string(activities.RoleDevReview), Round: "1", Status: 200},
+		{At: at(11), Worker: "w", Task: "t1", Role: dev, Round: "1", InputTokens: 200, Status: 200},
+		// The otel noise the folds must ignore: a 1-minute "loop" that
+		// would drag the average down, and a shrinking "round" that would
+		// invert the drift.
+		{At: at(0), Source: metricsrelay.SourceOtel, Task: "t1", Role: dev, Round: "1", InputTokens: 5000},
+		{At: at(1), Source: metricsrelay.SourceOtel, Task: "t1", Role: string(activities.RoleDevReview), Round: "1"},
+		{At: at(2), Source: metricsrelay.SourceOtel, Task: "t9", Role: dev, Round: "1", InputTokens: 1},
+		{At: at(3), Source: metricsrelay.SourceOtel, Task: "t9", Role: dev, Round: "1", InputTokens: 0},
+	}
+
+	st := foldLoops(entries)
+	if st.DevRuns != 1 || st.DevAvg != 10*time.Minute {
+		t.Errorf("dev loop = (%v over %d runs), want the relay's 10m alone", st.DevAvg, st.DevRuns)
+	}
+	avg, groups := foldDrift(entries)
+	if groups != 1 || avg != 100 {
+		t.Errorf("drift = (%d over %d groups), want the relay group's +100 alone", avg, groups)
+	}
+
+	totals := foldRelayTotals(entries, base)
+	if totals.Calls != 3 {
+		t.Errorf("relay totals = %d calls, want the relay entries only", totals.Calls)
+	}
+}
+
+// TestBuildTilesSplitDenominators pins the headline tiles' source split:
+// TokensPerRun is all-source — both its numerator and its distinct-task
+// denominator count otel rounds once, so the populations agree — while
+// TokensPerWorker reads the relay face on both sides, its denominator
+// (the worker fold) carrying no otel row to divide by.
+func TestBuildTilesSplitDenominators(t *testing.T) {
+	base := time.Now()
+	entries := []metricsrelay.Entry{
+		{At: base, Worker: "w-a", Task: "t1", InputTokens: 60, OutputTokens: 40},
+		{At: base, Source: metricsrelay.SourceOtel, Task: "t2", InputTokens: 300, OutputTokens: 100},
+	}
+	workers := foldUsage(entries, base, nil, usageWorkerKey)
+	tiles := buildTiles(entries, workers)
+	if tiles.TokensPerRun != "250" {
+		t.Errorf("TokensPerRun = %q, want 250 (500 over both tasks)", tiles.TokensPerRun)
+	}
+	if tiles.TokensPerWorker != "100" {
+		t.Errorf("TokensPerWorker = %q, want 100 (the relay face over its one worker)", tiles.TokensPerWorker)
+	}
+}
+
+// TestBuildFormRowsPoolsEraRows pins the price form's era pooling: a model
+// folded into two era rows pools into one form row — the form edits rates,
+// and rates have no era — with the calls summed and Last the newer era's.
+func TestBuildFormRowsPoolsEraRows(t *testing.T) {
+	now := time.Now()
+	modelRows := []metricsUsageRow{
+		{Key: "mA", Src: "", Calls: 3, Last: "3m ago", last: now.Add(-3 * time.Minute)},
+		{Key: "mA", Src: metricsrelay.SourceOtel, Calls: 2, Last: "1m ago", last: now.Add(-time.Minute)},
+	}
+	rows := buildFormRows(modelRows, map[string]modelPrice{"mA": {In: 3, Out: 2, Cached: 1}})
+	if len(rows) != 1 {
+		t.Fatalf("form rows = %d, want the eras pooled into one", len(rows))
+	}
+	row := rows[0]
+	if row.Model != "mA" || row.Calls != 5 || row.Last != "1m ago" {
+		t.Errorf("pooled row = %+v, want 5 calls and the newer era's Last", row)
+	}
+	if row.In != "3" || row.Out != "2" || row.Cached != "1" {
+		t.Errorf("pooled row rates = %+v, want the model's saved rates once", row)
+	}
+}
+
+// TestUIUsageTableRendersTheOtelEra pins the usage table's era render
+// (D1): an otel row shows the otel- key prefix and the em-dash set on the
+// per-request columns — an export batch carries no status, latency, or
+// cache-ratio signal to show — while the relay row beside it renders its
+// real figures, and a same-key tie orders relay before otel.
+func TestUIUsageTableRendersTheOtelEra(t *testing.T) {
+	h := newUIHarness(t)
+	now := time.Now()
+	h.led.Append(metricsrelay.Entry{At: now.Add(-time.Hour), Worker: "w", Wire: metricsrelay.WireAnthropic, Model: "mA",
+		InputTokens: 1000, OutputTokens: 2000, CacheReadTokens: 500, DurationMS: 1000, Status: 200})
+	h.led.Append(metricsrelay.Entry{At: now.Add(-time.Minute), Source: metricsrelay.SourceOtel, Task: "t1", Role: "dev", Round: "1",
+		Model: "mA", InputTokens: 300, OutputTokens: 100})
+
+	out := h.get(t, "/models")
+	relayAt, otelAt := strings.Index(out, `>mA</td>`), strings.Index(out, `>otel-mA</td>`)
+	if relayAt < 0 || otelAt < 0 {
+		t.Fatalf("usage table lacks the era rows (relay@%d otel@%d):\n%s", relayAt, otelAt, out)
+	}
+	if relayAt > otelAt {
+		t.Errorf("the otel row rendered before its relay twin:\n%s", out)
+	}
+	if !strings.Contains(out, ">33.3%<") {
+		t.Errorf("the relay row lost its cache-hit ratio (500 reads over 1500 anthropic denominator):\n%s", out)
+	}
+	// The otel row's per-request columns are dashes, not the zeros an
+	// export batch would fabricate.
+	if n := strings.Count(out, `<td class="mono">—</td>`); n < 4 {
+		t.Errorf("the otel row rendered %d dash cells, want the ratio and latency set:\n%s", n, out)
+	}
 }
