@@ -728,6 +728,88 @@ func buildModelsView(now time.Time, entries []metricsrelay.Entry, prices map[str
 	return v
 }
 
+// uiPricePreview is the what-if modal's payload: the whole ledger window's
+// token totals and the current total cost at the saved snapshot, plus —
+// when a model name was submitted — that name's block. Every money figure
+// arrives preformatted; a missing price renders the dash, never zero.
+type uiPricePreview struct {
+	Window                string
+	Calls                 int64
+	In, Out               int64
+	CacheRead, CacheWrite int64
+	Current               string
+	WhatIf                *uiPriceWhatIf
+}
+
+// uiPriceWhatIf is the named model's block: its saved rates and the whole
+// window repriced at them. Note carries the no-saved-rates face — the
+// fields above it render the dash then.
+type uiPriceWhatIf struct {
+	Name            string
+	In, Out, Cached string
+	Total           string
+	Delta           string
+	Note            string
+}
+
+// buildPricePreview folds the ledger window for the what-if modal: the
+// token totals, the current total cost (priced entries only — a window
+// nothing prices renders the dash, never zero), and, when a name is given,
+// the whole window repriced at that one model's saved rates through the
+// same entryCost the tables price with. Nothing here writes — the preview
+// is stateless, storage still happens only at the form's save.
+func buildPricePreview(now time.Time, entries []metricsrelay.Entry, prices map[string]modelPrice, name string) uiPricePreview {
+	v := uiPricePreview{Window: ledgerWindow(entries, now)}
+	rates, named := prices[name] // zero rates, false when the name is empty or unknown
+	var cur, whatIf float64
+	priced := false
+	for _, e := range entries {
+		v.Calls++
+		v.In += e.InputTokens
+		v.Out += e.OutputTokens
+		v.CacheRead += e.CacheReadTokens
+		v.CacheWrite += e.CacheWriteTokens
+		if p, ok := prices[e.Model]; ok {
+			priced = true
+			cur += entryCost(e, p)
+		}
+		if named {
+			whatIf += entryCost(e, rates)
+		}
+	}
+	v.Current = "—"
+	if priced {
+		v.Current = fmtUSD(cur)
+	}
+	if name != "" {
+		w := &uiPriceWhatIf{Name: name, In: "—", Out: "—", Cached: "—", Total: "—", Delta: "—"}
+		if named {
+			w.In, w.Out, w.Cached = formatRate(rates.In), formatRate(rates.Out), formatRate(rates.Cached)
+			w.Total = fmtUSD(whatIf)
+			if priced {
+				w.Delta = fmtUSD(whatIf - cur)
+				if whatIf < cur {
+					w.Delta = "-" + fmtUSD(cur-whatIf)
+				}
+			}
+		} else {
+			w.Note = "no saved rates for " + name
+		}
+		v.WhatIf = w
+	}
+	return v
+}
+
+// previewModels serves the what-if modal's fragment (query param model,
+// empty allowed): the window's baseline plus the named what-if, nothing
+// persisted — no file write, no snapshot swap, no server state. Plain
+// render, not renderFrag: the modal is fetched on demand, never polled,
+// and a 204 would leave a reopened modal unserved.
+func (s *uiServer) previewModels(w http.ResponseWriter, req *http.Request) {
+	v := buildPricePreview(time.Now(), s.ledgerEntries(), s.currentPrices(), strings.TrimSpace(req.URL.Query().Get("model")))
+	s.render(w, http.StatusOK, "frag_preview", v)
+}
+
 // uiRunModelCost is one model's row in the run-detail cost section.
 type uiRunModelCost struct {
 	Model string

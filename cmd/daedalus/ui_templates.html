@@ -269,6 +269,17 @@ if(!window.__ddWired){
   var pre=t.querySelector('pre');
   if(pre)pre.scrollTop=ddScroll;
  });
+ /* the Models tab's what-if modal: every fetch into #preview-body opens
+    the dialog, so the shell is up at once and the fold fills it — and a
+    re-submit inside the modal (same target) lands harmlessly, since
+    showModal throws on an already-open dialog. */
+ document.body.addEventListener('htmx:beforeRequest',function(ev){
+  var t=ev.detail.target;
+  if(t&&t.id==='preview-body'){
+   var d=document.getElementById('preview-dlg');
+   if(d&&!d.open)d.showModal();
+  }
+ });
 }
 /* the runs filters re-render the rows immediately (the poll region's
    change trigger) and sync the location so a filtered view survives a
@@ -594,7 +605,10 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 <main class="mx-auto max-w-[103.7rem] px-4 py-6">
  <div class="flex items-end justify-between flex-wrap gap-3 mb-4">
   <h1 class="text-lg font-semibold">Models</h1>
-  <span class="text-xs text-slate-500">{{.V.Window}}</span>
+  <div class="flex items-center gap-3">
+   <span class="text-xs text-slate-500">{{.V.Window}}</span>
+   <button class="btn" hx-get="/models/preview" hx-target="#preview-body" hx-swap="innerHTML">What-if preview</button>
+  </div>
  </div>
 
  {{if .V.FormRows}}
@@ -634,6 +648,17 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  <div hx-get="/models/body" hx-trigger="every 5s [!document.hidden]" hx-swap="innerHTML">
 {{template "frag_models" .V}}
  </div>
+
+ {{/* the what-if modal: native <dialog>, kept outside the polled region like the price form — a poll may never clobber an open modal. The first fetch into #preview-body opens it (the document-level htmx listener in the foot script); re-submitting the name inside refetches the fragment. Nothing it shows is ever stored. */}}
+ <dialog id="preview-dlg" class="card backdrop:bg-slate-950/70 w-[min(34rem,92vw)]">
+  <div class="p-5">
+   <div class="flex items-center justify-between gap-3 mb-3">
+    <div class="font-medium">What-if cost preview</div>
+    <form method="dialog" hx-boost="false"><button class="btn !px-2 !py-1" aria-label="close preview">✕</button></form>
+   </div>
+   <div id="preview-body"><p class="text-sm text-slate-500">Loading…</p></div>
+  </div>
+ </dialog>
 </main>
 {{template "foot"}}
 {{end}}
@@ -656,6 +681,40 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  <div class="card p-4 text-sm text-slate-500">
   Coverage: only relay-served rounds appear — unkeyed rounds attribute at worker level only, and a round dialing its CLI-default upstream bypasses the relay entirely. Loop averages span to the first review only and include non-provider time. Per-round rows: <span class="mono">daedalus dash list</span>. Charts: <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>.
  </div>
+{{end}}
+
+{{define "frag_preview"}}{{/* the what-if modal's body: the name form plus the read-only fold. No hx-trigger anywhere — the modal never joins the poll rotation. Money figures arrive preformatted; the dash is the no-signal face. */}}
+ <form hx-get="/models/preview" hx-target="#preview-body" hx-swap="innerHTML" class="flex gap-2 mb-4">
+  <input name="model" value="{{if .WhatIf}}{{.WhatIf.Name}}{{end}}" class="inp mono" placeholder="model name (optional)" autofocus>
+  <button type="submit" class="btn-p whitespace-nowrap">Recalculate</button>
+ </form>
+ <div class="text-xs text-slate-500 mb-2">{{.Window}}</div>
+ <table class="w-full text-sm">
+  <tbody>
+   <tr><td class="py-1 text-slate-500">Calls</td><td class="mono text-right">{{.Calls}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Tokens in</td><td class="mono text-right">{{tok .In}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Tokens out</td><td class="mono text-right">{{tok .Out}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Cache reads</td><td class="mono text-right">{{tok .CacheRead}}</td></tr>
+   <tr><td class="py-1 text-slate-500">Cache writes</td><td class="mono text-right">{{tok .CacheWrite}}</td></tr>
+   <tr class="border-t border-slate-200 dark:border-slate-800"><td class="py-1 font-medium">Current total (saved rates)</td><td class="mono text-right">{{.Current}}</td></tr>
+  </tbody>
+ </table>
+ {{if .WhatIf}}
+ <div class="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800">
+  <div class="mb-1 font-medium">What-if: whole window at <span class="mono">{{.WhatIf.Name}}</span>'s rates</div>
+  <table class="w-full text-sm">
+   <tbody>
+    <tr><td class="py-1 text-slate-500">In $/1M</td><td class="mono text-right">{{.WhatIf.In}}</td></tr>
+    <tr><td class="py-1 text-slate-500">Out $/1M</td><td class="mono text-right">{{.WhatIf.Out}}</td></tr>
+    <tr><td class="py-1 text-slate-500">Cached $/1M</td><td class="mono text-right">{{.WhatIf.Cached}}</td></tr>
+    <tr class="border-t border-slate-200 dark:border-slate-800"><td class="py-1 font-medium">What-if total</td><td class="mono text-right">{{.WhatIf.Total}}</td></tr>
+    <tr><td class="py-1 text-slate-500">Δ vs current</td><td class="mono text-right">{{.WhatIf.Delta}}</td></tr>
+   </tbody>
+  </table>
+  {{if .WhatIf.Note}}<p class="text-xs text-amber-700 dark:text-amber-400 mt-2">{{.WhatIf.Note}}</p>{{end}}
+ </div>
+ {{end}}
+ <p class="text-xs text-slate-500 mt-3">Preview only — nothing is stored. Storage still happens only when Save rates is hit.</p>
 {{end}}
 
 {{define "page_metrics"}}{{template "head" .Chrome.Title}}{{template "header" .Chrome}}

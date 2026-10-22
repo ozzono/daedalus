@@ -214,11 +214,14 @@ func (s *uiServer) routes() http.Handler {
 	mux.HandleFunc("GET /new/agents", s.fragAgents)
 	mux.HandleFunc("POST /new", s.submitNew)
 	// The Models tab: the price form (GET), its upsert-only save
-	// (POST, a redirect back to the form), and the polled body fragment
+	// (POST, a redirect back to the form), the polled body fragment
 	// the header countdown re-fetches — the read-only surfaces below the
-	// form (a poll may never swap the form's editable inputs).
+	// form (a poll may never swap the form's editable inputs) — and the
+	// what-if preview fragment the modal fetches on demand (read-only,
+	// nothing persisted; the save above stays the only write).
 	mux.HandleFunc("GET /models", s.pageModels)
 	mux.HandleFunc("GET /models/body", s.fragModels)
+	mux.HandleFunc("GET /models/preview", s.previewModels)
 	mux.HandleFunc("POST /models", s.saveModels)
 	// /metrics and its polled body are the daemon's own aggregates view;
 	// the trailing-slash face renders the same page. Everything else under
