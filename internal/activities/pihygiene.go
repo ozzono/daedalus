@@ -39,6 +39,19 @@ const piEditSteer = "EDIT LOOP: your recent `edit` calls failed because `oldText
 // delivered on every round so it is in-context when an edit is attempted.
 const piEditGuardrail = "\n\nEDIT DISCIPLINE: before any `edit` tool call, `read` the target file in this round first. If an edit fails, `read` the file again before retrying — never retry an edit with the same `oldText` that already failed."
 
+// piFreshSessionHandoff is appended to a pi round's prompt when an
+// api-error retry starts a fresh session (AgentRunInput.FreshRetry): the
+// retried phase's prompt was written for a conversation that already
+// carried the run's earlier phases (the plan, prior sub-tasks, prior
+// replies), and that conversation is deliberately not resumed — its
+// accumulated projection is the overload the retry must escape. The
+// worktree is the lost attempt's surviving state, so the hand-off points
+// the fresh session at it — the same framing the continue template gives
+// a fresh takeover — instead of leaving the phase prompt's in-conversation
+// assumptions standing or inviting a re-derivation of what the worktree
+// already holds.
+const piFreshSessionHandoff = "\n\nFRESH SESSION HANDOFF: this round runs in a new conversation — the previous conversation was lost to a provider error mid-round, and nothing it carried (the plan, earlier phases, prior replies) rides here. The worktree holds that attempt's work: inspect it first (`git log`, `git diff`, the changed files), then build on it — keep what is sound, fix or discard what is not. Do not redo from scratch what the worktree shows was already done."
+
 // piSessionHealth is what a session-file scan found. embeddedToolJSON marks
 // the self-reinforcing degenerate pattern (assistant text embedding
 // tool-call JSON) — poison worth dropping the whole session over. editLoop

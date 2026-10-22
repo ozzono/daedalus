@@ -58,6 +58,17 @@ type AgentRunInput struct {
 	// rounds carry no grants by design: grants serve the working agent's
 	// task (bookkeeping), not the review.
 	Folders []string
+	// FreshRetry marks the retry after a round died on a provider api error
+	// (the workflow's quota-heartbeat retry): the attempt being retried ran
+	// inside this role's conversation, whose accumulated projection is the
+	// overload the retry must not re-enter. A pi round answers it by
+	// starting a NEW session — no resume, and the recorded-session fallback
+	// below is skipped too, since the conversation it would resolve is the
+	// dead one — seeded by the round prompt plus piFreshSessionHandoff.
+	// Every other agent ignores the flag and keeps today's resume behavior,
+	// and a round that did not die exhausted never sets it, so healthy
+	// phase continues keep resuming as before.
+	FreshRetry bool
 }
 
 // AgentRunResult carries the agent's visible text and chain of thought into
@@ -166,6 +177,13 @@ type ReviewInput struct {
 	// on an old worker — disables the detector: degrade to the ordinary
 	// review, never a false halt.
 	BaseHead string
+	// FreshRetry marks the retry after a review round died on a provider
+	// api error (the workflow's quota-heartbeat retry): same semantics as
+	// AgentRunInput.FreshRetry. A pi reviewer round starts a NEW session —
+	// the review prompt is self-contained (focus, diff, and logs ride in
+	// it), so no hand-off seed is needed; the fresh session re-derives the
+	// review from the prompt. Every other agent ignores the flag.
+	FreshRetry bool
 }
 
 // ReviewResult is a reviewer verdict. Comments holds everything the reviewer
@@ -262,7 +280,21 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 	// restarting from zero.
 	_, canResume := agentResumeFlag(agent)
 	resume := input.SessionID
-	if resume == "" && canResume {
+	fresh := false
+	// An api-error retry of a pi round starts a NEW session: the attempt
+	// being retried died on a provider api error inside this role's
+	// conversation, whose phase-stacked projection is the very overload the
+	// retry must escape (prompt grown past the window's safe band — clamped
+	// one-token replies, re-delivered tool calls, host memory pressure).
+	// The recorded-session fallback below would resolve exactly that dead
+	// conversation, so the fresh branch takes precedence over it. Non-pi
+	// agents and non-retry rounds keep today's resume behavior untouched.
+	if input.FreshRetry && agent == "pi" {
+		resume = ""
+		fresh = true
+		activityLogger(ctx).Info("api-error retry: starting a fresh pi session instead of resuming",
+			"Role", string(input.Role))
+	} else if resume == "" && canResume {
 		logger := activityLogger(ctx)
 		id, stale := recordedAgentSession(ctx, agent, input.WorktreePath, input.Role)
 		if stale {
@@ -316,6 +348,13 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 		if resume == "" || !canResume {
 			prompt += foldersNote
 		}
+	}
+	// The fresh session's seed is the phase prompt plus the hand-off that
+	// replaces the conversation the prompt assumed (AgentRunInput.FreshRetry
+	// for the why). Reviewer rounds take no seed: their prompt is
+	// self-contained.
+	if fresh {
+		prompt += piFreshSessionHandoff
 	}
 	if steer {
 		prompt = piEditSteer + "\n\n" + prompt
@@ -478,7 +517,16 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	// from zero and never deliver a verdict.
 	_, canResume := agentResumeFlag(agent)
 	resume := input.SessionID
-	if resume == "" && canResume && !input.FreshReview {
+	// Same api-error fresh-start as the agent rounds, pi only (see
+	// AgentRunInput.FreshRetry): the retried review must not re-enter the
+	// conversation the exhausted attempt died in. The review prompt is
+	// self-contained, so the fresh session needs no hand-off seed. Non-pi
+	// agents and non-retry rounds keep today's resume behavior untouched.
+	if input.FreshRetry && agent == "pi" {
+		resume = ""
+		activityLogger(ctx).Info("api-error retry: starting a fresh pi reviewer session instead of resuming",
+			"Role", string(input.Role))
+	} else if resume == "" && canResume && !input.FreshReview {
 		logger := activityLogger(ctx)
 		id, stale := recordedAgentSession(ctx, agent, input.WorktreePath, input.Role)
 		if stale {

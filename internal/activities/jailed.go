@@ -23,6 +23,7 @@ import (
 	"go.temporal.io/sdk/log"
 
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/shrink"
 )
 
 // jailResult captures the jailed process's output streams separately: the
@@ -624,6 +625,58 @@ func runJailedKindFolders(ctx context.Context, role SessionRole, agent, worktree
 	return res, err
 }
 
+// windowPreflightReserve is the output headroom the round-start window
+// preflight (windowPreflight) reserves out of the staged context window:
+// the same 4096-token safety reserve the jailed agent's own max_tokens
+// clamp uses — request max_tokens = window − prompt estimate − 4096,
+// floored at 1 (pi-ai simple-options.js clampMaxTokensToContext; see
+// config's ContextTokens sizing caveat, which documents the same
+// arithmetic). A prompt above window − reserve starts the round inside
+// that clamp's floor band.
+const windowPreflightReserve = 4096
+
+// ErrPromptOverWindow marks a jailed round refused before launch because
+// its initial prompt cannot fit the staged context window with working
+// output headroom (windowPreflight). The size is static — the same prompt
+// is re-sent by every retry — so the workflow classifies it terminal (the
+// prompt-overflow marker list carries this error's text) instead of
+// spending its fresh-session fallback or quota heartbeats on it.
+var ErrPromptOverWindow = errors.New("initial prompt exceeds the staged context window")
+
+// windowPreflight is the round-start half of the budget preflight: refuse a
+// round whose initial prompt cannot fit the staged context window minus the
+// output reserve, before launch and before a concurrency slot is queued —
+// a round that starts past the clamp's floor can only produce degenerate
+// one-token replies (finish_reason=length), loop on re-delivered tool
+// calls, and press the model host's memory, and no retry can shrink a
+// static prompt. The estimate is shrink.Estimate — the biased-high
+// chars/4 estimator class the served models' own prompt sizing uses — so
+// the gate cannot under-count against the arithmetic that governs the wire
+// budget. Gated on a configured window: the round env's ContextTokensEnv
+// (read after the role overrides, so reviewer/dev sections' own windows
+// are honored — the exact value every provider staging consumes); no
+// staged window, no arithmetic to refuse on, gate off. Refusal, not trim:
+// a round prompt is workflow-composed phase instructions — trimming it
+// would corrupt the phase — and dieting task text is the submit half of
+// the preflight (the slim flow's max_input_tokens gate).
+// ponytail: the estimate covers only the prompt daedalus sends; a resumed
+// session's transcript projection is invisible here by design — the
+// api-error retry's fresh pi session (AgentRunInput.FreshRetry) is that
+// bloat's fix, not this estimate.
+func windowPreflight(prompt string, env []string, selected string) error {
+	window, err := strconv.Atoi(strings.TrimSpace(envLookup(env, config.ContextTokensEnv)))
+	if err != nil || window <= 0 {
+		return nil
+	}
+	estimate := shrink.Estimate(prompt)
+	budget := window - windowPreflightReserve
+	if estimate <= budget {
+		return nil
+	}
+	return fmt.Errorf("%w: %s round refused before launch: initial prompt ~%d tokens against the staged window arithmetic window %d - reserve %d = %d — shrink the prompt (the slim flow's max_input_tokens gates task text at submit) or raise the serving section's context_tokens",
+		ErrPromptOverWindow, selected, estimate, window, windowPreflightReserve, budget)
+}
+
 // runJailedRound is runJailedKind's single invocation against one provider's
 // environment. A tracked round (non-empty role) also snapshots the CLI's
 // transcript dir before spawn and records any transcript the round's
@@ -678,6 +731,15 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// (which re-enters with the original prompt) is not double-prefixed.
 	if selected == "pi" && !reviewRole(role) {
 		prompt += piEditGuardrail
+	}
+	// Round-start window preflight (see windowPreflight): the prompt is
+	// final here — the role overrides and the pi guardrail above have
+	// landed, and everything the callers append (folders note, aider
+	// staging) rides on the prompt that arrived — so the estimate is the
+	// launch estimate. Firing before the slot wait keeps a doomed round
+	// from queueing for a concurrency slot it can never use.
+	if err := windowPreflight(prompt, env, selected); err != nil {
+		return jailResult{}, err
 	}
 	lim := agentLimiter()
 	hbDone := make(chan struct{})

@@ -994,6 +994,13 @@ var promptOverflowMarkers = []string{
 	"Prompt is too long",
 	"context_length_exceeded",
 	"maximum context length",
+	// The activities' own round-start preflight refusal
+	// (activities.ErrPromptOverWindow) rides the same terminal
+	// classification: its refusal is static by construction (the prompt is
+	// final when the gate fires), so no retry can shrink it. Referenced,
+	// not re-literalized, so the sentinel and its workflow-side
+	// classification cannot drift apart.
+	activities.ErrPromptOverWindow.Error(),
 }
 
 // isPromptOverflow reports whether a failed round died because its prompt
@@ -1002,7 +1009,8 @@ var promptOverflowMarkers = []string{
 // fresh-session fallback or its quota heartbeats on it. The diff-file
 // handoff keeps initial reviewer prompts under the window; this is the
 // mid-round backstop (a conversation grown past the window by its own tool
-// traffic, or test logs the budget does not cover).
+// traffic, or test logs the budget does not cover) plus the activities'
+// round-start preflight refusal, which is static by construction.
 //
 // A killed round is refused before the text match: the kill wraps carry no
 // output by design, but the refusal keeps a marker echoed into an earlier
