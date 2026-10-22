@@ -1,9 +1,8 @@
 // The dashboard UI (htmx-ui pt2): the views the metrics daemon serves on
 // its LAN listener (metrics.port) — Workers (the `/` landing), Runs,
-// Run detail, New Task, the frozen metrics view (the relay ledger's
-// aggregates plus the live session counts; the GoLens embed itself is not
-// part of this build), and the Models tab — the price table plus the
-// round-2 usage surfaces (ui_metrics.go). Everything is
+// Run detail, New Task, the metrics view (the relay ledger's aggregates
+// plus the live session counts), and the Models tab — the price table
+// plus the usage surfaces (ui_metrics.go). Everything is
 // read-only except the New-Task submit — which goes through
 // internal/runstart, the exact path `daedalus run` submits through, so
 // the form can never drift from the CLI's gates (Q4 = C) — and the
@@ -38,6 +37,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/GoLens-Project/golens-metrics"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
@@ -75,14 +76,17 @@ const uiTestExcerptMax = 64 << 10
 // outlives server restarts), the started-event input cache shared by the
 // Workers and Runs renderers, the TTL-cached provider probes, the relay
 // ledger — the same in-process ledger the relay appends to, read
-// here for the metrics views — the operator's model price table (loaded
-// from the daemon dir at boot, swapped whole on save, read-only to every
-// renderer), and the last-sent fragment cache behind the polled views'
-// unchanged-poll 204s.
+// here for the metrics views — the golens-metrics registry whose
+// dashboard mounts beside this route map (golens.go; nil only in tests
+// that exercise the htmx surfaces without the embed), the operator's
+// model price table (loaded from the daemon dir at boot, swapped whole on
+// save, read-only to every renderer), and the last-sent fragment cache
+// behind the polled views' unchanged-poll 204s.
 type uiServer struct {
 	cfg    config.Config
 	tpl    *template.Template
 	ledger *metricsrelay.Ledger
+	golens *golens.Registry
 
 	mu     sync.Mutex
 	cl     client.Client
@@ -95,7 +99,7 @@ type uiServer struct {
 	prices  map[string]modelPrice
 }
 
-func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger) *uiServer {
+func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger, gl *golens.Registry) *uiServer {
 	tpl := template.Must(template.New("ui").Funcs(template.FuncMap{
 		// div100 is the slots bar's integer percentage — busy*100/total,
 		// total-proof.
@@ -109,7 +113,7 @@ func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger) *uiServer {
 		"tok": fmtTokens,
 		"usd": fmtUSD,
 	}).ParseFS(uiTemplateFS, "ui_templates.html"))
-	return &uiServer{cfg: cfg, tpl: tpl, ledger: ledger,
+	return &uiServer{cfg: cfg, tpl: tpl, ledger: ledger, golens: gl,
 		inputs: map[string]workflows.PipelineInput{},
 		probes: map[string]uiProbe{}, frags: map[string][]byte{},
 		prices: loadModelPrices()}
@@ -216,13 +220,21 @@ func (s *uiServer) routes() http.Handler {
 	mux.HandleFunc("GET /models", s.pageModels)
 	mux.HandleFunc("GET /models/body", s.fragModels)
 	mux.HandleFunc("POST /models", s.saveModels)
-	// /metrics and everything under it is the metrics view — the paths
-	// beneath are the GoLens mount's when the embed exists; today they all
-	// render the same aggregates-plus-placeholder page, with /metrics/body
-	// its polled fragment.
+	// /metrics and its polled body are the daemon's own aggregates view;
+	// the trailing-slash face renders the same page. Everything else under
+	// /metrics is the golens-metrics mount's — its HTML references its
+	// data/static/history paths absolutely, so its namespace serves beside
+	// the daemon's exact routes, with /full-metrics the dashboard's entry
+	// link. Pattern specificity keeps the two apart: the daemon's
+	// method-scoped exact patterns win their paths, the mount owns the
+	// rest.
 	mux.HandleFunc("GET /metrics", s.pageMetrics)
 	mux.HandleFunc("GET /metrics/body", s.fragMetrics)
-	mux.HandleFunc("GET /metrics/", s.pageMetrics)
+	mux.HandleFunc("GET /metrics/{$}", s.pageMetrics)
+	if s.golens != nil {
+		s.golens.MountUI(mux)
+		mux.HandleFunc("GET /full-metrics", s.golens.DashboardHandler)
+	}
 	return mux
 }
 
@@ -1272,12 +1284,12 @@ func (s *uiServer) metricsView() uiMetricsView {
 	}
 }
 
-// pageMetrics renders the frozen metrics view: the daemon's own
-// aggregates — the relay ledger's counters and the live session counts —
-// plus the note that the GoLens embed is not part of this build, so the
-// mount has no charts to serve where those would render. The counters
-// come from the same folds the Models tab reads (foldRelayTotals), so
-// the two views can never disagree.
+// pageMetrics renders the metrics view: the daemon's own aggregates —
+// the relay ledger's counters and the live session counts — plus the
+// pointer to the golens-metrics dashboard at /full-metrics, where the
+// same ledger's charts serve. The counters come from the same folds the
+// Models tab reads (foldRelayTotals), so the two views can never
+// disagree.
 func (s *uiServer) pageMetrics(w http.ResponseWriter, req *http.Request) {
 	s.render(w, http.StatusOK, "page_metrics", struct {
 		Chrome uiChrome

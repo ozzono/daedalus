@@ -3663,6 +3663,74 @@ func TestLoadMetricsNegativePorts(t *testing.T) {
 	}
 }
 
+// TestLoadMetricsStorageBackend pins the golens embed's retention knobs:
+// both load through verbatim when set, an unset backend is empty (the
+// daemon side defaults it to sqlite), an unknown backend is a load error
+// naming the field, and storage_path next to storage_backend: memory is
+// named together as the contradiction it is — while a path with the
+// defaulted backend loads.
+func TestLoadMetricsStorageBackend(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "metrics:\n  enabled: true\n"))
+	if err != nil {
+		t.Fatalf("Load(unset): %v", err)
+	}
+	if cfg.Metrics.StorageBackend != "" || cfg.Metrics.StoragePath != "" {
+		t.Errorf("unset knobs = (%q, %q), want both empty (the daemon defaults the backend)",
+			cfg.Metrics.StorageBackend, cfg.Metrics.StoragePath)
+	}
+
+	cfg, err = Load(writeConfig(t, "metrics:\n  storage_backend: sqlite\n  storage_path: /var/daedalus/golens.db\n"))
+	if err != nil {
+		t.Fatalf("Load(sqlite): %v", err)
+	}
+	if cfg.Metrics.StorageBackend != "sqlite" || cfg.Metrics.StoragePath != "/var/daedalus/golens.db" {
+		t.Errorf("knobs = (%q, %q), want both verbatim", cfg.Metrics.StorageBackend, cfg.Metrics.StoragePath)
+	}
+
+	cfg, err = Load(writeConfig(t, "metrics:\n  storage_backend: memory\n"))
+	if err != nil {
+		t.Fatalf("Load(memory): %v", err)
+	}
+	if cfg.Metrics.StorageBackend != "memory" {
+		t.Errorf("backend = %q, want memory", cfg.Metrics.StorageBackend)
+	}
+
+	// A path alone is fine — the backend it rides defaults to sqlite.
+	if _, err := Load(writeConfig(t, "metrics:\n  storage_path: /var/daedalus/golens.db\n")); err != nil {
+		t.Errorf("Load(path only) = %v, want the defaulted backend to accept it", err)
+	}
+
+	for _, doc := range []string{
+		"metrics:\n  storage_backend: redis\n",
+		"metrics:\n  storage_backend: SQLITE\n", // the vocabulary is lowercase
+	} {
+		_, err := Load(writeConfig(t, doc))
+		if err == nil || !strings.Contains(err.Error(), "storage_backend must be sqlite or memory") {
+			t.Errorf("Load(%q) error = %v, want the backend-vocabulary rejection", doc, err)
+		}
+	}
+
+	_, err = Load(writeConfig(t, "metrics:\n  storage_backend: memory\n  storage_path: /var/daedalus/golens.db\n"))
+	if err == nil || !strings.Contains(err.Error(), "drop one of the two") {
+		t.Errorf("Load(memory + path) error = %v, want the named-together rejection", err)
+	}
+
+	// The rendered section carries the knobs back: a round-trip keeps them.
+	raw, err := LoadRaw(writeConfig(t, "metrics:\n  storage_backend: sqlite\n  storage_path: /var/daedalus/golens.db\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	for _, want := range []string{"storage_backend: sqlite", "storage_path: /var/daedalus/golens.db"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderYAML output is missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // TestRenderYAMLMetrics pins the render: the metrics section round-trips —
 // an explicit section re-renders with its values, and the rendered file
 // loads back to the same section.

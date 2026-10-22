@@ -17,8 +17,10 @@
 // task-<id>-role-<role>-round-<n>, staged with the registration's secret
 // token as its -rk- tail; the token gates key restoration, anything else
 // attributes at worker level). ponytail: the ledger is in-memory only — a daemon restart drops
-// history, and a 10k-entry ring bounds memory; durable roll-ups wait on
-// the GoLens embed (SQLite). Cost stays render-time: the operator's price
+// its rows, and a 10k-entry ring bounds memory; the durable roll-ups are
+// the golens-metrics embed's sqlite store (cmd/daedalus/golens.go), fed
+// per append, not this package's concern. Cost stays render-time: the
+// operator's price
 // table (the dashboard's models tab) prices entries when the dashboard
 // reads them, and CostUSD is never written.
 package metricsrelay
@@ -104,17 +106,39 @@ type Entry struct {
 // Ledger is the relay's in-memory usage record. Safe for concurrent
 // append and query; the daemon process is its only writer and reader.
 type Ledger struct {
-	mu      sync.Mutex
-	entries []Entry
+	mu       sync.Mutex
+	entries  []Entry
+	onAppend func(Entry)
+}
+
+// SetOnAppend installs fn as the ledger's append observer — the daemon
+// feeds its golens-metrics registry this way. fn runs after the entry is
+// stored, once per Append, on the relay's serving goroutine; the invoke
+// happens outside the ledger lock, so fn may call back into the ledger
+// (Query, Len) without deadlocking, though two concurrent appends may
+// deliver out of order. Unset is the ordinary shape — the CLI reads the
+// ledger by polling, no observer.
+func (l *Ledger) SetOnAppend(fn func(Entry)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onAppend = fn
 }
 
 // Append records one entry, dropping the oldest past the cap.
 func (l *Ledger) Append(e Entry) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.entries = append(l.entries, e)
 	if len(l.entries) > ledgerCap {
 		l.entries = l.entries[len(l.entries)-ledgerCap:]
+	}
+	fn := l.onAppend
+	l.mu.Unlock()
+	// Observed outside the lock, so an observer that reads the ledger
+	// cannot deadlock against the append it belongs to; two concurrent
+	// appends may deliver to the observer out of order, which no fold of
+	// the samples cares about.
+	if fn != nil {
+		fn(e)
 	}
 }
 

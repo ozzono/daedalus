@@ -925,6 +925,17 @@ type MetricsConfig struct {
 	// serve the LAN; the relay never does). Zero (unset) defaults to
 	// DefaultMetricsRelayPort.
 	RelayPort int `yaml:"relay_port"`
+	// StorageBackend is the golens-metrics registry's retention backend —
+	// the daemon's embedded dashboard module (see cmd/daedalus/golens.go).
+	// "sqlite" persists the module's own roll-up windows (the decided
+	// posture: history survives daemon restarts and past the relay
+	// ledger's ring), "memory" keeps them in-process only. Empty defaults
+	// to sqlite — retention is why the embed exists.
+	StorageBackend string `yaml:"storage_backend,omitempty"`
+	// StoragePath is the sqlite database file when storage_backend is (or
+	// defaults to) sqlite; empty defaults to a file in the daemon dir.
+	// Meaningless with memory — named together they are a load error.
+	StoragePath string `yaml:"storage_path,omitempty"`
 }
 
 // Config holds the runtime configuration for a Daedalus process, loaded
@@ -2021,6 +2032,14 @@ func (c Config) validate(path string) error {
 	}
 	if c.Metrics.Port < 0 || c.Metrics.RelayPort < 0 {
 		return fmt.Errorf("config %s: metrics: port and relay_port must not be negative", path)
+	}
+	switch c.Metrics.StorageBackend {
+	case "", "sqlite", "memory":
+	default:
+		return fmt.Errorf("config %s: metrics: storage_backend must be sqlite or memory, got %q", path, c.Metrics.StorageBackend)
+	}
+	if c.Metrics.StoragePath != "" && c.Metrics.StorageBackend == "memory" {
+		return fmt.Errorf("config %s: metrics: storage_path names a sqlite file but storage_backend is memory — drop one of the two", path)
 	}
 	// validate runs after applyDefaults, so one side of this equality may
 	// be the operator's explicit port and the other the default that

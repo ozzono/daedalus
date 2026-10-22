@@ -1,18 +1,18 @@
 // The metrics view's data layer: the operator-editable model price table,
-// the ledger folds behind the usage tables, derived tiles, and charts, and
-// the server-built SVG line charts. Everything reads the relay ledger the
-// way `dash list` does — one clamped full-ring query, then plain folds;
-// a 10k-entry pass is microseconds, so no cache layer. Cost is computed at
-// render time from the saved prices and never stored — a retroactive price
-// edit reprices the whole window on the next render, and Entry.CostUSD
-// stays the reserved zero it has always been.
+// the ledger folds behind the usage tables, and derived tiles. Everything
+// reads the relay ledger the way `dash list` does — one clamped full-ring
+// query, then plain folds; a 10k-entry pass is microseconds, so no cache
+// layer. Cost is computed at render time from the saved prices and never
+// stored — a retroactive price edit reprices the whole window on the next
+// render, and Entry.CostUSD stays the reserved zero it has always been.
+// Charts live in the golens-metrics dashboard (golens.go) at
+// /full-metrics, fed per append from the same ledger — the server-built
+// SVG charts this file once rendered were removed once that mount served.
 package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"html"
-	"html/template"
 	"math"
 	"net/http"
 	"net/url"
@@ -434,10 +434,6 @@ func fmtUSD(v float64) string {
 	return fmt.Sprintf("$%.4f", v)
 }
 
-// chartTokens formats a bucketed token sum — the buckets accumulate in
-// float, the counts are integers, so round back.
-func chartTokens(v float64) string { return fmtTokens(int64(v + 0.5)) }
-
 // relayTotals is the frozen metrics tab's headline counters and slim
 // per-worker rows — the face that view has always rendered, now
 // projected from the same folds the Models tab reads so the two views
@@ -529,10 +525,10 @@ func formatRate(v float64) string {
 }
 
 // pageModels renders the Models tab: the price form over every
-// ledger-known model, plus the round-2 surfaces — the usage tables, the
-// derived tiles, and the token and cost charts — all from one fold and
-// one price snapshot, so the tab can never show a table disagreeing with
-// its charts.
+// ledger-known model, plus the usage tables and derived tiles — all from
+// one fold and one price snapshot, so the tab can never show a table
+// disagreeing with its tiles. The charts serve at /full-metrics (the
+// golens-metrics mount, golens.go), fed from the same ledger.
 func (s *uiServer) pageModels(w http.ResponseWriter, req *http.Request) {
 	now := time.Now()
 	v := buildModelsView(now, s.ledgerEntries(), s.currentPrices())
@@ -542,8 +538,8 @@ func (s *uiServer) pageModels(w http.ResponseWriter, req *http.Request) {
 	}{uiChrome{Nav: "models", Title: "daedalus — models"}, v})
 }
 
-// fragModels is the Models tab's polled region — the tiles, usage tables,
-// and charts, re-folded from the ledger each tick. The price form stays
+// fragModels is the Models tab's polled region — the tiles and usage
+// tables, re-folded from the ledger each tick. The price form stays
 // outside the region (the page template wraps only the read-only
 // surfaces): a poll may never swap editable inputs out from under the
 // operator — the runs feed's filter-selects rule.
@@ -709,27 +705,15 @@ type usageTable struct {
 	Rows []metricsUsageRow
 }
 
-// uiNamedChart is one mini-chart card: its server-built SVG, whose
-// caption names the worker or model it covers.
-type uiNamedChart struct {
-	Chart template.HTML
-}
-
-// uiModelsView is the Models tab's data. The token charts render once the
-// ledger has entries; the cost charts only when at least one model is
-// priced, each captioning itself as covering priced models only.
+// uiModelsView is the Models tab's data: the folds and tiles. The charts
+// serve at /full-metrics (the golens-metrics mount, golens.go), fed from
+// the same ledger.
 type uiModelsView struct {
 	Window      string
 	FormRows    []uiModelFormRow
 	Tiles       uiDerivedTiles
 	ModelTable  usageTable
 	WorkerTable usageTable
-
-	TokenChart       template.HTML
-	WorkerCharts     []uiNamedChart
-	CostChart        template.HTML
-	WorkerCostCharts []uiNamedChart
-	ModelCostCharts  []uiNamedChart
 }
 
 // buildModelsView folds one ledger window into those surfaces.
@@ -741,191 +725,7 @@ func buildModelsView(now time.Time, entries []metricsrelay.Entry, prices map[str
 	v.WorkerTable = usageTable{Head: "Worker", Rows: workers}
 	v.FormRows = buildFormRows(models, prices)
 	v.Tiles = buildTiles(entries, workers)
-
-	g, ok := newChartGrid(entries, now)
-	if !ok {
-		return v
-	}
-	v.TokenChart = buildLineChart(g, "Tokens — the whole ledger window", bucketTokens(g, entries))
-	byWorker := groupEntries(entries, usageWorkerKey)
-	for _, w := range workers {
-		v.WorkerCharts = append(v.WorkerCharts, uiNamedChart{
-			Chart: buildLineChart(g, w.Key+" — tokens", bucketTokens(g, byWorker[w.Key])),
-		})
-	}
-	if len(prices) > 0 {
-		v.CostChart = buildLineChart(g, "Cost — priced models only", bucketCost(g, entries, prices))
-		byModel := groupEntries(entries, usageModelKey)
-		for _, m := range models {
-			if m.Priced {
-				v.ModelCostCharts = append(v.ModelCostCharts, uiNamedChart{
-					Chart: buildLineChart(g, m.Key+" — cost (priced models only)", bucketCost(g, byModel[m.Key], prices)),
-				})
-			}
-		}
-		for _, w := range workers {
-			v.WorkerCostCharts = append(v.WorkerCostCharts, uiNamedChart{
-				Chart: buildLineChart(g, w.Key+" — cost (priced models only)", bucketCost(g, byWorker[w.Key], prices)),
-			})
-		}
-	}
 	return v
-}
-
-// groupEntries buckets the window once per key function, so the
-// mini-charts filter without rescanning the ledger per card.
-func groupEntries(entries []metricsrelay.Entry, keyOf func(metricsrelay.Entry) string) map[string][]metricsrelay.Entry {
-	groups := map[string][]metricsrelay.Entry{}
-	for _, e := range entries {
-		k := keyOf(e)
-		groups[k] = append(groups[k], e)
-	}
-	return groups
-}
-
-// chartBuckets is the fixed bucket count every chart spans — 24 equal
-// widths over the ledger window (oldest entry → now), one shared grid
-// for the global chart and every mini-chart (Q3).
-const chartBuckets = 24
-
-// chartGrid is that shared geometry.
-type chartGrid struct {
-	start time.Time
-	step  time.Duration
-	now   time.Time
-}
-
-// newChartGrid derives the grid from the ascending entries; ok is false
-// for an empty window — no entries, no chart.
-func newChartGrid(entries []metricsrelay.Entry, now time.Time) (g chartGrid, ok bool) {
-	if len(entries) == 0 {
-		return g, false
-	}
-	g = chartGrid{start: entries[0].At, now: now, step: now.Sub(entries[0].At) / chartBuckets}
-	if g.step <= 0 {
-		g.step = time.Millisecond // a single instant still buckets, never divides by zero
-	}
-	return g, true
-}
-
-// bucketOf indexes an entry's bucket, clamping the right edge in.
-func (g chartGrid) bucketOf(t time.Time) int {
-	idx := int(t.Sub(g.start) / g.step)
-	if idx < 0 {
-		return 0
-	}
-	return min(idx, chartBuckets-1)
-}
-
-// chartColor is a series color's light/dark pair, emitted as Tailwind
-// arbitrary-value classes so the SVG recolors with the theme toggle (the
-// header countdown ring's mechanism). The pairs are validated against
-// both dashboard surfaces (white / slate-900); the accepted WARN is
-// light-mode aqua at 2.74:1 on white — relieved by the direct labels and
-// the tables rendered beside every chart.
-type chartColor struct{ Light, Dark string }
-
-func (c chartColor) strokeClass() string {
-	return "stroke-[" + c.Light + "] dark:stroke-[" + c.Dark + "]"
-}
-func (c chartColor) fillClass() string { return "fill-[" + c.Light + "] dark:fill-[" + c.Dark + "]" }
-func (c chartColor) bgClass() string   { return "bg-[" + c.Light + "] dark:bg-[" + c.Dark + "]" }
-
-var (
-	colorIn   = chartColor{"#2a78d6", "#3987e5"}
-	colorOut  = chartColor{"#1baf7a", "#199e70"}
-	colorCost = chartColor{"#6250d6", "#9085e9"}
-)
-
-// chartSeries is one line: its legend label, its per-bucket sums (one
-// shared y-axis across a chart's series), its validated color pair, and
-// the value formatter its labels use — tokens and cost never share a
-// chart, and cost is single-series, never a dual axis.
-type chartSeries struct {
-	Label  string
-	Points [chartBuckets]float64
-	Color  chartColor
-	Format func(float64) string
-}
-
-// bucketTokens accumulates the entries' in/out sums into a fresh series
-// pair on the shared grid.
-func bucketTokens(g chartGrid, entries []metricsrelay.Entry) []chartSeries {
-	in := chartSeries{Label: "in", Color: colorIn, Format: chartTokens}
-	out := chartSeries{Label: "out", Color: colorOut, Format: chartTokens}
-	for _, e := range entries {
-		i := g.bucketOf(e.At)
-		in.Points[i] += float64(e.InputTokens)
-		out.Points[i] += float64(e.OutputTokens)
-	}
-	return []chartSeries{in, out}
-}
-
-// bucketCost accumulates the entries' render-time cost into one series,
-// priced models only — an unpriced model contributes nothing.
-func bucketCost(g chartGrid, entries []metricsrelay.Entry, prices map[string]modelPrice) []chartSeries {
-	cost := chartSeries{Label: "cost", Color: colorCost, Format: fmtUSD}
-	for _, e := range entries {
-		if p, ok := prices[e.Model]; ok {
-			cost.Points[g.bucketOf(e.At)] += entryCost(e, p)
-		}
-	}
-	return []chartSeries{cost}
-}
-
-// buildLineChart renders one chart's card content: a polyline per series,
-// a <title> hover point per bucket — the dashboard's tooltip idiom — the
-// legend row with each series' current (last-bucket) value, and the
-// window's end labels. No per-bucket grid, no client JS, no chart
-// library. Every interpolation is escaped here: the result returns as
-// template.HTML, trusted markup.
-func buildLineChart(g chartGrid, caption string, series []chartSeries) template.HTML {
-	const (
-		w, h   = 560.0, 148.0
-		topPad = 8.0
-		bottom = 132.0
-	)
-	maxv := 0.0
-	for _, s := range series {
-		for _, v := range s.Points {
-			maxv = max(maxv, v)
-		}
-	}
-	y := func(v float64) float64 {
-		if maxv <= 0 {
-			return bottom
-		}
-		return bottom - v/maxv*(bottom-topPad)
-	}
-	x := func(i int) float64 { return float64(i) * w / (chartBuckets - 1) }
-
-	var b strings.Builder
-	b.WriteString(`<div class="font-medium mb-2">` + html.EscapeString(caption) + `</div>`)
-	b.WriteString(`<svg viewBox="0 0 560 148" class="w-full h-auto" role="img" aria-label="` + html.EscapeString(caption) + `">`)
-	for _, s := range series {
-		pts := make([]string, chartBuckets)
-		for i, v := range s.Points {
-			pts[i] = fmt.Sprintf("%.1f,%.1f", x(i), y(v))
-		}
-		b.WriteString(`<polyline fill="none" stroke-width="1.5" class="` + s.Color.strokeClass() + `" points="` + strings.Join(pts, " ") + `"/>`)
-	}
-	for _, s := range series {
-		for i, v := range s.Points {
-			bucket := g.start.Add(time.Duration(i) * g.step)
-			b.WriteString(`<circle cx="` + strconv.FormatFloat(x(i), 'f', 1, 64) +
-				`" cy="` + strconv.FormatFloat(y(v), 'f', 1, 64) +
-				`" r="2.5" class="` + s.Color.fillClass() +
-				`"><title>` + clockOrDate(bucket) + ` · ` + html.EscapeString(s.Label) + ` ` + s.Format(v) + `</title></circle>`)
-		}
-	}
-	b.WriteString(`</svg><div class="flex gap-4 flex-wrap text-xs text-slate-500 mt-1">`)
-	for _, s := range series {
-		b.WriteString(`<span class="flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full ` + s.Color.bgClass() + `"></span>` +
-			html.EscapeString(s.Label) + ` <span class="mono">` + s.Format(s.Points[chartBuckets-1]) + `</span></span>`)
-	}
-	b.WriteString(`</div><div class="flex justify-between text-[10px] text-slate-500 mono mt-1"><span>` +
-		clockOrDate(g.start) + `</span><span>` + clockOrDate(g.now) + `</span></div>`)
-	return template.HTML(b.String())
 }
 
 // uiRunModelCost is one model's row in the run-detail cost section.

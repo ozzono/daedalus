@@ -875,6 +875,16 @@ metrics:
   # off-host. Must differ from port (one port cannot host both
   # listeners; equality fails the load). 0 (unset) = 7778.
   relay_port: 7778
+  # The embedded golens-metrics dashboard's retention backend — the
+  # module's own store, not a parallel one. "sqlite" (the default when
+  # unset) persists its roll-up windows so the /full-metrics charts
+  # survive daemon restarts and outlive the relay ledger's ring;
+  # "memory" keeps them in-process only.
+  # storage_backend: sqlite
+  # The sqlite database file (storage_path). Unset = metrics-golens.db
+  # beside the daemon's other files in the daemon dir; set it to
+  # relocate. Meaningless with storage_backend: memory (a load error
+  # named together).
 `
 
 // examplePromptBlock is the prompt: section — the "prompt" profile's slice.

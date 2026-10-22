@@ -333,7 +333,7 @@ func newUIHarness(t *testing.T) *uiHarness {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	h.cfg = config.Config{Temporal: config.TemporalConfig{Host: lis.Addr().String(), TaskQueue: "listq"}}
-	h.srv = httptest.NewServer(newUIServer(h.cfg, h.led).routes())
+	h.srv = httptest.NewServer(newUIServer(h.cfg, h.led, nil).routes())
 	t.Cleanup(h.srv.Close)
 	return h
 }
@@ -797,8 +797,8 @@ func TestUIPolledFragmentsAnswer204WhenUnchanged(t *testing.T) {
 
 	// The models body fragment: with an empty ledger the read-only face is
 	// stable, so the repeat dedupes — and a fresh entry rides a 200. No
-	// unchanged-ledger face is pinned past that: with entries the charts
-	// re-derive their bucket grid from the render clock, so byte-stability
+	// unchanged-ledger face is pinned past that: with entries the window
+	// note re-derives its span from the render clock, so byte-stability
 	// between two renders is timing luck, not behavior — the tick simply
 	// keeps the models view current.
 	if code, out := h.poll(t, "/models/body"); code != http.StatusOK || !strings.Contains(out, "Usage by model") {
@@ -899,7 +899,7 @@ func TestUIRunDetailErrorFaceHeals(t *testing.T) {
 // staleness. Exercised at the renderFrag seam: filling the cap through the
 // server would re-walk the host once per poll to test a map reset.
 func TestUIFragmentCacheCapDropsWholesale(t *testing.T) {
-	s := newUIServer(config.Config{}, nil)
+	s := newUIServer(config.Config{}, nil, nil)
 	poll := func(uri string) int {
 		t.Helper()
 		w := httptest.NewRecorder()
@@ -1326,7 +1326,10 @@ func TestUIMetricsBodyFragment(t *testing.T) {
 	for _, want := range []string{
 		">w-f</td>",   // the per-worker ledger row
 		"Relay calls", // the tile grid, the fragment's top
-		"The GoLens embed is not built into this binary", // the note closes the region
+		// The closing card points the charts at the golens-metrics mount.
+		"These aggregates are the daemon's own folds",
+		`href="/full-metrics"`,
+		"Check full-metrics",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the metrics body fragment lacks %q:\n%s", want, body)
