@@ -648,14 +648,18 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// The wire-level thinking knob resolves per role into the round env
 	// (see wireThinkingEnv), before any staging reads it.
 	env = wireThinkingEnv(env, role)
-	// Metrics staging: when the worker enabled metrics, route the round's
-	// provider calls through the metrics daemon's relay (staged path
-	// prefix, synthetic attribution key on keyed rounds) so the ledger
-	// sees every provider call. A no-op when the relay vars are absent —
-	// metrics disabled, or an endpoint override removed them upstream
-	// (see metricsRelayEnv).
-	env = metricsRelayEnv(ctx, env, role)
+	// The CLI resolve is hoisted above the metrics staging: the staging
+	// selector dispatches on the resolved binary (claude/codex stage the
+	// agent-native OTLP path when the toggle is on and the binary is new
+	// enough — see metricsRoundEnv).
 	selected, headless, _ := jailedAgentCLI(agent)
+	// Metrics staging: select the round's capture path and stage it — the
+	// agent-native OTLP path (otelArgs carries codex's -c overrides for
+	// the argv build below) or the metrics daemon's relay (staged path
+	// prefix, synthetic attribution key on keyed rounds). A no-op when the
+	// relay vars are absent — metrics disabled, or an endpoint override
+	// removed them upstream (see metricsRoundEnv).
+	env, otelArgs := metricsRoundEnv(ctx, env, role, selected)
 	// opencode and codex resumed rounds arrive with the whole post-`--`
 	// argv precomposed (agentResumeArgs — their resume tokens follow the
 	// run/exec subcommand, so the fixed headless set is already embedded);
@@ -1010,6 +1014,10 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			return jailResult{}, err
 		}
 		args = append(args, modelArgs...)
+		// The otel staging's -c overrides ride the same post-exec slot
+		// (empty unless metricsRoundEnv selected the OTLP path for this
+		// round), layered over the host config like the provider bridge.
+		args = append(args, otelArgs...)
 	}
 	// opencode's -m flag selecting the staged provider (stageOpencodeProvider
 	// above held it), appended after the headless set where the run

@@ -837,6 +837,16 @@ metrics:
   # off-host. Must differ from port (one port cannot host both
   # listeners; equality fails the load). 0 (unset) = 7778.
   relay_port: 7778
+  # Agent-native telemetry staging (the OTLP path): when true, claude
+  # and codex rounds whose CLI is new enough export their usage straight
+  # to the daemon's OTLP receiver instead of riding the relay — claude
+  # rounds stage the OTLP env vars, codex rounds stage -c overrides,
+  # keyed or not (otel attribution rides the staged identifiers, not the
+  # credential). A CLI below the staged version floor falls back to
+  # relay staging only when the round has an attributable key; below
+  # floor and unkeyed, the round stages nothing. The receiver itself is
+  # up whenever the daemon runs; this gates the staging only.
+  # otel: false
   # The embedded golens-metrics dashboard's retention backend — the
   # module's own store, not a parallel one. "sqlite" (the default when
   # unset) persists its roll-up windows so the /full-metrics charts

@@ -275,6 +275,20 @@ const (
 	// without it any on-host process could spend a registered worker's
 	// key with a fabricated task-shaped credential.
 	MetricsRelayTokenEnv = "DAEDALUS_METRICS_RELAY_TOKEN"
+	// MetricsOtelEndpointEnv is the toggle-on otel path's staging input:
+	// the worker exports <relay-root>/v1/metrics and the round staging
+	// (internal/activities) reads it to select agent-native OTLP staging
+	// over relay staging for a capable CLI. It is deliberately not one of
+	// the relay root vars — the failover and reviewer override paths strip
+	// those (provider_failover.go) so a staged URL can never route a round
+	// at an unregistered upstream, and an otel-staged round dials the
+	// daemon directly, needing no relay URL: the endpoint survives the
+	// override paths, so fallback and override rounds keep telemetry
+	// coverage too. Worker-side only (roundEnvWorkerSideVars): consumed at
+	// pre-spawn staging, never reaching the sandbox. Exported only while
+	// metrics.otel is on and the worker registered; absent means rounds
+	// stage the relay exactly as before.
+	MetricsOtelEndpointEnv = "DAEDALUS_METRICS_OTEL_ENDPOINT"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -925,6 +939,20 @@ type MetricsConfig struct {
 	// serve the LAN; the relay never does). Zero (unset) defaults to
 	// DefaultMetricsRelayPort.
 	RelayPort int `yaml:"relay_port"`
+	// Otel switches the agent-native staging on: when true, the worker
+	// exports MetricsOtelEndpointEnv beside the relay roots and a claude
+	// or codex round whose CLI probes at or above the staged version
+	// floor stages otel — claude's OTLP env vars, codex's -c overrides —
+	// instead of relay staging, keyed or not (otel attribution rides the
+	// staged identifiers, not the credential; replacement semantics:
+	// exactly one capture path per round). Below the floor, a keyed round
+	// stages the relay as before and an unkeyed one stages nothing — the
+	// relay fallback needs a registered key, so that round goes dark. The
+	// OTLP receiver itself mounts on the relay listener whenever the
+	// daemon runs — this toggle gates staging, not the port; foreign
+	// exporters on the host may post to it and their usage folds labeled
+	// otel-external, kept out of the daedalus views.
+	Otel bool `yaml:"otel,omitempty"`
 	// StorageBackend is the golens-metrics registry's retention backend —
 	// the daemon's embedded dashboard module (see cmd/daedalus/golens.go).
 	// "sqlite" persists the module's own roll-up windows (the decided
@@ -1719,6 +1747,7 @@ func ProviderEnvVars() []string {
 		MetricsRelayAnthropicEnv,
 		MetricsRelayOpenAIEnv,
 		MetricsRelayTokenEnv,
+		MetricsOtelEndpointEnv,
 		BugDirEnv,
 		BugMirrorEnv,
 		TestOutputMirrorEnv,
@@ -1791,6 +1820,7 @@ var roundEnvWorkerSideVars = map[string]bool{
 	MetricsRelayAnthropicEnv:            true,
 	MetricsRelayOpenAIEnv:               true,
 	MetricsRelayTokenEnv:                true,
+	MetricsOtelEndpointEnv:              true,
 	BugDirEnv:                           true,
 	BugMirrorEnv:                        true,
 	TestOutputMirrorEnv:                 true,
@@ -1816,7 +1846,7 @@ var roundEnvWorkerSideVars = map[string]bool{
 // rounds running there; a missing entry surfaces as a round-level tool
 // failure, never silently.
 func RoundEnvVars() []string {
-	vars := make([]string, 0, len(ProviderEnvVars())+33)
+	vars := make([]string, 0, len(ProviderEnvVars())+41)
 	for _, name := range ProviderEnvVars() {
 		if !roundEnvWorkerSideVars[name] {
 			vars = append(vars, name)
@@ -1826,6 +1856,16 @@ func RoundEnvVars() []string {
 		"OPENCODE_CONFIG",
 		"MAX_THINKING_TOKENS",
 		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+		// The toggle-on otel staging's claude exports (the staging writes
+		// them onto the round env only when it selected the OTLP path).
+		"CLAUDE_CODE_ENABLE_TELEMETRY",
+		"OTEL_METRICS_EXPORTER",
+		"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+		"OTEL_METRICS_INCLUDE_ACCOUNT_UUID",
+		"OTEL_LOGS_EXPORTER",
+		"OTEL_TRACES_EXPORTER",
+		"OTEL_RESOURCE_ATTRIBUTES",
 		"AIDER_MODEL",
 		"AIDER_WEAK_MODEL",
 		"AIDER_EDITOR_MODEL",

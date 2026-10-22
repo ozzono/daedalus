@@ -202,7 +202,9 @@ func (s *uiServer) runInput(c client.Client, workflowID string) workflows.Pipeli
 // by arbitrary web pages the operator's browser visits.
 func (s *uiServer) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.pageWorkers)
+	// Runs are the default view — what an operator opens the dashboard
+	// for — so the root serves them and the header's first tab matches.
+	mux.HandleFunc("GET /{$}", s.pageRuns)
 	mux.HandleFunc("GET /workers", s.pageWorkers)
 	mux.HandleFunc("GET /workers/rows", s.fragWorkers)
 	mux.HandleFunc("GET /runs", s.pageRuns)
@@ -299,16 +301,18 @@ type uiChrome struct {
 
 // badgeClass maps a display status onto the component kit's badge colors —
 // the claudio mapping, decided: emerald running, amber waiting, muted
-// approved, red failed/parked (and paused, the taxonomy's parked face).
+// approved, red failed/parked. Paused is a resumable parked state, not a
+// failure, so it renders amber with the waiting family (the park-cause
+// banner keeps its red text — diagnostic content, not a status chip).
 func badgeClass(status string) string {
 	switch status {
 	case "running":
 		return "b-run"
-	case "waiting", "pending":
+	case "waiting", "pending", "paused":
 		return "b-wait"
 	case "approved", "completed":
 		return "b-idle"
-	case "parked", "paused", "failed":
+	case "parked", "failed":
 		return "b-fail"
 	}
 	return "b-idle"
@@ -372,6 +376,9 @@ type uiRunRow struct {
 	Queue      string
 	Started    string
 	LastAt     string
+	// LastCoT is the runs table's time-since-last-CoT cell: the relative
+	// age of the run's newest exited round, "-" when it has none.
+	LastCoT string
 
 	startedAt time.Time
 }
@@ -538,6 +545,7 @@ func (s *uiServer) snapshot() uiSnapshot {
 					row.LastAt = relTime(vis.LastAt, snap.Generated)
 				}
 				row.Badge = badgeClass(row.Status)
+				row.LastCoT = lastCoTAge(row.WorkflowID, snap.Generated)
 				snap.Rows = append(snap.Rows, row)
 				byQueue[q] = append(byQueue[q], row)
 			}
@@ -591,6 +599,22 @@ func (s *uiServer) snapshot() uiSnapshot {
 		snap.Workers = append(snap.Workers, card)
 	}
 	return snap
+}
+
+// lastCoTAge renders the runs feed's Last-CoT cell: the age of the run's
+// newest exited round — the task log's own round-exit stamp, the same
+// grammar `daedalus log` parses — and "-" for a run with no completed
+// round or no readable log (relTime renders the zero time as a dash).
+func lastCoTAge(workflowID string, now time.Time) string {
+	path, err := activities.TaskLogPath(workflowID)
+	if err != nil {
+		return "-"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "-"
+	}
+	return relTime(lastRoundExit(string(data)), now)
 }
 
 // queueWork derives a queue's in-flight rounds from its running runs' task
@@ -1183,7 +1207,11 @@ func (s *uiServer) fragCot(w http.ResponseWriter, req *http.Request) {
 	if len(runs) == 0 {
 		runs = []string{""}
 	}
-	sections, err := cotSections(c, id, runs)
+	// In-process, the daemon knows its own relay port — the same source
+	// precedence the CLI's -cot resolves from the status file, dialed over
+	// the loopback listener this process owns.
+	src := fmt.Sprintf("http://127.0.0.1:%d", s.cfg.Metrics.RelayPort)
+	sections, err := cotSectionsWith(c, id, runs, src)
 	if err != nil {
 		s.render(w, http.StatusOK, "frag_cot", uiCot{Err: err.Error()})
 		return

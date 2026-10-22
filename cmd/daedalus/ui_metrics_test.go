@@ -1025,3 +1025,183 @@ func TestUIRunDetailLedgerCost(t *testing.T) {
 		}
 	})
 }
+
+// TestLedgerEntriesDropsExternalOtel pins the main dashboard's ledger face
+// (D6): external otel batches — any other exporter on the host — never
+// enter a main-dashboard fold; they render only on the golens-served
+// full-metrics page. Relay rows and daedalus otel rows both stay.
+func TestLedgerEntriesDropsExternalOtel(t *testing.T) {
+	useDaemonDir(t)
+	led := &metricsrelay.Ledger{}
+	t0 := time.Now().Add(-time.Hour)
+	led.Append(metricsrelay.Entry{At: t0, Worker: "w"})
+	led.Append(metricsrelay.Entry{At: t0.Add(time.Minute), Source: metricsrelay.SourceOtelExternal, Task: "foreign", InputTokens: 5})
+	led.Append(metricsrelay.Entry{At: t0.Add(2 * time.Minute), Source: metricsrelay.SourceOtel, Task: "t1", InputTokens: 7})
+
+	got := newUIServer(config.Config{}, led, nil).ledgerEntries()
+	if len(got) != 2 {
+		t.Fatalf("ledgerEntries = %d entries, want the external batch dropped", len(got))
+	}
+	if got[0].Worker != "w" || got[1].Source != metricsrelay.SourceOtel {
+		t.Errorf("ledgerEntries = %+v, want the relay row then the daedalus otel row, ascending", got)
+	}
+}
+
+// TestFoldUsageSplitsOtelEraRows pins the fold's era split: a relay row
+// and an otel row of the same model stay separate rows — pre-toggle relay
+// history sits beside post-toggle otel data, never summed — the otel row
+// stamps Src so the template renders the otel- prefix and its em-dash
+// set, same-key-same-calls ties order relay before otel, and the worker
+// fold drops otel entries whole (they carry no worker to fold under).
+func TestFoldUsageSplitsOtelEraRows(t *testing.T) {
+	now := time.Now()
+	entries := []metricsrelay.Entry{
+		{At: now.Add(-time.Hour), Worker: "w-a", Wire: metricsrelay.WireOpenAI, Model: "mA",
+			InputTokens: 100, OutputTokens: 50, DurationMS: 1000, Status: 200},
+		{At: now.Add(-time.Minute), Source: metricsrelay.SourceOtel, Task: "t1", Role: "dev", Round: "1",
+			Model: "mA", InputTokens: 200, OutputTokens: 100},
+	}
+	rows := foldUsage(entries, now, nil, usageModelKey)
+	if len(rows) != 2 {
+		t.Fatalf("model fold = %d rows, want the eras separate", len(rows))
+	}
+	relay, otel := rows[0], rows[1]
+	if relay.Key != "mA" || relay.Src != "" || relay.Calls != 1 || relay.In != 100 {
+		t.Errorf("relay row = %+v, want mA's relay era unstamped", relay)
+	}
+	if otel.Key != "mA" || otel.Src != metricsrelay.SourceOtel || otel.Calls != 1 || otel.In != 200 {
+		t.Errorf("otel row = %+v, want mA's otel era stamped and separate", otel)
+	}
+
+	// Same key, same calls: the relay row precedes its otel twin so the
+	// order is stable across renders despite the map walk.
+	tie := []metricsrelay.Entry{
+		{At: now.Add(-time.Hour), Source: metricsrelay.SourceOtel, Task: "t1", Model: "mB", InputTokens: 1},
+		{At: now.Add(-time.Minute), Worker: "w", Model: "mB", InputTokens: 2},
+	}
+	rows = foldUsage(tie, now, nil, usageModelKey)
+	if len(rows) != 2 || rows[0].Src != "" || rows[1].Src != metricsrelay.SourceOtel {
+		t.Errorf("tied rows = %+v, want the relay row before its otel twin", rows)
+	}
+
+	// The worker fold has no otel row to show: otel usage carries no
+	// worker attribution, and pooling it under a nameless key would read
+	// as a literal "otel-" worker.
+	wrows := foldUsage(entries, now, nil, usageWorkerKey)
+	if len(wrows) != 1 || wrows[0].Key != "w-a" {
+		t.Errorf("worker fold = %+v, want only the relay worker", wrows)
+	}
+}
+
+// TestFoldLoopsDriftAndTotalsIgnoreOtel pins the tiles' relay-only faces:
+// an otel batch's stamps are export-batch arrivals, not round-end proxies,
+// so the loop, drift, and relay-totals folds skip otel entries whole — a
+// multi-batch toggle-on round would otherwise read the loop through the
+// export interval and invert the drift tile's sign.
+func TestFoldLoopsDriftAndTotalsIgnoreOtel(t *testing.T) {
+	base := time.Now().Truncate(time.Second)
+	at := func(min int) time.Time { return base.Add(time.Duration(min) * time.Minute) }
+	dev := string(activities.RoleDev)
+
+	entries := []metricsrelay.Entry{
+		// The relay face: one dev loop of 10 minutes, one drift group of +100.
+		{At: at(0), Worker: "w", Task: "t1", Role: dev, Round: "1", InputTokens: 100, Status: 200},
+		{At: at(10), Worker: "w", Task: "t1", Role: string(activities.RoleDevReview), Round: "1", Status: 200},
+		{At: at(11), Worker: "w", Task: "t1", Role: dev, Round: "1", InputTokens: 200, Status: 200},
+		// The otel noise the folds must ignore: a 1-minute "loop" that
+		// would drag the average down, and a shrinking "round" that would
+		// invert the drift.
+		{At: at(0), Source: metricsrelay.SourceOtel, Task: "t1", Role: dev, Round: "1", InputTokens: 5000},
+		{At: at(1), Source: metricsrelay.SourceOtel, Task: "t1", Role: string(activities.RoleDevReview), Round: "1"},
+		{At: at(2), Source: metricsrelay.SourceOtel, Task: "t9", Role: dev, Round: "1", InputTokens: 1},
+		{At: at(3), Source: metricsrelay.SourceOtel, Task: "t9", Role: dev, Round: "1", InputTokens: 0},
+	}
+
+	st := foldLoops(entries)
+	if st.DevRuns != 1 || st.DevAvg != 10*time.Minute {
+		t.Errorf("dev loop = (%v over %d runs), want the relay's 10m alone", st.DevAvg, st.DevRuns)
+	}
+	avg, groups := foldDrift(entries)
+	if groups != 1 || avg != 100 {
+		t.Errorf("drift = (%d over %d groups), want the relay group's +100 alone", avg, groups)
+	}
+
+	totals := foldRelayTotals(entries, base)
+	if totals.Calls != 3 {
+		t.Errorf("relay totals = %d calls, want the relay entries only", totals.Calls)
+	}
+}
+
+// TestBuildTilesSplitDenominators pins the headline tiles' source split:
+// TokensPerRun is all-source — both its numerator and its distinct-task
+// denominator count otel rounds once, so the populations agree — while
+// TokensPerWorker reads the relay face on both sides, its denominator
+// (the worker fold) carrying no otel row to divide by.
+func TestBuildTilesSplitDenominators(t *testing.T) {
+	base := time.Now()
+	entries := []metricsrelay.Entry{
+		{At: base, Worker: "w-a", Task: "t1", InputTokens: 60, OutputTokens: 40},
+		{At: base, Source: metricsrelay.SourceOtel, Task: "t2", InputTokens: 300, OutputTokens: 100},
+	}
+	workers := foldUsage(entries, base, nil, usageWorkerKey)
+	tiles := buildTiles(entries, workers)
+	if tiles.TokensPerRun != "250" {
+		t.Errorf("TokensPerRun = %q, want 250 (500 over both tasks)", tiles.TokensPerRun)
+	}
+	if tiles.TokensPerWorker != "100" {
+		t.Errorf("TokensPerWorker = %q, want 100 (the relay face over its one worker)", tiles.TokensPerWorker)
+	}
+}
+
+// TestBuildFormRowsPoolsEraRows pins the price form's era pooling: a model
+// folded into two era rows pools into one form row — the form edits rates,
+// and rates have no era — with the calls summed and Last the newer era's.
+func TestBuildFormRowsPoolsEraRows(t *testing.T) {
+	now := time.Now()
+	modelRows := []metricsUsageRow{
+		{Key: "mA", Src: "", Calls: 3, Last: "3m ago", last: now.Add(-3 * time.Minute)},
+		{Key: "mA", Src: metricsrelay.SourceOtel, Calls: 2, Last: "1m ago", last: now.Add(-time.Minute)},
+	}
+	rows := buildFormRows(modelRows, map[string]modelPrice{"mA": {In: 3, Out: 2, Cached: 1}})
+	if len(rows) != 1 {
+		t.Fatalf("form rows = %d, want the eras pooled into one", len(rows))
+	}
+	row := rows[0]
+	if row.Model != "mA" || row.Calls != 5 || row.Last != "1m ago" {
+		t.Errorf("pooled row = %+v, want 5 calls and the newer era's Last", row)
+	}
+	if row.In != "3" || row.Out != "2" || row.Cached != "1" {
+		t.Errorf("pooled row rates = %+v, want the model's saved rates once", row)
+	}
+}
+
+// TestUIUsageTableRendersTheOtelEra pins the usage table's era render
+// (D1): an otel row shows the otel- key prefix and the em-dash set on the
+// per-request columns — an export batch carries no status, latency, or
+// cache-ratio signal to show — while the relay row beside it renders its
+// real figures, and a same-key tie orders relay before otel.
+func TestUIUsageTableRendersTheOtelEra(t *testing.T) {
+	h := newUIHarness(t)
+	now := time.Now()
+	h.led.Append(metricsrelay.Entry{At: now.Add(-time.Hour), Worker: "w", Wire: metricsrelay.WireAnthropic, Model: "mA",
+		InputTokens: 1000, OutputTokens: 2000, CacheReadTokens: 500, DurationMS: 1000, Status: 200})
+	h.led.Append(metricsrelay.Entry{At: now.Add(-time.Minute), Source: metricsrelay.SourceOtel, Task: "t1", Role: "dev", Round: "1",
+		Model: "mA", InputTokens: 300, OutputTokens: 100})
+
+	out := h.get(t, "/models")
+	relayAt, otelAt := strings.Index(out, `>mA</td>`), strings.Index(out, `>otel-mA</td>`)
+	if relayAt < 0 || otelAt < 0 {
+		t.Fatalf("usage table lacks the era rows (relay@%d otel@%d):\n%s", relayAt, otelAt, out)
+	}
+	if relayAt > otelAt {
+		t.Errorf("the otel row rendered before its relay twin:\n%s", out)
+	}
+	if !strings.Contains(out, ">33.3%<") {
+		t.Errorf("the relay row lost its cache-hit ratio (500 reads over 1500 anthropic denominator):\n%s", out)
+	}
+	// The otel row's per-request columns are dashes, not the zeros an
+	// export batch would fabricate.
+	if n := strings.Count(out, `<td class="mono">—</td>`); n < 4 {
+		t.Errorf("the otel row rendered %d dash cells, want the ratio and latency set:\n%s", n, out)
+	}
+}

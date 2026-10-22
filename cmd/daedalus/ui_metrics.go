@@ -115,14 +115,22 @@ func (s *uiServer) swapPrices(prices map[string]modelPrice) {
 
 // ledgerEntries reads the whole ring once, ascending by At — Query
 // returns newest-first, and every first/last bookkeeping in the folds
-// depends on chronological order.
+// depends on chronological order. External otel batches are dropped here
+// (D6): they render only on the golens-served full-metrics page, never in
+// a main-dashboard fold.
 func (s *uiServer) ledgerEntries() []metricsrelay.Entry {
 	if s.ledger == nil {
 		return nil
 	}
 	entries, _, _ := s.ledger.Query("", 1, 1<<30)
-	sort.Slice(entries, func(i, j int) bool { return entries[i].At.Before(entries[j].At) })
-	return entries
+	kept := entries[:0]
+	for _, e := range entries {
+		if e.Source != metricsrelay.SourceOtelExternal {
+			kept = append(kept, e)
+		}
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].At.Before(kept[j].At) })
+	return kept
 }
 
 // modelUnknown is the fold key for calls whose usage block carried no
@@ -156,7 +164,11 @@ func entryCost(e metricsrelay.Entry, p modelPrice) float64 {
 // is zero); Cost stays raw for the usd template func, with Priced gating
 // it — unpriced rows render the dash, never a zero.
 type metricsUsageRow struct {
-	Key                     string
+	Key string
+	// Src stamps the row's capture era: "" is the relay's own
+	// observation, "otel" an export-batch fold — the template renders the
+	// otel- key prefix and D1's em-dash set from it.
+	Src                     string
 	Calls                   int64
 	In, Out                 int64
 	CacheRead, CacheWrite   int64
@@ -184,6 +196,15 @@ func latencyDur(d time.Duration) string {
 	return dur(d)
 }
 
+// rowKey is foldUsage's grouping key: the fold's own key plus the entry's
+// capture era. A relay row and an otel row of the same model stay separate
+// rows — pre-toggle relay history sits beside post-toggle otel data, and
+// D1's em-dash set applies per row — never summed into one.
+type rowKey struct {
+	key  string
+	otel bool
+}
+
 // foldUsage reduces the ascending ledger into one row per key: the token
 // sums, the distinct keyed runs, the dev/test/review call split, the
 // wire-aware cache-hit ratio (the anthropic wire reports cache reads
@@ -194,14 +215,21 @@ func latencyDur(d time.Duration) string {
 // rate, and the render-time cost of the priced models. Rows order by
 // call count — the tables' and the charts' shared order.
 func foldUsage(entries []metricsrelay.Entry, now time.Time, prices map[string]modelPrice, keyOf func(metricsrelay.Entry) string) []metricsUsageRow {
-	byKey := map[string]*metricsUsageRow{}
-	durs := map[string][]int64{}
-	runs := map[string]map[string]bool{}
+	byKey := map[rowKey]*metricsUsageRow{}
+	durs := map[rowKey][]int64{}
+	runs := map[rowKey]map[string]bool{}
 	for _, e := range entries {
-		k := keyOf(e)
+		k := rowKey{keyOf(e), e.Source != ""}
+		if k.key == "" {
+			// Otel entries carry no worker, so the worker fold would pool
+			// them into one nameless row reading as a literal "otel-" —
+			// otel usage has no worker attribution to show. The model fold
+			// never yields "" (empty models bucket to modelUnknown).
+			continue
+		}
 		r := byKey[k]
 		if r == nil {
-			r = &metricsUsageRow{Key: k}
+			r = &metricsUsageRow{Key: k.key, Src: e.Source}
 			byKey[k] = r
 		}
 		r.Calls++
@@ -269,7 +297,12 @@ func foldUsage(entries []metricsrelay.Entry, now time.Time, prices map[string]mo
 		if rows[i].Calls != rows[j].Calls {
 			return rows[i].Calls > rows[j].Calls
 		}
-		return rows[i].Key < rows[j].Key
+		if rows[i].Key != rows[j].Key {
+			return rows[i].Key < rows[j].Key
+		}
+		// Same key, same calls: the relay row before its otel twin, so
+		// the order is stable across renders despite the map walk.
+		return rows[i].Src < rows[j].Src
 	})
 	return rows
 }
@@ -310,14 +343,16 @@ type runLoop struct {
 // re-enter the loop with fixes and would skew the reading — and the
 // implementation side freezes at the last call before that review, so a
 // fix round after it cannot turn the gap negative. Unkeyed rounds (empty
-// Task) drop out. Known approximation, accepted: the gap includes
+// Task) drop out, and so do otel entries: their stamps are export-batch
+// arrivals, not round-end proxies, and would read the loop through the
+// ~60s export interval. Known approximation, accepted: the gap includes
 // non-provider time (local test runs, tool exec) and misses any
 // direct-dial calls.
 func foldLoops(entries []metricsrelay.Entry) loopStats {
 	dev := map[string]*runLoop{}
 	test := map[string]*runLoop{}
 	for _, e := range entries {
-		if e.Task == "" {
+		if e.Task == "" || e.Source != "" {
 			continue
 		}
 		var m map[string]*runLoop
@@ -373,12 +408,15 @@ func averageLoop(m map[string]*runLoop) (avg time.Duration, runs int) {
 // foldDrift measures the context-creep signal: within a keyed round (the
 // task+role+round group), how far the input grew from the first call to
 // the last, averaged over the groups with at least two calls — a single
-// call has no first→last span to measure.
+// call has no first→last span to measure. Relay entries only: an otel
+// batch carries that minute's delta, not the round's live context size,
+// so a multi-batch toggle-on round would read last−first strongly
+// negative and invert the tile's sign.
 func foldDrift(entries []metricsrelay.Entry) (avg int64, groups int) {
 	type groupKey struct{ task, role, round string }
 	byGroup := map[groupKey]*driftGroup{}
 	for _, e := range entries {
-		if e.Task == "" {
+		if e.Task == "" || e.Source != "" {
 			continue
 		}
 		k := groupKey{e.Task, e.Role, e.Round}
@@ -456,9 +494,18 @@ type relayWorkerTotals struct {
 }
 
 // foldRelayTotals reduces the ledger to that face: the counters over one
-// pass, the worker rows projected from the usage fold.
+// pass, the worker rows projected from the usage fold. Only the relay's
+// own observations count — otel entries carry no request-level signal
+// (D1: no status, no duration) and would read as errors and zeros here.
 func foldRelayTotals(entries []metricsrelay.Entry, now time.Time) relayTotals {
 	st := relayTotals{Window: "no relayed calls yet"}
+	relay := make([]metricsrelay.Entry, 0, len(entries))
+	for _, e := range entries {
+		if e.Source == "" {
+			relay = append(relay, e)
+		}
+	}
+	entries = relay
 	var oldest time.Time
 	for _, e := range entries {
 		st.Calls++
@@ -502,10 +549,24 @@ type uiModelFormRow struct {
 }
 
 // buildFormRows lays the form out over every ledger-known model — pricing
-// unseen models is speculative, the ledger is the only source of names.
+// unseen models is speculative, the ledger is the only source of names. A
+// model folded into two era rows pools into one form row: the form edits
+// rates, and rates have no era — calls sum, Last keeps the newer era's.
 func buildFormRows(modelRows []metricsUsageRow, prices map[string]modelPrice) []uiModelFormRow {
 	rows := make([]uiModelFormRow, 0, len(modelRows))
+	idx := map[string]int{}
+	lasts := make([]time.Time, 0, len(modelRows))
 	for _, r := range modelRows {
+		if i, ok := idx[r.Key]; ok {
+			rows[i].Calls += r.Calls
+			if r.last.After(lasts[i]) {
+				lasts[i] = r.last
+				rows[i].Last = r.Last
+			}
+			continue
+		}
+		idx[r.Key] = len(rows)
+		lasts = append(lasts, r.last)
 		row := uiModelFormRow{Model: r.Key, Calls: r.Calls, Last: r.Last, Unknown: r.Key == modelUnknown}
 		if p, ok := prices[r.Key]; ok && !row.Unknown {
 			row.In = formatRate(p.In)
@@ -659,13 +720,22 @@ type uiDerivedTiles struct {
 }
 
 // buildTiles averages the whole window: tokens per keyed run, tokens per
-// worker, the two loop averages, and the per-round input drift.
+// worker, the two loop averages, and the per-round input drift. The
+// worker tile reads the relay face on both sides — its denominator is the
+// worker fold (relay rows only, otel carries no worker) — so its numerator
+// sums relay entries too; otel batches are minute-deltas, and dividing
+// them across relay workers would inflate the tile without bound.
+// TokensPerRun stays all-source: both its numerator and its distinct-task
+// denominator count otel rounds once, so the populations agree.
 func buildTiles(entries []metricsrelay.Entry, workers []metricsUsageRow) uiDerivedTiles {
 	t := uiDerivedTiles{TokensPerRun: "—", TokensPerWorker: "—", DevLoop: "—", TestLoop: "—", Drift: "—"}
-	var total int64
+	var total, relayTotal int64
 	runs := map[string]bool{}
 	for _, e := range entries {
 		total += e.InputTokens + e.OutputTokens
+		if e.Source == "" {
+			relayTotal += e.InputTokens + e.OutputTokens
+		}
 		if e.Task != "" {
 			runs[e.Task] = true
 		}
@@ -674,7 +744,7 @@ func buildTiles(entries []metricsrelay.Entry, workers []metricsUsageRow) uiDeriv
 		t.TokensPerRun = fmtTokens(total / int64(n))
 	}
 	if n := len(workers); n > 0 {
-		t.TokensPerWorker = fmtTokens(total / int64(n))
+		t.TokensPerWorker = fmtTokens(relayTotal / int64(n))
 	}
 	loops := foldLoops(entries)
 	if loops.DevRuns > 0 {

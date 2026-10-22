@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -19,6 +23,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/ozzono/daedalus/internal/activities"
+	"github.com/ozzono/daedalus/internal/metricsrelay"
 )
 
 // fakeCotServer is an in-process stand-in for the Temporal frontend the
@@ -268,5 +273,378 @@ func TestTaskLogCotVisibilityLagFallbackHasNoAttribution(t *testing.T) {
 	}
 	if strings.Join(fake.reads, "|") != "wf-lagging/" {
 		t.Errorf("history reads = %v, want the empty-run-id read alone", fake.reads)
+	}
+}
+
+// cotStubRelay is the in-process stand-in for the live daemon the -cot
+// dump reads first: a /capture endpoint holding one round's record (404
+// for every other) and a /ledger page carrying one otel-stamped entry.
+type cotStubRelay struct {
+	srv *httptest.Server
+}
+
+// startCotStubRelay mounts the stub; the round-1 capture and the round-2
+// otel entry are fixed so the precedence walk has one of each source.
+func startCotStubRelay(t *testing.T, task string) *cotStubRelay {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/capture":
+			q := r.URL.Query()
+			if q.Get("task") == task && q.Get("role") == "dev" && q.Get("round") == "1" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(metricsrelay.CapturedRound{
+					At:       time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC),
+					Prompt:   "the staged prompt",
+					Response: "the staged answer",
+				})
+				return
+			}
+			http.Error(w, "metricsrelay: no capture for that round", http.StatusNotFound)
+		case "/ledger":
+			// The round field is the activity id — the walk's third round
+			// (scheduled id 5) is the otel-staged one.
+			entries := []metricsrelay.Entry{
+				{Source: metricsrelay.SourceOtel, Task: task, Role: "dev", Round: "5",
+					InputTokens: 10, OutputTokens: 5, CacheReadTokens: 2, CacheWriteTokens: 1},
+				// A relay-era and an external entry: neither may read as
+				// the round's otel usage.
+				{Task: task, Role: "dev", Round: "5", InputTokens: 999},
+				{Source: metricsrelay.SourceOtelExternal, Task: task, Role: "dev", Round: "1", InputTokens: 999},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"total": len(entries), "page": 1, "page_size": len(entries), "entries": entries})
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return &cotStubRelay{srv: srv}
+}
+
+// TestTaskLogCotLiveDaemonPrecedence pins the dump's source precedence end
+// to end, in-process against a fake frontend and a stub daemon: a keyed
+// round's relay capture renders the round's real prompt and response
+// instead of the Temporal CoT, a capture-absent round with otel ledger
+// usage renders the usage stamp over its Temporal CoT (metadata, not a
+// replacement), and a round with neither renders from the walk stamped
+// temporal. The live daemon is resolved from the status record, not the
+// config.
+func TestTaskLogCotLiveDaemonPrecedence(t *testing.T) {
+	dc := converter.GetDefaultDataConverter()
+	at := func(mins int) time.Time {
+		return time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC).Add(time.Duration(mins) * time.Minute)
+	}
+	round := func(id int64, mins int, thinking string) []*historypb.HistoryEvent {
+		return cotRound(t, dc, id, at(mins), "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			activities.AgentRunResult{Thinking: thinking, Text: "the walk text " + thinking})
+	}
+	fake := &fakeCotServer{
+		rows: []*workflowpb.WorkflowExecutionInfo{
+			{Execution: &commonpb.WorkflowExecution{WorkflowId: "wf-live", RunId: "run-live"}, StartTime: timestamppb.New(at(0))},
+		},
+		history: map[string][]*historypb.HistoryEvent{
+			"run-live": append(round(1, 5, "capture round"), round(3, 15, "plain round")...),
+		},
+		status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+	}
+	fake.history["run-live"] = append(fake.history["run-live"], round(5, 25, "otel round")...)
+	startCotServer(t, fake)
+
+	stub := startCotStubRelay(t, "wf-live")
+	port := stub.srv.Listener.Addr().(*net.TCPAddr).Port
+	useMetricsDaemonDir(t, metricsStatusDoc{PID: os.Getpid(), Updated: time.Now().UTC(), RelayPort: port})
+
+	out := captureStdout(t, func() { runTaskLogCot("wf-live", -1) })
+
+	// Round 1: the relay capture — the walk's own CoT must not surface.
+	for _, want := range []string{
+		"source: relay",
+		"--- prompt ---\nthe staged prompt",
+		"--- response ---\nthe staged answer",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "capture round") {
+		t.Errorf("a relay-captured round must render the capture, not the walk's CoT:\n%s", out)
+	}
+	// Round 2: the otel usage stamp over the Temporal walk's text.
+	for _, want := range []string{
+		"source: otel",
+		"usage: in 10, out 5, cache read 2/write 1",
+		"otel round",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
+		}
+	}
+	// Round 3: the walk itself, stamped temporal — and the external
+	// ledger entry staging round 3's usage must not read as otel.
+	for _, want := range []string{
+		"source: temporal",
+		"plain round",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "source: ") != 3 {
+		t.Errorf("every live section stamps its source once; got:\n%s", out)
+	}
+}
+
+// TestCotRoundBody pins the per-round render precedence as a unit: the
+// relay capture wins (its empty sides omitted), the otel usage stamp rides
+// over the Temporal text, the walk alone stamps temporal, and an off or
+// mid-dump-dead daemon degrades the unstamped pre-capture shape byte for
+// byte — never an error, never a half-stamped dump.
+func TestCotRoundBody(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("round") {
+		case "1":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(metricsrelay.CapturedRound{Prompt: "p1", Response: "r1"})
+		case "2":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(metricsrelay.CapturedRound{At: time.Now()})
+		default:
+			http.Error(w, "no capture", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(stub.Close)
+
+	otel := map[string]otelUsage{
+		roundKey("wf", "dev", "4"): {in: 10, out: 5, cacheRead: 2, cacheWrite: 1},
+	}
+
+	t.Run("capture wins, empty sides omitted", func(t *testing.T) {
+		live := true
+		got := cotRoundBody(stub.URL, &live, otel, "wf", "dev", "1", "walk text")
+		if want := "source: relay\n--- prompt ---\np1\n--- response ---\nr1\n"; got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+		if !live {
+			t.Errorf("a served capture must not flip the dump's liveness off")
+		}
+		got = cotRoundBody(stub.URL, &live, otel, "wf", "dev", "2", "walk text")
+		if got != "source: relay\n" {
+			t.Errorf("body = %q, want the bare stamp for a capture with no content", got)
+		}
+	})
+
+	t.Run("otel usage stamps the walk's text", func(t *testing.T) {
+		live := true
+		got := cotRoundBody(stub.URL, &live, otel, "wf", "dev", "4", "walk text")
+		if want := "source: otel\nusage: in 10, out 5, cache read 2/write 1\nwalk text\n"; got != want {
+			t.Errorf("body = %q, want the usage stamp over the walk", got)
+		}
+		// Without Temporal text the stamp is all there is.
+		got = cotRoundBody(stub.URL, &live, otel, "wf", "dev", "4", "")
+		if want := "source: otel\nusage: in 10, out 5, cache read 2/write 1\n"; got != want {
+			t.Errorf("body = %q, want the usage stamp alone", got)
+		}
+	})
+
+	t.Run("the walk alone stamps temporal", func(t *testing.T) {
+		live := true
+		if got, want := cotRoundBody(stub.URL, &live, otel, "wf", "dev", "9", "walk text"), "source: temporal\nwalk text\n"; got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+		if got, want := cotRoundBody(stub.URL, &live, otel, "wf", "dev", "9", ""), "source: temporal\nno CoT captured for this round\n"; got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a daemon dying mid-dump degrades the rest unstamped", func(t *testing.T) {
+		// Unreachability — not an answered error — is the death: a 404 or
+		// 500 only degrades that one round to the next source.
+		dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+		live := true
+		got := cotRoundBody(deadURL, &live, otel, "wf", "dev", "1", "walk text")
+		if got != "walk text\n" {
+			t.Errorf("body = %q, want the unstamped walk for the dying daemon", got)
+		}
+		if live {
+			t.Fatalf("the death must flip the dump's liveness off")
+		}
+		// The next round renders unstamped without another dial.
+		if got := cotRoundBody(deadURL, &live, otel, "wf", "dev", "2", ""); got != "no CoT captured for this round\n" {
+			t.Errorf("body = %q, want the unstamped no-CoT note after the death", got)
+		}
+	})
+
+	t.Run("an answered error degrades only that round", func(t *testing.T) {
+		flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer flaky.Close()
+		live := true
+		// The failed capture fetch falls to the next source — the otel
+		// map (absent here), then the stamped walk — never to the
+		// unstamped shape, and never off.
+		if got := cotRoundBody(flaky.URL, &live, otel, "wf", "dev", "1", "walk text"); got != "source: temporal\nwalk text\n" {
+			t.Errorf("body = %q, want the walk from the next source for the failing round", got)
+		}
+		if !live {
+			t.Errorf("an answered error must not flip the dump's liveness off")
+		}
+	})
+
+	t.Run("a daemon-less dump is the pre-capture shape", func(t *testing.T) {
+		live := false
+		if got := cotRoundBody("", &live, otel, "wf", "dev", "1", "walk text"); got != "walk text\n" {
+			t.Errorf("body = %q, want the unstamped walk", got)
+		}
+		if got := cotRoundBody("", &live, otel, "wf", "dev", "1", ""); got != "no CoT captured for this round\n" {
+			t.Errorf("body = %q, want the unstamped no-CoT note", got)
+		}
+	})
+}
+
+// TestFetchCotCapture pins the capture fetch's degrade-on shape: a capture
+// the daemon does not hold — a 404 as much as any other answered-but-not-
+// served status — is found=false but up (the round falls to the next
+// source), a served record decodes on the wire shape with its query parts
+// escaped, and only an unreachable daemon reports the daemon down.
+func TestFetchCotCapture(t *testing.T) {
+	var seen url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.URL.Query()
+		if r.URL.Query().Get("round") == "1" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(metricsrelay.CapturedRound{Prompt: "p", Response: "r"})
+			return
+		}
+		if r.URL.Query().Get("round") == "5" {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "no capture", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	cr, found, up := fetchCotCapture(srv.URL, "wf one", "dev", "1")
+	if !found || !up || cr.Prompt != "p" || cr.Response != "r" {
+		t.Errorf("fetch = (%+v, %v, %v), want the record found on a live daemon", cr, found, up)
+	}
+	if seen.Get("task") != "wf one" || seen.Get("role") != "dev" || seen.Get("round") != "1" {
+		t.Errorf("query = %v, want the escaped parts landing whole", seen)
+	}
+
+	if _, found, up = fetchCotCapture(srv.URL, "wf", "dev", "2"); found || !up {
+		t.Errorf("absent capture = (found %v, up %v), want found=false up=true", found, up)
+	}
+	if _, found, up = fetchCotCapture(srv.URL, "wf", "dev", "5"); found || !up {
+		t.Errorf("erroring capture = (found %v, up %v), want found=false up=true", found, up)
+	}
+
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	if _, _, up = fetchCotCapture(deadURL, "wf", "dev", "1"); up {
+		t.Errorf("an unreachable daemon read as up; only unreachability flips the dump's liveness")
+	}
+}
+
+// TestCotOtelUsageFold pins the ledger's otel face as the dump reads it:
+// only SourceOtel entries with a task fold into per-round usage stamps,
+// same-round entries sum, and an unreachable, absent, or erroring daemon
+// degrades to not-live — the walk then renders unstamped, never an error.
+func TestCotOtelUsageFold(t *testing.T) {
+	if otel, live := cotOtelUsage(""); otel != nil || live {
+		t.Errorf("cotOtelUsage(empty root) = (%v, %v), want nothing live", otel, live)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entries := []metricsrelay.Entry{
+			{Source: metricsrelay.SourceOtel, Task: "wf", Role: "dev", Round: "1", InputTokens: 10, OutputTokens: 5},
+			{Source: metricsrelay.SourceOtel, Task: "wf", Role: "dev", Round: "1", InputTokens: 3, CacheReadTokens: 2, CacheWriteTokens: 1},
+			{Source: metricsrelay.SourceOtel, Task: "wf", Role: "dev", Round: "2", InputTokens: 7},
+			// A relay-era entry and an external one: neither is the otel face.
+			{Task: "wf", Role: "dev", Round: "3", InputTokens: 999},
+			{Source: metricsrelay.SourceOtelExternal, Task: "wf", Role: "dev", Round: "4", InputTokens: 999},
+			// An otel row with no task has nothing to file under.
+			{Source: metricsrelay.SourceOtel, InputTokens: 999},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"total": len(entries), "page": 1, "page_size": len(entries), "entries": entries})
+	}))
+	defer srv.Close()
+
+	otel, live := cotOtelUsage(srv.URL)
+	if !live {
+		t.Fatalf("a serving daemon read as not live")
+	}
+	if got, want := otel[roundKey("wf", "dev", "1")], (otelUsage{in: 13, out: 5, cacheRead: 2, cacheWrite: 1}); got != want {
+		t.Errorf("round 1 usage = %+v, want the same-round entries summed (%+v)", got, want)
+	}
+	if got := otel[roundKey("wf", "dev", "2")]; got.in != 7 {
+		t.Errorf("round 2 usage = %+v, want its own fold", got)
+	}
+	if n := len(otel); n != 2 {
+		t.Errorf("fold holds %d rounds, want 2 (relay, external, and unattributed rows excluded)", n)
+	}
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+	if _, live := cotOtelUsage(bad.URL); live {
+		t.Errorf("an erroring daemon read as live")
+	}
+
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	if _, live := cotOtelUsage(deadURL); live {
+		t.Errorf("an unreachable daemon read as live")
+	}
+}
+
+// TestLastRoundExit pins the task log's round-exit stamp parse: the newest
+// "jailed … round exited" header's timestamp, later headers winning,
+// everything else — started blocks, review verdicts, malformed stamps,
+// non-header lines — ignored, and a log with no exited round reading zero.
+func TestLastRoundExit(t *testing.T) {
+	early := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+	late := early.Add(5 * time.Minute)
+	log := strings.Join([]string{
+		"run started: issue 42",
+		"=== " + early.Format(time.RFC3339) + " jailed claude round started: stage=dev worktree=/wt pgid=5 (run 01234567) ===",
+		"=== " + early.Format(time.RFC3339) + " jailed claude round exited after 1m0s (run 01234567) ===",
+		"=== " + early.Format(time.RFC3339) + " reviewer: CHANGES_REQUESTED (run 01234567) ===",
+		"=== " + late.Format(time.RFC3339) + " jailed claude round exited after 2m0s (run 89abcdef) ===",
+		"=== not-a-stamp jailed claude round exited after 3m0s (run fedcba98) ===",
+		"=== " + late.Add(time.Hour).Format(time.RFC3339) + " jailed claude round exited after 4m0s",
+		"garbage line",
+	}, "\n")
+	if got := lastRoundExit(log); !got.Equal(late) {
+		t.Errorf("lastRoundExit = %v, want the newest well-formed exited stamp %v", got, late)
+	}
+	if got := lastRoundExit("no headers at all"); !got.IsZero() {
+		t.Errorf("lastRoundExit(headerless log) = %v, want zero", got)
+	}
+}
+
+// TestLastCoTAge pins the runs feed's Last-CoT cell: the age of the log's
+// newest exited round, and the dash for a run with no readable log —
+// relTime renders the zero time as a dash, so a run that never completed a
+// round reads the same as one with no log file.
+func TestLastCoTAge(t *testing.T) {
+	useTaskLogDir(t)
+	now := time.Now()
+	stamp := now.Add(-5 * time.Minute)
+	writeTaskLogFile(t, "wf-aged",
+		"=== "+stamp.Format(time.RFC3339)+" jailed claude round exited after 1m0s (run 01234567) ===")
+	if got := lastCoTAge("wf-aged", now); got != "5m ago" {
+		t.Errorf("lastCoTAge = %q, want %q", got, "5m ago")
+	}
+	if got := lastCoTAge("wf-missing", now); got != "-" {
+		t.Errorf("lastCoTAge(no log) = %q, want the dash", got)
 	}
 }

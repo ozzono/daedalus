@@ -713,9 +713,20 @@ func TestRoundEnvVarsCoversServedAndStagedVars(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"OPENCODE_CONFIG",                                       // opencode bridge staging
-		"MAX_THINKING_TOKENS",                                   // claude thinking pin
-		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",                         // claude output budget
+		"OPENCODE_CONFIG",               // opencode bridge staging
+		"MAX_THINKING_TOKENS",           // claude thinking pin
+		"CLAUDE_CODE_MAX_OUTPUT_TOKENS", // claude output budget
+		// The toggle-on otel staging's claude exports: staging writes them
+		// onto the round env only when it selected the OTLP path, and an
+		// unlisted name is stripped by the jail before the CLI reads it.
+		"CLAUDE_CODE_ENABLE_TELEMETRY",
+		"OTEL_METRICS_EXPORTER",
+		"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+		"OTEL_METRICS_INCLUDE_ACCOUNT_UUID",
+		"OTEL_LOGS_EXPORTER",
+		"OTEL_TRACES_EXPORTER",
+		"OTEL_RESOURCE_ATTRIBUTES",
 		"AIDER_MODEL", "AIDER_WEAK_MODEL", "AIDER_EDITOR_MODEL", // slim pins + operator exports
 		"AMP_API_KEY", "CODEX_HOME", "XDG_DATA_HOME", // named agents' in-jail exports
 		"PATH", "HOME", "TMPDIR", // exec, identity, scratch

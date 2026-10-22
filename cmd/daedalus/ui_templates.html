@@ -52,8 +52,8 @@ details>summary::-webkit-details-marker{display:none}
  <div class="mx-auto max-w-[103.7rem] px-4 py-2.5 flex items-center gap-3 flex-wrap">
   <a class="font-semibold tracking-tight mr-2 flex items-center gap-2" href="/"><span class="h-2 w-2 rounded-full bg-emerald-500"></span>daedalus</a>
   <nav class="flex gap-1 flex-wrap">
-   <a class="tab {{if eq .Nav "workers"}}on{{end}}" href="/workers">Workers</a>
    <a class="tab {{if eq .Nav "runs"}}on{{end}}" href="/runs">Runs</a>
+   <a class="tab {{if eq .Nav "workers"}}on{{end}}" href="/workers">Workers</a>
    <a class="tab {{if eq .Nav "new"}}on{{end}}" href="/new">New Task</a>
    <a class="tab {{if eq .Nav "models"}}on{{end}}" href="/models">Models</a>
    <a class="tab {{if eq .Nav "metrics"}}on{{end}}" href="/metrics">Metrics</a>
@@ -387,7 +387,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 <div class="overflow-x-auto" hx-get="/runs/rows" hx-trigger="every 5s [!document.hidden], change from:#fq, change from:#fs" hx-include="#fq,#fs" hx-target="#rtbody" hx-swap="innerHTML">
 <table class="card w-full text-sm min-w-[820px]">
  <thead class="text-left text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
-  <tr><th scope="col" class="p-3">Workflow id</th><th scope="col">Status</th><th scope="col">Issue</th><th scope="col">Repo</th><th scope="col">Queue</th><th scope="col">Started</th><th scope="col">Last interaction</th></tr>
+  <tr><th scope="col" class="p-3">Workflow id</th><th scope="col">Status</th><th scope="col">Issue</th><th scope="col">Repo</th><th scope="col">Queue</th><th scope="col">Started</th><th scope="col">Last interaction</th><th scope="col">Last CoT</th></tr>
  </thead>
  <tbody id="rtbody">
 {{template "frag_runs" .}}
@@ -409,9 +409,10 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
   <td class="mono">{{.Queue}}</td>
   <td class="text-slate-500 mono">{{.Started}}</td>
   <td class="text-slate-500">{{.LastAt}}</td>
+  <td class="text-slate-500">{{.LastCoT}}</td>
  </tr>
 {{else}}
- <tr><td colspan="7" class="p-6 text-center text-slate-500">{{if .WalkErr}}Run feed unavailable: {{.WalkErr}}{{else}}No runs match.{{end}}</td></tr>
+ <tr><td colspan="8" class="p-6 text-center text-slate-500">{{if .WalkErr}}Run feed unavailable: {{.WalkErr}}{{else}}No runs match.{{end}}</td></tr>
 {{end}}
 {{end}}
 
@@ -578,7 +579,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
   <tbody>
   {{range .Rows}}
    <tr class="border-b last:border-0 border-slate-100 dark:border-slate-800/70">
-    <td class="p-3 mono">{{.Key}}</td>
+    <td class="p-3 mono">{{if .Src}}otel-{{end}}{{.Key}}</td>
     <td>{{.Calls}}</td>
     <td class="mono">{{tok .In}}</td>
     <td class="mono">{{tok .Out}}</td>
@@ -586,10 +587,10 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
     <td class="mono">{{tok .CacheWrite}}</td>
     <td>{{.Runs}}</td>
     <td>{{.Dev}}</td><td>{{.Test}}</td><td>{{.Review}}</td>
-    <td class="mono">{{.HitPct}}</td>
-    <td>{{.OK2xx}}</td><td>{{.R429}}</td><td>{{.R4xx}}</td><td{{if gt .R5xx 0}} class="text-red-600 dark:text-red-400"{{end}}>{{.R5xx}}</td>
-    <td class="mono">{{.P50}}</td><td class="mono">{{.P95}}</td>
-    <td class="mono">{{.RPM}}</td>
+    <td class="mono">{{if .Src}}—{{else}}{{.HitPct}}{{end}}</td>
+    <td>{{if .Src}}—{{else}}{{.OK2xx}}{{end}}</td><td>{{if .Src}}—{{else}}{{.R429}}{{end}}</td><td>{{if .Src}}—{{else}}{{.R4xx}}{{end}}</td><td{{if gt .R5xx 0}} class="text-red-600 dark:text-red-400"{{end}}>{{if .Src}}—{{else}}{{.R5xx}}{{end}}</td>
+    <td class="mono">{{if .Src}}—{{else}}{{.P50}}{{end}}</td><td class="mono">{{if .Src}}—{{else}}{{.P95}}{{end}}</td>
+    <td class="mono">{{if .Src}}—{{else}}{{.RPM}}{{end}}</td>
     <td class="text-slate-500">{{.Last}}</td>
     <td class="mono">{{if .Priced}}{{usd .Cost}}{{else}}—{{end}}</td>
    </tr>
@@ -679,7 +680,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  {{template "usage_table" .WorkerTable}}
 
  <div class="card p-4 text-sm text-slate-500">
-  Coverage: only relay-served rounds appear — unkeyed rounds attribute at worker level only, and a round dialing its CLI-default upstream bypasses the relay entirely. Loop averages span to the first review only and include non-provider time. Per-round rows: <span class="mono">daedalus dash list</span>. Charts: <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>.
+  Coverage: the ledger's daedalus rounds — relay-captured and otel-staged (<span class="mono">otel-</span> rows are export batches, so their per-request columns read —) alike; a round dialing its CLI-default upstream with the toggle off bypasses both. External telemetry renders only on <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>. Loop averages span to the first review only and include non-provider time; the loop, drift, and Tokens/worker tiles read the relay face only — otel batches are minute-deltas, not request records. Per-round rows: <span class="mono">daedalus dash list</span>. Charts: <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>.
  </div>
 {{end}}
 

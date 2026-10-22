@@ -253,7 +253,8 @@ func runMetricsDaemon(cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("listen on :%d: %w (the metrics.port knob names this port)", cfg.Metrics.Port, err)
 	}
-	srv := &http.Server{Handler: newUIServer(cfg, ledger, gl).routes(), ReadHeaderTimeout: 30 * time.Second}
+	uiSrv := newUIServer(cfg, ledger, gl)
+	srv := &http.Server{Handler: uiSrv.routes(), ReadHeaderTimeout: 30 * time.Second}
 	go func() {
 		if err := srv.Serve(ui); err != http.ErrServerClosed {
 			fmt.Printf("metrics: dashboard serve: %v\n", err)
@@ -385,10 +386,10 @@ func runMetricsList(args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(w, "METRICS LEDGER — %d entr%s, page %d (page size %d)%s\n\n",
 		doc.Total, pluralY(doc.Total), doc.Page, doc.PageSize, workerFilterNote(worker))
-	fmt.Fprintln(w, "TIME\tWORKER\tTASK\tROLE\tROUND\tMODEL\tIN\tOUT\tCACHE R/W\tMS\tSTATUS")
+	fmt.Fprintln(w, "TIME\tWORKER\tTASK\tROLE\tROUND\tMODEL\tSRC\tIN\tOUT\tCACHE R/W\tMS\tSTATUS")
 	for _, e := range doc.Entries {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d/%d\t%d\t%d\n",
-			e.At.Local().Format("15:04:05"), cellText(e.Worker), cellText(e.Task), cellText(e.Role), cellText(e.Round), cellText(e.Model),
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d/%d\t%d\t%d\n",
+			e.At.Local().Format("15:04:05"), cellText(e.Worker), cellText(e.Task), cellText(e.Role), cellText(e.Round), cellText(e.Model), cellText(e.Source),
 			e.InputTokens, e.OutputTokens, e.CacheReadTokens, e.CacheWriteTokens,
 			e.DurationMS, e.Status)
 	}

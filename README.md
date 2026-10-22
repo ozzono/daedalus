@@ -608,6 +608,66 @@ issue never share live state). Re-running
   `<branch_prefix>/` branches are never touched; leftover worktree state is healed on the next
   run of the same issue.
 
+## Telemetry
+
+Daedalus can meter every jailed provider round — tokens in and out,
+cached tokens, cost, duration — through the host metrics daemon
+(`daedalus metrics`): a loopback usage relay (default port 7778), an
+in-memory usage ledger, and a web dashboard (default port 7777). A worker
+started with `metrics.enabled: true` gates its boot on the daemon being
+up, registers its provider upstreams and keys with it, and every round's
+provider environment is rewritten so the round dials the relay instead of
+its provider (`/relay/<worker>/<wire>/…`): the relay forwards verbatim,
+and for the two inspected provider-call shapes (anthropic
+`/v1/messages`, openai `/chat/completions`) it tees the usage block out
+of the response into the ledger while the client's stream passes through
+unharmed. Rounds whose endpoint was explicitly overridden — the fallback
+section and the per-role reviewer/dev/final-reviewer sections — are not
+staged. The ledger is memory-only: a 10,000-entry ring, wiped by a daemon
+restart. `metrics list` pages it newest-first (`--worker`, `--page`,
+`--json`), and the dashboard folds it into tiles, tables, and charts.
+Cost is never stored: the dashboard prices every entry at render time
+from the operator-editable model price table (the models tab, USD per 1M
+tokens, in/out/cached rates; cache writes bill at the in rate), so a
+model absent from the table reads unpriced and a retroactive price edit
+reprices the whole window on the next render.
+
+The daemon serves an OpenTelemetry receiver whenever it runs — OTLP
+over HTTP with JSON encoding at `/v1/metrics` on the same loopback relay
+listener, no new port — and any claude or codex on the host can point
+its own OTel config at it; batches arriving without daedalus's staged
+identifiers render only on the full-metrics page as a per-model,
+per-agent section. With `metrics.otel: true` (off by default) the
+worker additionally stages telemetry into jailed rounds themselves
+instead of rewriting their provider endpoint: claude rounds receive the
+`CLAUDE_CODE_ENABLE_TELEMETRY`/`OTEL_*` environment (per-round
+`daedalus.task`/`role`/`round` resource attributes, delta-temporality
+token counters), codex rounds receive an `otel.metrics_exporter="otlp-http"`
+`-c` override pointed at the same endpoint — which also silences codex's
+`statsig` default, its release build otherwise shipping metrics to
+OpenAI. Each round is recorded by exactly one system: with the toggle
+on, claude and codex rounds stage otel and the relay does not see them;
+opencode/pi/aider rounds, and every round with the toggle off, stage the
+relay exactly as before. Receiver entries land in the same ledger tagged
+`source: otel` — one row per export batch, and claude exports every ~60
+seconds plus a final flush at exit, so short rounds emit exactly one —
+and the dashboard labels otel-sourced figures with an `otel-` prefix.
+Three edges, each by design: codex's headless entry (`codex exec`)
+exports no usage metrics yet (an upstream gap), so toggle-on codex rounds
+stage otel but record nothing until it closes; agents older than the
+probe-verified floors (claude 2.1.304, codex 0.160.0) silently ignore
+the otel staging, so the worker probes both binaries' versions (lazily,
+once per worker, then cached) and falls such rounds back to the relay
+path; and the models table's per-request columns (p50/p95, status
+codes, req/min) are em-dashed on otel rows, because the metrics stream
+carries no request-level signal — the loop, drift, and per-worker tiles
+likewise read the relay face only, since otel batches are minute-deltas,
+not request records.
+Pricing is identical on both paths — every entry prices through the same
+render-time table — and an agent's own cost report is deliberately not
+displayed, so a proxy-served model name is priced by your table rather
+than the agent's built-in list.
+
 ## Development
 
 Known open bugs live in `backlog/bugs/`. Notably: from a directory where no

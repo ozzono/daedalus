@@ -46,9 +46,12 @@ func TestBadgeClass(t *testing.T) {
 		"approved":  "b-idle",
 		"completed": "b-idle",
 		"parked":    "b-fail",
-		"paused":    "b-fail",
-		"failed":    "b-fail",
-		"TimedOut":  "b-idle", // a raw enum the mapping does not know
+		// Paused is a resumable parked state, not a failure: it renders
+		// with the waiting family (the park-cause banner keeps its red
+		// text — diagnostic content, not a status chip).
+		"paused":   "b-wait",
+		"failed":   "b-fail",
+		"TimedOut": "b-idle", // a raw enum the mapping does not know
 	}
 	for status, want := range cases {
 		if got := badgeClass(status); got != want {
@@ -539,9 +542,9 @@ func TestUIWorkersPage(t *testing.T) {
 			t.Errorf("rows output lacks the queue-depth count:\n%s", out)
 		}
 
-		page := h.get(t, "/")
+		page := h.get(t, "/workers")
 		if !strings.Contains(page, "Workers on this host") || !strings.Contains(page, "w1") {
-			t.Errorf("landing page should embed the same roster")
+			t.Errorf("the workers page should embed the same roster")
 		}
 	})
 
@@ -831,10 +834,11 @@ func TestUIPolledFragmentsAnswer204WhenUnchanged(t *testing.T) {
 	}
 
 	// Pages are not fragments: they render 200 whole on every request, so
-	// the shell's own markup never depends on poll history.
+	// the shell's own markup never depends on poll history. The root is
+	// the runs view now, so both spellings render the same page.
 	for i := 0; i < 2; i++ {
-		if code, out := h.poll(t, "/"); code != http.StatusOK || !strings.Contains(out, "Workers on this host") {
-			t.Errorf("page / poll %d = %d, want 200 with the shell every time", i+1, code)
+		if code, out := h.poll(t, "/"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
+			t.Errorf("page / poll %d = %d, want 200 with the runs feed embedded", i+1, code)
 		}
 		if code, out := h.poll(t, "/runs"); code != http.StatusOK || !strings.Contains(out, "listq-live") {
 			t.Errorf("page /runs poll %d = %d, want 200 with the shell every time", i+1, code)
@@ -1140,7 +1144,7 @@ func TestUIPolledPageFaces(t *testing.T) {
 			StartTime: timestamppb.New(started),
 		},
 	}
-	index := h.get(t, "/")
+	index := h.get(t, "/workers")
 	runs := h.get(t, "/runs")
 	detail := h.get(t, "/runs/listq-live")
 
@@ -1250,8 +1254,8 @@ func TestUIPageA11yFaces(t *testing.T) {
 
 	t.Run("tables declare column headers", func(t *testing.T) {
 		runs := h.get(t, "/runs")
-		if n := strings.Count(runs, `<th scope="col"`); n != 7 {
-			t.Errorf("the runs table declares %d column headers, want 7:\n%s", n, runs)
+		if n := strings.Count(runs, `<th scope="col"`); n != 8 {
+			t.Errorf("the runs table declares %d column headers, want 8 (the Last CoT column included):\n%s", n, runs)
 		}
 		metrics := h.get(t, "/metrics")
 		if !strings.Contains(metrics, `<th scope="col" class="font-medium pb-2">Queue</th>`) {
@@ -1649,5 +1653,68 @@ func TestClosedRunParkReasonFaces(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("run-reason-park probed %d times, want 1 (the memo serves the reason too)", n)
+	}
+}
+
+// TestLandingPageServesTheRunsFeed pins the root route: runs are the
+// default view — what an operator opens the dashboard for — so / serves
+// the runs page with its rows embedded and the runs tab lit, while
+// /workers keeps serving the workers page the old landing rendered.
+func TestLandingPageServesTheRunsFeed(t *testing.T) {
+	h := newUIHarness(t)
+	started := time.Now().Add(-time.Hour)
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+		uiRow(t, "listq-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started, nil),
+	}
+	h.fake.wfHistory["listq-live"] = []*historypb.HistoryEvent{
+		uiStartedEvent(t, workflows.PipelineInput{IssueID: "42", RepoPath: "", Flow: "feature-dev"}),
+	}
+
+	landing := h.get(t, "/")
+	if !strings.Contains(landing, "listq-live") {
+		t.Errorf("the landing page does not embed the runs feed:\n%s", landing)
+	}
+	if !strings.Contains(landing, `<a class="tab on" href="/runs">`) {
+		t.Errorf("the landing page does not light the runs tab:\n%s", landing)
+	}
+	if strings.Contains(landing, `<a class="tab on" href="/workers">`) {
+		t.Errorf("the landing page lights the workers tab:\n%s", landing)
+	}
+	workers := h.get(t, "/workers")
+	if !strings.Contains(workers, "Workers on this host") {
+		t.Errorf("/workers lost the workers page:\n%s", workers)
+	}
+}
+
+// TestRunsFeedCarriesTheLastCoTCell pins the runs table's time-since-last-
+// CoT column: a run whose task log carries an exited round renders that
+// round's age in the cell, computed from the log's own round-exit stamps —
+// the same grammar `daedalus log` parses — so the operator sees staleness
+// without opening the log.
+func TestRunsFeedCarriesTheLastCoTCell(t *testing.T) {
+	h := newUIHarness(t)
+	useTaskLogDir(t)
+	started := time.Now().Add(-time.Hour)
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+		uiRow(t, "listq-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started, nil),
+	}
+	h.fake.wfHistory["listq-live"] = []*historypb.HistoryEvent{
+		uiStartedEvent(t, workflows.PipelineInput{IssueID: "42", RepoPath: "", Flow: "feature-dev"}),
+	}
+
+	runs := h.get(t, "/runs")
+	if !strings.Contains(runs, "<th scope=\"col\">Last CoT</th>") {
+		t.Errorf("the runs table lost the Last CoT column:\n%s", runs)
+	}
+	if !strings.Contains(runs, ">-<") && !strings.Contains(runs, ">-</td>") {
+		t.Errorf("a run with no log renders the dash cell; got:\n%s", runs)
+	}
+
+	stamp := time.Now().Add(-5 * time.Minute).Format(time.RFC3339)
+	writeTaskLogFile(t, "listq-live",
+		"=== "+stamp+" jailed claude round exited after 1m0s (run run-live-) ===")
+	runs = h.get(t, "/runs")
+	if !strings.Contains(runs, "5m ago") {
+		t.Errorf("the Last CoT cell does not render the newest exited round's age:\n%s", runs)
 	}
 }
