@@ -37,7 +37,11 @@ const piEditSteer = "EDIT LOOP: your recent `edit` calls failed because `oldText
 // piEditGuardrail is appended to every pi round's prompt (implementing
 // rounds only — reviewers do not edit). Cheap insurance for small models;
 // delivered on every round so it is in-context when an edit is attempted.
-const piEditGuardrail = "\n\nEDIT DISCIPLINE: before any `edit` tool call, `read` the target file in this round first. If an edit fails, `read` the file again before retrying — never retry an edit with the same `oldText` that already failed."
+// Carries the tool-repeat rule too: re-issued identical calls are the
+// livelock piToolLoopWatcher kills rounds for, and this is that kill's
+// prompt-side nudge — the kill is the guarantee, the line only helps a
+// model that still reads its context.
+const piEditGuardrail = "\n\nEDIT DISCIPLINE: before any `edit` tool call, `read` the target file in this round first. If an edit fails, `read` the file again before retrying — never retry an edit with the same `oldText` that already failed.\n\nREPEAT DISCIPLINE: never re-run a tool call identical to one you already ran this round — when its result is already in your context, analyze it and act on it instead of calling again."
 
 // piFreshSessionHandoff is appended to a pi round's prompt when an
 // api-error retry starts a fresh session (AgentRunInput.FreshRetry): the

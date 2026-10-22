@@ -1,7 +1,9 @@
 package activities
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -311,6 +313,117 @@ func agentAPIError(agent, stdout string) string {
 		}
 	}
 	return ""
+}
+
+// toolLoopThreshold is the consecutive-identical-call count at which a pi
+// round's loop watcher kills the round: three — one legitimate retry of a
+// flaky command is a single repeat, so two identical calls stay under the
+// threshold, and a third in a row is the degenerate livelock (every call
+// succeeds, heartbeats stay fresh, and only the round budget would ever
+// end it). Named so the kill's wrap can cite the count it fired at.
+const toolLoopThreshold = 3
+
+// piToolExecEvent is the one pi json event the loop watcher consumes
+// (pi.dev/docs/latest/json): tool_execution_start fires once per executed
+// tool call, naming the tool and carrying its arguments object. The
+// generated call id is deliberately not captured — a re-issued call gets
+// a new id every time, so the loop identity excludes it by construction.
+type piToolExecEvent struct {
+	Type     string          `json:"type"`
+	ToolName string          `json:"toolName"`
+	Args     json.RawMessage `json:"args"`
+}
+
+// canonicalJSON re-encodes raw json so equal values render equal strings:
+// decoding into any and marshaling again sorts object keys and strips
+// whitespace, while UseNumber keeps every number literal verbatim — plain
+// float64 decoding collapses adjacent integers above 2^53 (snowflake ids,
+// unix-nano timestamps) onto one float, which would alias distinct calls
+// into one loop identity. Two emissions of the same call compare equal
+// regardless of key order or spacing; any argument difference stays
+// distinct. Raw bytes fall through when they are not exactly one json
+// value — byte-identical repeats still compare equal.
+func canonicalJSON(raw json.RawMessage) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return string(raw)
+	}
+	// Unmarshal's own strictness: the input must be exactly one value, or
+	// the raw bytes stay the identity.
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return string(raw)
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return string(raw)
+	}
+	return string(b)
+}
+
+// piToolLoopWatcher watches one pi round's json stream live for the
+// identical-tool-call livelock small models fall into: every round-trip
+// re-issues the call, every call executes successfully, and the round
+// looks healthy to everything but its budget while it produces nothing.
+// It implements io.Writer and rides the round's stdout tee (an
+// io.MultiWriter beside the collection buffer, which keeps its existing
+// role), carrying partial lines between writes, and counts consecutive
+// tool_execution_start identities — tool name plus canonicalized
+// arguments. At toolLoopThreshold identical calls it kills the round
+// through kill (the round's process-group kill) and stays fired; a call
+// with a different identity resets the streak, so interleaved distinct
+// calls, tool-name changes, and argument changes never fire it. The
+// comparison runs on parsed structured events — the same machine-readable
+// surface agentAPIError reads post-hoc — never on raw text markers, so
+// nothing the agent prints can forge the kill or its classification.
+// Writes arrive on exec's stdout-copy goroutine and all complete before
+// cmd.Wait returns (Wait reaps the copiers), so the caller reads fired
+// after Wait without a lock.
+type piToolLoopWatcher struct {
+	// kill ends the round once fired. Called on exec's stdout-copy
+	// goroutine.
+	kill  func()
+	buf   []byte // partial line carried between writes
+	last  string // identity of the previous tool call
+	count int    // consecutive calls matching last
+	fired bool
+}
+
+// Write tees the stream through the line scanner. It never fails: the tee
+// must stay transparent, and an error here would corrupt the round's own
+// output collection.
+func (w *piToolLoopWatcher) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		w.scanLine(w.buf[:i])
+		w.buf = w.buf[i+1:]
+	}
+	return len(p), nil
+}
+
+// scanLine folds one completed stream line into the streak, killing the
+// round on the threshold hit.
+func (w *piToolLoopWatcher) scanLine(line []byte) {
+	var e piToolExecEvent
+	if json.Unmarshal(line, &e) != nil || e.Type != "tool_execution_start" {
+		return
+	}
+	id := e.ToolName + "\x00" + canonicalJSON(e.Args)
+	if id == w.last {
+		w.count++
+	} else {
+		w.last, w.count = id, 1
+	}
+	if w.count >= toolLoopThreshold && !w.fired {
+		w.fired = true
+		w.kill()
+	}
 }
 
 // verdictMarkers are the four daedalus review verdict markers — the set

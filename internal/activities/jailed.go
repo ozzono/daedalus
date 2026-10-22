@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -1191,7 +1192,20 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 		}
 	}
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	// pi rounds tee their stream through the loop watcher: the buffer keeps
+	// its collection role, and the watcher reads the same bytes as they
+	// flow — pi's json stream carries every tool call — killing the round
+	// once toolLoopThreshold consecutive calls are identical (the
+	// degenerate livelock: every call succeeds, so nothing but the budget
+	// would ever end it; see ErrAgentLoop). Other agents have no structured
+	// tool-call face here and run unwrapped.
+	var loopWatch *piToolLoopWatcher
+	if selected == "pi" {
+		loopWatch = &piToolLoopWatcher{kill: func() { killGroup(cmd) }}
+		cmd.Stdout = io.MultiWriter(&stdout, loopWatch)
+	} else {
+		cmd.Stdout = &stdout
+	}
 	cmd.Stderr = &stderr
 	start := time.Now()
 	logger := activityLogger(ctx)
@@ -1248,6 +1262,17 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// still outranks this report, exactly as it outranks the text markers.
 	apiErr := agentAPIError(selected, res.Stdout)
 	if err != nil && !isWaitDelay(err) {
+		// The loop watcher's own kill lands here as a signal death (it
+		// SIGKILLs the group from the stream), so this check outranks the
+		// deathSignal wrap below: the round died to its own detected
+		// livelock, not to an outside signal. The wrap carries no output,
+		// like the ErrAgentKilled wrap — the cause is the watcher's kill
+		// on parsed structured events, and embedding output would let
+		// agent text reach the classification.
+		if loopWatch != nil && loopWatch.fired {
+			return res, fmt.Errorf("%w: %s round repeated the identical tool call %d times: %w",
+				ErrAgentLoop, selected, toolLoopThreshold, ErrAPIExhausted)
+		}
 		if sig := deathSignal(err); sig != "" {
 			logDeath(logger, cmd, err, start, sig)
 			// A signaled death is wait-status-derived, so it outranks the
@@ -1601,6 +1626,27 @@ var ErrAgentSlotsBusy = errors.New("all jailed-agent slots busy")
 // reported. The wrap carries no output — the workflow must not classify on
 // text an agent printed.
 var ErrAgentKilled = errors.New("jailed agent killed by signal")
+
+// ErrAgentLoop marks a jailed pi round daedalus killed mid-run because its
+// structured stream showed toolLoopThreshold consecutive identical tool
+// calls — the degenerate livelock a weak model falls into: every call
+// succeeds, so activity heartbeats stay fresh and no error surface ever
+// fires, and without the kill the round burns its entire budget producing
+// nothing. The kill decision comes from parsed tool_execution_start
+// events (identity = tool name plus canonicalized arguments, generated
+// call ids excluded), never from output text, so it is not forgeable.
+//
+// It deliberately wraps ErrAPIExhausted at the return site — family
+// membership, not the killed face: the exhaustion path is the established
+// remediation for a poisoned conversation. The in-activity failover first
+// hands the same conversation to the other provider (a different model may
+// break the loop), and the workflow's retry then runs the round in a fresh
+// pi session (AgentRunInput.FreshRetry), which is what actually drops the
+// degenerate transcript. The killed face was the wrong answer: its
+// continuation reply resumes the very conversation that looped, and the
+// fresh-session fallback behind brokenResume never fires for a first
+// round, where the livelock lives.
+var ErrAgentLoop = errors.New("jailed agent stuck in an identical-tool-call loop")
 
 // matchesAny reports whether s contains any marker, case-insensitively.
 func matchesAny(s string, markers []string) bool {
