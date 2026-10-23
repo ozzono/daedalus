@@ -793,7 +793,24 @@ func applyUsage(e *Entry, body []byte) {
 			continue
 		}
 		var chunk struct {
-			Model   string `json:"model"`
+			Model string `json:"model"`
+			// Choices is the openai chunk's payload side. Only a chunk that
+			// carries payload vouches for the model name it names: model
+			// hosts emit synthetic SSE keepalive frames naming a non-model
+			// while a request waits (omlx streams a model literally named
+			// "keepalive" while a model loads, and again during generation
+			// stalls), and a stream killed in that phase must not record
+			// the phantom name as a live model's row. An explicit null
+			// tool_calls carries none — RawMessage keeps the literal
+			// bytes, so the guard rejects the null literal outright.
+			Choices []struct {
+				Delta struct {
+					Content          string          `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					ToolCalls        json.RawMessage `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
 			Message *struct {
 				Model string    `json:"model"`
 				Usage wireUsage `json:"usage"`
@@ -809,7 +826,16 @@ func applyUsage(e *Entry, body []byte) {
 			}
 			setTokens(e, &chunk.Message.Usage)
 		}
-		if chunk.Model != "" {
+		serves := chunk.Usage != nil
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" || c.Delta.ReasoningContent != "" ||
+				(len(c.Delta.ToolCalls) > 0 && string(c.Delta.ToolCalls) != "null") ||
+				c.FinishReason != "" {
+				serves = true
+				break
+			}
+		}
+		if chunk.Model != "" && serves {
 			e.Model = chunk.Model
 		}
 		if chunk.Usage != nil {

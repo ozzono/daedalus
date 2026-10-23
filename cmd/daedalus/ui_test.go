@@ -289,9 +289,21 @@ func (f *uiFrontend) ListWorkflowExecutions(_ context.Context, req *workflowserv
 
 // GetWorkflowExecutionHistory serves the workflow-id-keyed histories when
 // the read names no run id (the dashboard walks history by workflow id) and
-// falls back to the embedded run-id-keyed serving — the close-event probe
-// the status derivation issues.
+// a run-id-keyed full event list when one is staged there (the CoT box's
+// walk pairs scheduled and terminal events, more than the close-event
+// serving can hold); anything else falls back to the embedded run-id-keyed
+// serving — the close-event probe the status derivation issues.
 func (f *uiFrontend) GetWorkflowExecutionHistory(ctx context.Context, req *workflowservice.GetWorkflowExecutionHistoryRequest) (*workflowservice.GetWorkflowExecutionHistoryResponse, error) {
+	if runID := req.GetExecution().GetRunId(); runID != "" {
+		f.mu.Lock()
+		evs, ok := f.wfHistory[runID]
+		f.mu.Unlock()
+		if ok {
+			return &workflowservice.GetWorkflowExecutionHistoryResponse{
+				History: &historypb.History{Events: evs},
+			}, nil
+		}
+	}
 	if req.GetExecution().GetRunId() == "" {
 		f.mu.Lock()
 		evs, ok := f.wfHistory[req.GetExecution().GetWorkflowId()]
@@ -1116,6 +1128,45 @@ func TestUIRunDetailCauseCard(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestUIRunCotBoxTailsTheKilledRound pins the run detail's last-round CoT
+// box on a cancelled round: the box serves the walk's tail-1 view, so the
+// newest finished section — the killed round's degraded one, not the
+// completed predecessor before it — is what opens, and the in-flight face
+// stays out (a dead round is not in flight).
+func TestUIRunCotBoxTailsTheKilledRound(t *testing.T) {
+	h := newUIHarness(t)
+	dc := converter.GetDefaultDataConverter()
+	started := time.Now().Add(-time.Hour)
+	closed := started.Add(30 * time.Minute)
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+		uiRow(t, "wf-kill", "run-kill", enums.WORKFLOW_EXECUTION_STATUS_CANCELED, "", started, &closed),
+	}
+	h.fake.wfHistory["run-kill"] = append(
+		cotRound(t, dc, 1, started.Add(-time.Minute), "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			activities.AgentRunResult{Thinking: "predecessor reasoning", Text: "answer"}),
+		cotDeadRound(t, dc, 3, closed, "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			"canceled", "")...,
+	)
+
+	out := h.get(t, "/runs/wf-kill/cot")
+	for _, want := range []string{
+		"=== round 2: dev (run run-kill) @",
+		"round cancelled",
+		"no CoT captured for this round",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the CoT box lacks %q:\n%s", want, out)
+		}
+	}
+	for _, absent := range []string{"=== round 1:", "predecessor reasoning", "in-flight round"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("the CoT box must tail one section — the killed round's — not %q:\n%s", absent, out)
+		}
+	}
 }
 
 // TestUIPolledPageFaces pins the polling client's decisions as the page

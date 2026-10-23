@@ -86,9 +86,10 @@ func plainTailState(log string) string {
 // run's chain-of-thought logs instead of the task
 // log — one complete section per jailed round (implementation and review),
 // never truncated. Each section opens with a `=====` divider and stamps
-// the round's Temporal completion time in its header, so consecutive
-// rounds read as separate blocks. cotN tails the completed sections to
-// the last N rounds (-1 means every round); a live in-flight section,
+// the round's finish time in its header — the completion event's, or the
+// terminal event's for a round that died — so consecutive rounds read as
+// separate blocks. cotN tails the finished sections (completed or dead)
+// to the last N rounds (-1 means every round); a live in-flight section,
 // when one exists, always follows — it is the newest material there is.
 // Rounds with a native thinking channel (claude, amp, pi)
 // show their captured Thinking — implementing and reviewer rounds alike;
@@ -102,7 +103,7 @@ func plainTailState(log string) string {
 // every other client command — else the default, so the command works
 // wherever the Temporal service is reachable. When a round is in flight
 // right now, a live section rendered from the agent's host-side transcript
-// follows the completed ones (see liveCotSectionWith). The dump ends with a
+// follows the finished ones (see liveCotSectionWith). The dump ends with a
 // log-tail block naming when the last log arrived and the workflow's real
 // Temporal state, so a finished run's output never reads as live (see
 // logTail).
@@ -139,8 +140,9 @@ func runTaskLogCot(workflowID string, cotN int) {
 	if err != nil {
 		exitf("%v", err)
 	}
-	// cotN tails the completed sections to the last N; whole sections
-	// only — the no-truncation rule is per section, never per byte.
+	// cotN tails the finished sections (completed or dead) to the last N;
+	// whole sections only — the no-truncation rule is per section, never
+	// per byte.
 	shown := sections
 	if cotN >= 0 && len(sections) > cotN {
 		shown = sections[len(sections)-cotN:]
@@ -151,9 +153,9 @@ func runTaskLogCot(workflowID string, cotN int) {
 		fmt.Print("\n")
 	}
 	// The in-flight section replaces, never accompanies, the no-rounds
-	// message: a round running with zero completed rounds is exactly the
+	// message: a round running with zero finished rounds is exactly the
 	// case the live view exists for. It rides outside the tail: the round
-	// it renders is newer than every completed one.
+	// it renders is newer than every finished one.
 	live := liveCotSectionWith(workflowID, c)
 	if live != "" {
 		fmt.Print("=====================================\n")
@@ -169,18 +171,20 @@ func runTaskLogCot(workflowID string, cotN int) {
 }
 
 // cotSectionsWith walks each run's history like the usage report does: pair
-// every jailed round's completed result with its scheduled input, which
+// every jailed round's terminal event with its scheduled input, which
 // carries the round's role and (when the run pinned one) its agent, and
-// render one section per completed round, oldest first. Each section is
-// its header line then its body — the round's CoT, or the no-CoT note —
-// without the ===== divider; the printers add their own. Shared by the
-// CLI's -cot dump and the run detail's last-round box.
+// render one section per finished round — completed, or dead by failure,
+// cancellation, or timeout (the dead ones render their degraded section;
+// see the terminal branch below) — oldest first. Each section is its header line then its
+// body — the round's CoT, or the no-CoT note — without the ===== divider;
+// the printers add their own. Shared by the CLI's -cot dump and the run
+// detail's last-round box.
 //
 // src names the live metrics daemon's relay root and turns on the source
 // precedence: a keyed round's relay capture (content, stamped relay), else
 // its otel ledger entries (usage stamp over the Temporal CoT, stamped
 // otel), else the Temporal walk itself (stamped temporal). An empty src —
-// no daemon — is today's walk, unstamped: a capture-absent dump and a
+// no daemon — is the plain walk, unstamped: a capture-absent dump and a
 // daemon-less one render byte-identically to the pre-capture shape.
 func cotSectionsWith(c client.Client, workflowID string, runs []string, src string) ([]string, error) {
 	dc := converter.GetDefaultDataConverter()
@@ -192,6 +196,22 @@ func cotSectionsWith(c client.Client, workflowID string, runs []string, src stri
 		activityID string
 	}
 	otel, live := cotOtelUsage(src)
+	// deadSection renders a failed, cancelled, or timed-out round's
+	// degraded section: the shared header stamped with the terminal
+	// event's time, the terminal face, then the usual source-precedence
+	// body — the relay capture still matches by roundKey because the
+	// activity id rode the scheduled event, so a killed round renders
+	// whatever wire traffic it managed to stream. temporal is empty: no
+	// result payload exists to walk.
+	deadSection := func(n int, sr scheduledRound, runID, face string, at time.Time) string {
+		roleName := string(sr.role)
+		if roleName == "" {
+			roleName = "none"
+		}
+		return cotHeader(n, string(sr.role), sr.agent, runID, at) + "\n" +
+			face + "\n" +
+			cotRoundBody(src, &live, otel, ledgerTaskID(workflowID), roleName, sr.activityID, "")
+	}
 	var sections []string
 	for _, runID := range runs {
 		scheduled := map[int64]scheduledRound{}
@@ -228,6 +248,45 @@ func cotSectionsWith(c client.Client, workflowID string, runs []string, src stri
 			}
 			a := ev.GetActivityTaskCompletedEventAttributes()
 			if a == nil {
+				// A round that died before completing — a failure or a
+				// cancellation (a kill, an abort) — still owns a section:
+				// rendering only completed rounds left every view tailing
+				// the walk pointing at a hours-stale predecessor, with the
+				// dead round's own relay capture sitting unrendered. Only a
+				// terminal event emits: a scheduled event with no terminal
+				// yet is the live round, and the live path
+				// (liveCotSectionWith) owns that face — emitting here too
+				// would double-render it.
+				if f := ev.GetActivityTaskFailedEventAttributes(); f != nil {
+					if sr := scheduled[f.GetScheduledEventId()]; agentActivityTypes[sr.typ] {
+						face := "round failed"
+						if msg := singleLine(f.GetFailure().GetMessage()); msg != "" {
+							face += ": " + msg
+						}
+						sections = append(sections, deadSection(len(sections)+1, sr, runID,
+							face, ev.GetEventTime().AsTime()))
+					}
+					continue
+				}
+				// A cancelled round carries no result payload to name a
+				// reason with — the plain face says all that is known.
+				if cx := ev.GetActivityTaskCanceledEventAttributes(); cx != nil {
+					if sr := scheduled[cx.GetScheduledEventId()]; agentActivityTypes[sr.typ] {
+						sections = append(sections, deadSection(len(sections)+1, sr, runID,
+							"round cancelled", ev.GetEventTime().AsTime()))
+					}
+					continue
+				}
+				// The third terminal a round can die by: its StartToClose
+				// burned before the activity could honor its own deadline —
+				// rare (the round's wait paths watch ctx), but reachable,
+				// and the walk renders it like any other killed round.
+				if tx := ev.GetActivityTaskTimedOutEventAttributes(); tx != nil {
+					if sr := scheduled[tx.GetScheduledEventId()]; agentActivityTypes[sr.typ] {
+						sections = append(sections, deadSection(len(sections)+1, sr, runID,
+							"round timed out", ev.GetEventTime().AsTime()))
+					}
+				}
 				continue
 			}
 			sr := scheduled[a.GetScheduledEventId()]
@@ -273,27 +332,9 @@ func cotSectionsWith(c client.Client, workflowID string, runs []string, src stri
 			default:
 				continue
 			}
-			header := fmt.Sprintf("=== round %d: %s", len(sections)+1, sr.role)
-			if sr.agent != "" {
-				header += fmt.Sprintf(" (%s)", sr.agent)
-			}
-			// Run-id attribution, the task-log blocks' own convention (an
-			// 8-char prefix): a continued session's identically-headed retry
-			// sections attribute to the execution that produced them. The
-			// visibility-lag fallback walks the latest run without an id —
-			// there is nothing to stamp, and the section says so by omission.
-			if runID != "" {
-				short := runID
-				if len(short) > 8 {
-					short = short[:8]
-				}
-				header += " (run " + short + ")"
-			}
-			// The completed event's time is when this attempt's CoT
-			// became final — the honest per-round stamp.
-			header += fmt.Sprintf(" @ %s ===", ev.GetEventTime().AsTime().Format("2006-01-02 15:04:05 MST"))
 			var b strings.Builder
-			b.WriteString(header + "\n")
+			b.WriteString(cotHeader(len(sections)+1, string(sr.role), sr.agent, runID,
+				ev.GetEventTime().AsTime()) + "\n")
 			roleName := string(sr.role)
 			if roleName == "" {
 				roleName = "none"
@@ -303,6 +344,42 @@ func cotSectionsWith(c client.Client, workflowID string, runs []string, src stri
 		}
 	}
 	return sections, nil
+}
+
+// cotHeader renders a section's header line: the round ordinal, the role,
+// the pinned agent, the run-id attribution, and the stamp. Shared by the
+// completed and the degraded (failed/cancelled) section builders, so the
+// shapes cannot drift.
+//
+// Run-id attribution, the task-log blocks' own convention (an 8-char
+// prefix): a continued session's identically-headed retry sections
+// attribute to the execution that produced them. The visibility-lag
+// fallback walks the latest run without an id — there is nothing to stamp,
+// and the section says so by omission.
+func cotHeader(n int, role, agent, runID string, at time.Time) string {
+	header := fmt.Sprintf("=== round %d: %s", n, role)
+	if agent != "" {
+		header += fmt.Sprintf(" (%s)", agent)
+	}
+	if runID != "" {
+		short := runID
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		header += " (run " + short + ")"
+	}
+	// The stamp is when this round's material became final — a completed
+	// event's time (the CoT became final) or a terminal event's (the round
+	// died).
+	return header + fmt.Sprintf(" @ %s ===", at.Format("2006-01-02 15:04:05 MST"))
+}
+
+// singleLine flattens s onto one line — a failure message with newlines
+// inside a section would carry header-shaped material past every parser —
+// without truncating it: the no-truncation rule holds for the terminal
+// face the way it holds for a section's body.
+func singleLine(s string) string {
+	return strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(s))
 }
 
 // otelUsage is one round's folded otel ledger counters — the usage stamp
@@ -377,10 +454,11 @@ func fetchCotCapture(root, task, role, round string) (cr metricsrelay.CapturedRo
 	return cr, true, true
 }
 
-// cotRoundBody renders one completed round's body from the source
-// precedence: the relay capture (the round's real prompt and response,
-// stamped relay), else the otel ledger's usage stamp over the Temporal
-// walk's CoT (stamped otel — otel carries the counts, Temporal the text),
+// cotRoundBody renders one finished round's body (completed, or dead by
+// failure, cancellation, or timeout) from the source precedence: the
+// relay capture (the round's real prompt and response, stamped relay),
+// else the otel ledger's usage stamp over the Temporal walk's CoT
+// (stamped otel — otel carries the counts, Temporal the text),
 // else the Temporal walk itself (stamped temporal). The unstamped shape —
 // !*live, or a daemon that died mid-dump, which flips *live off — is the
 // pre-capture body byte-for-byte, so a daemon-less dump renders exactly
@@ -414,9 +492,11 @@ func cotRoundBody(src string, live *bool, otel map[string]otelUsage, task, role,
 	if u, ok := otel[roundKey(task, role, round)]; ok {
 		b := fmt.Sprintf("source: otel\nusage: in %d, out %d, cache read %d/write %d\n",
 			u.in, u.out, u.cacheRead, u.cacheWrite)
-		// The otel stamp is metadata, not a replacement: the Temporal
-		// result still carries the round's real CoT, and the toggle must
-		// never downgrade the diagnostic surface to four numbers.
+		// The otel stamp is metadata, not a replacement: a completed
+		// round's Temporal result still carries its real CoT (a dead
+		// round walked no result, so only the counts render), and the
+		// toggle must never downgrade the diagnostic surface to four
+		// numbers.
 		if temporal != "" {
 			b += temporal + "\n"
 		}
