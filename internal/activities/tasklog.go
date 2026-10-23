@@ -11,11 +11,28 @@ import (
 )
 
 // TaskLogDir is the daemon directory holding one append-only log per
-// pipeline task: /tmp/daedalus/<workflow-id>.log. It is the daemon dir
-// itself, not a subdirectory, so the worker startup's pruneOldLogs
-// (cmd/daedalus) — which removes any *.log untouched for logRetention —
-// prunes task logs for free alongside the worker logs.
-var TaskLogDir = "/tmp/daedalus"
+// pipeline task: ~/.local/state/daedalus/<workflow-id>.log — the
+// platform-conventional durable state home for a per-user service (Q2,
+// shared-metrics-db design: the daemon's runtime files leave tmpfs, where
+// a reboot wiped them). It is the daemon dir itself, not a subdirectory,
+// so the worker startup's pruneOldLogs (cmd/daedalus) — which removes any
+// *.log untouched for logRetention — prunes task logs for free alongside
+// the worker logs. The directory is created by every daemon start
+// (worker/metrics MkdirAll their daemon dir before anything writes).
+var TaskLogDir = taskLogDir()
+
+// taskLogDir resolves the state dir at init. No HOME is the one
+// degradation: the old /tmp/daedalus location stands in rather than
+// failing every daemon start on a host that exports no HOME.
+// ponytail: such hosts are exotic; a fuller answer (an env knob) is
+// deliberately absent until one appears.
+func taskLogDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "/tmp/daedalus"
+	}
+	return filepath.Join(home, ".local", "state", "daedalus")
+}
 
 // TaskLogPath returns the task log file path for workflowID. The id is
 // validated first: it embeds the operator-supplied issue id, so a crafted

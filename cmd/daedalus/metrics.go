@@ -46,6 +46,42 @@ const (
 	metricsHeartbeatInterval = 15 * time.Second
 )
 
+// metricsDBPath resolves the shared metrics database: config
+// metrics.storage_path when set, else ~/.config/daedalus/metrics.db — the
+// config home the config search order already ends at, holding the config
+// plus all durable metrics state (relay ledger rows, model prices, the
+// golens roll-ups and layout document) in one file. The default path's
+// parent directory is created here, the one resolution both the ledger
+// store and the golens registry route through; a custom storage_path's
+// parent stays the operator's.
+func metricsDBPath(cfg config.Config) (string, error) {
+	if p := cfg.Metrics.StoragePath; p != "" {
+		return p, nil
+	}
+	// No HOME degrades to the daemon dir — the same fallback TaskLogDir
+	// applies (which lands on the old /tmp/daedalus there) — so a
+	// HOME-less host boots the metrics daemon with the pre-diff volatile
+	// layout rather than failing every start.
+	dir := daemonDir
+	if home, err := os.UserHomeDir(); err == nil {
+		dir = filepath.Join(home, ".config", "daedalus")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "metrics.db"), nil
+}
+
+// ledgerMaxAge resolves the ledger's retention horizon: the configured
+// metrics.ledger_max_age (an explicit 0s keeps every row forever), else
+// the default.
+func ledgerMaxAge(cfg config.Config) time.Duration {
+	if cfg.Metrics.LedgerMaxAge != nil {
+		return *cfg.Metrics.LedgerMaxAge
+	}
+	return config.DefaultLedgerMaxAge
+}
+
 // metricsHTTP bounds every CLI-side call into the daemon — the ledger read
 // and the worker's registration/heartbeat, both on the loopback listener.
 // The client default (no timeout) would hang the worker boot or the CLI
@@ -220,7 +256,31 @@ func metricsStatus() error {
 // mux, the status publisher, and a signal-driven shutdown. In-flight
 // requests are not drained — the lifecycle contract is the worker's.
 func runMetricsDaemon(cfg config.Config) error {
-	ledger := &metricsrelay.Ledger{} // zero value ready: mutex plus empty ring
+	// The ledger's home: sqlite mode (the default) persists the rows to
+	// the shared metrics database — the same file the golens roll-ups and
+	// the price table use; memory mode keeps them in-process, no file at
+	// all (storage_backend: memory is the decided no-disk posture).
+	ledger := &metricsrelay.Ledger{}
+	var pstore *priceStore
+	if cfg.Metrics.StorageBackend != "memory" {
+		path, err := metricsDBPath(cfg)
+		if err != nil {
+			return fmt.Errorf("resolve metrics db: %w", err)
+		}
+		store, err := metricsrelay.OpenStore(path, ledgerMaxAge(cfg))
+		if err != nil {
+			return fmt.Errorf("open metrics ledger: %w", err)
+		}
+		defer store.Close()
+		ledger = metricsrelay.NewLedger(store)
+		// The model price table's own connection to the same file — each
+		// owner opens its own, the module's coexistence shape.
+		pstore, err = openPriceStore(path)
+		if err != nil {
+			return fmt.Errorf("open model prices: %w", err)
+		}
+		defer pstore.Close()
+	}
 
 	// The golens-metrics embed: the /full-metrics dashboard and the sqlite
 	// retention behind it. Boot fails loudly when it cannot start — a
@@ -235,7 +295,7 @@ func runMetricsDaemon(cfg config.Config) error {
 	defer gl.Close()
 	// The dashboard server is built first: the feed below reads its price
 	// snapshot for the per-model cost counters.
-	uiSrv := newUIServer(cfg, ledger, gl)
+	uiSrv := newUIServer(cfg, ledger, gl, pstore)
 	// The feed: every request lands in the registry as it lands in the
 	// ledger — same goroutine, non-blocking — so a mount without data
 	// cannot exist.
@@ -320,8 +380,9 @@ func publishMetricsStatus(cfg config.Config, stop <-chan struct{}) {
 
 // runMetricsList is the CLI ledger read path: the live daemon's /ledger
 // endpoint, newest first, one page at a time, optional worker filter,
-// table or --json. The daemon is the ledger's only home (in-memory), so
-// the endpoint comes from its published status file — no config involved.
+// table or --json. The ledger lives in the daemon process (sqlite or
+// memory — the CLI never reads the db itself), so the endpoint comes from
+// its published status file — no config involved.
 func runMetricsList(args []string) error {
 	worker, page, jsonOut := "", 1, false
 	for i := 0; i < len(args); i++ {

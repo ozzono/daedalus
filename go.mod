@@ -3,7 +3,7 @@ module github.com/ozzono/daedalus
 go 1.26.5
 
 require (
-	github.com/GoLens-Project/golens-metrics v1.1.6
+	github.com/GoLens-Project/golens-metrics v1.1.8
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/stretchr/testify v1.10.0
 	go.temporal.io/api v1.63.4
@@ -12,6 +12,7 @@ require (
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
+	modernc.org/sqlite v1.34.5
 )
 
 require (
@@ -42,5 +43,4 @@ require (
 	modernc.org/libc v1.55.3 // indirect
 	modernc.org/mathutil v1.6.0 // indirect
 	modernc.org/memory v1.8.0 // indirect
-	modernc.org/sqlite v1.34.5 // indirect
 )

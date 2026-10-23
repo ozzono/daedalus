@@ -4,10 +4,10 @@
 // ledger's append observer at it, so every recorded provider request
 // lands in the registry as metric samples the dashboard charts. Retention
 // rides the module's own sqlite layer — the decided posture, no parallel
-// schema: the module's roll-up windows persist across restarts and past
-// the ledger ring's horizon, while the per-request rows themselves stay
-// the in-memory ledger's, served by `daedalus dash list` and the run
-// detail.
+// schema: the module's roll-up windows persist in the shared metrics
+// database across restarts, and so do the per-request rows themselves
+// (the relay ledger's table, internal/metricsrelay's store), served by
+// `daedalus dash list` and the run detail.
 //
 // The dashboard is sectioned: a Global band over the six deployment-wide
 // metrics, a per-worker band for the config-known worker (with a nested
@@ -34,8 +34,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -137,14 +135,16 @@ func golensBounds(kind string) []float64 {
 }
 
 // startGolens builds and starts the daemon's registry: sqlite retention
-// (metrics.storage_backend/storage_path — empty backend defaults sqlite,
-// empty path defaults beside the daemon's other files), the layout
-// document beside it so a saved dashboard survives restarts, and the six
-// global ledger metrics registered up front so the samples land typed — a
-// Record for an unknown name auto-registers a plain label-less counter,
-// which is not what these are. The per-slice child metrics register in
-// golensSyncLayout, which also pins the sectioned layout; startGolens
-// keeps only what every deployment carries regardless of config.
+// into the shared metrics database (metrics.storage_backend/storage_path —
+// empty backend defaults sqlite, empty path defaults to the shared
+// metrics.db), the layout document persisted into that same database
+// (the module's DashboardConfigDB, Q6 — the file-backed layout store is
+// retired), and the six global ledger metrics registered up front so the
+// samples land typed — a Record for an unknown name auto-registers a
+// plain label-less counter, which is not what these are. The per-slice
+// child metrics register in golensSyncLayout, which also pins the
+// sectioned layout; startGolens keeps only what every deployment carries
+// regardless of config.
 func startGolens(cfg config.Config) (*golens.Registry, error) {
 	gc := golens.DefaultConfig()
 	gc.ProjectName = "daedalus"
@@ -162,17 +162,23 @@ func startGolens(cfg config.Config) (*golens.Registry, error) {
 	}
 	gc.Storage.Backend = backend
 	if backend == "sqlite" {
-		gc.Storage.Path = cfg.Metrics.StoragePath
-		if gc.Storage.Path == "" {
-			gc.Storage.Path = filepath.Join(daemonDir, "metrics-golens.db")
+		path, err := metricsDBPath(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("resolve metrics db: %w", err)
 		}
-	}
-	gc.UI.DashboardConfig = filepath.Join(daemonDir, "metrics-golens-layout.json")
-	// sqlite creates its file, never its parent — a fresh host's first
-	// `dash start` reaches here before anything else has made the daemon
-	// dir exist.
-	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create daemon dir: %w", err)
+		// The DSN, not the bare path: the module splices Storage.Path raw
+		// into sql.Open pragma-less, so without this its roll-up writer
+		// runs sqlite's zero busy timeout — a flush colliding with a
+		// ledger insert fails immediately and the window is dropped
+		// silently. StoreDSN is what daedalus's own connections open the
+		// file with; the module's connection gets the same patience.
+		gc.Storage.Path = metricsrelay.StoreDSN(path)
+		// The layout document joins the shared db as a single-row JSON
+		// document (the module's sanctioned same-db-as-storage.path
+		// shape); DashboardConfig stays unset, so no file is written
+		// anywhere. Plain path: the module appends its own pragma suffix
+		// here, and a pre-DSN'd string would corrupt it.
+		gc.UI.DashboardConfigDB = path
 	}
 	reg, err := golens.New(gc)
 	if err != nil {

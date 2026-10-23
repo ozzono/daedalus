@@ -1162,3 +1162,62 @@ func TestRunWorkerMetricsEnvExports(t *testing.T) {
 		t.Errorf("tool relay URL path = %q, want the metrics relay's staged prefix (pi → slim relay → metrics relay)", staged.Path)
 	}
 }
+
+// TestMetricsDBPath pins the shared metrics database's resolution: an
+// explicit storage_path is returned verbatim (the operator owns its parent,
+// no mkdir on their tree), the default lives at ~/.config/daedalus/metrics.db
+// with its directory created on first use, and a HOME-less host degrades to
+// the daemon dir rather than failing the boot.
+func TestMetricsDBPath(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Metrics.StoragePath = "/var/daedalus/custom.db"
+	got, err := metricsDBPath(cfg)
+	if err != nil || got != "/var/daedalus/custom.db" {
+		t.Errorf("metricsDBPath(custom) = (%q, %v), want the path verbatim, untouched", got, err)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	got, err = metricsDBPath(config.Config{})
+	if err != nil {
+		t.Fatalf("metricsDBPath(default): %v", err)
+	}
+	if want := filepath.Join(home, ".config", "daedalus", "metrics.db"); got != want {
+		t.Errorf("metricsDBPath(default) = %q, want %q", got, want)
+	}
+	if fi, err := os.Stat(filepath.Join(home, ".config", "daedalus")); err != nil || !fi.IsDir() {
+		t.Errorf("the default's parent dir = (%v, %v), want created by the resolution", fi, err)
+	}
+
+	useDaemonDir(t)
+	t.Setenv("HOME", "")
+	got, err = metricsDBPath(config.Config{})
+	if err != nil {
+		t.Fatalf("metricsDBPath(no HOME): %v", err)
+	}
+	if want := filepath.Join(daemonDir, "metrics.db"); got != want {
+		t.Errorf("metricsDBPath(no HOME) = %q, want the daemon-dir degradation %q", got, want)
+	}
+}
+
+// TestLedgerMaxAgeResolution pins the retention horizon's resolution: nil
+// (the unset knob) resolves the config package's default, while an explicit
+// value — the keep-forever 0s included — passes through as-is.
+func TestLedgerMaxAgeResolution(t *testing.T) {
+	if got := ledgerMaxAge(config.Config{}); got != config.DefaultLedgerMaxAge {
+		t.Errorf("ledgerMaxAge(unset) = %s, want the default %s", got, config.DefaultLedgerMaxAge)
+	}
+
+	zero := 0 * time.Second
+	cfg := config.Config{}
+	cfg.Metrics.LedgerMaxAge = &zero
+	if got := ledgerMaxAge(cfg); got != 0 {
+		t.Errorf("ledgerMaxAge(0s) = %s, want 0 (keep every row forever)", got)
+	}
+
+	hour := time.Hour
+	cfg.Metrics.LedgerMaxAge = &hour
+	if got := ledgerMaxAge(cfg); got != time.Hour {
+		t.Errorf("ledgerMaxAge(1h) = %s, want 1h through", got)
+	}
+}

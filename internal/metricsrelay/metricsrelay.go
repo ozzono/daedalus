@@ -20,10 +20,11 @@
 // synthetic per-round key in the credential slot —
 // task-<id>-role-<role>-round-<n>, staged with the registration's secret
 // token as its -rk- tail; the token gates key restoration, anything else
-// attributes at worker level). ponytail: the ledger is in-memory only — a daemon restart drops
-// its rows, and a 10k-entry ring bounds memory; the durable roll-ups are
-// the golens-metrics embed's sqlite store (cmd/daedalus/golens.go), fed
-// per append, not this package's concern. Cost stays render-time: the
+// attributes at worker level). The ledger persists to the relay_entries
+// table of the shared metrics database (store.go — sqlite mode, the
+// daemon's default); memory mode (the zero-value Ledger, no store wired)
+// keeps the rows in-process only — explicitly the no-disk posture, so its
+// slice is unbounded by design. Cost stays render-time: the
 // operator's price
 // table (the dashboard's models tab) prices entries when the dashboard
 // reads them, and CostUSD is never written.
@@ -76,10 +77,6 @@ func StagedBase(root, worker, wire, base string) string {
 	return staged.String()
 }
 
-// ledgerCap bounds the in-memory ledger; appending past it drops the
-// oldest entries.
-const ledgerCap = 10_000
-
 // Entry is one relayed provider request's record. Task/Role/Round are
 // parsed from the synthetic attribution key when the round carried one;
 // empty means an unkeyed round attributed at worker level. Alias is the
@@ -112,13 +109,21 @@ type Entry struct {
 	Source string `json:"source,omitempty"`
 }
 
-// Ledger is the relay's in-memory usage record. Safe for concurrent
-// append and query; the daemon process is its only writer and reader.
+// Ledger is the relay's usage record: sqlite mode when a Store is wired
+// in (NewLedger — the daemon's shape, rows persist across restarts),
+// memory mode as the zero value (the rows live in the in-process slice,
+// dropped on exit — unbounded by design, the no-disk posture). Safe for
+// concurrent append and query; the daemon process is its only writer and
+// reader.
 type Ledger struct {
 	mu       sync.Mutex
-	entries  []Entry
+	store    *Store
+	entries  []Entry // memory mode only
 	onAppend func(Entry)
 }
+
+// NewLedger returns a ledger persisting through the store.
+func NewLedger(store *Store) *Ledger { return &Ledger{store: store} }
 
 // SetOnAppend installs fn as the ledger's append observer — the daemon
 // feeds its golens-metrics registry this way. fn runs after the entry is
@@ -133,15 +138,17 @@ func (l *Ledger) SetOnAppend(fn func(Entry)) {
 	l.onAppend = fn
 }
 
-// Append records one entry, dropping the oldest past the cap.
+// Append records one entry: sqlite mode writes the row (the ledger is the
+// table), memory mode appends the slice.
 func (l *Ledger) Append(e Entry) {
-	l.mu.Lock()
-	l.entries = append(l.entries, e)
-	if len(l.entries) > ledgerCap {
-		l.entries = l.entries[len(l.entries)-ledgerCap:]
+	if l.store != nil {
+		l.store.Append(e)
+	} else {
+		l.mu.Lock()
+		l.entries = append(l.entries, e)
+		l.mu.Unlock()
 	}
-	fn := l.onAppend
-	l.mu.Unlock()
+	fn := l.onAppendRead()
 	// Observed outside the lock, so an observer that reads the ledger
 	// cannot deadlock against the append it belongs to; two concurrent
 	// appends may deliver to the observer out of order, which no fold of
@@ -151,22 +158,57 @@ func (l *Ledger) Append(e Entry) {
 	}
 }
 
+func (l *Ledger) onAppendRead() func(Entry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.onAppend
+}
+
 // Len reports the ledger's current size.
 func (l *Ledger) Len() int {
+	if l.store != nil {
+		return l.store.Len()
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.entries)
 }
 
+// Ascending returns every entry, oldest first — the folds' full-window
+// read. The result is a fresh slice; callers may filter it in place.
+func (l *Ledger) Ascending() []Entry {
+	if l.store != nil {
+		return l.store.Ascending()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]Entry, len(l.entries))
+	copy(out, l.entries)
+	return out
+}
+
+// ledgerPageSizeCap bounds one query's page — the retired ring cap's
+// request-side stand-in: /ledger serves the loopback listener, which any
+// local process reaches (jailed rounds included, by design), and an
+// unbounded page_size would materialize the whole retained table per
+// request.
+const ledgerPageSizeCap = 10_000
+
 // Query returns the newest entries first, one page's worth: page counts
 // from 1, pageSize bounds it (below 1 means the 50 default, above the
-// ledger cap clamps to the cap — the ledger cannot serve more; the
-// effective value is returned, so callers report what was served, not
-// what was asked), worker filters to one worker's entries when non-empty.
-// total is the filtered count across all pages; a page past the last one
-// — an overflowed page number included, whose offset would leave int's
-// range in the multiply below — is empty.
+// page cap clamps to it), worker filters to one worker's entries when
+// non-empty. total is the filtered count across all pages; a page past
+// the last one — an overflowed page number included, whose offset would
+// leave int's range in the multiply below — is empty.
 func (l *Ledger) Query(worker string, page, pageSize int) (entries []Entry, total, size int) {
+	// Clamped before either body: /ledger's request is the only external
+	// caller and routes through here in both ledger modes.
+	if pageSize > ledgerPageSizeCap {
+		pageSize = ledgerPageSizeCap
+	}
+	if l.store != nil {
+		return l.store.Query(worker, page, pageSize)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	// Newest first: walk the append-ordered slice backwards.
@@ -184,13 +226,10 @@ func (l *Ledger) Query(worker string, page, pageSize int) (entries []Entry, tota
 	if pageSize < 1 {
 		pageSize = 50
 	}
-	// Clamped before the ceil below, whose total + pageSize - 1 would
-	// wrap for a page_size near MaxInt.
-	if pageSize > ledgerCap {
-		pageSize = ledgerCap
-	}
 	size = pageSize
-	if last := (total + pageSize - 1) / pageSize; page > last {
+	// int64 arithmetic: total + pageSize - 1 would wrap for a page_size
+	// near MaxInt, serving an empty page for an in-range one.
+	if last := (int64(total) + int64(pageSize) - 1) / int64(pageSize); int64(page) > last {
 		return nil, total, size
 	}
 	start := (page - 1) * pageSize
