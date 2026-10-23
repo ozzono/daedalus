@@ -151,9 +151,14 @@ func usageWorkerKey(e metricsrelay.Entry) string { return e.Worker }
 
 // entryCost prices one entry at render time: input and cache-write at the
 // in rate (writes bill at the in rate — there is deliberately no fourth
-// rate), output at the out rate, cache reads at the cached rate.
+// rate), output at the out rate, cache reads at the cached rate. The
+// input side is wire-aware (inputTokensExCache): openai's prompt_tokens
+// includes the cached reads, so billing it whole at the in rate would
+// bill every cached token twice — once inside input, once at the cached
+// rate.
 func entryCost(e metricsrelay.Entry, p modelPrice) float64 {
-	return float64(e.InputTokens+e.CacheWriteTokens)/1e6*p.In +
+	in := inputTokensExCache(e)
+	return float64(in+e.CacheWriteTokens)/1e6*p.In +
 		float64(e.OutputTokens)/1e6*p.Out +
 		float64(e.CacheReadTokens)/1e6*p.Cached
 }
@@ -612,7 +617,9 @@ func (s *uiServer) fragModels(w http.ResponseWriter, req *http.Request) {
 // saveModels upserts the submitted rates and redirects back to the form.
 // Only the form's own editable rows are taken (parseModelPrices), the
 // file is rewritten atomically, and the server's snapshot swaps to the
-// reloaded table — the next render prices through the new rates.
+// reloaded table — the next render prices through the new rates, and the
+// golens sync re-evaluates the price gate (a newly priced model's cost
+// counter and its Model prices panel appear; golensSyncLayout).
 func (s *uiServer) saveModels(w http.ResponseWriter, req *http.Request) {
 	if err := req.ParseForm(); err != nil {
 		http.Error(w, "read form: "+err.Error(), http.StatusBadRequest)
@@ -634,6 +641,7 @@ func (s *uiServer) saveModels(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	s.swapPrices(loadModelPrices())
+	s.golensSyncLayout()
 	http.Redirect(w, req, "/models", http.StatusSeeOther)
 }
 
