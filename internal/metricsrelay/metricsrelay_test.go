@@ -1117,6 +1117,64 @@ func TestApplyUsage(t *testing.T) {
 			t.Errorf("entry = %+v, want 100 in kept and the explicit 0 out landed", e)
 		}
 	})
+
+	t.Run("a payload-less chunk naming a model does not vouch it", func(t *testing.T) {
+		// The captured live frame (the model host's SSE keepalive, streamed
+		// while the real model loads): a role-only delta, no content, no
+		// usage. A stream killed in that phase must record no model at all —
+		// the entry lands in the Models tab's unknown bucket, never a
+		// phantom row named by whatever the wire carried.
+		var e Entry
+		applyUsage(&e, []byte(`data: {"model":"keepalive","choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}]}`+"\n\n"))
+		if e != (Entry{}) {
+			t.Errorf("entry = %+v, want untouched by the payload-less frame", e)
+		}
+		// The mechanism, not the name: any model-named chunk without
+		// payload or usage stays unstamped, on the SSE walk as in plain
+		// JSON. The explicit-null frame is its own trap: RawMessage keeps
+		// the literal bytes, so a null tool_calls is len 4 and must be
+		// rejected as the null it names, not read as payload by length.
+		applyUsage(&e, []byte(`data: {"model":"phantom-synthetic","choices":[]}`+"\n\n"))
+		applyUsage(&e, []byte(`{"model":"phantom-synthetic"}`))
+		applyUsage(&e, []byte(`data: {"model":"keepalive","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":null},"finish_reason":null}]}`+"\n\n"))
+		if e != (Entry{}) {
+			t.Errorf("entry = %+v, want untouched by every payload-less shape", e)
+		}
+	})
+
+	t.Run("payload vouches the model it names", func(t *testing.T) {
+		cases := map[string]string{
+			"content":         `data: {"model":"m","choices":[{"delta":{"content":"a"}}]}`,
+			"reasoning":       `data: {"model":"m","choices":[{"delta":{"reasoning_content":"think"}}]}`,
+			"tool calls":      `data: {"model":"m","choices":[{"delta":{"tool_calls":[{"id":"t1"}]}}]}`,
+			"finish reason":   `data: {"model":"m","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			"usage alone":     `data: {"model":"m","choices":[],"usage":{"prompt_tokens":9}}`,
+			"anthropic body":  `data: {"message":{"model":"m","usage":{"input_tokens":3}}}`,
+			"plain openai":    `{"model":"m","usage":{"prompt_tokens":9}}`,
+			"plain anthropic": `{"model":"m","usage":{"input_tokens":3}}`,
+		}
+		for name, body := range cases {
+			var e Entry
+			applyUsage(&e, []byte(body+"\n\n"))
+			if e.Model != "m" {
+				t.Errorf("%s: entry model = %q, want the payload-vouched name", name, e.Model)
+			}
+		}
+	})
+
+	t.Run("a late payload-less frame cannot overwrite a vouched model", func(t *testing.T) {
+		// The killed-mid-generation shape: content chunks vouched the real
+		// model, then the host's synthetic frame rode a generation stall.
+		// The vouched name stands.
+		var e Entry
+		applyUsage(&e, []byte(
+			`data: {"model":"real-m","choices":[{"delta":{"content":"a"}}]}`+"\n\n"+
+				`data: {"model":"real-m","choices":[{"delta":{"content":"b"}}]}`+"\n\n"+
+				`data: {"model":"keepalive","choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}]}`+"\n\n"))
+		if e.Model != "real-m" {
+			t.Errorf("entry model = %q, want the payload-vouched model kept against the late frame", e.Model)
+		}
+	})
 }
 
 // TestCloseIsQuiet pins the designed shutdown's face: Close goes through

@@ -233,10 +233,17 @@ func runMetricsDaemon(cfg config.Config) error {
 		return fmt.Errorf("start golens metrics: %w", err)
 	}
 	defer gl.Close()
+	// The dashboard server is built first: the feed below reads its price
+	// snapshot for the per-model cost counters.
+	uiSrv := newUIServer(cfg, ledger, gl)
 	// The feed: every request lands in the registry as it lands in the
 	// ledger — same goroutine, non-blocking — so a mount without data
 	// cannot exist.
-	ledger.SetOnAppend(func(e metricsrelay.Entry) { feedGolensEntry(gl, e) })
+	ledger.SetOnAppend(func(e metricsrelay.Entry) { uiSrv.feedGolensEntry(e) })
+	// The sectioned layout: slice metrics registered from the boot
+	// vocabulary and the persisted document synced to it — before the
+	// relay serves, so the first dashboard open meets the bands in place.
+	uiSrv.golensSyncLayout()
 
 	registry := metricsrelay.NewRegistry(metricsRegistrationTTL)
 	relay, err := metricsrelay.Start(cfg.Metrics.RelayPort, ledger, registry)
@@ -253,7 +260,6 @@ func runMetricsDaemon(cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("listen on :%d: %w (the metrics.port knob names this port)", cfg.Metrics.Port, err)
 	}
-	uiSrv := newUIServer(cfg, ledger, gl)
 	srv := &http.Server{Handler: uiSrv.routes(), ReadHeaderTimeout: 30 * time.Second}
 	go func() {
 		if err := srv.Serve(ui); err != http.ErrServerClosed {

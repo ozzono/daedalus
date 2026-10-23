@@ -81,7 +81,9 @@ func TestUsageFormatters(t *testing.T) {
 // TestEntryCostPricesEachSide pins the render-time pricing: input and
 // cache-write bill at the in rate (there is deliberately no fourth rate),
 // output at the out rate, cache reads at the cached rate — USD per 1M
-// tokens throughout.
+// tokens throughout. The input side is wire-aware: the openai wire's prompt
+// includes its cached reads and bills net of them, the anthropic wire's
+// input already excludes both cache sides.
 func TestEntryCostPricesEachSide(t *testing.T) {
 	e := metricsrelay.Entry{
 		InputTokens:      1_000_000,
@@ -96,6 +98,26 @@ func TestEntryCostPricesEachSide(t *testing.T) {
 	if got := entryCost(e, modelPrice{}); got != 0 {
 		t.Errorf("entryCost at zero rates = %v, want 0", got)
 	}
+
+	t.Run("the openai wire bills input net of the cached reads", func(t *testing.T) {
+		e := metricsrelay.Entry{Wire: metricsrelay.WireOpenAI,
+			InputTokens: 1_000_000, CacheReadTokens: 400_000, CacheWriteTokens: 100_000, OutputTokens: 500_000}
+		// (600k net input + 100k writes) at $3/1M, 500k at $2/1M, reads at
+		// $1/1M — billing the whole prompt would charge every cached token
+		// twice, once inside input and once at the cached rate.
+		want := float64(700_000)/1e6*3 + float64(500_000)/1e6*2 + float64(400_000)/1e6*1
+		if got := entryCost(e, modelPrice{In: 3, Out: 2, Cached: 1}); got != want {
+			t.Errorf("entryCost = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("the anthropic wire bills the whole input beside its reads", func(t *testing.T) {
+		e := metricsrelay.Entry{Wire: metricsrelay.WireAnthropic,
+			InputTokens: 1_000_000, CacheReadTokens: 400_000}
+		if got := entryCost(e, modelPrice{In: 3, Out: 2, Cached: 1}); math.Abs(got-3.4) > 1e-9 {
+			t.Errorf("entryCost = %v, want 3.4 (input and reads are disjoint)", got)
+		}
+	})
 }
 
 // TestModelPriceFileContract pins the price table's record in the daemon

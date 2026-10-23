@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ozzono/daedalus/internal/config"
 	"gopkg.in/yaml.v3"
@@ -1682,5 +1683,119 @@ exit 0`)
 				t.Fatalf("ai-jail called %d times, want 1", len(calls))
 			}
 		})
+	}
+}
+
+// jailedPiRoundEnv is the serving provider's environment a jailed pi round
+// arrives with, staged fixed (never os.Environ) like every round-boundary
+// pin; PATH carries the stub dir so the stub's own commands resolve inside
+// the child. Deliberately openai-free: an OPENAI_* export would send the
+// round through stagePiProvider (a ~/.pi staging these pins do not test).
+func jailedPiRoundEnv() []string {
+	return []string{
+		"ANTHROPIC_BASE_URL=https://pi.example",
+		"ANTHROPIC_API_KEY=sk-pi",
+		"ANTHROPIC_MODEL=pi-model",
+		"PATH=" + os.Getenv("PATH"),
+	}
+}
+
+// TestPiRoundKillsIdenticalToolLoop pins the loop kill at the round
+// boundary: a pi round whose structured stream carries three consecutive
+// identical tool calls — fresh generated ids, same tool and arguments, the
+// degenerate livelock that only its budget would ever end — is killed
+// mid-run and classified ErrAgentLoop wrapping ErrAPIExhausted (the
+// exhaustion family: provider failover, then the fresh-session retry), not
+// ErrAgentKilled (whose continuation reply would resume the very
+// conversation that looped). The collection buffer keeps its role: the
+// killed round's stdout still carries the stream.
+func TestPiRoundKillsIdenticalToolLoop(t *testing.T) {
+	if !signalsPermitted() {
+		t.Skip("environment forbids signals; the watcher's group kill cannot fire here")
+	}
+	newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"session","id":"sess-loop"}'
+i=0
+while true; do
+  printf '%s\n' "{\"type\":\"tool_execution_start\",\"id\":\"call-$i\",\"toolName\":\"bash\",\"args\":{\"command\":\"ls\"}}"
+  i=$((i+1))
+  sleep 0.02
+done`)
+	// A bounded context: a watcher that never fires leaves the stub
+	// looping forever — fail the pin in 30s instead of hanging the suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	res, err := runJailedRound(ctx, jailedPiRoundEnv(), "", "pi", t.TempDir(), "round prompt")
+	if !errors.Is(err, ErrAgentLoop) {
+		t.Fatalf("error = %v, want ErrAgentLoop", err)
+	}
+	if !errors.Is(err, ErrAPIExhausted) {
+		t.Errorf("error = %v, want the ErrAgentLoop wrap to carry ErrAPIExhausted (the exhaustion family's remediation)", err)
+	}
+	if errors.Is(err, ErrAgentKilled) {
+		t.Errorf("error = %v, want the loop face to outrank the killed face", err)
+	}
+	if want := fmt.Sprintf("pi round repeated the identical tool call %d times", toolLoopThreshold); !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q should contain %q", err, want)
+	}
+	if !strings.Contains(res.Stdout, "tool_execution_start") {
+		t.Errorf("killed round stdout = %q, want the streamed events (the tee must keep the collection buffer's role)", res.Stdout)
+	}
+}
+
+// TestPiRoundToleratesSubLoopCalls pins the threshold's underside at the
+// round boundary: a clean-exiting pi round with two identical calls (one
+// legitimate retry of a flaky command) succeeds, and so does one whose
+// identical calls are split by a distinct call — the streak resets, the
+// count is not cumulative — with the stream still collected.
+func TestPiRoundToleratesSubLoopCalls(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"two identical calls succeed", `printf '%s\n' \
+  '{"type":"session","id":"sess-ok"}' \
+  '{"type":"tool_execution_start","id":"c1","toolName":"bash","args":{"command":"ls"}}' \
+  '{"type":"tool_execution_start","id":"c2","toolName":"bash","args":{"command":"ls"}}'
+exit 0`},
+		{"a distinct call resets the streak", `printf '%s\n' \
+  '{"type":"session","id":"sess-reset"}' \
+  '{"type":"tool_execution_start","id":"c1","toolName":"bash","args":{"command":"ls"}}' \
+  '{"type":"tool_execution_start","id":"c2","toolName":"bash","args":{"command":"ls"}}' \
+  '{"type":"tool_execution_start","id":"c3","toolName":"edit","args":{"path":"a.go"}}' \
+  '{"type":"tool_execution_start","id":"c4","toolName":"bash","args":{"command":"ls"}}' \
+  '{"type":"tool_execution_start","id":"c5","toolName":"bash","args":{"command":"ls"}}'
+exit 0`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			newStubLog(t)
+			stubBin(t, "ai-jail", c.body)
+			res, err := runJailedRound(context.Background(), jailedPiRoundEnv(), "", "pi", t.TempDir(), "round prompt")
+			if err != nil {
+				t.Fatalf("runJailedRound: %v", err)
+			}
+			if !strings.Contains(res.Stdout, `"id":"c2"`) {
+				t.Errorf("stdout = %q, want the round's stream collected through the tee", res.Stdout)
+			}
+		})
+	}
+}
+
+// TestClaudeRoundRunsUnwrappedByLoopWatcher pins the agent gate: only pi
+// rounds tee through the loop watcher — a claude round printing the same
+// identical-call stream is not killed (it holds still past where a
+// watcher's kill would have landed) and exits clean.
+func TestClaudeRoundRunsUnwrappedByLoopWatcher(t *testing.T) {
+	newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' \
+  '{"type":"tool_execution_start","id":"c1","toolName":"bash","args":{"command":"ls"}}' \
+  '{"type":"tool_execution_start","id":"c2","toolName":"bash","args":{"command":"ls"}}' \
+  '{"type":"tool_execution_start","id":"c3","toolName":"bash","args":{"command":"ls"}}'
+sleep 0.3
+exit 0`)
+	if _, err := runJailedRound(context.Background(), jailedPiRoundEnv(), "", "claude", t.TempDir(), "round prompt"); err != nil {
+		t.Fatalf("runJailedRound: %v", err)
 	}
 }

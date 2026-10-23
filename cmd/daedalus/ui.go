@@ -1187,8 +1187,9 @@ type uiCot struct {
 // open — the walk reads every execution's full history (the same walk the
 // CLI's `log -cot` prints), so rendering it into the polled body would
 // double every poll's work for a box that is closed almost all of the
-// time. It serves the tail-1 view: the last completed round's section,
-// with the in-flight live section standing in before any round completes.
+// time. It serves the tail-1 view: the last finished round's section
+// (completed or dead), with the in-flight live section standing in
+// before any round finishes.
 func (s *uiServer) fragCot(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
 	// listWorkflowRuns exits on an id its visibility query cannot carry;

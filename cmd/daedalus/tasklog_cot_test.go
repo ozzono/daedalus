@@ -15,6 +15,7 @@ import (
 
 	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
@@ -135,6 +136,69 @@ func cotRound(t *testing.T, dc converter.DataConverter, id int64, when time.Time
 		},
 	}
 	return []*historypb.HistoryEvent{scheduled, completed}
+}
+
+// cotDeadRound builds one jailed round's scheduled+terminal event pair —
+// term naming how the round died: "failed" (carrying msg as the failure's
+// message), "canceled", or "timed_out". No result payload rides a terminal:
+// the degraded section the walk must render from these events is the shape
+// on trial. The scheduled event sits a minute before the terminal one, so a
+// header stamped with the terminal event's time is tellable from one stamped
+// with the schedule's.
+func cotDeadRound(t *testing.T, dc converter.DataConverter, id int64, when time.Time, typ string, input any, term, msg string) []*historypb.HistoryEvent {
+	t.Helper()
+	inPayload, err := dc.ToPayload(input)
+	if err != nil {
+		t.Fatalf("encode %s input: %v", typ, err)
+	}
+	scheduled := &historypb.HistoryEvent{
+		EventId:   id,
+		EventTime: timestamppb.New(when.Add(-time.Minute)),
+		Attributes: &historypb.HistoryEvent_ActivityTaskScheduledEventAttributes{
+			ActivityTaskScheduledEventAttributes: &historypb.ActivityTaskScheduledEventAttributes{
+				ActivityId:   strconv.FormatInt(id, 10),
+				ActivityType: &commonpb.ActivityType{Name: typ},
+				Input:        &commonpb.Payloads{Payloads: []*commonpb.Payload{inPayload}},
+			},
+		},
+	}
+	var terminal *historypb.HistoryEvent
+	switch term {
+	case "failed":
+		terminal = &historypb.HistoryEvent{
+			EventId:   id + 1,
+			EventTime: timestamppb.New(when),
+			Attributes: &historypb.HistoryEvent_ActivityTaskFailedEventAttributes{
+				ActivityTaskFailedEventAttributes: &historypb.ActivityTaskFailedEventAttributes{
+					ScheduledEventId: id,
+					Failure:          &failurepb.Failure{Message: msg},
+				},
+			},
+		}
+	case "canceled":
+		terminal = &historypb.HistoryEvent{
+			EventId:   id + 1,
+			EventTime: timestamppb.New(when),
+			Attributes: &historypb.HistoryEvent_ActivityTaskCanceledEventAttributes{
+				ActivityTaskCanceledEventAttributes: &historypb.ActivityTaskCanceledEventAttributes{
+					ScheduledEventId: id,
+				},
+			},
+		}
+	case "timed_out":
+		terminal = &historypb.HistoryEvent{
+			EventId:   id + 1,
+			EventTime: timestamppb.New(when),
+			Attributes: &historypb.HistoryEvent_ActivityTaskTimedOutEventAttributes{
+				ActivityTaskTimedOutEventAttributes: &historypb.ActivityTaskTimedOutEventAttributes{
+					ScheduledEventId: id,
+				},
+			},
+		}
+	default:
+		t.Fatalf("cotDeadRound: unknown terminal kind %q", term)
+	}
+	return []*historypb.HistoryEvent{scheduled, terminal}
 }
 
 // seedCotRun registers a two-execution workflow on a fake frontend: the
@@ -273,6 +337,157 @@ func TestTaskLogCotVisibilityLagFallbackHasNoAttribution(t *testing.T) {
 	}
 	if strings.Join(fake.reads, "|") != "wf-lagging/" {
 		t.Errorf("history reads = %v, want the empty-run-id read alone", fake.reads)
+	}
+}
+
+// TestTaskLogCotRendersDeadRounds pins the degraded-section render end to
+// end against a live daemon: a round that died carries a section like any
+// other — the header stamped with the terminal event's time, the terminal
+// face naming how it died, and the same source-precedence body keyed by the
+// activity id that rode the scheduled event. A failure's message renders
+// flattened onto the one face line (no truncation), a cancel says plainly
+// what is known, and a non-agent activity's failure emits nothing.
+func TestTaskLogCotRendersDeadRounds(t *testing.T) {
+	dc := converter.GetDefaultDataConverter()
+	at := func(mins int) time.Time {
+		return time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC).Add(time.Duration(mins) * time.Minute)
+	}
+	// The walk re-materializes event times through protobuf, so the
+	// expected stamps render the way the walk itself will see them —
+	// zone included — rather than the way the fixtures built them.
+	stamp := func(mins int) string {
+		return timestamppb.New(at(mins)).AsTime().Format("2006-01-02 15:04:05 MST")
+	}
+	fake := &fakeCotServer{
+		rows: []*workflowpb.WorkflowExecutionInfo{
+			{Execution: &commonpb.WorkflowExecution{WorkflowId: "wf-dead", RunId: "run-dead"}, StartTime: timestamppb.New(at(0))},
+		},
+		history: map[string][]*historypb.HistoryEvent{
+			"run-dead": append(append(append(
+				cotDeadRound(t, dc, 1, at(5), "RunJailedClaudeActivity",
+					activities.AgentRunInput{Role: activities.RoleDev},
+					"failed", "jailed agent killed by signal: signal: killed\nsecond line\ttabbed tail"),
+				cotDeadRound(t, dc, 3, at(8), "RecaptureActivity",
+					activities.AgentRunInput{Role: activities.RoleTest},
+					"failed", "nonagent boom")...),
+				cotDeadRound(t, dc, 5, at(25), "RunJailedClaudeActivity",
+					activities.AgentRunInput{Role: activities.RoleDev},
+					"canceled", "")...),
+				cotDeadRound(t, dc, 7, at(35), "RunJailedReviewerActivity",
+					activities.ReviewInput{Role: activities.RoleTest},
+					"timed_out", "")...),
+		},
+		status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+	}
+	startCotServer(t, fake)
+
+	stub := startCotStubRelay(t, "wf-dead")
+	port := stub.srv.Listener.Addr().(*net.TCPAddr).Port
+	useMetricsDaemonDir(t, metricsStatusDoc{PID: os.Getpid(), Updated: time.Now().UTC(), RelayPort: port})
+
+	out := captureStdout(t, func() { runTaskLogCot("wf-dead", -1) })
+
+	// Round 1, failed: the face carries the failure message flattened onto
+	// one line — every word, none of the newlines — and the body is the
+	// round's relay capture, matched by the scheduled event's activity id.
+	for _, want := range []string{
+		"=== round 1: dev (run run-dead) @ " + stamp(5) + " ===",
+		"round failed: jailed agent killed by signal: signal: killed second line tabbed tail\n",
+		"source: relay",
+		"--- prompt ---\nthe staged prompt",
+		"--- response ---\nthe staged answer",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
+		}
+	}
+	// Round 2, cancelled: no payload rides a cancel, so the face is plain —
+	// and the body renders the round's otel usage alone, a dead round having
+	// no Temporal text to stamp it over.
+	for _, want := range []string{
+		"=== round 2: dev (run run-dead) @ " + stamp(25) + " ===",
+		"round cancelled\n",
+		"source: otel",
+		"usage: in 10, out 5, cache read 2/write 1\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
+		}
+	}
+	// Round 3, timed out: the third terminal renders like any other killed
+	// round, degrading to the stamped no-CoT note with neither capture nor
+	// ledger entry.
+	for _, want := range []string{
+		"=== round 3: test (run run-dead) @ " + stamp(35) + " ===",
+		"round timed out\n",
+		"source: temporal\nno CoT captured for this round\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
+		}
+	}
+	// The non-agent activity's failure emitted nothing, and nothing
+	// doubled: three dead rounds, three sections, three source stamps.
+	if n := strings.Count(out, "=== round "); n != 3 {
+		t.Errorf("-cot output rendered %d sections, want the 3 dead rounds alone (the non-agent failure silent):\n%s", n, out)
+	}
+	if n := strings.Count(out, "source: "); n != 3 {
+		t.Errorf("every dead section stamps its source once; got:\n%s", out)
+	}
+	if strings.Contains(out, "nonagent boom") {
+		t.Errorf("-cot output rendered a non-agent activity's failure:\n%s", out)
+	}
+	// Oldest terminal first.
+	if i, j := strings.Index(out, "round 1:"), strings.Index(out, "round 2:"); i > j {
+		t.Errorf("-cot output ordered the newer terminal first:\n%s", out)
+	}
+}
+
+// TestTaskLogCotLeavesTheLiveRoundToTheLivePath pins the walk's exclusivity
+// face: a scheduled agent activity with no terminal event yet is the round
+// in flight — it owns no walk section, or the dash would double-render it
+// beside the live view. Only a terminal event emits.
+func TestTaskLogCotLeavesTheLiveRoundToTheLivePath(t *testing.T) {
+	dc := converter.GetDefaultDataConverter()
+	when := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	inPayload, err := dc.ToPayload(activities.AgentRunInput{Role: activities.RoleDevReview})
+	if err != nil {
+		t.Fatalf("encode pending input: %v", err)
+	}
+	// The round in flight: scheduled, no terminal event after it.
+	pending := &historypb.HistoryEvent{
+		EventId:   3,
+		EventTime: timestamppb.New(when.Add(5 * time.Minute)),
+		Attributes: &historypb.HistoryEvent_ActivityTaskScheduledEventAttributes{
+			ActivityTaskScheduledEventAttributes: &historypb.ActivityTaskScheduledEventAttributes{
+				ActivityId:   "3",
+				ActivityType: &commonpb.ActivityType{Name: "RunJailedClaudeActivity"},
+				Input:        &commonpb.Payloads{Payloads: []*commonpb.Payload{inPayload}},
+			},
+		},
+	}
+	fake := &fakeCotServer{
+		history: map[string][]*historypb.HistoryEvent{
+			"": append(cotRound(t, dc, 1, when, "RunJailedClaudeActivity",
+				activities.AgentRunInput{Role: activities.RoleDev},
+				activities.AgentRunResult{Thinking: "finished reasoning", Text: "answer"}), pending),
+		},
+		status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+	}
+	startCotServer(t, fake)
+
+	out := captureStdout(t, func() { runTaskLogCot("wf-inflight", -1) })
+
+	if !strings.Contains(out, "=== round 1: dev @") || !strings.Contains(out, "finished reasoning") {
+		t.Errorf("the completed round should render as the walk's only section; got:\n%s", out)
+	}
+	if n := strings.Count(out, "=== round "); n != 1 {
+		t.Errorf("the scheduled-without-terminal round must own no walk section; got %d sections:\n%s", n, out)
+	}
+	for _, absent := range []string{"round 2:", "round failed", "round cancelled", "round timed out"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("the in-flight round must not render as a finished one (%q present):\n%s", absent, out)
+		}
 	}
 }
 

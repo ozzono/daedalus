@@ -1,4 +1,8 @@
 bin/
+# `make build` drops the compiled daemon here; never tracked again — the
+# committed copy (45MB) poisoned every -S history search with its embedded
+# gRPC strings.
+/daedalus
 
 .ai-jail
 .aider*

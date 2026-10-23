@@ -391,3 +391,16 @@ exit 0`)
 		}
 	})
 }
+
+// TestPiEditGuardrailCarriesRepeatDiscipline pins the loop kill's
+// prompt-side half: the guardrail every pi implementing round receives
+// carries the repeat rule the piToolLoopWatcher kill enforces — the kill
+// is the guarantee, the line only helps a model that still reads its
+// context.
+func TestPiEditGuardrailCarriesRepeatDiscipline(t *testing.T) {
+	for _, want := range []string{"REPEAT DISCIPLINE", "never re-run a tool call identical"} {
+		if !strings.Contains(piEditGuardrail, want) {
+			t.Errorf("piEditGuardrail lost the repeat-discipline line (%q): %q", want, piEditGuardrail)
+		}
+	}
+}
