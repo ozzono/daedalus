@@ -104,10 +104,15 @@ type ReviewInput struct {
 	// repro-first gate cannot. Takes precedence over TestsInScope; no
 	// REBUILD verdict exists in this framing.
 	ReproInScope bool
-	// AgentReply, when set, quotes the test agent's latest reply for the
-	// test reviewer: the agent may report that the fix the work needs is
-	// an implementation change its test-only scope forbids — the claim the
-	// reviewer weighs (and may act on with a Rebuild verdict) or rejects.
+	// AgentReply, when set, quotes an agent's latest reply for its
+	// reviewer. The test agent's reply reaches the test reviewer: the
+	// agent may report that the fix the work needs is an implementation
+	// change its test-only scope forbids — the claim the reviewer weighs
+	// (and may act on with a Rebuild verdict) or rejects. The
+	// implementing agent's reply reaches every implementation review: a
+	// skip the round declared travels with it, so the reviewer weighs the
+	// declaration instead of discovering the skip — or, worse, never
+	// seeing it in a diff that carries no lines of it.
 	AgentReply string
 	// Agent, set by `run -cli/--cli`, overrides the worker's agent for
 	// this run; empty falls back to DAEDALUS_AGENT (see jailedAgentCLI).
@@ -498,7 +503,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 			return template.ReviewRepro(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir, extras...)
 		}
 		if len(input.AcceptanceCriteria) > 0 {
-			return template.SlimReview(input.Focus, diff, input.TestLogs, bugDir, input.AcceptanceCriteria, extras...)
+			return template.SlimReview(input.Focus, diff, input.TestLogs, input.AgentReply, bugDir, input.AcceptanceCriteria, extras...)
 		}
 		return template.Review(input.Focus, diff, input.TestLogs, input.TestsInScope, input.AgentReply, bugDir, extras...)
 	}()
