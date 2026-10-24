@@ -48,7 +48,7 @@ func DevOnlyWorkflow(ctx workflow.Context, input PipelineInput) (string, error) 
 	}
 
 	for {
-		verdict, err := run.review(reviewOpts{focus: "the implementation", role: activities.RoleDevReview, session: &run.devReviewSession, touchesJail: touchesJail})
+		verdict, err := run.review(reviewOpts{focus: run.taskFocus("the implementation"), agentReply: run.devReply, role: activities.RoleDevReview, session: &run.devReviewSession, touchesJail: touchesJail})
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
 		}

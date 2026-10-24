@@ -515,6 +515,14 @@ func (r *pipelineRun) devFixRound(comments string, touchesJail bool) error {
 	return nil
 }
 
+// taskFocus names a dev review's focus: what is under review plus the
+// run's own task text — the review prompt's only copy of what was asked,
+// and the anchor its completeness contract enumerates change requests
+// from.
+func (r *pipelineRun) taskFocus(what string) string {
+	return fmt.Sprintf("%s. The task:\n\n%s", what, r.input.Prompt)
+}
+
 // codeReviewLoop runs implementation ↔ code-review rounds until the code
 // reviewer approves, parking on NEEDS_MAINTAINER — then one ping-pong per
 // review_skill_list entry, in order, each a reviewer conversation of its
@@ -524,7 +532,7 @@ func (r *pipelineRun) devFixRound(comments string, touchesJail bool) error {
 // re-enters the same reviewer conversations instead of starting cold.
 func (r *pipelineRun) codeReviewLoop(touchesJail bool) error {
 	for {
-		verdict, err := r.review(reviewOpts{focus: "the implementation", role: activities.RoleDevReview, session: &r.devReviewSession, touchesJail: touchesJail})
+		verdict, err := r.review(reviewOpts{focus: r.taskFocus("the implementation"), agentReply: r.devReply, role: activities.RoleDevReview, session: &r.devReviewSession, touchesJail: touchesJail})
 		if err != nil {
 			return fmt.Errorf("code review: %w", err)
 		}
@@ -545,7 +553,7 @@ func (r *pipelineRun) codeReviewLoop(touchesJail bool) error {
 	for i, entry := range r.input.ReviewSkillList {
 		label := skillLabel(i, entry)
 		for {
-			verdict, err := r.review(reviewOpts{focus: "the implementation", role: activities.RoleDevReview, session: &r.skillDevReviewSessions[i], touchesJail: touchesJail, skill: entry})
+			verdict, err := r.review(reviewOpts{focus: r.taskFocus("the implementation"), agentReply: r.devReply, role: activities.RoleDevReview, session: &r.skillDevReviewSessions[i], touchesJail: touchesJail, skill: entry})
 			if err != nil {
 				return fmt.Errorf("skill review %s: %w", label, err)
 			}
