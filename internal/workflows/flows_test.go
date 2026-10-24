@@ -140,8 +140,8 @@ func TestInvestigateWorkflowHappyPath(t *testing.T) {
 		t.Fatalf("reviewer ran %d times, want 1 (docs review)", len(rev.inputs))
 	}
 	ri := rev.inputs[0]
-	if ri.Focus != "the documentation" || ri.TestLogs != "" || ri.TestsInScope || ri.ReproInScope || ri.AgentReply != "" {
-		t.Errorf("docs review input = %+v, want the documentation focus with no test machinery", ri)
+	if ri.Focus != "the documentation. The task:\n\nimplement the feature" || ri.TestLogs != "" || ri.TestsInScope || ri.ReproInScope || ri.AgentReply != "stub agent output" {
+		t.Errorf("docs review input = %+v, want the documentation focus with the task text and the dev relay, no test machinery", ri)
 	}
 	if got := ri.Role; got != activities.RoleDevReview {
 		t.Errorf("docs review Role = %q, want %q", got, activities.RoleDevReview)
@@ -562,9 +562,9 @@ func TestRefactorWorkflowLoop(t *testing.T) {
 	if len(rev.inputs) != 2 {
 		t.Fatalf("reviewer ran %d times, want 2", len(rev.inputs))
 	}
-	if rev.inputs[0].Focus != "the refactoring" || rev.inputs[0].TestLogs != "--- FAIL: TestParse" ||
-		rev.inputs[0].TestsInScope || rev.inputs[0].ReproInScope {
-		t.Errorf("refactor review input = %+v, want the refactoring focus with the red logs", rev.inputs[0])
+	if rev.inputs[0].Focus != "the refactoring. The task:\n\nimplement the feature" || rev.inputs[0].TestLogs != "--- FAIL: TestParse" ||
+		rev.inputs[0].TestsInScope || rev.inputs[0].ReproInScope || rev.inputs[0].AgentReply != "stub agent output" {
+		t.Errorf("refactor review input = %+v, want the refactoring focus with the task text, the red logs, and the dev relay", rev.inputs[0])
 	}
 	if len(scope.inputs) != 1 || !reflect.DeepEqual(scope.inputs[0].Frozen, activities.TestPathPatterns) ||
 		len(scope.inputs[0].Allowed) != 0 {
@@ -639,8 +639,8 @@ func TestBugFixWorkflowReproGateLoops(t *testing.T) {
 		t.Fatalf("reviewer ran %d times, want 1 (only the reproduced round)", len(rev.inputs))
 	}
 	ri := rev.inputs[0]
-	if ri.Focus != "the bug fix and its reproducing test" || !ri.ReproInScope || ri.TestsInScope || ri.AgentReply != "" {
-		t.Errorf("bug-fix review input = %+v, want the repro framing with no tester relay", ri)
+	if ri.Focus != "the bug fix and its reproducing test. The task:\n\nimplement the feature" || !ri.ReproInScope || ri.TestsInScope || ri.AgentReply != "stub agent output" {
+		t.Errorf("bug-fix review input = %+v, want the repro framing with the task text and the dev relay", ri)
 	}
 	if !strings.HasPrefix(ri.TestLogs, "REPRO-FIRST GATE: passed — ") {
 		t.Errorf("bug-fix review logs = %q, want the gate's pass note prefixed", ri.TestLogs)
@@ -1029,8 +1029,8 @@ func TestDevOnlyWorkflowHappyPath(t *testing.T) {
 		t.Fatalf("reviewer ran %d times, want 1 (code review)", len(rev.inputs))
 	}
 	ri := rev.inputs[0]
-	if ri.Focus != "the implementation" || ri.TestLogs != "" || ri.TestsInScope || ri.ReproInScope || ri.AgentReply != "" {
-		t.Errorf("code review input = %+v, want the implementation focus with no test machinery", ri)
+	if ri.Focus != "the implementation. The task:\n\nimplement the feature" || ri.TestLogs != "" || ri.TestsInScope || ri.ReproInScope || ri.AgentReply != "stub agent output" {
+		t.Errorf("code review input = %+v, want the implementation focus with the task text and the dev relay, no test machinery", ri)
 	}
 	if got := ri.Role; got != activities.RoleDevReview {
 		t.Errorf("code review Role = %q, want %q", got, activities.RoleDevReview)

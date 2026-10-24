@@ -73,7 +73,7 @@ func TestImplement(t *testing.T) {
 	want := phaseRulesMarker + "\n\n" +
 		"add the feature\n\n" +
 		"Implement the change. Do not write, modify, or delete test code; leave every existing test file untouched and pay it no attention.\n\n" +
-		"If the task as stated cannot be completed — contradictory requirements, something missing from the worktree or outside your reach — say exactly what is impossible and why in your reply, then do the best sound partial work you can. Never silently loop over an impossible goal; your reply is what lets the reviewer halt the run for maintainer input instead of requesting changes forever.\n\n" +
+		"If the task as stated cannot be completed — contradictory requirements, something missing from the worktree or outside your reach — say exactly what is impossible and why in your reply, then do the best sound partial work you can. Never silently loop over an impossible goal; your reply is what lets the reviewer halt the run for maintainer input instead of requesting changes forever. Partial delivery is never silent either: name in your reply every change request of the task you skipped — the reviewer reads that reply, and a skip it declares is weighed while one it does not is work you silently dropped. The task text decides what is delivered; the laziness rules below only decide how.\n\n" +
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
 		"The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.\n\n" +
 		"Work style — the laziest solution that actually works:\n\n" +
@@ -252,6 +252,7 @@ func TestReview(t *testing.T) {
 	want := phaseRulesMarker + "\n\n" +
 		"You are a maximally rigorous reviewer. Review the implementation in this repository and let nothing pass.\n\n" +
 		"The full diff of the change under review:\n\nM foo.go\n\n" +
+		"\nCompleteness contract — before judging how the change is built, enumerate what it must deliver: the change requests the task text in the focus above names, each one checked against the diff and the reply. Every change request is delivered by the diff or explicitly declared skipped in the reply; one that is neither is CHANGES_REQUESTED, naming it — absence leaves no diff lines, so silence is never delivery. A declared skip naming a genuine blocker (contradictory requirements, something outside this worktree's reach) is NEEDS_MAINTAINER, exactly as the verdict contract below provides. The laziness rules decide how the work is done, never whether it is.\n\n" +
 		"Review with zero tolerance: read every changed line plus the surrounding code it touches, and verify every claim against the actual code — never trust comments, names, or the author's intent. " +
 		"Hunt for: incorrect edge cases (empty, nil, zero, off-by-one, overflow); error paths and cleanup skipped on failure branches; docs or names that contradict behavior; mishandled cancellation, timeouts, and concurrency; " +
 		"trust-boundary breaches (path traversal, injection, secrets leaking into logs, argv, or history); " +
@@ -662,7 +663,7 @@ func TestReviewJailCarveout(t *testing.T) {
 // sub-tasks' criteria are explicitly not findings — the red suite logs
 // relay, and no test-phase framing (and so no REBUILD verdict) exists.
 func TestSlimReview(t *testing.T) {
-	got, err := SlimReview("subtask 1 (add the adder)", "M adder.go", "--- FAIL: TestAdd", "",
+	got, err := SlimReview("subtask 1 (add the adder)", "M adder.go", "--- FAIL: TestAdd", "", "",
 		[]string{"Add(2,2) returns 4", "adder.go defines Add"})
 	if err != nil {
 		t.Fatalf("SlimReview: %v", err)
@@ -681,6 +682,16 @@ func TestSlimReview(t *testing.T) {
 	}
 	if strings.Contains(got, "REBUILD") {
 		t.Error("SlimReview must not offer the REBUILD verdict (the slim loop runs the suite itself)")
+	}
+	// The agentReply param relays the implementing agent's latest reply into
+	// the slim framing, the same section the standard Review renders.
+	withReply, err := SlimReview("subtask 1 (add the adder)", "M adder.go", "", "the adder overflowed on negatives", "",
+		[]string{"Add(2,2) returns 4"})
+	if err != nil {
+		t.Fatalf("SlimReview: %v", err)
+	}
+	if !strings.Contains(withReply, "The implementing agent's latest reply:\n\nthe adder overflowed on negatives") {
+		t.Errorf("SlimReview = %q, want the implementing agent's reply relayed", withReply)
 	}
 	// The slim framing carries its own coverage lead: no false promise of a
 	// separate test phase that never comes, and the criteria-keyed missing-
@@ -1030,7 +1041,7 @@ func TestReviewSkillSection(t *testing.T) {
 		!strings.Contains(testPhase, instructions) {
 		t.Errorf("Review (test framing) = %q, want the skill section alongside the REBUILD framing", testPhase)
 	}
-	slim, err := SlimReview("subtask 1 (add the adder)", "M adder.go", "", "",
+	slim, err := SlimReview("subtask 1 (add the adder)", "M adder.go", "", "", "",
 		[]string{"Add(2,2) returns 4"}, Skill{Instructions: instructions})
 	if err != nil {
 		t.Fatalf("SlimReview: %v", err)
@@ -1083,7 +1094,7 @@ func TestSlimReviewWithDiffHandoff(t *testing.T) {
 		Stat:  "M a.go | 2 +-\n",
 		Files: []string{"lines 1-4: a.go", "lines 5-7: b.go"},
 	}
-	got, err := SlimReview("subtask 1 (add the adder)", "RAW DIFF BODY", "--- FAIL: TestAdd", "",
+	got, err := SlimReview("subtask 1 (add the adder)", "RAW DIFF BODY", "--- FAIL: TestAdd", "", "",
 		[]string{"Add(2,2) returns 4"}, handoff)
 	if err != nil {
 		t.Fatalf("SlimReview: %v", err)

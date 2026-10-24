@@ -89,9 +89,9 @@ func TestFeatureDevWorkflowSkillReviewsChain(t *testing.T) {
 	// Phase 1 stays an implementation review for every skill; phase 2 the
 	// test review.
 	for i := 0; i < 4; i++ {
-		if rev.inputs[i].Focus != "the implementation" || rev.inputs[i].TestsInScope ||
+		if rev.inputs[i].Focus != "the implementation. The task:\n\nimplement the feature" || rev.inputs[i].TestsInScope ||
 			rev.inputs[i].Role != activities.RoleDevReview {
-			t.Errorf("review %d = %+v, want an implementation review on the dev-review role", i, rev.inputs[i])
+			t.Errorf("review %d = %+v, want an implementation review with the task text on the dev-review role", i, rev.inputs[i])
 		}
 	}
 	for i := 4; i < 7; i++ {

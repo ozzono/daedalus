@@ -340,8 +340,8 @@ func TestFeatureDevWorkflowHappyPath(t *testing.T) {
 	if len(rev.inputs) != 2 {
 		t.Fatalf("reviewer ran %d times, want 2 (code + tests)", len(rev.inputs))
 	}
-	if rev.inputs[0].Focus != "the implementation" || rev.inputs[0].TestLogs != "" {
-		t.Errorf("code review input = %+v, want focus on the implementation with no test logs", rev.inputs[0])
+	if rev.inputs[0].Focus != "the implementation. The task:\n\nimplement the feature" || rev.inputs[0].TestLogs != "" || rev.inputs[0].AgentReply != "stub agent output" {
+		t.Errorf("code review input = %+v, want focus on the implementation with the task text and the dev relay, no test logs", rev.inputs[0])
 	}
 	if rev.inputs[1].Focus != "the test suite" || rev.inputs[1].TestLogs != "ok" {
 		t.Errorf("test review input = %+v, want focus on the test suite with test logs", rev.inputs[1])
@@ -464,7 +464,7 @@ func TestFeatureDevWorkflowHandoffRejectionFeedsFindingsToDev(t *testing.T) {
 	if !rev.inputs[0].ClaimReview {
 		t.Error("first review ClaimReview = false, want the hand-off confirmation")
 	}
-	if rev.inputs[1].ClaimReview || rev.inputs[1].Focus != "the implementation" {
+	if rev.inputs[1].ClaimReview || rev.inputs[1].Focus != "the implementation. The task:\n\nimplement the feature" {
 		t.Errorf("second review = (claim %v, focus %q), want the ordinary implementation review of the fixed state",
 			rev.inputs[1].ClaimReview, rev.inputs[1].Focus)
 	}
@@ -3215,15 +3215,16 @@ func TestFeatureDevWorkflowTestReviewRebuildLoopsThroughDevCycle(t *testing.T) {
 
 	// Reviewer rounds: code review, test review (rebuild), code review on
 	// the rebuild, test review on the resumed loop — each role resuming its
-	// own session, and the tester's reply relayed to the test reviewer only.
+	// own session; the tester's reply relayed to the test reviewer only,
+	// the dev's latest word to every implementation review.
 	if len(rev.inputs) != 4 {
 		t.Fatalf("reviewer ran %d times, want 4 (code + test + code + test)", len(rev.inputs))
 	}
 	if rev.inputs[1].AgentReply == "" {
 		t.Error("test review should carry the tester's latest reply")
 	}
-	if rev.inputs[2].AgentReply != "" || rev.inputs[2].TestsInScope {
-		t.Error("the rebuild's code review must not carry the tester relay")
+	if rev.inputs[2].AgentReply != "stub agent output" || rev.inputs[2].TestsInScope {
+		t.Error("the rebuild's code review carries the dev relay, never the tester's")
 	}
 	if rev.inputs[2].SessionID != "code-sess" {
 		t.Errorf("post-rebuild code review SessionID = %q, want the code-review session resumed", rev.inputs[2].SessionID)
@@ -3436,8 +3437,11 @@ func TestFeatureDevWorkflowTesterReplyRelayedToReview(t *testing.T) {
 	if len(rev.inputs) != 3 {
 		t.Fatalf("reviewer ran %d times, want 3 (code + test + test)", len(rev.inputs))
 	}
-	if rev.inputs[0].AgentReply != "" {
-		t.Errorf("code review AgentReply = %q, want empty outside the test phase", rev.inputs[0].AgentReply)
+	// The code review carries the dev agent's latest reply — the relay the
+	// completeness contract reads skips from; the test reviews carry the
+	// tester's latest reply instead.
+	if rev.inputs[0].AgentReply != "the handler fix is outside my test-only scope" {
+		t.Errorf("code review AgentReply = %q, want the dev agent's latest reply relayed", rev.inputs[0].AgentReply)
 	}
 	for i := 1; i < len(rev.inputs); i++ {
 		if rev.inputs[i].AgentReply != "the handler fix is outside my test-only scope" {
