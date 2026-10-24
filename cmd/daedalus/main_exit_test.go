@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/version"
 )
@@ -179,17 +178,19 @@ func TestRunMainWithinDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("HOME", t.TempDir())       // claude's and pi's dirs off the host
+	home := t.TempDir()
+	t.Setenv("HOME", home)              // claude's and pi's dirs off the host — and the child's state home rides it
 	t.Setenv("CODEX_HOME", t.TempDir()) // codex's rollout tree off the host
 
-	// The brief only runs once the task log exists; the child resolves the
-	// real daemon dir, so the probe's log lands there under an id no real
-	// run can hold, and is removed after.
+	// The brief only runs once the task log exists; the child resolves its
+	// own state home from the HOME above, so the probe's log lands there
+	// under an id no real run can hold, and is removed after.
 	id := fmt.Sprintf("daedalus-hangprobe-%d", time.Now().UnixNano())
-	if err := os.MkdirAll(activities.TaskLogDir, 0o755); err != nil {
+	logDir := filepath.Join(home, ".local", "state", "daedalus")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	logPath := filepath.Join(activities.TaskLogDir, id+".log")
+	logPath := filepath.Join(logDir, id+".log")
 	started := "=== 2026-10-07T09:00:00Z jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===\n"
 	if err := os.WriteFile(logPath, []byte(started), 0o644); err != nil {
 		t.Fatal(err)

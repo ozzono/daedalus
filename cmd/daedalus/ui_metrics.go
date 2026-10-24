@@ -1,23 +1,24 @@
-// The metrics view's data layer: the operator-editable model price table,
-// the ledger folds behind the usage tables, and derived tiles. Everything
-// reads the relay ledger the way `dash list` does — one clamped full-ring
-// query, then plain folds; a 10k-entry pass is microseconds, so no cache
-// layer. Cost is computed at render time from the saved prices and never
-// stored — a retroactive price edit reprices the whole window on the next
-// render, and Entry.CostUSD stays the reserved zero it has always been.
+// The metrics view's data layer: the operator-editable model price table
+// (the model_prices table of the shared metrics database — nil store in
+// memory mode, where the snapshot is the whole store), the ledger folds
+// behind the usage tables, and derived tiles. Everything reads the relay
+// ledger the way `dash list` does — one full-ledger ascending read (the
+// sqlite table; age-pruned, not count-bounded), then plain folds. Cost is
+// computed at render time from the saved prices and never stored — a
+// retroactive price edit reprices the whole window on the next render,
+// and Entry.CostUSD stays the reserved zero it has always been.
 // Charts live in the golens-metrics dashboard (golens.go) at
 // /full-metrics, fed per append from the same ledger — the server-built
 // SVG charts this file once rendered were removed once that mount served.
 package main
 
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,65 +37,100 @@ type modelPrice struct {
 	Cached float64 `json:"cached"`
 }
 
-// modelPricesPath is the price table's record in the daemon dir, beside
-// the pid/status files — host-global like everything else in there, and
-// per-test isolated wherever the daemon dir is.
-func modelPricesPath() string { return filepath.Join(daemonDir, "metrics-models.json") }
+// modelPricesSchema is the price table's namespaced slice of the shared
+// metrics database (Q1: the JSON file retires; the upsert-never-delete
+// semantics carry over, and the atomic-write dance is inherited from
+// sqlite's transactionality). "in" is quoted — a keyword the parser
+// would otherwise choke on.
+const modelPricesSchema = `
+CREATE TABLE IF NOT EXISTS model_prices (
+    model TEXT PRIMARY KEY,
+    "in" REAL NOT NULL,
+    out REAL NOT NULL,
+    cached REAL NOT NULL
+)`
 
-// loadModelPrices reads the saved table. A missing file is the ordinary
-// first boot; an unparsable one starts empty too — the next save rewrites
-// it whole (write-then-rename), and refusing the daemon's boot over price
-// JSON would trade every dashboard view for one hand-mangled file.
-func loadModelPrices() map[string]modelPrice {
-	data, err := os.ReadFile(modelPricesPath())
+// priceStore is the model price table's own connection to the shared
+// metrics database — the models screen's saved rates. Opened through
+// metricsrelay.StoreDSN, the one helper every connection to the file
+// routes through (one file, several owners, each opening its own
+// connection; WAL so readers never block, busy timeout for colliding
+// writers). Nil means memory mode: the price snapshot is the whole
+// store, nothing touches disk.
+type priceStore struct {
+	db *sql.DB
+}
+
+func openPriceStore(path string) (*priceStore, error) {
+	db, err := sql.Open("sqlite", metricsrelay.StoreDSN(path))
 	if err != nil {
+		return nil, fmt.Errorf("open model prices sqlite: %w", err)
+	}
+	if _, err := db.Exec(modelPricesSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init model prices schema: %w", err)
+	}
+	return &priceStore{db: db}, nil
+}
+
+// Close releases the database connection.
+func (p *priceStore) Close() error { return p.db.Close() }
+
+// load reads the saved table. Nil store (memory mode) reads as no table.
+// A failed read logs and reads as empty too — refusing the daemon's boot
+// over prices would trade every dashboard view for one bad table, and the
+// next save rewrites the rows whole.
+func (p *priceStore) load() map[string]modelPrice {
+	if p == nil {
 		return nil
 	}
+	rows, err := p.db.Query(`SELECT model, "in", out, cached FROM model_prices`)
+	if err != nil {
+		log.Printf("metrics: read model prices: %v", err)
+		return nil
+	}
+	defer rows.Close()
 	prices := map[string]modelPrice{}
-	if json.Unmarshal(data, &prices) != nil {
+	for rows.Next() {
+		var name string
+		var mp modelPrice
+		if err := rows.Scan(&name, &mp.In, &mp.Out, &mp.Cached); err != nil {
+			log.Printf("metrics: scan model prices: %v", err)
+			return nil
+		}
+		prices[name] = mp
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("metrics: read model prices: %v", err)
 		return nil
 	}
 	return prices
 }
 
-// saveModelPrices merges the submitted entries into the saved table and
-// writes it back atomically (unique-temp write-then-rename — a fixed
-// temp name would let two concurrent saves rename each other's
-// half-written file and wipe the table). The merge is an upsert that
-// never deletes:
-// model names do not change and prices are only ever added, so entries
-// survive ring rotation and daemon restarts by construction — the only
-// removal path is hand-editing the file, the accepted escape hatch.
-func saveModelPrices(upsert map[string]modelPrice) error {
-	prices := loadModelPrices()
-	if prices == nil {
-		prices = map[string]modelPrice{}
-	}
-	for name, p := range upsert {
-		prices[name] = p
-	}
-	data, err := json.MarshalIndent(prices, "", "  ")
+// upsert merges the submitted entries into the saved table: an upsert
+// that never deletes — model names do not change and prices are only ever
+// added, so entries survive retention prunes and daemon restarts by
+// construction; the only removal path is hand-editing the db, the
+// accepted escape hatch. One transaction, so the merge lands whole or
+// not at all.
+func (p *priceStore) upsert(m map[string]modelPrice) error {
+	tx, err := p.db.Begin()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
-		return err
-	}
-	path := modelPricesPath()
-	f, err := os.CreateTemp(daemonDir, filepath.Base(path)+".*.tmp")
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO model_prices (model, "in", out, cached) VALUES (?, ?, ?, ?)
+		ON CONFLICT(model) DO UPDATE SET "in" = excluded."in", out = excluded.out, cached = excluded.cached`)
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
-	defer os.Remove(tmp) // no-op once the rename has moved it
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
+	defer stmt.Close()
+	for name, mp := range m {
+		if _, err := stmt.Exec(name, mp.In, mp.Out, mp.Cached); err != nil {
+			return err
+		}
 	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return tx.Commit()
 }
 
 // currentPrices snapshots the server's price table. Callers treat the map
@@ -113,17 +149,42 @@ func (s *uiServer) swapPrices(prices map[string]modelPrice) {
 	s.mu.Unlock()
 }
 
-// ledgerEntries reads the whole ring once, ascending by At — Query
-// returns newest-first, and every first/last bookkeeping in the folds
-// depends on chronological order. External otel batches are dropped here
-// (D6): they render only on the golens-served full-metrics page, never in
-// a main-dashboard fold.
+// savePrices merges the submitted entries into the saved table and
+// refreshes the snapshot to the reloaded one. sqlite mode: the
+// priceStore's transactional upsert, then a reload — the next render
+// prices through the new rates. Memory mode: there is no disk, so the
+// merge into a fresh clone of the snapshot is the whole save.
+func (s *uiServer) savePrices(upsert map[string]modelPrice) error {
+	if s.priceStore == nil {
+		merged := make(map[string]modelPrice, len(s.currentPrices())+len(upsert))
+		for name, p := range s.currentPrices() {
+			merged[name] = p
+		}
+		for name, p := range upsert {
+			merged[name] = p
+		}
+		s.swapPrices(merged)
+		return nil
+	}
+	if err := s.priceStore.upsert(upsert); err != nil {
+		return err
+	}
+	s.swapPrices(s.priceStore.load())
+	return nil
+}
+
+// ledgerEntries reads the whole ledger once, ascending by At — every
+// first/last bookkeeping in the folds depends on chronological order
+// (the sqlite read returns it ordered; the memory slice is append-order,
+// so the sort stands for both). External otel batches are dropped here
+// (D6): they render only on the golens-served full-metrics page, never
+// in a main-dashboard fold.
 func (s *uiServer) ledgerEntries() []metricsrelay.Entry {
 	if s.ledger == nil {
 		return nil
 	}
-	entries, _, _ := s.ledger.Query("", 1, 1<<30)
-	kept := entries[:0]
+	entries := s.ledger.Ascending()
+	kept := make([]metricsrelay.Entry, 0, len(entries))
 	for _, e := range entries {
 		if e.Source != metricsrelay.SourceOtelExternal {
 			kept = append(kept, e)
@@ -616,18 +677,19 @@ func (s *uiServer) fragModels(w http.ResponseWriter, req *http.Request) {
 
 // saveModels upserts the submitted rates and redirects back to the form.
 // Only the form's own editable rows are taken (parseModelPrices), the
-// file is rewritten atomically, and the server's snapshot swaps to the
-// reloaded table — the next render prices through the new rates, and the
-// golens sync re-evaluates the price gate (a newly priced model's cost
-// counter and its Model prices panel appear; golensSyncLayout).
+// save refreshes the snapshot to the reloaded table — the next render
+// prices through the new rates, and the golens sync re-evaluates the
+// price gate (a newly priced model's cost counter and its Model prices
+// panel appear; golensSyncLayout).
 func (s *uiServer) saveModels(w http.ResponseWriter, req *http.Request) {
 	if err := req.ParseForm(); err != nil {
 		http.Error(w, "read form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	// Pricable = the ledger-known models minus the unknown bucket — the
-	// form's editable rows exactly, recomputed fresh so a rotation between
-	// render and submit cannot price a name the ledger no longer knows.
+	// form's editable rows exactly, recomputed fresh so a retention prune
+	// between render and submit cannot price a name the ledger no longer
+	// knows.
 	pricable := map[string]bool{}
 	for _, m := range foldUsage(s.ledgerEntries(), time.Now(), nil, usageModelKey) {
 		if m.Key != modelUnknown {
@@ -635,12 +697,11 @@ func (s *uiServer) saveModels(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	if upsert := parseModelPrices(req.Form, pricable); len(upsert) > 0 {
-		if err := saveModelPrices(upsert); err != nil {
+		if err := s.savePrices(upsert); err != nil {
 			http.Error(w, "save model prices: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-	s.swapPrices(loadModelPrices())
 	s.golensSyncLayout()
 	http.Redirect(w, req, "/models", http.StatusSeeOther)
 }

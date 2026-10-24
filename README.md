@@ -197,7 +197,7 @@ the help text are kept in agreement.
 | `worker status` | — | — | List every worker on record (plus live strays) with live probes; the stuck-work recapture point |
 | `worker restart` | — | `-c -t` | Stop + start this config's worker with the config re-read from disk |
 | `worker restart <worker>` | `<worker>` | — | Restart one worker from its recorded config, from any directory |
-| `worker restart all` | — | — | Restart every worker on record, each from its own record — host-global: every worker on record in /tmp/daedalus regardless of the invoking directory |
+| `worker restart all` | — | — | Restart every worker on record, each from its own record — host-global: every worker on record in ~/.local/state/daedalus regardless of the invoking directory |
 | `worker foreground` | — | `-c -t` | Run the worker attached to this terminal |
 | `worker wakeup` | `<workflow-id>` | `-c` | Interrupt a RUNNING session's quota heartbeat so the round resumes |
 | `worker report` | — | `--json --table` | Summarize AI provider usage (cost, tokens, time) for this config's worker, plus worker slots |
@@ -233,7 +233,7 @@ Flag reference:
 | `-cot` | `log` | Print the run's chain-of-thought logs from Temporal history |
 | `-cot-n <N>` | `log -cot` | Tail the CoT view to the last N completed rounds (whole sections only) |
 | `-t, --type dev\|test` | `worker start`, bare `worker restart`, `worker foreground` | Which pollers the daemon starts (`dev` or `test`; omit for both). Rejected everywhere else — `run`, `worker status`, the record-driven restarts, `worker stop`/`wakeup`, and every non-worker command |
-| `--all` | `worker restart` | Restart every worker on record (same as the `all` argument; host-global — every worker on record in /tmp/daedalus, any invoking directory) |
+| `--all` | `worker restart` | Restart every worker on record (same as the `all` argument; host-global — every worker on record in ~/.local/state/daedalus, any invoking directory) |
 | `--force` (`-f`) | `worker restart` | Immediate swap: SIGTERM the old daemon and start the replacement at once instead of scheduling a drain. The drain restart keeps the old daemon serving until it has drained, then re-executes in place, so only a failure at or after the re-exec takes it down; a forced replacement is a fresh start — a failure after the old daemon was signaled (a relay dying mid-swap, a config deleted after it was loaded, a spawn or boot failure) leaves that worker down |
 | `--yes` | `wipe` | Skip the interactive confirmation (scripted use) |
 | `--json` / `--table` | `worker report`, `metrics list` | JSON vs table output (table is the default; `--table` is accepted for explicitness) |
@@ -271,19 +271,19 @@ Flag reference:
    field merging — while an explicit `-c` still wins over it.
 
    `daedalus worker` runs the worker as a detached daemon: one per task
-   queue, logs appending to `/tmp/daedalus/worker-<queue>.log` (pruned to
-   the past week), pid in `/tmp/daedalus/worker-<queue>.pid`. Manage it with
+   queue, logs appending to `~/.local/state/daedalus/worker-<queue>.log` (pruned
+   to the past week), pid in `~/.local/state/daedalus/worker-<queue>.pid`. Manage it with
    `daedalus worker stop|status|restart`, or `daedalus worker foreground` to
    run it attached to a terminal (the way to debug a worker that will not
    start). Each worker records the config it was started with (in
-   `/tmp/daedalus/worker-<queue>.conf`), so `restart` reuses the recorded
+   `~/.local/state/daedalus/worker-<queue>.conf`), so `restart` reuses the recorded
    settings wherever it's invoked, as long as some config resolves to name
    the queue (pass `-c` or keep a user-level config) — stop then
    `start -c <new>` to move a worker to a different config.
    `daedalus worker restart all` restarts every worker on record, each
    with its own config, in one call — records alone, no config needed
    (an explicit `-c` is rejected there; it would have no effect). "all" is
-   host-global: it signals every worker on record in `/tmp/daedalus`
+   host-global: it signals every worker on record in `~/.local/state/daedalus`
    regardless of the invoking directory, and `--force` trades the drain —
    which keeps the old daemon serving until it has drained and re-executes
    in place, so only a failure at or after the re-exec takes it down — for
@@ -612,8 +612,8 @@ issue never share live state). Re-running
 
 Daedalus can meter every jailed provider round — tokens in and out,
 cached tokens, cost, duration — through the host metrics daemon
-(`daedalus metrics`): a loopback usage relay (default port 7778), an
-in-memory usage ledger, and a web dashboard (default port 7777). A worker
+(`daedalus metrics`): a loopback usage relay (default port 7778), a
+usage ledger, and a web dashboard (default port 7777). A worker
 started with `metrics.enabled: true` gates its boot on the daemon being
 up, registers its provider upstreams and keys with it, and every round's
 provider environment is rewritten so the round dials the relay instead of
@@ -623,8 +623,12 @@ and for the two inspected provider-call shapes (anthropic
 of the response into the ledger while the client's stream passes through
 unharmed. Rounds whose endpoint was explicitly overridden — the fallback
 section and the per-role reviewer/dev/final-reviewer sections — are not
-staged. The ledger is memory-only: a 10,000-entry ring, wiped by a daemon
-restart. `metrics list` pages it newest-first (`--worker`, `--page`,
+staged. The ledger persists in the shared metrics database
+(`~/.config/daedalus/metrics.db` — also home to the model price table
+and the dashboard's own roll-ups and layout; `storage_backend: memory`
+keeps everything in-process instead), and rows older than
+`metrics.ledger_max_age` (45 days by default, `0s` keeps everything) are
+pruned. `metrics list` pages it newest-first (`--worker`, `--page`,
 `--json`), and the dashboard folds it into tiles, tables, and charts.
 Cost is never stored: the dashboard prices every entry at render time
 from the operator-editable model price table (the models tab, USD per 1M

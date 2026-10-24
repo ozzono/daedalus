@@ -23,6 +23,23 @@ func useTaskLogDir(t *testing.T) string {
 	return TaskLogDir
 }
 
+// TestTaskLogDirResolvesTheStateHome pins the daemon dir's resolution: the
+// platform-conventional state home under $HOME, with the legacy
+// /tmp/daedalus standing in on a HOME-less host rather than failing every
+// daemon start there.
+func TestTaskLogDirResolvesTheStateHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if got, want := taskLogDir(), filepath.Join(home, ".local", "state", "daedalus"); got != want {
+		t.Errorf("taskLogDir() = %q, want %q", got, want)
+	}
+
+	t.Setenv("HOME", "")
+	if got := taskLogDir(); got != "/tmp/daedalus" {
+		t.Errorf("taskLogDir() with no HOME = %q, want the legacy /tmp/daedalus fallback", got)
+	}
+}
+
 // TestTaskLogPath pins the task log's file layout and id validation: a
 // valid workflow id maps to <dir>/<id>.log, and an id that could escape the
 // daemon directory — empty, relative, or carrying a separator — is rejected

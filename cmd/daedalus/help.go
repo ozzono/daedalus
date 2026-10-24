@@ -18,7 +18,7 @@ WORKFLOW COMMANDS
               flags: none
   list        Display past and current sessions on the task queue
               flags: none
-  log         Show a session's captured task log (/tmp/daedalus/<workflow-id>.log)
+  log         Show a session's captured task log (~/.local/state/daedalus/<workflow-id>.log)
               flags: --status -cot -cot-n
   wipe        Erase a session's disk work entirely (worktree, branches, logs)
               flags: --yes
@@ -81,11 +81,12 @@ whether their workers participate (metrics.enabled).
 
 ACTIONS
   start         (default) Run the daemon detached: logs append to
-                /tmp/daedalus/metrics.log, the pid lives in
-                /tmp/daedalus/metrics.pid.
+                ~/.local/state/daedalus/metrics.log, the pid lives in
+                ~/.local/state/daedalus/metrics.pid.
   stop          Terminate the daemon (SIGTERM) and clear its pid file. The
-                ledger is in-memory only: stopping the daemon discards every
-                recorded entry.
+                ledger persists in the shared metrics db; only
+                storage_backend: memory (the in-process mode) loses the
+                recorded rows on stop.
   restart       Stop + start with the config the restart is invoked with
                 (the ports re-read from disk).
   status        Print the daemon's pid, its two ports, its version, and how
@@ -338,7 +339,7 @@ USAGE
   daedalus log <workflow-id> -cot
   daedalus log <workflow-id> -cot -cot-n <N>
 
-Prints the task log /tmp/daedalus/<workflow-id>.log: one block per jailed
+Prints the task log ~/.local/state/daedalus/<workflow-id>.log: one block per jailed
 agent or reviewer round — full stdout and stderr, untruncated — and one per
 native test-suite execution. (Body lines that would look like a block
 header are prefixed with one space, so output is preserved except for that
@@ -452,8 +453,9 @@ USAGE
 
 ACTIONS
   start         (default) Run the worker as a detached daemon: logs append to
-                /tmp/daedalus/worker-<name>.log (pruned to the past week), the
-                pid lives in /tmp/daedalus/worker-<name>.pid — one daemon per
+                ~/.local/state/daedalus/worker-<name>.log (pruned to the past
+                week), the pid lives in
+                ~/.local/state/daedalus/worker-<name>.pid — one daemon per
                 worker name (the config's worker_id, else its task_queue).
   stop          Drain the daemon gracefully (SIGTERM).
   restart       Schedule a drain-restart: the config the restart is invoked with
@@ -468,7 +470,7 @@ ACTIONS
                 both pids reported, without blocking.
                 Blast radius: a bare "worker restart" touches exactly the one
                 worker it resolves to; "all"/--all signals every worker on
-                record in the host-global record dir (/tmp/daedalus)
+                record in the host-global record dir (~/.local/state/daedalus)
                 regardless of the invoking directory. The drain restart keeps
                 the old daemon serving until it has drained, then re-executes
                 in place — only a failure at or after the re-exec takes it
@@ -517,8 +519,9 @@ ARGUMENTS
   <action>              One of the actions above (default: start).
   restart <worker>      That one worker, from its recorded config, from any directory.
   restart all | --all   Every worker on record, each with its own recorded config —
-                        host-global: every worker on record in /tmp/daedalus,
-                        whatever directory the command runs from.
+                        host-global: every worker on record in
+                        ~/.local/state/daedalus, whatever directory the command
+                        runs from.
 
 FLAGS
   -c, --config <path>   Path to the config file. Accepted by start, stop, bare
@@ -824,7 +827,8 @@ with it), the session's in-flight feat/<segment>-* branches (stale ones
 from crashed runs included), every preserved
 <branch-prefix>/<segment>-* deliverable branch, the aborted/<segment>
 continue-snapshot branch, the per-worktree session-state file under
-~/.daedalus/sessions/, and the task log /tmp/daedalus/<workflow-id>.log.
+~/.daedalus/sessions/, and the task log
+~/.local/state/daedalus/<workflow-id>.log.
 <segment> is "issue-<id>", prefixed "<flow>-" for any flow other than
 feature-dev; the interactive confirmation prints the real derived paths
 before asking.
@@ -898,8 +902,9 @@ default worker action).
 USAGE
   daedalus [-c config.yaml] worker start [-t dev|test]
 
-Logs append to /tmp/daedalus/worker-<name>.log (pruned to the past week),
-the pid lives in /tmp/daedalus/worker-<name>.pid — one daemon per worker
+Logs append to ~/.local/state/daedalus/worker-<name>.log (pruned to the
+past week), the pid lives in ~/.local/state/daedalus/worker-<name>.pid —
+one daemon per worker
 name (the config's worker_id, else its task_queue). The daemon re-executes
 "worker foreground" with the resolved config path, so it keeps serving if
 the invoking directory goes away.
