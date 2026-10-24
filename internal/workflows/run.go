@@ -152,6 +152,14 @@ type pipelineRun struct {
 	devSession, testSession             string
 	devReviewSession, testReviewSession string
 
+	// devReply is the implementing agent's latest reply text: runAgent
+	// records it on every RoleDev round, and every implementation review
+	// carries it (reviewOpts.agentReply), so a skip the round declares in
+	// its reply reaches the reviewer instead of dying in a conversation
+	// the reviewer never sees. Test rounds are untouched — the flows track
+	// testerReply themselves, including the rebuild re-point.
+	devReply string
+
 	// skillDevReviewSessions and skillTestReviewSessions chain each entry
 	// of the run's review_skill_list to its own reviewer conversation —
 	// one ping-pong per skill per phase, each resuming its own session
@@ -502,7 +510,9 @@ func (r *pipelineRun) heartbeat(err error, stage string) error {
 
 // runAgent executes one autonomous agent round in the given role's session,
 // resuming it when set, and returns the round's result — its reply text is
-// what a test phase relays to its reviewer. The role also scopes the
+// what a test phase relays to its reviewer, and a dev-role round's reply is
+// also recorded on the run (devReply) as the implementing agent's latest
+// word for every implementation review. The role also scopes the
 // activity's recorded-session fallback, so a retry of a round killed at its
 // ceiling resumes that role's own conversation.
 func (r *pipelineRun) runAgent(prompt string, stage string, role activities.SessionRole, session *string) (activities.AgentRunResult, error) {
@@ -537,6 +547,9 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			// terminal freshness gate's edit timestamp (suiteStale).
 			r.lastEdit = workflow.Now(r.ctx)
 			*session = result.SessionID
+			if role == activities.RoleDev {
+				r.devReply = result.Text
+			}
 			r.logger.Info("Agent run completed", "Stage", stage,
 				"TextChars", len(result.Text), "ThinkingChars", len(result.Thinking))
 			return result, nil
