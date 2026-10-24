@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -529,6 +530,207 @@ func TestStartDispatch(t *testing.T) {
 		}
 		if len(fake.starts) != 0 {
 			t.Errorf("the unverifiable chain dispatched %d starts, want 0", len(fake.starts))
+		}
+	})
+
+	t.Run("an in-repo grant rides as scope, never a mount", func(t *testing.T) {
+		repo := gitRepo(t, "main")
+		// An empty untracked directory keeps the clean-repo gate silent.
+		if err := os.MkdirAll(filepath.Join(repo, "specs"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fake := &fakeFrontend{}
+		cfg := startFake(t, fake)
+
+		req := valid(repo)
+		req.WorkflowName = "investigate" // a flow with an allowed-path policy
+		req.Folders = []string{filepath.Join(repo, "specs")}
+		if _, err := Start(cfg, req); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		in := dispatchInput(t, fake.starts[0])
+		if len(in.Folders) != 0 {
+			t.Errorf("input Folders = %v, want none — mounting the host copy would bypass the worktree commit model", in.Folders)
+		}
+		if want := []string{"*.md", "docs/", "specs/"}; !slices.Equal(in.AllowedPaths, want) {
+			t.Errorf("input AllowedPaths = %v, want the flow's policy extended by the grant's prefix %v", in.AllowedPaths, want)
+		}
+	})
+
+	t.Run("a repo-root grant is refused before anything is dispatched", func(t *testing.T) {
+		repo := gitRepo(t, "main")
+		fake := &fakeFrontend{}
+		cfg := startFake(t, fake)
+
+		req := valid(repo)
+		req.Folders = []string{repo}
+		_, err := Start(cfg, req)
+		if err == nil || !strings.Contains(err.Error(), "is the repo root") {
+			t.Fatalf("Start(repo-root grant) = %v, want the repo-root refusal", err)
+		}
+		if len(fake.starts) != 0 {
+			t.Errorf("the repo-root refusal dispatched %d starts, want 0", len(fake.starts))
+		}
+	})
+}
+
+// TestScopeFolderGrants pins the submit-time split of folder grants against
+// the repo root: an in-repo grant is a scope grant — it extends a flow's
+// allowed-path policy by the grant's repo-relative directory prefix and
+// never mounts (the worktree already carries the files, and a mount would
+// let the agent edit the host repo past the worktree commit model); a grant
+// outside the repo keeps the mount and extends nothing; a grant equal to
+// the repo root is refused; nested, duplicate, and trailing-slash
+// spellings are left as-is; a policy-free flow is never seeded (an empty
+// allowed set means unrestricted, and seeding it would strand every write
+// outside the grant); and the caller's policy slice is never mutated in
+// place — it aliases the shared Registry spec.
+func TestScopeFolderGrants(t *testing.T) {
+	repo := t.TempDir()
+	policy := []string{"*.md", "docs/"}
+
+	t.Run("an in-repo grant extends the policy and mounts nothing", func(t *testing.T) {
+		mounts, extended, err := scopeFolderGrants(repo, []string{filepath.Join(repo, "specs")}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if mounts != nil {
+			t.Errorf("mounts = %v, want none — the worktree carries the grant's files", mounts)
+		}
+		if want := []string{"*.md", "docs/", "specs/"}; !slices.Equal(extended, want) {
+			t.Errorf("extended = %v, want %v", extended, want)
+		}
+		if want := []string{"*.md", "docs/"}; !slices.Equal(policy, want) {
+			t.Errorf("the caller's policy was mutated in place: %v, want %v", policy, want)
+		}
+	})
+
+	t.Run("a trailing-slash spelling normalizes to the same prefix", func(t *testing.T) {
+		_, extended, err := scopeFolderGrants(repo, []string{filepath.Join(repo, "specs") + "/"}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if want := []string{"*.md", "docs/", "specs/"}; !slices.Equal(extended, want) {
+			t.Errorf("extended = %v, want %v (no doubled or uncleaned prefix)", extended, want)
+		}
+	})
+
+	t.Run("a grant outside the repo keeps the mount and extends nothing", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "shared")
+		mounts, extended, err := scopeFolderGrants(repo, []string{outside}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if !slices.Equal(mounts, []string{outside}) {
+			t.Errorf("mounts = %v, want [%s]", mounts, outside)
+		}
+		if !slices.Equal(extended, policy) {
+			t.Errorf("extended = %v, want the flow's policy unchanged %v", extended, policy)
+		}
+	})
+
+	t.Run("mixed grants split by location in submission order", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "notes")
+		mounts, extended, err := scopeFolderGrants(repo, []string{outside, filepath.Join(repo, "specs")}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if !slices.Equal(mounts, []string{outside}) {
+			t.Errorf("mounts = %v, want only the out-of-repo grant %s", mounts, outside)
+		}
+		if want := []string{"*.md", "docs/", "specs/"}; !slices.Equal(extended, want) {
+			t.Errorf("extended = %v, want %v", extended, want)
+		}
+	})
+
+	t.Run("the repo root is refused", func(t *testing.T) {
+		for _, spelling := range []string{repo, repo + "/"} {
+			mounts, extended, err := scopeFolderGrants(repo, []string{spelling}, policy)
+			if err == nil || !strings.Contains(err.Error(), "is the repo root") {
+				t.Errorf("scopeFolderGrants(%s) err = %v, want the repo-root refusal", spelling, err)
+			}
+			if mounts != nil || extended != nil {
+				t.Errorf("scopeFolderGrants(%s) = %v, %v, want nothing back on a refusal", spelling, mounts, extended)
+			}
+		}
+	})
+
+	t.Run("nested and duplicate grants are left as-is", func(t *testing.T) {
+		mounts, extended, err := scopeFolderGrants(repo, []string{
+			filepath.Join(repo, "specs"),
+			filepath.Join(repo, "specs", "deep"),
+			filepath.Join(repo, "specs"),
+		}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if mounts != nil {
+			t.Errorf("mounts = %v, want none", mounts)
+		}
+		if want := []string{"*.md", "docs/", "specs/", "specs/deep/", "specs/"}; !slices.Equal(extended, want) {
+			t.Errorf("extended = %v, want the prefixes kept verbatim %v — they cannot shadow, only re-match", extended, want)
+		}
+	})
+
+	t.Run("a policy-free flow is never seeded", func(t *testing.T) {
+		mounts, extended, err := scopeFolderGrants(repo, []string{filepath.Join(repo, "specs")}, nil)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if mounts != nil {
+			t.Errorf("mounts = %v, want none", mounts)
+		}
+		if extended != nil {
+			t.Errorf("extended = %v, want nil — an empty allowed set means unrestricted, and seeding it would strand every write outside the grant", extended)
+		}
+	})
+
+	t.Run("no grants is a no-op", func(t *testing.T) {
+		mounts, extended, err := scopeFolderGrants(repo, nil, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if mounts != nil || !slices.Equal(extended, policy) {
+			t.Errorf("scopeFolderGrants(repo, nil, policy) = %v, %v, want nil mounts and the policy unchanged", mounts, extended)
+		}
+	})
+
+	t.Run("a relative grant resolves against the process cwd", func(t *testing.T) {
+		t.Chdir(repo)
+		mounts, extended, err := scopeFolderGrants(repo, []string{"specs"}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if mounts != nil {
+			t.Errorf("mounts = %v, want none — the relative grant resolves inside the repo", mounts)
+		}
+		if want := []string{"*.md", "docs/", "specs/"}; !slices.Equal(extended, want) {
+			t.Errorf("extended = %v, want %v", extended, want)
+		}
+	})
+
+	t.Run("a parent of the repo is a mount, not a refusal", func(t *testing.T) {
+		parent := filepath.Dir(repo)
+		mounts, _, err := scopeFolderGrants(repo, []string{parent}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if !slices.Equal(mounts, []string{parent}) {
+			t.Errorf("mounts = %v, want [%s] — the .. boundary is a mount like any outside path", mounts, parent)
+		}
+	})
+
+	t.Run("a traversal spelling that resolves inside is a scope grant", func(t *testing.T) {
+		winding := filepath.Join(repo, "..", filepath.Base(repo), "specs")
+		mounts, extended, err := scopeFolderGrants(repo, []string{winding}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if mounts != nil {
+			t.Errorf("mounts = %v, want none — the cleaned path is inside the repo", mounts)
+		}
+		if want := []string{"*.md", "docs/", "specs/"}; !slices.Equal(extended, want) {
+			t.Errorf("extended = %v, want %v", extended, want)
 		}
 	})
 }

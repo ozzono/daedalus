@@ -204,6 +204,31 @@ func TestConfigRecordRoundTrip(t *testing.T) {
 			t.Errorf("readConfigRecord(blank) = (%q, %q), want empty both", path, typ)
 		}
 	})
+
+	t.Run("a fresh host's absent state dir is created by the write", func(t *testing.T) {
+		// First-ever start on a host without the daemon dir: the record
+		// write is the dir's first touch on the start path (it precedes
+		// spawnDaemon's own MkdirAll), so it must create the dir itself —
+		// the bare WriteFile this mkdir guards failed here with ENOENT.
+		reset := t.TempDir()
+		t.Cleanup(func() { daemonDir = reset })
+		daemonDir = filepath.Join(t.TempDir(), "state", "daedalus")
+		_, _, confFile := daemonPaths("w")
+		if err := writeConfigRecord(confFile, "/cfgs/fresh.yaml", ""); err != nil {
+			t.Fatalf("writeConfigRecord on a fresh host: %v", err)
+		}
+		if path, typ := readConfigRecord("w"); path != "/cfgs/fresh.yaml" || typ != "" {
+			t.Errorf("readConfigRecord(fresh host) = (%q, %q), want (/cfgs/fresh.yaml, %q)", path, typ, "")
+		}
+		// A second write onto the now-existing dir keeps working — the
+		// mkdir is a no-op there, and the record still round-trips typed.
+		if err := writeConfigRecord(confFile, "/cfgs/again.yaml", "dev"); err != nil {
+			t.Fatalf("writeConfigRecord(second): %v", err)
+		}
+		if path, typ := readConfigRecord("w"); path != "/cfgs/again.yaml" || typ != "dev" {
+			t.Errorf("readConfigRecord(second) = (%q, %q), want (/cfgs/again.yaml, dev)", path, typ)
+		}
+	})
 }
 
 // TestWorkerRestartSchedulesDrain pins the default restart on a live
