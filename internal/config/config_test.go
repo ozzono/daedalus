@@ -3742,6 +3742,109 @@ func TestLoadMetricsStorageBackend(t *testing.T) {
 	}
 }
 
+// TestLoadMetricsLedgerMaxAge pins the ledger retention knob: unset is nil
+// (the daemon resolves DefaultLedgerMaxAge — the decided 45 days — at use),
+// an explicit duration loads through, an explicit 0s is the keep-forever
+// value and distinct from nil, a negative age is a load error, and the knob
+// named together with the memory backend is the contradiction it is — there
+// is no ledger on disk to age.
+func TestLoadMetricsLedgerMaxAge(t *testing.T) {
+	if DefaultLedgerMaxAge != 45*24*time.Hour {
+		t.Fatalf("DefaultLedgerMaxAge = %s, want the decided 45 days (720h)", DefaultLedgerMaxAge)
+	}
+
+	cfg, err := Load(writeConfig(t, "metrics:\n  enabled: true\n"))
+	if err != nil {
+		t.Fatalf("Load(unset): %v", err)
+	}
+	if cfg.Metrics.LedgerMaxAge != nil {
+		t.Errorf("unset LedgerMaxAge = %v, want nil (the daemon resolves the default)", *cfg.Metrics.LedgerMaxAge)
+	}
+
+	cfg, err = Load(writeConfig(t, "metrics:\n  ledger_max_age: 1h\n"))
+	if err != nil {
+		t.Fatalf("Load(1h): %v", err)
+	}
+	if cfg.Metrics.LedgerMaxAge == nil || *cfg.Metrics.LedgerMaxAge != time.Hour {
+		t.Errorf("LedgerMaxAge = %v, want 1h through", cfg.Metrics.LedgerMaxAge)
+	}
+
+	cfg, err = Load(writeConfig(t, "metrics:\n  ledger_max_age: 0s\n"))
+	if err != nil {
+		t.Fatalf("Load(0s): %v", err)
+	}
+	if cfg.Metrics.LedgerMaxAge == nil || *cfg.Metrics.LedgerMaxAge != 0 {
+		t.Errorf("LedgerMaxAge = %v, want an explicit 0s kept forever — a value, not the unset nil", cfg.Metrics.LedgerMaxAge)
+	}
+
+	for _, doc := range []string{
+		"metrics:\n  ledger_max_age: -1h\n",
+		"metrics:\n  ledger_max_age: -1s\n",
+	} {
+		_, err := Load(writeConfig(t, doc))
+		if err == nil || !strings.Contains(err.Error(), "ledger_max_age must not be negative") {
+			t.Errorf("Load(%q) error = %v, want the negativity rejection", doc, err)
+		}
+	}
+
+	if _, err := Load(writeConfig(t, "metrics:\n  storage_backend: sqlite\n  ledger_max_age: 1h\n")); err != nil {
+		t.Errorf("Load(sqlite + age) = %v, want the pair to load", err)
+	}
+	_, err = Load(writeConfig(t, "metrics:\n  storage_backend: memory\n  ledger_max_age: 1h\n"))
+	if err == nil || !strings.Contains(err.Error(), "no ledger on disk to age") {
+		t.Errorf("Load(memory + age) error = %v, want the named-together rejection", err)
+	}
+}
+
+// TestRenderYAMLMetricsLedgerMaxAge pins the ledger age's render: it prints
+// as the duration string a config file expresses it with ("1h30m0s", "0s" —
+// never a nanosecond count, which yaml.v3 refuses to decode back into a
+// duration), an unset age renders the key absent, and the rendered file
+// reloads to the same value.
+func TestRenderYAMLMetricsLedgerMaxAge(t *testing.T) {
+	render := func(t *testing.T, doc string) string {
+		t.Helper()
+		raw, err := LoadRaw(writeConfig(t, doc))
+		if err != nil {
+			t.Fatalf("LoadRaw(%q): %v", doc, err)
+		}
+		out, err := raw.RenderYAML()
+		if err != nil {
+			t.Fatalf("RenderYAML(%q): %v", doc, err)
+		}
+		return out
+	}
+
+	out := render(t, "metrics:\n  ledger_max_age: 1080h\n")
+	if !strings.Contains(out, "ledger_max_age: 1080h0m0s") {
+		t.Errorf("RenderYAML =\n%s\nwant the age as a loadable duration string", out)
+	}
+	cfg, err := Load(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("the rendered file does not load back: %v\n%s", err, out)
+	}
+	if cfg.Metrics.LedgerMaxAge == nil || *cfg.Metrics.LedgerMaxAge != 1080*time.Hour {
+		t.Errorf("reloaded LedgerMaxAge = %v, want 1080h", cfg.Metrics.LedgerMaxAge)
+	}
+
+	out = render(t, "metrics:\n  ledger_max_age: 0s\n")
+	if !strings.Contains(out, "ledger_max_age: 0s") {
+		t.Errorf("RenderYAML =\n%s\nwant the explicit forever value rendered loadable", out)
+	}
+	cfg, err = Load(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("the rendered 0s does not load back: %v\n%s", err, out)
+	}
+	if cfg.Metrics.LedgerMaxAge == nil || *cfg.Metrics.LedgerMaxAge != 0 {
+		t.Errorf("reloaded LedgerMaxAge = %v, want the explicit 0s kept", cfg.Metrics.LedgerMaxAge)
+	}
+
+	out = render(t, "metrics:\n  enabled: true\n")
+	if strings.Contains(out, "ledger_max_age") {
+		t.Errorf("RenderYAML =\n%s\nwant the unset age rendered absent, not null", out)
+	}
+}
+
 // TestRenderYAMLMetrics pins the render: the metrics section round-trips —
 // an explicit section re-renders with its values, and the rendered file
 // loads back to the same section.

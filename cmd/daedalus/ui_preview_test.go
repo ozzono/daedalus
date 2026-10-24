@@ -167,9 +167,9 @@ func TestUIModelsPreviewModal(t *testing.T) {
 				t.Errorf("the what-if fragment lacks %q:\n%s", want, out)
 			}
 		}
-		// The preview is read-only: the price file the save wrote is
-		// exactly what a later read sees.
-		if p := loadModelPrices(); len(p) != 1 || p["mA"] != (modelPrice{In: 3, Out: 2, Cached: 1}) {
+		// The preview is read-only: the saved table in the db is exactly
+		// what a later read sees.
+		if p := h.prices.load(); len(p) != 1 || p["mA"] != (modelPrice{In: 3, Out: 2, Cached: 1}) {
 			t.Errorf("the preview left the price table %+v, want the saved mA rates untouched", p)
 		}
 	})

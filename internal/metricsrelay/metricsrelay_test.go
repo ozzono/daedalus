@@ -136,29 +136,47 @@ func TestStagedBase(t *testing.T) {
 	}
 }
 
-// TestLedgerCapRing pins the ring: appending past the cap drops the oldest
-// entries, so the ledger holds the newest ledgerCap records and no more.
-func TestLedgerCapRing(t *testing.T) {
+// TestLedgerMemoryModeKeepsEverything pins the memory ledger's shape after
+// the ring's retirement: the zero-value ledger is the no-disk posture and
+// unbounded by design — appending past the retired 10k cap keeps every
+// entry, still served newest-first, with the oldest record surviving at the
+// bottom of the ascending read.
+func TestLedgerMemoryModeKeepsEverything(t *testing.T) {
 	l := &Ledger{}
-	for i := 0; i < ledgerCap+2; i++ {
+	const n = 10_001 // just past the retired ledgerCap
+	for i := 0; i < n; i++ {
 		l.Append(Entry{Task: "t" + strconv.Itoa(i)})
 	}
-	if l.Len() != ledgerCap {
-		t.Fatalf("Len = %d, want the cap %d", l.Len(), ledgerCap)
+	if l.Len() != n {
+		t.Fatalf("Len = %d, want every one of the %d appends (memory mode is unbounded)", l.Len(), n)
 	}
-	entries, total, size := l.Query("", 1, ledgerCap)
-	if total != ledgerCap || size != ledgerCap || len(entries) != ledgerCap {
-		t.Fatalf("Query = %d entries, total %d, size %d, want the full cap", len(entries), total, size)
+	entries, total, _ := l.Query("", 1, 5)
+	if total != n || len(entries) != 5 {
+		t.Fatalf("Query = %d entries total %d, want the first page of five over %d", len(entries), total, n)
 	}
-	// Newest first: the two dropped entries are t0 and t1, and the newest
-	// page opens with the last append.
-	if entries[0].Task != "t"+strconv.Itoa(ledgerCap+1) {
-		t.Errorf("newest entry = %q, want t%d", entries[0].Task, ledgerCap+1)
+	if entries[0].Task != "t"+strconv.Itoa(n-1) {
+		t.Errorf("newest entry = %q, want t%d", entries[0].Task, n-1)
 	}
-	for _, e := range entries {
-		if e.Task == "t0" || e.Task == "t1" {
-			t.Errorf("dropped entry %q still served after the ring wrapped", e.Task)
-		}
+	asc := l.Ascending()
+	if len(asc) != n || asc[0].Task != "t0" || asc[n-1].Task != "t"+strconv.Itoa(n-1) {
+		t.Errorf("Ascending = %d entries (%q..%q), want all %d oldest-first", len(asc), asc[0].Task, asc[n-1].Task, n)
+	}
+}
+
+// TestLedgerMemoryAscendingCopies pins the memory read's shape: Ascending
+// hands the entries back in append order as a fresh slice — mutating the
+// result must not reach into the ledger.
+func TestLedgerMemoryAscendingCopies(t *testing.T) {
+	l := &Ledger{}
+	l.Append(Entry{Task: "a"})
+	l.Append(Entry{Task: "b"})
+	got := l.Ascending()
+	if len(got) != 2 || got[0].Task != "a" || got[1].Task != "b" {
+		t.Fatalf("Ascending = %+v, want append order", got)
+	}
+	got[0].Task = "mutated"
+	if fresh := l.Ascending(); fresh[0].Task != "a" {
+		t.Errorf("mutating the returned slice leaked into the ledger: %q", fresh[0].Task)
 	}
 }
 
@@ -203,20 +221,24 @@ func TestLedgerQuery(t *testing.T) {
 	}
 
 	// A page number whose offset multiply would overflow int must serve
-	// empty, not panic or wrap into a live offset.
-	entries, total, _ = l.Query("", math.MaxInt, math.MaxInt)
+	// empty, not panic or wrap into a live offset — and the oversized page
+	// size comes back clamped to the request-side cap, the effective value
+	// callers report.
+	entries, total, size = l.Query("", math.MaxInt, math.MaxInt)
 	if entries != nil || total != 10 {
 		t.Errorf("MaxInt page = %d entries total %d, want nil/10 (clamped, no wrap)", len(entries), total)
+	}
+	if size != ledgerPageSizeCap {
+		t.Errorf("MaxInt page size = %d, want the page cap %d", size, ledgerPageSizeCap)
 	}
 }
 
 // TestLedgerAppendObserver pins the append observer — the daemon's
 // golens-metrics feed hangs off it: each Append delivers its entry exactly
 // once, to an observer installed mid-stream (earlier appends stay
-// unobserved — the unset observer is the ordinary shape), a capped append
-// still delivers its own entry, and the invoke happens outside the ledger
-// lock, so an observer that reads the ledger back (Query, Len) cannot
-// deadlock against the append it belongs to.
+// unobserved — the unset observer is the ordinary shape), and the invoke
+// happens outside the ledger lock, so an observer that reads the ledger
+// back (Query, Len) cannot deadlock against the append it belongs to.
 func TestLedgerAppendObserver(t *testing.T) {
 	t.Run("delivers each append once, outside the lock", func(t *testing.T) {
 		done := make(chan struct{})
@@ -251,30 +273,6 @@ func TestLedgerAppendObserver(t *testing.T) {
 		case <-done:
 		case <-time.After(5 * time.Second):
 			t.Fatal("the observed append deadlocked — the observer ran inside the ledger lock")
-		}
-	})
-
-	t.Run("a capped append still delivers its entry", func(t *testing.T) {
-		l := &Ledger{}
-		var mu sync.Mutex
-		delivered := 0
-		var last Entry
-		l.SetOnAppend(func(e Entry) {
-			mu.Lock()
-			defer mu.Unlock()
-			delivered++
-			last = e
-		})
-		for i := 0; i < ledgerCap+1; i++ {
-			l.Append(Entry{Task: "t" + strconv.Itoa(i)})
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if delivered != ledgerCap+1 {
-			t.Errorf("delivered %d appends, want every one past the cap too", delivered)
-		}
-		if last.Task != "t"+strconv.Itoa(ledgerCap) {
-			t.Errorf("last delivered entry = %q, want the append that wrapped the ring", last.Task)
 		}
 	})
 }

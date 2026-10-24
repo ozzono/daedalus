@@ -1,5 +1,5 @@
-github.com/GoLens-Project/golens-metrics v1.1.6 h1:hratyOfNRd4JcmYKmw8X6p9wNBswxk/huSgKN6rV9Lo=
-github.com/GoLens-Project/golens-metrics v1.1.6/go.mod h1:BAPdC7x81zI5jUBE188ZTsy8zJS2XTrPqxUbGZMGC8s=
+github.com/GoLens-Project/golens-metrics v1.1.8 h1:G6M0GpPdAssZemQOMmjBmzKTxQN4Osczx889N3eTZSw=
+github.com/GoLens-Project/golens-metrics v1.1.8/go.mod h1:BAPdC7x81zI5jUBE188ZTsy8zJS2XTrPqxUbGZMGC8s=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

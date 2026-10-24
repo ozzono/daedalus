@@ -89,29 +89,35 @@ func golensLabelMap(values []golens.Label) map[string]string {
 }
 
 // TestStartGolensBootFaces pins the registry's boot: the default config
-// opens the sqlite store beside the daemon's files (creating the daemon
-// dir a fresh host lacks) and registers the six ledger metrics up front
-// so fed samples land typed; an explicit storage path relocates the store;
-// the memory backend keeps no file; and the two boot failures name their
-// cause — an unwritable daemon dir and an unopenable sqlite path.
+// opens the shared metrics db in the config home (creating it a fresh host
+// lacks) and registers the six ledger metrics up front so fed samples land
+// typed — and writes neither of the two retired daemon-dir files; an
+// explicit storage path relocates the shared db; the memory backend keeps
+// no file at all; and the two boot failures name their cause — an
+// unresolvable config home and an unopenable sqlite path.
 func TestStartGolensBootFaces(t *testing.T) {
 	sixMetrics := []string{
 		golensTokensIn, golensTokensOut, golensCacheRead, golensCacheWrite,
 		golensRequests, golensDuration,
 	}
 
-	t.Run("defaults create the sqlite store beside the daemon's files", func(t *testing.T) {
+	t.Run("defaults create the shared db in the config home", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
 		dir := useDaemonDir(t)
-		if err := os.RemoveAll(dir); err != nil {
-			t.Fatal(err)
-		}
 		reg, err := startGolens(config.Config{})
 		if err != nil {
 			t.Fatalf("startGolens: %v", err)
 		}
 		defer reg.Close()
-		if _, err := os.Stat(filepath.Join(dir, "metrics-golens.db")); err != nil {
-			t.Errorf("the default sqlite store is missing after boot: %v", err)
+		if _, err := os.Stat(filepath.Join(home, ".config", "daedalus", "metrics.db")); err != nil {
+			t.Errorf("the shared metrics db is missing after boot: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "metrics-golens.db")); !os.IsNotExist(err) {
+			t.Errorf("the retired daemon-dir store was created: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "metrics-golens-layout.json")); !os.IsNotExist(err) {
+			t.Errorf("the retired daemon-dir layout file was written: %v", err)
 		}
 		for _, name := range sixMetrics {
 			if _, ok := reg.Snapshot(name); !ok {
@@ -120,9 +126,11 @@ func TestStartGolensBootFaces(t *testing.T) {
 		}
 	})
 
-	t.Run("an explicit storage path relocates the store", func(t *testing.T) {
-		dir := useDaemonDir(t)
-		custom := filepath.Join(t.TempDir(), "relocated", "golens.db")
+	t.Run("an explicit storage path relocates the shared db", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		useDaemonDir(t)
+		custom := filepath.Join(t.TempDir(), "relocated", "metrics.db")
 		if err := os.MkdirAll(filepath.Dir(custom), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -137,12 +145,14 @@ func TestStartGolensBootFaces(t *testing.T) {
 		if _, err := os.Stat(custom); err != nil {
 			t.Errorf("the explicit store is missing after boot: %v", err)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "metrics-golens.db")); !os.IsNotExist(err) {
-			t.Errorf("the default store was created beside the explicit one: %v", err)
+		if _, err := os.Stat(filepath.Join(home, ".config", "daedalus", "metrics.db")); !os.IsNotExist(err) {
+			t.Errorf("the default db was created beside the explicit one: %v", err)
 		}
 	})
 
 	t.Run("the memory backend keeps no file", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
 		dir := useDaemonDir(t)
 		reg, err := startGolens(golensMemoryConfig())
 		if err != nil {
@@ -150,20 +160,25 @@ func TestStartGolensBootFaces(t *testing.T) {
 		}
 		defer reg.Close()
 		if _, err := os.Stat(filepath.Join(dir, "metrics-golens.db")); !os.IsNotExist(err) {
-			t.Errorf("the memory backend wrote a store file: %v", err)
+			t.Errorf("the memory backend wrote a daemon-dir store file: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config", "daedalus", "metrics.db")); !os.IsNotExist(err) {
+			t.Errorf("the memory backend wrote the shared metrics db: %v", err)
 		}
 	})
 
-	t.Run("an unwritable daemon dir fails the boot", func(t *testing.T) {
-		dir := useDaemonDir(t)
-		if err := os.RemoveAll(dir); err != nil {
+	t.Run("an unresolvable config home fails the boot", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		useDaemonDir(t)
+		if err := os.MkdirAll(filepath.Join(home, ".config"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(dir, []byte("not a dir"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(home, ".config", "daedalus"), []byte("not a dir"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := startGolens(config.Config{}); err == nil || !strings.Contains(err.Error(), "create daemon dir") {
-			t.Errorf("startGolens over a blocked daemon dir = %v, want the mkdir diagnostic", err)
+		if _, err := startGolens(config.Config{}); err == nil || !strings.Contains(err.Error(), "resolve metrics db") {
+			t.Errorf("startGolens over a blocked config home = %v, want the resolve diagnostic", err)
 		}
 	})
 
@@ -196,7 +211,7 @@ func TestFeedGolensEntryFoldsTheSixMetrics(t *testing.T) {
 		t.Fatalf("startGolens: %v", err)
 	}
 	defer reg.Close()
-	srv := newUIServer(config.Config{}, &metricsrelay.Ledger{}, reg)
+	srv := newUIServer(config.Config{}, &metricsrelay.Ledger{}, reg, nil)
 
 	srv.feedGolensEntry(metricsrelay.Entry{
 		Worker: "w-a", Wire: metricsrelay.WireAnthropic, Model: "mA", Role: "dev", Alias: "k1",
@@ -268,7 +283,7 @@ func TestUIRoutesServeTheGolensMountBesideTheExactRoutes(t *testing.T) {
 	}
 	defer reg.Close()
 	led := &metricsrelay.Ledger{}
-	srv := httptest.NewServer(newUIServer(config.Config{}, led, reg).routes())
+	srv := httptest.NewServer(newUIServer(config.Config{}, led, reg, nil).routes())
 	defer srv.Close()
 
 	get := func(t *testing.T, path string) (int, string) {
@@ -324,7 +339,7 @@ func TestUIRoutesServeTheGolensMountBesideTheExactRoutes(t *testing.T) {
 	// Without the embed the mount's routes vanish and the aggregates page
 	// keeps its path — the prefix catch-all that once served /metrics/...
 	// stays gone.
-	bare := httptest.NewServer(newUIServer(config.Config{}, led, nil).routes())
+	bare := httptest.NewServer(newUIServer(config.Config{}, led, nil, nil).routes())
 	defer bare.Close()
 	bareGet := func(path string) int {
 		resp, err := http.Get(bare.URL + path)
@@ -369,7 +384,7 @@ func TestInputTokensExCacheNormalizesTheWire(t *testing.T) {
 // face: the htmx-only harnesses and embed-less daedalus runs carry a nil
 // registry, and neither the feed nor the sync may notice.
 func TestFeedGolensEntryWithoutARegistryIsASilentNoop(t *testing.T) {
-	srv := newUIServer(config.Config{}, &metricsrelay.Ledger{}, nil)
+	srv := newUIServer(config.Config{}, &metricsrelay.Ledger{}, nil, nil)
 	srv.feedGolensEntry(metricsrelay.Entry{Worker: "w", Model: "m", Status: 200})
 	srv.golensSyncLayout()
 }
@@ -390,7 +405,7 @@ func TestFeedGolensEntrySlicesTheChildMetrics(t *testing.T) {
 	defer reg.Close()
 	cfg := config.Config{WorkerID: "w-a"}
 	cfg.Provider = &config.ProviderConfig{KeyAlias: "k1"}
-	srv := newUIServer(cfg, &metricsrelay.Ledger{}, reg)
+	srv := newUIServer(cfg, &metricsrelay.Ledger{}, reg, nil)
 	srv.swapPrices(map[string]modelPrice{"mA": {In: 3, Out: 2, Cached: 1}})
 	srv.golensSyncLayout()
 
@@ -714,7 +729,7 @@ func TestGolensSyncLayoutSeesTheConfigVocabularies(t *testing.T) {
 			t.Fatalf("startGolens: %v", err)
 		}
 		t.Cleanup(func() { reg.Close() })
-		srv := newUIServer(cfg, &metricsrelay.Ledger{}, reg)
+		srv := newUIServer(cfg, &metricsrelay.Ledger{}, reg, nil)
 		if prices != nil {
 			srv.swapPrices(prices)
 		}
@@ -797,8 +812,11 @@ func TestGolensSyncLayoutSeesTheConfigVocabularies(t *testing.T) {
 		if want := []string{modelCostMetricName("mA"), modelCostMetricName("zB")}; !slices.Equal(prices.Items, want) {
 			t.Errorf("prices band items = %v, want the models sorted %v", prices.Items, want)
 		}
-		if _, err := os.Stat(filepath.Join(daemonDir, "metrics-golens-layout.json")); err != nil {
-			t.Errorf("the layout document is not persisted in the daemon dir: %v", err)
+		// The file-backed layout store is retired: the document lives in
+		// the registry (sqlite mode persists it into the shared db —
+		// TestGolensLayoutPersistsInTheSharedDB), never in a file.
+		if _, err := os.Stat(filepath.Join(daemonDir, "metrics-golens-layout.json")); !os.IsNotExist(err) {
+			t.Errorf("the retired layout file was written in the daemon dir: %v", err)
 		}
 	})
 
@@ -841,6 +859,66 @@ func TestGolensSyncLayoutSeesTheConfigVocabularies(t *testing.T) {
 	})
 }
 
+// TestGolensLayoutPersistsInTheSharedDB pins the layout document's home in
+// sqlite mode: it persists into the shared metrics database (the module's
+// DashboardConfigDB, the retired file store's replacement) and survives
+// closing the registry and reopening it on the same file — the face a
+// daemon restart meets — while the ledger's own store shares that file
+// untouched: one db, several owners.
+func TestGolensLayoutPersistsInTheSharedDB(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dbPath := filepath.Join(t.TempDir(), "shared-metrics.db")
+	// The ledger's co-owner connection, open across the whole dance: the
+	// layout writes must not disturb its table.
+	ledger, err := metricsrelay.OpenStore(dbPath, 0)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() { ledger.Close() })
+	ledger.Append(metricsrelay.Entry{At: time.Now(), Worker: "w"})
+
+	cfg := config.Config{}
+	cfg.Metrics.StorageBackend = "sqlite"
+	cfg.Metrics.StoragePath = dbPath
+
+	reg, err := startGolens(cfg)
+	if err != nil {
+		t.Fatalf("startGolens: %v", err)
+	}
+	srv := newUIServer(cfg, &metricsrelay.Ledger{}, reg, nil)
+	srv.golensSyncLayout()
+	before, err := golensConfigDoc(reg, http.MethodGet, nil)
+	if err != nil {
+		t.Fatalf("read the layout document: %v", err)
+	}
+	if len(before.Sections) == 0 {
+		t.Fatal("the sync pinned no sections")
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatalf("close the registry: %v", err)
+	}
+
+	reg2, err := startGolens(cfg)
+	if err != nil {
+		t.Fatalf("startGolens(restarted): %v", err)
+	}
+	defer reg2.Close()
+	after, err := golensConfigDoc(reg2, http.MethodGet, nil)
+	if err != nil {
+		t.Fatalf("read the restarted layout document: %v", err)
+	}
+	if !reflect.DeepEqual(before.Sections, after.Sections) {
+		t.Errorf("the restarted registry's sections differ:\nbefore %+v\nafter %+v", before.Sections, after.Sections)
+	}
+
+	// The co-owner's rows rode through the layout writes untouched.
+	remaining := ledger.Ascending()
+	if len(remaining) != 1 || remaining[0].Worker != "w" {
+		t.Errorf("the ledger's rows after the layout persistence = %+v, want the one entry intact", remaining)
+	}
+}
+
 // TestSaveModelsResyncsTheGolensLayout pins the save-side price gate end to
 // end: a save re-runs the sync, so the newly priced model's cost panel takes
 // its place in the persisted document, and the feed stamps its cost counter
@@ -853,7 +931,7 @@ func TestSaveModelsResyncsTheGolensLayout(t *testing.T) {
 	}
 	defer reg.Close()
 	led := &metricsrelay.Ledger{}
-	srv := newUIServer(config.Config{WorkerID: "w-a"}, led, reg)
+	srv := newUIServer(config.Config{WorkerID: "w-a"}, led, reg, nil)
 	// The daemon's boot order (runMetricsDaemon): the layout sync registers
 	// the worker's duration histogram before the relay can feed a sample.
 	srv.golensSyncLayout()

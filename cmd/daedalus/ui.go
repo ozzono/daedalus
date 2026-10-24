@@ -6,8 +6,8 @@
 // read-only except the New-Task submit — which goes through
 // internal/runstart, the exact path `daedalus run` submits through, so
 // the form can never drift from the CLI's gates (Q4 = C) — and the
-// Models price save, which writes the daemon dir's metrics-models.json.
-// All views read
+// Models price save, which writes the model_prices table of the shared
+// metrics db (ui_metrics.go's priceStore). All views read
 // the same walks the CLI reads: Workers and Runs ride the Temporal
 // visibility list `list` uses (one shared status derivation,
 // runDisplayStatus), Run detail's usage table reads the same history
@@ -75,18 +75,20 @@ const uiTestExcerptMax = 64 << 10
 // templates, one reusable Temporal client (reset on error — the daemon
 // outlives server restarts), the started-event input cache shared by the
 // Workers and Runs renderers, the TTL-cached provider probes, the relay
-// ledger — the same in-process ledger the relay appends to, read
-// here for the metrics views — the golens-metrics registry whose
-// dashboard mounts beside this route map (golens.go; nil only in tests
-// that exercise the htmx surfaces without the embed), the operator's
-// model price table (loaded from the daemon dir at boot, swapped whole on
-// save, read-only to every renderer), and the last-sent fragment cache
-// behind the polled views' unchanged-poll 204s.
+// ledger — the same ledger the relay appends to (sqlite-backed in the
+// daemon; the memory shape only where no store is wired), read here for
+// the metrics views — the golens-metrics registry whose dashboard mounts
+// beside this route map (golens.go; nil only in tests that exercise the
+// htmx surfaces without the embed), the operator's model price table
+// (loaded from the shared metrics db at boot, swapped whole on save,
+// read-only to every renderer; priceStore nil in memory mode), and the
+// last-sent fragment cache behind the polled views' unchanged-poll 204s.
 type uiServer struct {
-	cfg    config.Config
-	tpl    *template.Template
-	ledger *metricsrelay.Ledger
-	golens *golens.Registry
+	cfg        config.Config
+	tpl        *template.Template
+	ledger     *metricsrelay.Ledger
+	golens     *golens.Registry
+	priceStore *priceStore
 
 	mu     sync.Mutex
 	cl     client.Client
@@ -99,7 +101,7 @@ type uiServer struct {
 	prices  map[string]modelPrice
 }
 
-func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger, gl *golens.Registry) *uiServer {
+func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger, gl *golens.Registry, pstore *priceStore) *uiServer {
 	tpl := template.Must(template.New("ui").Funcs(template.FuncMap{
 		// div100 is the slots bar's integer percentage — busy*100/total,
 		// total-proof.
@@ -113,10 +115,10 @@ func newUIServer(cfg config.Config, ledger *metricsrelay.Ledger, gl *golens.Regi
 		"tok": fmtTokens,
 		"usd": fmtUSD,
 	}).ParseFS(uiTemplateFS, "ui_templates.html"))
-	return &uiServer{cfg: cfg, tpl: tpl, ledger: ledger, golens: gl,
+	return &uiServer{cfg: cfg, tpl: tpl, ledger: ledger, golens: gl, priceStore: pstore,
 		inputs: map[string]workflows.PipelineInput{},
 		probes: map[string]uiProbe{}, frags: map[string][]byte{},
-		prices: loadModelPrices()}
+		prices: pstore.load()}
 }
 
 // temporal returns the cached client, dialing on first use and after any

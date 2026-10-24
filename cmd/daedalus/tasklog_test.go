@@ -836,6 +836,13 @@ func TestMainLogDispatch(t *testing.T) {
 // with the not-started diagnostic — the same either way, --status included.
 // The id is chosen so no real run can hold it; nothing is written.
 func TestMainTaskLogMissingExits(t *testing.T) {
+	// The child resolves its own state home from the inherited HOME —
+	// pinned to a temp dir here, so the diagnostic is asserted against a
+	// path no real deployment holds.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	want := "no task log for daedalus-tasklog-missing-probe at " +
+		filepath.Join(home, ".local", "state", "daedalus", "daedalus-tasklog-missing-probe.log")
 	for _, args := range [][]string{
 		{"log", "daedalus-tasklog-missing-probe"},
 		{"log", "daedalus-tasklog-missing-probe", "--status"},
@@ -847,9 +854,8 @@ func TestMainTaskLogMissingExits(t *testing.T) {
 		if stdout != "" {
 			t.Errorf("daedalus %v stdout = %q, want empty", args, stdout)
 		}
-		want := "no task log for daedalus-tasklog-missing-probe at /tmp/daedalus/daedalus-tasklog-missing-probe.log"
 		if !strings.HasPrefix(stderr, want) {
-			t.Errorf("daedalus %v stderr = %q, want the not-started diagnostic", args, stderr)
+			t.Errorf("daedalus %v stderr = %q, want the not-started diagnostic %q", args, stderr, want)
 		}
 		if strings.Contains(stderr, "Usage:") {
 			t.Errorf("daedalus %v must not append the usage text, got %q", args, stderr)

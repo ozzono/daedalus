@@ -120,51 +120,124 @@ func TestEntryCostPricesEachSide(t *testing.T) {
 	})
 }
 
-// TestModelPriceFileContract pins the price table's record in the daemon
-// dir: a missing file is the ordinary first boot and loads empty, a save
-// writes the file and reads back identically, a save is an upsert that
-// never deletes (a model absent from the post survives), and a hand-mangled
-// file loads empty too — refusing the boot over one bad file would trade
-// every view for it — with the next save rewriting it whole.
-func TestModelPriceFileContract(t *testing.T) {
-	dir := useDaemonDir(t)
-	path := filepath.Join(dir, "metrics-models.json")
-
-	if p := loadModelPrices(); p != nil {
-		t.Errorf("loadModelPrices(no file) = %v, want nil", p)
+// TestModelPriceStoreContract pins the price table's record in the shared
+// metrics database: a fresh db loads empty, a save reads back identically,
+// a save is an upsert that never deletes, the table persists across a
+// close-reopen (the daemon restart's face), a nil store — memory mode —
+// reads as no table, and the price store coexists with the ledger store's
+// own connection to the same file: one db, several owners, each seeing only
+// its namespaced table.
+func TestModelPriceStoreContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics.db")
+	p, err := openPriceStore(path)
+	if err != nil {
+		t.Fatalf("openPriceStore: %v", err)
+	}
+	if got := p.load(); len(got) != 0 {
+		t.Errorf("load(fresh db) = %v, want empty", got)
 	}
 
 	m1 := modelPrice{In: 3, Out: 0.000015, Cached: 0.15}
-	if err := saveModelPrices(map[string]modelPrice{"m1": m1}); err != nil {
-		t.Fatalf("saveModelPrices: %v", err)
+	if err := p.upsert(map[string]modelPrice{"m1": m1}); err != nil {
+		t.Fatalf("upsert: %v", err)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("the save wrote no file at %s: %v", path, err)
-	}
-	if p := loadModelPrices(); len(p) != 1 || p["m1"] != m1 {
-		t.Errorf("loadModelPrices(after save) = %+v, want the saved table", p)
+	if got := p.load(); len(got) != 1 || got["m1"] != m1 {
+		t.Errorf("load(after save) = %+v, want the saved table", got)
 	}
 
-	if err := saveModelPrices(map[string]modelPrice{"m2": {In: 1}}); err != nil {
-		t.Fatalf("saveModelPrices(second): %v", err)
+	if err := p.upsert(map[string]modelPrice{"m2": {In: 1}}); err != nil {
+		t.Fatalf("upsert(second): %v", err)
 	}
-	p := loadModelPrices()
-	if p["m1"] != m1 || p["m2"] != (modelPrice{In: 1}) {
-		t.Errorf("loadModelPrices(after upsert) = %+v, want m1 preserved and m2 added", p)
+	if got := p.load(); got["m1"] != m1 || got["m2"] != (modelPrice{In: 1}) {
+		t.Errorf("load(after upsert) = %+v, want m1 preserved and m2 added", got)
 	}
 
-	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+	if err := p.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := openPriceStore(path)
+	if err != nil {
+		t.Fatalf("openPriceStore(reopened): %v", err)
+	}
+	defer reopened.Close()
+	if got := reopened.load(); len(got) != 2 || got["m1"] != m1 || got["m2"] != (modelPrice{In: 1}) {
+		t.Errorf("load(reopened) = %+v, want the table persisted across the restart", got)
+	}
+
+	var nilStore *priceStore
+	if got := nilStore.load(); got != nil {
+		t.Errorf("nil store load = %v, want nil (memory mode has no table)", got)
+	}
+
+	// The daemon's co-ownership shape: the ledger's store and the price
+	// store each hold their own connection to the same file, and neither
+	// sees the other's rows.
+	ledger, err := metricsrelay.OpenStore(path, 0)
+	if err != nil {
+		t.Fatalf("OpenStore on the shared file: %v", err)
+	}
+	defer ledger.Close()
+	ledger.Append(metricsrelay.Entry{Worker: "w"})
+	if err := reopened.upsert(map[string]modelPrice{"m3": {In: 2}}); err != nil {
+		t.Fatalf("upsert beside the ledger's connection: %v", err)
+	}
+	if got := reopened.load(); len(got) != 3 || got["m3"].In != 2 {
+		t.Errorf("load = %+v, want the third model written beside the ledger's connection", got)
+	}
+	if got := ledger.Len(); got != 1 {
+		t.Errorf("ledger Len = %d, want its own row untouched by the price writes", got)
+	}
+
+	// A hand-mangled db file is not the missing-table case: the open fails
+	// and names it, rather than the daemon silently serving without its
+	// saved prices.
+	corrupt := filepath.Join(t.TempDir(), "metrics.db")
+	if err := os.WriteFile(corrupt, []byte("not a sqlite database"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if p := loadModelPrices(); len(p) != 0 {
-		t.Errorf("loadModelPrices(corrupt) = %v, want an empty table", p)
+	if broken, err := openPriceStore(corrupt); err == nil {
+		broken.Close()
+		t.Errorf("openPriceStore(corrupt file) = nil error, want the open refused")
 	}
-	if err := saveModelPrices(map[string]modelPrice{"m9": {In: 2}}); err != nil {
-		t.Fatalf("saveModelPrices(after corrupt): %v", err)
-	}
-	if p := loadModelPrices(); len(p) != 1 || p["m9"].In != 2 {
-		t.Errorf("loadModelPrices(after rewrite) = %+v, want the corrupt file replaced whole", p)
-	}
+}
+
+// TestSavePricesRefreshesTheSnapshot pins both save faces: sqlite mode
+// persists through the store and swaps the server's snapshot to the
+// reloaded table — the next render prices through the new rates; memory
+// mode (nil store) has no disk, so the merge into the snapshot is the
+// whole save.
+func TestSavePricesRefreshesTheSnapshot(t *testing.T) {
+	t.Run("sqlite mode persists and reloads", func(t *testing.T) {
+		p, err := openPriceStore(filepath.Join(t.TempDir(), "metrics.db"))
+		if err != nil {
+			t.Fatalf("openPriceStore: %v", err)
+		}
+		t.Cleanup(func() { p.Close() })
+		s := newUIServer(config.Config{}, nil, nil, p)
+
+		if err := s.savePrices(map[string]modelPrice{"mA": {In: 3}}); err != nil {
+			t.Fatalf("savePrices: %v", err)
+		}
+		if got := s.currentPrices(); len(got) != 1 || got["mA"].In != 3 {
+			t.Errorf("snapshot = %+v, want the reloaded table", got)
+		}
+		if got := p.load(); len(got) != 1 || got["mA"].In != 3 {
+			t.Errorf("store = %+v, want the rates persisted", got)
+		}
+	})
+
+	t.Run("memory mode merges into the snapshot", func(t *testing.T) {
+		s := newUIServer(config.Config{}, nil, nil, nil)
+		s.swapPrices(map[string]modelPrice{"mA": {In: 1}})
+
+		if err := s.savePrices(map[string]modelPrice{"mB": {In: 2}}); err != nil {
+			t.Fatalf("savePrices(memory mode): %v", err)
+		}
+		got := s.currentPrices()
+		if got["mA"] != (modelPrice{In: 1}) || got["mB"] != (modelPrice{In: 2}) {
+			t.Errorf("snapshot = %+v, want the upsert merged over the old table", got)
+		}
+	})
 }
 
 // TestParseRateTakesFiniteNonNegativeOnly pins the rate decoder: only
@@ -255,7 +328,7 @@ func TestLedgerEntriesReadAscending(t *testing.T) {
 	led.Append(metricsrelay.Entry{At: t0, Worker: "w"})
 	led.Append(metricsrelay.Entry{At: t0.Add(time.Minute), Worker: "w"})
 
-	got := newUIServer(config.Config{}, led, nil).ledgerEntries()
+	got := newUIServer(config.Config{}, led, nil, nil).ledgerEntries()
 	if len(got) != 3 {
 		t.Fatalf("ledgerEntries = %d entries, want 3", len(got))
 	}
@@ -264,8 +337,37 @@ func TestLedgerEntriesReadAscending(t *testing.T) {
 			t.Errorf("ledgerEntries[%d].At = %v, want %v (ascending)", i, got[i].At, want)
 		}
 	}
-	if e := newUIServer(config.Config{}, nil, nil).ledgerEntries(); e != nil {
+	if e := newUIServer(config.Config{}, nil, nil, nil).ledgerEntries(); e != nil {
 		t.Errorf("ledgerEntries(nil ledger) = %v, want nil", e)
+	}
+}
+
+// TestLedgerEntriesReadsTheSQLiteLedgerAscending pins the same read in the
+// daemon's sqlite shape: the whole table comes back ascending by At — the
+// store orders what a scrambled append order would not — with the
+// otel-external rows dropped by the same filter the memory face applies.
+func TestLedgerEntriesReadsTheSQLiteLedgerAscending(t *testing.T) {
+	store, err := metricsrelay.OpenStore(filepath.Join(t.TempDir(), "metrics.db"), 0)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	led := metricsrelay.NewLedger(store)
+	t0 := time.Now().Add(-time.Hour)
+	// Appended scrambled: the fold's order must come off the table's At
+	// column, never the append order.
+	led.Append(metricsrelay.Entry{At: t0.Add(2 * time.Minute), Worker: "w"})
+	led.Append(metricsrelay.Entry{At: t0, Worker: "w", Source: metricsrelay.SourceOtelExternal, Task: "foreign"})
+	led.Append(metricsrelay.Entry{At: t0.Add(time.Minute), Worker: "w"})
+
+	got := newUIServer(config.Config{}, led, nil, nil).ledgerEntries()
+	if len(got) != 2 {
+		t.Fatalf("ledgerEntries = %d entries, want the external batch dropped", len(got))
+	}
+	for i, want := range []time.Time{t0.Add(time.Minute), t0.Add(2 * time.Minute)} {
+		if !got[i].At.Equal(want) {
+			t.Errorf("ledgerEntries[%d].At = %v, want %v (ascending off the table)", i, got[i].At, want)
+		}
 	}
 }
 
@@ -721,7 +823,7 @@ func TestRunLedgerCostRowsAndDashes(t *testing.T) {
 	led.Append(metricsrelay.Entry{At: base.Add(4 * time.Minute), Worker: "w", Task: "listq-other",
 		Model: "mA", InputTokens: 9_000_000, Status: 200})
 
-	s := newUIServer(config.Config{}, led, nil)
+	s := newUIServer(config.Config{}, led, nil, nil)
 	if rows, total := s.runLedgerCost(wid); rows != nil || total != "—" {
 		t.Errorf("runLedgerCost(unpriced) = (%v, %q), want the dash", rows, total)
 	}
@@ -793,7 +895,7 @@ func setDetailRun(t *testing.T, h *uiHarness, id string) {
 // the unknown bucket's inputs disabled, the save's upsert-and-redirect
 // round trip repricing the tab, the forged and malformed posts a hostile
 // submit cannot smuggle past the pricable gate, and the 500 with its
-// diagnostic when the daemon dir refuses the write.
+// diagnostic when the price table's write fails.
 func TestUIModelsTab(t *testing.T) {
 	// relayed entries lays one priced-candidate model (1M in, 2M out) and
 	// one failed model-less call — the unknown bucket.
@@ -862,7 +964,7 @@ func TestUIModelsTab(t *testing.T) {
 		if code != http.StatusSeeOther || loc != "/models" {
 			t.Fatalf("save answered %d to %q, want 303 back to /models", code, loc)
 		}
-		if p := loadModelPrices(); len(p) != 1 || p["mA"] != (modelPrice{In: 3, Out: 2, Cached: 1.5}) {
+		if p := h.prices.load(); len(p) != 1 || p["mA"] != (modelPrice{In: 3, Out: 2, Cached: 1.5}) {
 			t.Fatalf("the save wrote %+v, want mA at {3 2 1.5}", p)
 		}
 
@@ -889,7 +991,7 @@ func TestUIModelsTab(t *testing.T) {
 		if code != http.StatusSeeOther {
 			t.Fatalf("the dropped save answered %d, want the redirect", code)
 		}
-		if p := loadModelPrices(); len(p) != 0 {
+		if p := h.prices.load(); len(p) != 0 {
 			t.Errorf("the forged save wrote %+v, want nothing", p)
 		}
 
@@ -902,7 +1004,7 @@ func TestUIModelsTab(t *testing.T) {
 		if code, _, _ := postModels(t, h, url.Values{"in[mA]": {"-5"}, "out[mA]": {"NaN"}, "cached[mA]": {"1"}}); code != http.StatusSeeOther {
 			t.Fatalf("the malformed save answered %d", code)
 		}
-		if p := loadModelPrices(); p["mA"] != (modelPrice{In: 0, Out: 0, Cached: 1}) {
+		if p := h.prices.load(); p["mA"] != (modelPrice{In: 0, Out: 0, Cached: 1}) {
 			t.Errorf("the malformed save wrote %+v, want zeros for -5 and NaN, 1 kept", p["mA"])
 		}
 		if out := h.get(t, "/models"); !strings.Contains(out, `name="in[mA]" value="0"`) {
@@ -913,15 +1015,15 @@ func TestUIModelsTab(t *testing.T) {
 	t.Run("a refused write answers 500 with its diagnostic", func(t *testing.T) {
 		h := newUIHarness(t)
 		seedLedger(h, relayed(time.Now()))
-		if err := os.RemoveAll(daemonDir); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(daemonDir, []byte("not a dir"), 0o644); err != nil {
+		// The write's failure face: the price table's connection gone
+		// mid-flight — the save must answer 500 naming the save, never
+		// silently drop the operator's submitted rates.
+		if err := h.prices.db.Close(); err != nil {
 			t.Fatal(err)
 		}
 		code, _, body := postModels(t, h, url.Values{"in[mA]": {"3"}})
 		if code != http.StatusInternalServerError || !strings.Contains(body, "save model prices:") {
-			t.Errorf("save over a blocked daemon dir = %d, %q; want 500 naming the save", code, body)
+			t.Errorf("save over a dead price connection = %d, %q; want 500 naming the save", code, body)
 		}
 	})
 }
@@ -1060,7 +1162,7 @@ func TestLedgerEntriesDropsExternalOtel(t *testing.T) {
 	led.Append(metricsrelay.Entry{At: t0.Add(time.Minute), Source: metricsrelay.SourceOtelExternal, Task: "foreign", InputTokens: 5})
 	led.Append(metricsrelay.Entry{At: t0.Add(2 * time.Minute), Source: metricsrelay.SourceOtel, Task: "t1", InputTokens: 7})
 
-	got := newUIServer(config.Config{}, led, nil).ledgerEntries()
+	got := newUIServer(config.Config{}, led, nil, nil).ledgerEntries()
 	if len(got) != 2 {
 		t.Fatalf("ledgerEntries = %d entries, want the external batch dropped", len(got))
 	}

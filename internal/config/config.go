@@ -102,6 +102,11 @@ const (
 	// unreachable off-host (Q17), one below the UI port by the same
 	// day-one-knob precedent.
 	DefaultMetricsRelayPort = 7778
+	// DefaultLedgerMaxAge is the relay ledger's retention horizon when
+	// metrics.ledger_max_age is unset: 45 days of per-request rows before
+	// the daemon's hourly prune pass drops them (Q3/Q7, shared-metrics-db
+	// design). An explicit 0s keeps everything forever.
+	DefaultLedgerMaxAge = 45 * 24 * time.Hour
 )
 
 // Fallback wire styles accepted by the config's fallback.type.
@@ -733,7 +738,8 @@ type BugFilingConfig struct {
 // to the jailed tester and reviewer — a worktree-relative dir puts the dump
 // inside the ai-jail sandbox's only mounted tree, so the fix loop holding a
 // transport-bounded tail can read the complete record (the task-log
-// pointer is decorative to a jailed agent; /tmp/daedalus is not mounted).
+// pointer is decorative to a jailed agent; the daemon's task-log dir is
+// not mounted).
 // Dir empty keeps DefaultTestOutputDir. Unlike bug_filing's files, a dump
 // is transient and never part of the deliverable: the activity keeps the
 // dir out of `git status` via .git/info/exclude.
@@ -953,17 +959,25 @@ type MetricsConfig struct {
 	// exporters on the host may post to it and their usage folds labeled
 	// otel-external, kept out of the daedalus views.
 	Otel bool `yaml:"otel,omitempty"`
-	// StorageBackend is the golens-metrics registry's retention backend —
-	// the daemon's embedded dashboard module (see cmd/daedalus/golens.go).
-	// "sqlite" persists the module's own roll-up windows (the decided
-	// posture: history survives daemon restarts and past the relay
-	// ledger's ring), "memory" keeps them in-process only. Empty defaults
-	// to sqlite — retention is why the embed exists.
+	// StorageBackend governs all metrics persistence: "sqlite" (the
+	// default when unset) writes the relay ledger rows, the model price
+	// table, and the golens-metrics roll-ups into the shared metrics
+	// database — history survives daemon restarts; "memory" keeps all of
+	// it in-process only, no file at all (the no-disk posture).
 	StorageBackend string `yaml:"storage_backend,omitempty"`
-	// StoragePath is the sqlite database file when storage_backend is (or
-	// defaults to) sqlite; empty defaults to a file in the daemon dir.
-	// Meaningless with memory — named together they are a load error.
+	// StoragePath is the shared metrics database file when storage_backend
+	// is (or defaults to) sqlite; empty defaults to
+	// ~/.config/daedalus/metrics.db. Everything durable lives here: the
+	// relay ledger's rows, the model price table, the golens roll-ups, and
+	// the dashboard layout document. Meaningless with memory — named
+	// together they are a load error.
 	StoragePath string `yaml:"storage_path,omitempty"`
+	// LedgerMaxAge bounds the relay ledger's retention: rows older than
+	// this are pruned (hourly, and once at daemon boot). Nil (unset)
+	// defaults to DefaultLedgerMaxAge (45 days); an explicit 0s keeps
+	// every row forever. A set value under memory is a load error — there
+	// is no ledger on disk to age.
+	LedgerMaxAge *time.Duration `yaml:"ledger_max_age,omitempty"`
 }
 
 // Config holds the runtime configuration for a Daedalus process, loaded
@@ -1246,6 +1260,38 @@ func (d durationValue) MarshalYAML() (any, error) {
 	return time.Duration(d).String(), nil
 }
 
+// metricsRender mirrors MetricsConfig for the render: the ledger age
+// rides *durationValue so it prints loadable ("720h", "0s" — never a
+// nanosecond int, which yaml.v3 refuses to decode back into a duration;
+// see durationValue). The nil stays nil — an unset key renders absent.
+type metricsRender struct {
+	Enabled        *bool          `yaml:"enabled,omitempty"`
+	Port           int            `yaml:"port"`
+	RelayPort      int            `yaml:"relay_port"`
+	Otel           bool           `yaml:"otel,omitempty"`
+	StorageBackend string         `yaml:"storage_backend,omitempty"`
+	StoragePath    string         `yaml:"storage_path,omitempty"`
+	LedgerMaxAge   *durationValue `yaml:"ledger_max_age,omitempty"`
+}
+
+// metricsRenderOf projects a MetricsConfig onto its render shape — the
+// ledger age through durationValue, everything else verbatim.
+func metricsRenderOf(m MetricsConfig) metricsRender {
+	r := metricsRender{
+		Enabled:        m.Enabled,
+		Port:           m.Port,
+		RelayPort:      m.RelayPort,
+		Otel:           m.Otel,
+		StorageBackend: m.StorageBackend,
+		StoragePath:    m.StoragePath,
+	}
+	if m.LedgerMaxAge != nil {
+		age := durationValue(*m.LedgerMaxAge)
+		r.LedgerMaxAge = &age
+	}
+	return r
+}
+
 // renderConfig mirrors Config field-for-field so a re-marshal prints every
 // field in struct order with the durations carried by durationValue; the
 // nested sections marshal as themselves.
@@ -1277,7 +1323,7 @@ type renderConfig struct {
 	BugFiling              BugFilingConfig     `yaml:"bug_filing"`
 	TestOutput             TestOutputConfig    `yaml:"test_output"`
 	Dependency             DependencyConfig    `yaml:"dependency"`
-	Metrics                MetricsConfig       `yaml:"metrics"`
+	Metrics                metricsRender       `yaml:"metrics"`
 	Prompt                 string              `yaml:"prompt"`
 }
 
@@ -1318,7 +1364,7 @@ func (c Config) RenderYAML() (string, error) {
 		BugFiling:              c.BugFiling,
 		TestOutput:             c.TestOutput,
 		Dependency:             c.Dependency,
-		Metrics:                c.Metrics,
+		Metrics:                metricsRenderOf(c.Metrics),
 		Prompt:                 c.Prompt,
 	})
 	return string(out), err
@@ -2079,7 +2125,13 @@ func (c Config) validate(path string) error {
 		return fmt.Errorf("config %s: metrics: storage_backend must be sqlite or memory, got %q", path, c.Metrics.StorageBackend)
 	}
 	if c.Metrics.StoragePath != "" && c.Metrics.StorageBackend == "memory" {
-		return fmt.Errorf("config %s: metrics: storage_path names a sqlite file but storage_backend is memory — drop one of the two", path)
+		return fmt.Errorf("config %s: metrics: storage_path names the shared metrics db but storage_backend is memory — the knob carries the ledger rows and price table too, none of which memory mode writes; drop one of the two", path)
+	}
+	if c.Metrics.LedgerMaxAge != nil && *c.Metrics.LedgerMaxAge < 0 {
+		return fmt.Errorf("config %s: metrics: ledger_max_age must not be negative — an explicit 0s keeps every row forever", path)
+	}
+	if c.Metrics.LedgerMaxAge != nil && c.Metrics.StorageBackend == "memory" {
+		return fmt.Errorf("config %s: metrics: ledger_max_age ages sqlite rows but storage_backend is memory — there is no ledger on disk to age; drop one of the two", path)
 	}
 	// validate runs after applyDefaults, so one side of this equality may
 	// be the operator's explicit port and the other the default that

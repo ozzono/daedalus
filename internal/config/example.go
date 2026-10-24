@@ -885,16 +885,21 @@ metrics:
   # floor and unkeyed, the round stages nothing. The receiver itself is
   # up whenever the daemon runs; this gates the staging only.
   # otel: false
-  # The embedded golens-metrics dashboard's retention backend — the
-  # module's own store, not a parallel one. "sqlite" (the default when
-  # unset) persists its roll-up windows so the /full-metrics charts
-  # survive daemon restarts and outlive the relay ledger's ring;
-  # "memory" keeps them in-process only.
+  # All metrics persistence — one knob for the whole subsystem.
+  # "sqlite" (the default when unset) writes the relay ledger's
+  # per-request rows, the model price table, the golens-metrics roll-ups,
+  # and the dashboard layout document into one shared sqlite database, so
+  # everything survives daemon restarts; "memory" keeps all of it
+  # in-process only — no file at all.
   # storage_backend: sqlite
-  # The sqlite database file (storage_path). Unset = metrics-golens.db
-  # beside the daemon's other files in the daemon dir; set it to
-  # relocate. Meaningless with storage_backend: memory (a load error
-  # named together).
+  # The shared metrics database file (storage_path). Unset =
+  # ~/.config/daedalus/metrics.db; set it to relocate. Meaningless with
+  # storage_backend: memory (a load error named together).
+  # The relay ledger's retention (ledger_max_age): per-request rows older
+  # than this are pruned, once an hour and once at daemon boot. Unset =
+  # 720h (45 days); an explicit 0s keeps every row forever. Meaningless
+  # with storage_backend: memory (a load error named together).
+  # ledger_max_age: 720h
 `
 
 // examplePromptBlock is the prompt: section — the "prompt" profile's slice.

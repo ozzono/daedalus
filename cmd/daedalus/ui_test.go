@@ -320,17 +320,20 @@ func (f *uiFrontend) GetWorkflowExecutionHistory(ctx context.Context, req *workf
 
 // uiHarness is one dashboard under test: an isolated daemon dir, a fake
 // Temporal frontend, a fresh uiServer on an httptest listener, and the
-// relay ledger its metrics view reads.
+// relay ledger its metrics view reads — with the price table in the
+// daemon's sqlite shape, its own connection to a shared metrics db beside
+// the daemon files.
 type uiHarness struct {
-	fake *uiFrontend
-	cfg  config.Config
-	srv  *httptest.Server
-	led  *metricsrelay.Ledger
+	fake   *uiFrontend
+	cfg    config.Config
+	srv    *httptest.Server
+	led    *metricsrelay.Ledger
+	prices *priceStore
 }
 
 func newUIHarness(t *testing.T) *uiHarness {
 	t.Helper()
-	useDaemonDir(t)
+	dir := useDaemonDir(t)
 	h := &uiHarness{
 		fake: &uiFrontend{
 			fakeListServer: &fakeListServer{history: map[string]*historypb.HistoryEvent{}},
@@ -339,6 +342,14 @@ func newUIHarness(t *testing.T) *uiHarness {
 		},
 		led: &metricsrelay.Ledger{},
 	}
+	// The price table in the daemon's sqlite shape: its own connection to
+	// a shared metrics db beside the daemon files.
+	prices, err := openPriceStore(filepath.Join(dir, "metrics.db"))
+	if err != nil {
+		t.Fatalf("open the harness price store: %v", err)
+	}
+	t.Cleanup(func() { prices.Close() })
+	h.prices = prices
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("bind the fake frontend: %v", err)
@@ -348,7 +359,7 @@ func newUIHarness(t *testing.T) *uiHarness {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	h.cfg = config.Config{Temporal: config.TemporalConfig{Host: lis.Addr().String(), TaskQueue: "listq"}}
-	h.srv = httptest.NewServer(newUIServer(h.cfg, h.led, nil).routes())
+	h.srv = httptest.NewServer(newUIServer(h.cfg, h.led, nil, h.prices).routes())
 	t.Cleanup(h.srv.Close)
 	return h
 }
@@ -915,7 +926,7 @@ func TestUIRunDetailErrorFaceHeals(t *testing.T) {
 // staleness. Exercised at the renderFrag seam: filling the cap through the
 // server would re-walk the host once per poll to test a map reset.
 func TestUIFragmentCacheCapDropsWholesale(t *testing.T) {
-	s := newUIServer(config.Config{}, nil, nil)
+	s := newUIServer(config.Config{}, nil, nil, nil)
 	poll := func(uri string) int {
 		t.Helper()
 		w := httptest.NewRecorder()
