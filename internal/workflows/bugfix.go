@@ -70,7 +70,7 @@ func BugFixWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 			}
 		}
 		if reviewRound {
-			verdict, err = run.review(reviewOpts{focus: run.taskFocus("the bug fix and its reproducing test"), testLogs: result.Logs, reproInScope: true, agentReply: run.devReply, role: activities.RoleDevReview, session: &run.devReviewSession})
+			verdict, err = run.review(reviewOpts{focus: "the bug fix and its reproducing test", testLogs: result.Logs, reproInScope: true, role: activities.RoleDevReview, session: &run.devReviewSession})
 			if err != nil {
 				return "", fmt.Errorf("code review: %w", err)
 			}

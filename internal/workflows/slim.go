@@ -226,7 +226,7 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 			testLogs = result.Logs
 		}
 		var session string // freshReviews: never read, never written
-		verdict, err := r.review(reviewOpts{focus: focus, testLogs: testLogs, agentReply: r.devReply, role: reviewRole, session: &session})
+		verdict, err := r.review(reviewOpts{focus: focus, testLogs: testLogs, role: reviewRole, session: &session})
 		if err != nil {
 			return fmt.Errorf("slim subtask review: %w", err)
 		}

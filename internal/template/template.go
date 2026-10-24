@@ -679,9 +679,7 @@ func review(d reviewData) (string, error) {
 // (phase 1) is told test coverage is out of scope — tests get their own
 // reviewed phase — while the test reviewer (phase 2) judges the suite itself
 // and alone carries the REBUILD verdict. agentReply, when set, quotes the
-// producing agent's latest reply for its reviewer to weigh — the test
-// agent's in the test framing, the implementing agent's in the code
-// framings. bugDir is the
+// test agent's latest reply for the test reviewer to weigh. bugDir is the
 // configured out-of-scope-bug filing folder; empty drops the file-filing
 // instruction from the bug policy. For the bug-fix
 // framing — the diff's own repro test in the deliverable — see ReviewRepro.
@@ -732,20 +730,16 @@ func ReviewRepro(focus, diff, testLogs, agentReply, bugDir string, extra ...Revi
 // SlimReview renders the reviewer prompt for the slim flow's atomic
 // sub-task review: the diff is one sub-task of a larger plan, and the
 // reviewer judges it against exactly the sub-task's acceptance criteria —
-// criteria belonging to later sub-tasks are not findings. agentReply
-// quotes the implementing agent's latest reply (the worker conversation
-// chains across sub-tasks, so this is the current sub-task's round), the
-// same section Review renders for a dev reply. No test-phase framing
-// exists (the slim loop runs the suite itself and relays it via
+// criteria belonging to later sub-tasks are not findings. No test-phase
+// framing exists (the slim loop runs the suite itself and relays it via
 // testLogs), and no REBUILD verdict. The trailing extras are Review's
 // (jail carve-out, diff file handoff, skill section).
-func SlimReview(focus, diff, testLogs, agentReply, bugDir string, criteria []string, extra ...ReviewExtra) (string, error) {
+func SlimReview(focus, diff, testLogs, bugDir string, criteria []string, extra ...ReviewExtra) (string, error) {
 	jail, handoff, skill, _ := reviewExtras(extra)
 	return review(reviewData{
 		Focus:              focus,
 		Diff:               diff,
 		TestLogs:           testLogs,
-		AgentReply:         agentReply,
 		BugDir:             bugDir,
 		AcceptanceCriteria: criteria,
 		Handoff:            handoff,

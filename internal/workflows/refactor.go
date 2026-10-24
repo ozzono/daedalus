@@ -51,7 +51,7 @@ func RefactorWorkflow(ctx workflow.Context, input PipelineInput) (string, error)
 		if err != nil {
 			return "", err
 		}
-		verdict, err := run.review(reviewOpts{focus: run.taskFocus("the refactoring"), testLogs: result.Logs, agentReply: run.devReply, role: activities.RoleDevReview, session: &run.devReviewSession})
+		verdict, err := run.review(reviewOpts{focus: "the refactoring", testLogs: result.Logs, role: activities.RoleDevReview, session: &run.devReviewSession})
 		if err != nil {
 			return "", fmt.Errorf("code review: %w", err)
 		}
