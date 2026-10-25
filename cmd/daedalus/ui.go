@@ -51,6 +51,7 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/metricsrelay"
 	"github.com/ozzono/daedalus/internal/runstart"
+	"github.com/ozzono/daedalus/internal/version"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
 
@@ -294,11 +295,26 @@ func (s *uiServer) renderFrag(w http.ResponseWriter, req *http.Request, name str
 	_, _ = w.Write(fresh)
 }
 
-// uiChrome is the shell data every page carries: the active nav tab and
-// the document title.
+// uiChrome is the shell data every page carries: the active nav tab, the
+// document title, the serving build's version tag (the operator can tell
+// which binary a page came from), and the stale-binary banner text —
+// empty while the running executable matches the on-disk one.
 type uiChrome struct {
-	Nav   string
-	Title string
+	Nav     string
+	Title   string
+	Version string
+	Skew    string
+}
+
+// uiChromeFor builds the shell data for one render: the version names the
+// build, the skew banner names a stale one — one stat per render, no
+// timer machinery (dash-hardening Q2).
+func uiChromeFor(nav, title string) uiChrome {
+	c := uiChrome{Nav: nav, Title: title, Version: version.String()}
+	if binarySkewed() {
+		c.Skew = "stale binary: the on-disk executable changed since this daemon started — run `daedalus dash restart` to serve the new build"
+	}
+	return c
 }
 
 // badgeClass maps a display status onto the component kit's badge colors —
@@ -671,7 +687,7 @@ func (s *uiServer) pageWorkers(w http.ResponseWriter, req *http.Request) {
 	s.render(w, http.StatusOK, "page_workers", struct {
 		Chrome uiChrome
 		Snap   uiSnapshot
-	}{uiChrome{Nav: "workers", Title: "daedalus — workers"}, snap})
+	}{uiChromeFor("workers", "daedalus — workers"), snap})
 }
 
 // fragWorkers is the workers view's polled region: the cards alone.
@@ -737,7 +753,7 @@ func (s *uiServer) runsView(w http.ResponseWriter, req *http.Request, tpl string
 		Filters uiFilters
 		Rows    []uiRunRow
 		WalkErr string
-	}{uiChrome{Nav: "runs", Title: "daedalus — runs"}, f, rows, snap.WalkErr}
+	}{uiChromeFor("runs", "daedalus — runs"), f, rows, snap.WalkErr}
 	if tpl == "frag_runs" {
 		s.renderFrag(w, req, tpl, data)
 		return
@@ -760,6 +776,11 @@ type uiUsage struct {
 	NA       bool
 }
 
+// usageRow builds one usage-table row from a round's history usage — the
+// token and duration figures only. The cost cell is deliberately absent:
+// the CLI's self-reported total is never displayed (dash-hardening Q3 —
+// the calc's only source is the operator's prices), so detail() fills
+// Cost from the priced ledger fold or the dash.
 func usageRow(round int, role, agent string, u activities.Usage) uiUsage {
 	return uiUsage{
 		Round:    round,
@@ -768,7 +789,6 @@ func usageRow(round int, role, agent string, u activities.Usage) uiUsage {
 		In:       u.InputTokens,
 		Out:      u.OutputTokens,
 		Duration: dur(u.Duration),
-		Cost:     fmt.Sprintf("%.4f", u.CostUSD),
 		NA:       u == (activities.Usage{}),
 	}
 }
@@ -972,16 +992,23 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 	d.TemporalURL = temporalUILink(s.cfg.Temporal.Host, workflowID)
 
 	// One history pass builds the rail, the usage rows, and the latest
-	// test and review panels.
+	// test and review panels. The cost cells price from the ledger fold
+	// (roundLedgerCosts) — fetched once here, empty when no prices are
+	// saved, which is itself the gate (dash-hardening Q3).
 	type sched struct {
 		name  string
 		agent string
 		role  activities.SessionRole
+		actID string
 	}
 	scheduled := map[int64]sched{}
 	at := map[int64]time.Time{}
 	roundN := 0
-	total := 0.0
+	prices := s.currentPrices()
+	var roundCosts map[string]float64
+	if len(prices) > 0 {
+		roundCosts = roundLedgerCosts(s.ledgerEntries(), prices, ledgerTaskID(workflowID))
+	}
 
 	addRound := func(role, agent, outcome, badge string, span time.Duration, u uiUsage) {
 		roundN++
@@ -1005,6 +1032,7 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 				name:  a.GetActivityType().GetName(),
 				agent: scheduledAgent(a.GetInput().GetPayloads(), dc),
 				role:  schedRole(a.GetInput().GetPayloads(), dc),
+				actID: a.GetActivityId(),
 			}
 			at[ev.GetEventId()] = ev.GetEventTime().AsTime()
 		case ev.GetActivityTaskCompletedEventAttributes() != nil:
@@ -1019,7 +1047,7 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 					var r activities.AgentRunResult
 					if dc.FromPayload(ps[0], &r) == nil {
 						u = usageRow(0, "", "", r.Usage)
-						total += r.Usage.CostUSD
+						u.Cost = roundCostCell(roundCosts, sc.actID)
 					}
 				}
 				addRound(roundRole(sc.role), sc.agent, "ok", "b-run", span, u)
@@ -1030,7 +1058,7 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 					var r activities.ReviewResult
 					if dc.FromPayload(ps[0], &r) == nil {
 						u = usageRow(0, "", "", r.Usage)
-						total += r.Usage.CostUSD
+						u.Cost = roundCostCell(roundCosts, sc.actID)
 						outcome, badge = reviewVerdict(r)
 						d.ReviewFound = true
 						d.ReviewVd, d.ReviewBadge = outcome, badge
@@ -1074,8 +1102,11 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 			}
 		}
 	}
-	d.TotalCost = fmt.Sprintf("%.4f", total)
+	// The rounds table's total prices from the same ledger fold the
+	// section below renders — the dash until prices exist, never the
+	// CLI-reported sum (dash-hardening Q3).
 	d.LedgerCost, d.LedgerTotal = s.runLedgerCost(workflowID)
+	d.TotalCost = d.LedgerTotal
 	d.LogTail = taskLogTail(workflowID)
 	return d, nil
 }
@@ -1255,7 +1286,7 @@ func (s *uiServer) runBody(w http.ResponseWriter, req *http.Request, tpl string)
 		s.render(w, http.StatusOK, "page_error", struct {
 			Chrome uiChrome
 			Err    string
-		}{uiChrome{Nav: "runs", Title: "daedalus — error"}, err.Error()})
+		}{uiChromeFor("runs", "daedalus — error"), err.Error()})
 		return
 	}
 	// frag_run reads the bare detail — here and where page_run includes it
@@ -1268,7 +1299,7 @@ func (s *uiServer) runBody(w http.ResponseWriter, req *http.Request, tpl string)
 	s.render(w, http.StatusOK, tpl, struct {
 		Chrome uiChrome
 		D      uiRunDetail
-	}{uiChrome{Nav: "runs", Title: "daedalus — " + d.WorkflowID}, d})
+	}{uiChromeFor("runs", "daedalus — "+d.WorkflowID), d})
 }
 
 // uiQueueSessions is one queue's live session gauges — the counts the
@@ -1328,7 +1359,7 @@ func (s *uiServer) pageMetrics(w http.ResponseWriter, req *http.Request) {
 	s.render(w, http.StatusOK, "page_metrics", struct {
 		Chrome uiChrome
 		M      uiMetricsView
-	}{uiChrome{Nav: "metrics", Title: "daedalus — metrics"}, s.metricsView()})
+	}{uiChromeFor("metrics", "daedalus — metrics"), s.metricsView()})
 }
 
 // fragMetrics is the metrics view's polled region: everything below the
@@ -1406,7 +1437,7 @@ func (s *uiServer) pageNew(w http.ResponseWriter, req *http.Request) {
 		Form   uiFormData
 		Agents uiAgentSelect
 	}{
-		Chrome: uiChrome{Nav: "new", Title: "daedalus — new task"},
+		Chrome: uiChromeFor("new", "daedalus — new task"),
 		Form: uiFormData{
 			Workers: s.workerOptions(sel),
 			Flows:   formFlows(),

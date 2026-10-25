@@ -133,6 +133,35 @@ func loadTestConfig(t *testing.T, path string) config.Config {
 	return cfg
 }
 
+// writeQueueHostConfig and writeWorkerIDHostConfig are the queue- and
+// worker-id-config shapes with the Temporal frontend pinned to host. A
+// live-restart test must pin it: the restart's alert walks the config's
+// queue, and an unpinned host dials the ambient frontend — the real
+// deployment on this host — making the announcement read live state.
+func writeQueueHostConfig(t *testing.T, queue, host string) string {
+	t.Helper()
+	return writeWorkerHostConfig(t, "", queue, host)
+}
+
+func writeWorkerIDHostConfig(t *testing.T, id, host string) string {
+	t.Helper()
+	return writeWorkerHostConfig(t, id, "q7", host)
+}
+
+func writeWorkerHostConfig(t *testing.T, workerID, queue, host string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "agent: claude\nmetrics:\n  enabled: false\n"
+	if workerID != "" {
+		body += "worker_id: " + workerID + "\n"
+	}
+	body += "temporal:\n  host: " + host + "\n  task_queue: " + queue + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // TestConfigRecordRoundTrip pins the record's two-line format: line 1 the
 // absolute config path, the optional line 2 the run type — written by
 // writeConfigRecord only when one is given, read back by
@@ -238,11 +267,15 @@ func TestConfigRecordRoundTrip(t *testing.T) {
 // daemon: the config is re-recorded, one SIGHUP is delivered (proved by a
 // HUP-immune child surviving where a SIGTERM would have killed it), and
 // the command returns without stopping anything — pid file untouched, no
-// replacement spawned. A failed boot gate schedules nothing at all.
+// replacement spawned. The announcement keys off the queue walk (pinned
+// in TestWorkerRestartLiveMessaging); here the frontend serves an empty
+// queue, so the idle face answers. A failed boot gate schedules nothing
+// at all.
 func TestWorkerRestartSchedulesDrain(t *testing.T) {
 	t.Run("a live daemon is signaled, not waited on", func(t *testing.T) {
 		useDaemonDir(t)
-		cliCfg := writeQueueConfig(t, "daedalus")
+		host := startListServer(t, &fakeListServer{}) // an empty queue: the idle walk
+		cliCfg := writeQueueHostConfig(t, "daedalus", host.Temporal.Host)
 		cfg := loadTestConfig(t, cliCfg)
 		child := sleepIgnoring(t, "HUP")
 		writePidFile(t, "daedalus", child)
@@ -252,9 +285,8 @@ func TestWorkerRestartSchedulesDrain(t *testing.T) {
 				t.Errorf("workerRestart: %v", err)
 			}
 		})
-		if !strings.Contains(out, "restart scheduled (drains current tasks)") ||
-			!strings.Contains(out, strconv.Itoa(child)) {
-			t.Errorf("restart output %q should name the scheduled drain and the signaled pid %d", out, child)
+		if !strings.Contains(out, "worker daedalus is idle — restarting immediately (pid "+strconv.Itoa(child)+")") {
+			t.Errorf("restart output %q should name the idle restart and the signaled pid %d", out, child)
 		}
 		// SIGHUP, not a stop: the HUP-immune child lives on, and a
 		// stop-then-start would have emptied the pid file and reported a
@@ -272,7 +304,8 @@ func TestWorkerRestartSchedulesDrain(t *testing.T) {
 
 	t.Run("the scheduling restart records the run type", func(t *testing.T) {
 		useDaemonDir(t)
-		cliCfg := writeQueueConfig(t, "daedalus")
+		host := startListServer(t, &fakeListServer{})
+		cliCfg := writeQueueHostConfig(t, "daedalus", host.Temporal.Host)
 		cfg := loadTestConfig(t, cliCfg)
 		child := sleepIgnoring(t, "HUP")
 		writePidFile(t, "daedalus", child)
@@ -282,8 +315,8 @@ func TestWorkerRestartSchedulesDrain(t *testing.T) {
 				t.Errorf("workerRestart: %v", err)
 			}
 		})
-		if !strings.Contains(out, "restart scheduled (drains current tasks)") {
-			t.Errorf("restart output %q should schedule the drain", out)
+		if !strings.Contains(out, "is idle — restarting immediately") {
+			t.Errorf("restart output %q should announce the immediate restart", out)
 		}
 		if path, typ := readConfigRecord("daedalus"); path != cliCfg || typ != "dev" {
 			t.Errorf("record = (%q, %q), want (%q, dev) — the re-exec must come back typed", path, typ, cliCfg)
@@ -409,7 +442,8 @@ func TestWorkerRestartForceSwapsNow(t *testing.T) {
 
 // TestWorkerRestartNamedForce pins force's pass-through on the
 // record-driven named restart: forced it swaps immediately, default it
-// schedules the drain — both from the recorded config alone.
+// signals the live daemon — an idle queue answers the immediate-restart
+// face — both from the recorded config alone.
 func TestWorkerRestartNamedForce(t *testing.T) {
 	t.Run("force swaps now", func(t *testing.T) {
 		useDaemonDir(t)
@@ -455,9 +489,10 @@ func TestWorkerRestartNamedForce(t *testing.T) {
 		}
 	})
 
-	t.Run("the default schedules the drain", func(t *testing.T) {
+	t.Run("the default signals, never swaps", func(t *testing.T) {
 		useDaemonDir(t)
-		cfgPath := writeWorkerIDConfig(t, "alpha")
+		host := startListServer(t, &fakeListServer{}) // an empty queue: the idle walk
+		cfgPath := writeWorkerIDHostConfig(t, "alpha", host.Temporal.Host)
 		writeRecord(t, "alpha", cfgPath)
 		child := sleepIgnoring(t, "HUP")
 		writePidFile(t, "alpha", child)
@@ -467,8 +502,8 @@ func TestWorkerRestartNamedForce(t *testing.T) {
 				t.Errorf("workerRestartNamed: %v", err)
 			}
 		})
-		if !strings.Contains(out, "restart scheduled (drains current tasks)") {
-			t.Errorf("named restart output %q should schedule the drain", out)
+		if !strings.Contains(out, "worker alpha is idle — restarting immediately") {
+			t.Errorf("named restart output %q should announce the idle restart", out)
 		}
 		if strings.Contains(out, "force restart") {
 			t.Errorf("named restart output %q must not swap without force", out)

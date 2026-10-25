@@ -739,7 +739,7 @@ func (s *uiServer) pageModels(w http.ResponseWriter, req *http.Request) {
 	s.render(w, http.StatusOK, "page_models", struct {
 		Chrome uiChrome
 		V      uiModelsView
-	}{uiChrome{Nav: "models", Title: "daedalus — models"}, v})
+	}{uiChromeFor("models", "daedalus — models"), v})
 }
 
 // fragModels is the Models tab's polled region — the tiles and usage
@@ -1094,4 +1094,37 @@ func (s *uiServer) runLedgerCost(workflowID string) ([]uiRunModelCost, string) {
 // run-detail match must scrub the same way.
 func ledgerTaskID(workflowID string) string {
 	return strings.NewReplacer("-role-", "_role_", "-round-", "_round_").Replace(workflowID)
+}
+
+// roundLedgerCosts folds one run's ledger entries into priced per-round
+// figures, keyed by the relay's Round — the scheduled activity id the
+// worker sends as its attribution (internal/activities/metricsrelay.go).
+// The same entryCost pricing the ledger views use; unpriced models
+// contribute nothing, so a round with no priced calls is simply absent.
+func roundLedgerCosts(entries []metricsrelay.Entry, prices map[string]modelPrice, task string) map[string]float64 {
+	costs := map[string]float64{}
+	for _, e := range entries {
+		if e.Task != task {
+			continue
+		}
+		if p, ok := prices[e.Model]; ok {
+			costs[e.Round] += entryCost(e, p)
+		}
+	}
+	return costs
+}
+
+// roundCostCell renders the usage table's Cost cell for one round: the
+// round's priced ledger fold, or the dash when the operator has no prices
+// saved (nil map) or the round has no priced calls. The CLI's
+// self-reported cost is never displayed (dash-hardening Q3 — the calc's
+// only source is user-input model prices).
+func roundCostCell(costs map[string]float64, activityID string) string {
+	if costs == nil {
+		return "—"
+	}
+	if c, ok := costs[activityID]; ok {
+		return fmtUSD(c)
+	}
+	return "—"
 }

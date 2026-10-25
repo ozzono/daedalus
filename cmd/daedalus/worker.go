@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"go.temporal.io/api/workflowservice/v1"
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
@@ -331,11 +334,20 @@ func workerStop(cfg config.Config) error {
 // (the metrics gate included) and re-recorded, then a SIGHUP schedules the
 // daemon to drain every active task and re-exec itself on the fresh record
 // — the command returns as soon as the signal is delivered, with no
-// 30s wait and no pid-file change. The optional trailing force swaps
-// immediately instead: SIGTERM to the old daemon and a replacement started
-// on the spot (workerStart's live-pid refusal skipped), never blocking on
-// the old process's drain. A worker that is not running starts exactly as
-// `worker start` would.
+// 30s wait and no pid-file change. The ruled semantics (dash-hardening
+// Q6) key the path off the rounds actually in flight on the worker's
+// queue: an idle worker re-execs on the spot (its drain is empty by
+// construction), whatever the args; --force is the immediate swap only
+// when rounds are active; and a non-force restart with active rounds
+// names them first — workflow id, agent, stage, age — then proceeds on
+// the drain, the alert informing the decision, never prompting. A queue
+// walk that cannot run (Temporal unreachable) counts as unknown, not
+// idle: the drain stays the default when liveness cannot be seen, and
+// --force remains the immediate alternative. The optional trailing force
+// swaps immediately instead: SIGTERM to the old daemon and a replacement
+// started on the spot (workerStart's live-pid refusal skipped), never
+// blocking on the old process's drain. A worker that is not running
+// starts exactly as `worker start` would.
 func workerRestart(cfg config.Config, cliConfigPath, workerType string, force ...bool) error {
 	pidFile, _, confFile := daemonPaths(cfg.WorkerName())
 	if forceSet(force) {
@@ -365,16 +377,83 @@ func workerRestart(cfg config.Config, cliConfigPath, workerType string, force ..
 				return err
 			}
 		}
+		active, walkErr := workerActiveRounds(cfg)
 		if err := writeConfigRecord(confFile, cliConfigPath, workerType); err != nil {
 			return err
 		}
 		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
 			return fmt.Errorf("signal pid %d: %w", pid, err)
 		}
-		fmt.Printf("restart scheduled (drains current tasks) for worker %s (pid %d)\n", cfg.WorkerName(), pid)
+		switch {
+		case walkErr == nil && len(active) == 0:
+			fmt.Printf("worker %s is idle — restarting immediately (pid %d)\n", cfg.WorkerName(), pid)
+		case len(active) > 0:
+			fmt.Printf("restart scheduled for worker %s (pid %d) — these rounds drain first; use --force to swap immediately:\n", cfg.WorkerName(), pid)
+			for _, r := range active {
+				fmt.Printf("  %s\n", r)
+			}
+		default:
+			fmt.Printf("restart scheduled (drains current tasks) for worker %s (pid %d)\n", cfg.WorkerName(), pid)
+		}
 		return nil
 	}
 	return workerStart(cfg, cliConfigPath, workerType)
+}
+
+// workerActiveRounds names the rounds in flight on the worker's task
+// queue — what a drain restart would wait on, and what its alert names
+// (dash-hardening Q6). The same derivation the dashboard's queueWork
+// renders: the queue's running visibility rows, each task log read
+// through lastRoundState, the parser that makes "currently running"
+// derivable from the log alone; the age is the round's own start stamp.
+// Attribution is the queue's, not the worker process's (the task-log
+// header carries no worker name — the same ceiling queueWork records).
+// A walk that cannot run — Temporal unreachable, bounded at three
+// seconds so a down frontend never stalls the restart — returns an
+// error: liveness unknown.
+func workerActiveRounds(cfg config.Config) ([]string, error) {
+	c, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := c.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+		Namespace: "default",
+		PageSize:  100,
+		Query:     fmt.Sprintf("TaskQueue = '%s' AND ExecutionStatus = 'Running'", cfg.Temporal.TaskQueue),
+	})
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	var out []string
+	for _, info := range resp.GetExecutions() {
+		id := info.GetExecution().GetWorkflowId()
+		path, err := activities.TaskLogPath(id)
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // no log, no round in flight
+		}
+		log := string(data)
+		name, stage, _, running := lastRoundState(log)
+		if !running {
+			continue
+		}
+		if stage == "" {
+			stage = "unknown"
+		}
+		age := "age unknown"
+		if t := lastRoundStart(log); !t.IsZero() {
+			age = "started " + relTime(t, now)
+		}
+		out = append(out, fmt.Sprintf("%s — %s, stage %s, %s", id, name, stage, age))
+	}
+	return out, nil
 }
 
 // forceSet reports the optional trailing force flag's value — the

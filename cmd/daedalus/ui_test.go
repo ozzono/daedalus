@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"text/template"
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
@@ -33,6 +35,7 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/metricsrelay"
 	"github.com/ozzono/daedalus/internal/runstart"
+	"github.com/ozzono/daedalus/internal/version"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
 
@@ -135,16 +138,84 @@ func TestTemporalUILink(t *testing.T) {
 }
 
 // TestUsageRow pins the usage-table row: figures ride named fields, the
-// cost renders at four decimals, and an all-zero capture is the n/a face —
-// not a row of fabricated zeros.
+// cost cell stays empty — the detail walk prices it from the ledger fold,
+// the CLI's self-reported total never rides the row (dash-hardening Q3) —
+// and an all-zero capture is the n/a face, not a row of fabricated zeros.
 func TestUsageRow(t *testing.T) {
 	na := usageRow(1, "implement", "pi", activities.Usage{})
 	if !na.NA {
 		t.Errorf("usageRow(zero) = %+v, want the n/a face", na)
 	}
 	u := usageRow(2, "review", "claude", activities.Usage{InputTokens: 3, OutputTokens: 4, Duration: 90 * time.Second, CostUSD: 0.5})
-	if u.NA || u.In != 3 || u.Out != 4 || u.Duration != "1m30s" || u.Cost != "0.5000" {
+	if u.NA || u.In != 3 || u.Out != 4 || u.Duration != "1m30s" {
 		t.Errorf("usageRow(figures) = %+v, want the round's own numbers", u)
+	}
+	if u.Cost != "" {
+		t.Errorf("usageRow carried a cost %q, want it empty — the CLI's self-reported cost is never displayed", u.Cost)
+	}
+}
+
+// TestUIChromeFor pins the shell data every page carries: the version
+// names the serving build, and a healthy host — this test process, whose
+// executable is still linked — carries no skew banner. The banner's set
+// face is TestUIHeaderChrome's, which crafts the chrome a real skew
+// produces.
+func TestUIChromeFor(t *testing.T) {
+	c := uiChromeFor("runs", "daedalus — runs")
+	if c.Nav != "runs" || c.Title != "daedalus — runs" {
+		t.Errorf("uiChromeFor = %+v, want the nav and title carried", c)
+	}
+	if c.Version != version.String() {
+		t.Errorf("uiChromeFor Version = %q, want the serving build's tag %q", c.Version, version.String())
+	}
+	if c.Skew != "" {
+		t.Errorf("uiChromeFor Skew = %q on a healthy host, want banner-free", c.Skew)
+	}
+}
+
+// TestUIHeaderChrome pins the header shell's faces as markup: the settings
+// panel rides the platform popover primitive (a popovertarget button
+// opening the #cfg popover — dash-hardening Q4), the version badge names
+// the serving build on every page, and the stale-binary banner renders
+// above the chrome only when the chrome carries a skew — rendered here
+// with a crafted skewed chrome, since no healthy host can produce one.
+func TestUIHeaderChrome(t *testing.T) {
+	render := func(t *testing.T, chrome uiChrome) string {
+		t.Helper()
+		tpl := template.Must(template.New("ui").Funcs(template.FuncMap{
+			"div100": func(busy, total int) int {
+				if total <= 0 {
+					return 0
+				}
+				return busy * 100 / total
+			},
+			"tok": fmtTokens,
+			"usd": fmtUSD,
+		}).ParseFS(uiTemplateFS, "ui_templates.html"))
+		var out bytes.Buffer
+		if err := tpl.ExecuteTemplate(&out, "header", chrome); err != nil {
+			t.Fatalf("render the header: %v", err)
+		}
+		return out.String()
+	}
+
+	quiet := render(t, uiChromeFor("runs", "daedalus — runs"))
+	for _, want := range []string{
+		`popovertarget="cfg"`,
+		`<div id="cfg" popover`,
+		`aria-hidden="true">` + version.String() + `</span>`,
+	} {
+		if !strings.Contains(quiet, want) {
+			t.Errorf("the header lacks %q:\n%s", want, quiet)
+		}
+	}
+	if strings.Contains(quiet, "stale binary:") {
+		t.Errorf("a healthy host's header carries a skew banner:\n%s", quiet)
+	}
+
+	skewed := render(t, uiChrome{Nav: "runs", Version: version.String(), Skew: "stale binary: the on-disk executable changed — restart to serve the new build"})
+	if !strings.Contains(skewed, "⚠ stale binary: the on-disk executable changed — restart to serve the new build") {
+		t.Errorf("the skewed chrome lost its banner:\n%s", skewed)
 	}
 }
 
@@ -995,11 +1066,19 @@ func TestUIRunDetailPage(t *testing.T) {
 		"APPROVED", "ship it",
 		"suite green", "go test ./...",
 		">100</td>", ">50</td>", "1m0s",
-		"1.0000",
+		// No prices are saved here: every cost cell is the dash — the
+		// rounds table priced from the ledger fold or nothing (the CLI's
+		// self-reported figures, 0.25 + 0.75, must never render).
+		">—</td>",
 		"http://127.0.0.1:8233/namespaces/default/workflows/listq-iss9",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("detail page lacks %q", want)
+		}
+	}
+	for _, banned := range []string{"0.2500", "0.7500", "1.0000"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("detail page renders the CLI-reported cost %q; only the ledger fold may price:\n%s", banned, out)
 		}
 	}
 
@@ -1219,6 +1298,16 @@ func TestUIPolledPageFaces(t *testing.T) {
 		}
 		if !strings.Contains(runs, `hx-trigger="every 5s [!document.hidden], change from:#fq, change from:#fs"`) {
 			t.Errorf("the runs region lost its hidden gate or its filter change triggers:\n%s", runs)
+		}
+	})
+
+	t.Run("the runs region's targeting is not inherited", func(t *testing.T) {
+		// The wrapper aims its own poll at #rtbody and carries the filter
+		// fields; its hx-disinherit is what keeps an inner element's own
+		// request from inheriting that targeting and fold the page's nav
+		// swaps into the table body.
+		if !strings.Contains(runs, `hx-get="/runs/rows" hx-trigger="every 5s [!document.hidden], change from:#fq, change from:#fs" hx-include="#fq,#fs" hx-target="#rtbody" hx-disinherit="hx-target hx-include"`) {
+			t.Errorf("the runs wrapper lost its disinherit guard:\n%s", runs)
 		}
 	})
 
