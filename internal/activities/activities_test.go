@@ -2,6 +2,8 @@ package activities
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1979,16 +1981,27 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 4 {
-		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+	if len(calls) != 7 {
+		t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{"-C", worktree, "add", "-N", "-A"}, "git add")
-	assertArgs(t, calls[1].Args, []string{"-C", worktree, "diff", "HEAD"}, "git diff")
-	assertArgs(t, calls[2].Args, []string{"-C", worktree, "reset", "-q"}, "git reset")
+	assertArgs(t, calls[0].Args, []string{"-C", worktree, "add", "-N", "-A"}, "digest git add")
+	assertArgs(t, calls[1].Args, []string{"-C", worktree, "diff", "HEAD"}, "digest git diff")
+	assertArgs(t, calls[2].Args, []string{"-C", worktree, "reset", "-q"}, "digest git reset")
+	assertArgs(t, calls[3].Args, []string{"-C", worktree, "add", "-N", "-A"}, "git add")
+	assertArgs(t, calls[4].Args, []string{"-C", worktree, "diff", "HEAD"}, "git diff")
+	assertArgs(t, calls[5].Args, []string{"-C", worktree, "reset", "-q"}, "git reset")
+
+	// The result carries the round's diff digest — the sha256 of exactly
+	// the diff text both collections gathered (the stub prints it each
+	// time).
+	wantDigest := sha256.Sum256([]byte("M foo.go\n"))
+	if res.DiffDigest != hex.EncodeToString(wantDigest[:]) {
+		t.Errorf("DiffDigest = %q, want the sha256 of the collected diff", res.DiffDigest)
+	}
 
 	// The reviewer prompt must carry the focus, the diff, and the verdict
 	// instructions — via stdin, like every prompt.
-	jailed := calls[3]
+	jailed := calls[6]
 	for _, want := range []string{"the implementation", "M foo.go", "APPROVED", "CHANGES_REQUESTED"} {
 		if !strings.Contains(jailed.Stdin, want) {
 			t.Errorf("reviewer prompt should mention %q", want)
@@ -2021,12 +2034,12 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 4 {
-		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+	if len(calls) != 7 {
+		t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 	}
 	// Test logs given to the reviewer must reach its prompt.
 	for _, want := range []string{"Latest test run output", "--- FAIL: TestBoom"} {
-		if !strings.Contains(calls[3].Stdin, want) {
+		if !strings.Contains(calls[6].Stdin, want) {
 			t.Errorf("reviewer prompt should mention %q", want)
 		}
 	}
@@ -2053,10 +2066,10 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 4 {
-		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+	if len(calls) != 7 {
+		t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 	}
-	assertArgs(t, calls[3].Args, slices.Concat(
+	assertArgs(t, calls[6].Args, slices.Concat(
 		[]string{"--worktree",
 			"--network",
 			"--no-save-config",
@@ -2108,8 +2121,8 @@ exit 0`)
 		}
 
 		calls := readCalls(t, log)
-		if len(calls) != 4 {
-			t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+		if len(calls) != 7 {
+			t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 		}
 	})
 
@@ -2189,10 +2202,10 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 4 {
-		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+	if len(calls) != 7 {
+		t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 	}
-	assertArgs(t, calls[3].Args, []string{
+	assertArgs(t, calls[6].Args, []string{
 		"--worktree",
 		"--network",
 		"--no-save-config",
@@ -4723,14 +4736,14 @@ exit 0`)
 				t.Error("Approved = false, want true")
 			}
 			calls := readCalls(t, log)
-			if len(calls) != 4 {
-				t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+			if len(calls) != 7 {
+				t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 			}
-			if tc.want != "" && !strings.Contains(calls[3].Stdin, tc.want) {
-				t.Errorf("reviewer prompt should carry the bug dir %q, got %q", tc.want, calls[3].Stdin)
+			if tc.want != "" && !strings.Contains(calls[6].Stdin, tc.want) {
+				t.Errorf("reviewer prompt should carry the bug dir %q, got %q", tc.want, calls[6].Stdin)
 			}
-			if tc.notWant != "" && strings.Contains(calls[3].Stdin, tc.notWant) {
-				t.Errorf("reviewer prompt should not carry a file-filing instruction, got %q", calls[3].Stdin)
+			if tc.notWant != "" && strings.Contains(calls[6].Stdin, tc.notWant) {
+				t.Errorf("reviewer prompt should not carry a file-filing instruction, got %q", calls[6].Stdin)
 			}
 		})
 	}

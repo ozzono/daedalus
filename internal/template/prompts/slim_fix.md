@@ -9,4 +9,4 @@ Sub-task "{{.Description}}" not accepted yet. Fix it — this sub-task's scope o
 
 {{.Comments}}
 {{end}}
-Address every point above; re-verify the sub-task's acceptance criteria against real build/test output before replying. The diff is the deliverable — no temp, backup, or paste-buffer files left in the worktree; no session logs, changelogs, or progress commentary as source comments. Zero fluff: reply with a short factual summary of the fix and the outputs proving it.
+Address every point above; re-verify the sub-task's acceptance criteria against real build/test output before replying — if the project builds Go (a go.mod at its root), the build is the compile check `go build -o /dev/null ./...` and the round is not done while it fails. The diff is the deliverable — no temp, backup, or paste-buffer files left in the worktree; no session logs, changelogs, or progress commentary as source comments. Zero fluff: reply with a short factual summary of the fix and the outputs proving it.

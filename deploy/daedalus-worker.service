@@ -1,0 +1,70 @@
+# Systemd unit supervising a daedalus worker daemon: the supervisor owns
+# crashes and boots (Restart=on-failure revives a dead worker, the start
+# rate limit caps a crash loop, the Install target starts it at boot), so a
+# worker that dies mid-run no longer stalls every run it was carrying until
+# an operator types `daedalus worker start`.
+#
+# Install: copy to /etc/systemd/system/daedalus-worker.service, edit the
+# ExecStart binary and config paths (and the User/Group) for this host,
+# then `systemctl daemon-reload && systemctl enable --now daedalus-worker`.
+#
+# Lifecycle contract (one owner per job — see the README's systemd
+# section):
+#   crash / OOM / reboot  → systemd revives it (Restart=on-failure, backoff,
+#                           StartLimit* caps the loop; boot start via
+#                           [Install])
+#   `daedalus worker stop`       → SIGTERM, graceful drain, exit 0 —
+#                           Restart=on-failure leaves a clean exit alone, so
+#                           the worker stays down
+#   `daedalus worker restart`    → SIGHUP drain restart, re-exec in place,
+#                           same pid — systemd never notices
+#   `daedalus worker start`, `worker restart --force` → unsupervised-mode
+#                           only: with the unit active, `start` double-starts
+#                           (refused only while the unit's pid file is live)
+#                           and a forced swap spawns a daemon outside the
+#                           unit — use systemctl instead
+#
+# The unit sets DAEDALUS_WORKER_DAEMON=1 so the worker writes and clears
+# its own pid file (the same marker the spawned daemon carries): every
+# pid-file gate (`worker start` refusal, stop/restart/status/report) sees
+# the supervised worker exactly as a spawned one. A supervised boot opens
+# no worker log — journald (`journalctl -u daedalus-worker`) is the only
+# output record, and a config-broken crash loop surfaces there.
+
+[Unit]
+Description=daedalus pipeline worker
+# The worker dials the Temporal frontend and the serving provider over the
+# network; a stale start order would fail the boot and burn a restart
+# attempt.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit for the host: absolute binary path (the release install or
+# `go install` output) and the absolute config path. -t dev / -t test may
+# be appended to start only one poller family.
+ExecStart=/usr/local/bin/daedalus worker foreground -c /etc/daedalus/worker.yaml
+# The supervised-worker marker: pid file ownership + the SIGHUP drain
+# restart. Must stay set for the lifecycle contract above to hold.
+Environment=DAEDALUS_WORKER_DAEMON=1
+# Replace with the account that owns ~/.local/state/daedalus on this host.
+User=daedalus
+Group=daedalus
+# systemd before v252 runs User= services with HOME unset: the worker's
+# task-log paths fall back to /tmp/daedalus, but home-relative defaults
+# (config, state) do not resolve without it — pin it for the account.
+# Environment=HOME=/var/lib/daedalus
+# Revive on any failure — crash, OOM kill, nonzero exit — never on a clean
+# stop (a SIGTERM drain exits 0, so `worker stop` stays down).
+Restart=on-failure
+# Backoff between revives; a broken-config crash loop is capped below.
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# The graceful drain (SIGTERM → in-flight rounds report, up to the
+# worker's 30s WorkerStopTimeout) must fit inside systemd's stop window.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

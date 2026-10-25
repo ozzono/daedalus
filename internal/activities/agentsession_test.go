@@ -602,11 +602,11 @@ exit 0`)
 	}
 
 	calls := readCalls(t, log)
-	if len(calls) != 4 {
-		t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+	if len(calls) != 7 {
+		t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 	}
-	if !contains(calls[3].Args, "--resume") || !contains(calls[3].Args, "rev-cut") {
-		t.Errorf("review args %v should resume the recorded reviewer session rev-cut", calls[3].Args)
+	if !contains(calls[6].Args, "--resume") || !contains(calls[6].Args, "rev-cut") {
+		t.Errorf("review args %v should resume the recorded reviewer session rev-cut", calls[6].Args)
 	}
 }
 
@@ -1228,8 +1228,8 @@ exit 0`)
 	if jail == nil {
 		t.Fatal("no ai-jail call recorded")
 	}
-	if len(calls) != 4 {
-		t.Errorf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, one fresh ai-jail) — no resume retry may fire", len(calls))
+	if len(calls) != 7 {
+		t.Errorf("%d subprocess calls, want 7 (the two diff collections' git calls, one fresh ai-jail) — no resume retry may fire", len(calls))
 	}
 	if contains(jail.Args, "--resume") || contains(jail.Args, "rev-past") {
 		t.Errorf("fresh review args %v must start clean, not resume rev-past", jail.Args)

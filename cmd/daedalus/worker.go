@@ -24,8 +24,11 @@ import (
 // covers both). Overridable in tests.
 var daemonDir = activities.TaskLogDir
 
-// daemonEnv marks the re-exec'd background worker process so the child
-// knows to clear the pid file on exit.
+// daemonEnv marks a background-managed worker process: the re-exec'd
+// daemon clears its pid file on exit and arms the SIGHUP drain restart,
+// and a supervisor-run worker (the systemd unit sets the marker) also
+// writes its own pid file at boot, so the CLI's pid-file gates treat both
+// exactly alike.
 const daemonEnv = "DAEDALUS_WORKER_DAEMON"
 
 // logRetention bounds how long daemon logs are kept.

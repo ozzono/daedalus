@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/mock"
-	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
@@ -35,11 +34,12 @@ type depProbeRecorder struct {
 }
 
 func (r *depProbeRecorder) record() {
-	// The probe is registered under its pinned string name (the worker's
-	// registration shape) before the mock wraps it — the test environment
-	// refuses an OnActivity by name for an unregistered activity.
-	r.env.RegisterActivityWithOptions(activities.NewCheckDependencyActivity(nil),
-		activity.RegisterOptions{Name: activities.CheckDependencyActivityName})
+	// The probe itself is registered under its pinned string name by
+	// registerPipelineActivities (the worker's registration shape) before
+	// any mock exists — the test environment refuses an OnActivity by name
+	// for an unregistered activity, and refuses a registration once a mock
+	// exists.
+	//
 	// Maybe: a non-dependent run must never probe at all, and the tests
 	// pin the call counts explicitly off ids.
 	r.env.OnActivity(activities.CheckDependencyActivityName, mock.Anything, mock.Anything).Maybe().
@@ -142,17 +142,11 @@ type depPokeRecorder struct {
 	stubErr error
 }
 
-// register pins the poke's registered name (the worker's registration
-// shape) — the test environment refuses an OnActivity by name for an
-// unregistered activity, and refuses the registration itself once any
-// activity mock exists, so a test mixing recorders registers everything
-// before mocking anything.
-func (r *depPokeRecorder) register() {
-	r.env.RegisterActivityWithOptions(activities.NewNotifyDependentsActivity(nil),
-		activity.RegisterOptions{Name: activities.NotifyDependentsActivityName})
-}
-
-// record wires the recording mock. register must have run already.
+// record wires the recording mock. The poke's registered name (the
+// worker's registration shape) is registered by registerPipelineActivities
+// before any mock exists — the test environment refuses an OnActivity by
+// name for an unregistered activity, and refuses a registration once a
+// mock exists.
 func (r *depPokeRecorder) record() {
 	r.env.OnActivity(activities.NotifyDependentsActivityName, mock.Anything, mock.Anything).Maybe().
 		Run(func(args mock.Arguments) {
@@ -642,7 +636,6 @@ func TestDependentRunFallbackReleasesGate(t *testing.T) {
 func TestDependentRunLegacyReplayGate(t *testing.T) {
 	env := newTestEnv(t)
 	poke := &depPokeRecorder{env: env}
-	poke.register()
 	probe := &depProbeRecorder{env: env, script: []depProbeStep{
 		{probe: activities.DependencyProbe{Status: "running"}},
 		{probe: activities.DependencyProbe{Terminal: true, Completed: true, Result: "daedalus/issue-41-1", Status: "completed"}},
@@ -697,7 +690,6 @@ func TestCompleteGreenPokesDependents(t *testing.T) {
 	t.Run("an approved run pokes its dependents", func(t *testing.T) {
 		env := newTestEnv(t)
 		poke := &depPokeRecorder{env: env}
-		poke.register()
 		stubWorktree(t, env)
 		rec := &agentRecorder{env: env}
 		rec.record()
@@ -728,7 +720,6 @@ func TestCompleteGreenPokesDependents(t *testing.T) {
 	t.Run("a parked run pokes its dependents too", func(t *testing.T) {
 		env := newTestEnv(t)
 		poke := &depPokeRecorder{env: env}
-		poke.register()
 		stubWorktree(t, env)
 		rec := &agentRecorder{env: env}
 		rec.record()
@@ -756,7 +747,6 @@ func TestCompleteGreenPokesDependents(t *testing.T) {
 	t.Run("a failed poke leaves the run's outcome untouched", func(t *testing.T) {
 		env := newTestEnv(t)
 		poke := &depPokeRecorder{env: env, stubErr: errors.New("visibility store down")}
-		poke.register()
 		stubWorktree(t, env)
 		rec := &agentRecorder{env: env}
 		rec.record()
