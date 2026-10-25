@@ -44,14 +44,21 @@ import (
 	"github.com/ozzono/daedalus/internal/metricsrelay"
 )
 
-// The fed metrics' names and label sets. The global six keep their names
-// and label sets; the per-slice child metrics build on the same kinds —
-// one metric name per slice value, so a per-slice panel exists (golens
-// cannot filter a single metric by label). Run metrics embed the worker
-// and task so the All Metrics list clusters a run's panels under its
-// worker.
+// The fed metrics' names and label sets. The global six keep their label
+// sets; the per-slice child metrics build on the same kinds — one metric
+// name per slice value, so a per-slice panel exists (golens cannot filter
+// a single metric by label). Run metrics embed the worker and task so the
+// All Metrics list clusters a run's panels under its worker. The input
+// counter's name is era-stamped on purpose: the fed figure is the
+// wire-normalized whole input (cache sides included, inputTokensTotal),
+// and the ex-cache figure the old daedalus_tokens_in_total name carried
+// is a different measure — the persisted counters are cumulative
+// sqlite series, so the rename (not a silent meaning-change inside one
+// series) is what keeps every one name comparable within itself; the
+// layout sync drops the old daemon-owned panels at the next boot and the
+// old series ends where the new one begins.
 const (
-	golensTokensIn   = "daedalus_tokens_in_total"
+	golensTokensIn   = "daedalus_input_tokens_total"
 	golensTokensOut  = "daedalus_tokens_out_total"
 	golensCacheRead  = "daedalus_tokens_cache_read_total"
 	golensCacheWrite = "daedalus_tokens_cache_write_total"
@@ -63,7 +70,7 @@ const (
 // document's daemon-owned section ids (the ownership prefix the sync
 // merges on).
 const (
-	golensKIn       = "tokens_in_total"
+	golensKIn       = "input_tokens_total"
 	golensKOut      = "tokens_out_total"
 	golensKRead     = "tokens_cache_read_total"
 	golensKWrite    = "tokens_cache_write_total"
@@ -184,7 +191,7 @@ func startGolens(cfg config.Config) (*golens.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	reg.Register(golensTokensIn, golens.CounterType, "Ledger input tokens", golensTokenLabels, nil, 0, 0)
+	reg.Register(golensTokensIn, golens.CounterType, "Ledger input tokens (cache included)", golensTokenLabels, nil, 0, 0)
 	reg.Register(golensTokensOut, golens.CounterType, "Ledger output tokens", golensTokenLabels, nil, 0, 0)
 	reg.Register(golensCacheRead, golens.CounterType, "Ledger cache-read tokens", golensTokenLabels, nil, 0, 0)
 	reg.Register(golensCacheWrite, golens.CounterType, "Ledger cache-write tokens", golensTokenLabels, nil, 0, 0)
@@ -197,33 +204,15 @@ func startGolens(cfg config.Config) (*golens.Registry, error) {
 	return reg, nil
 }
 
-// inputTokensExCache is the feed's wire normalization: every wire feeds
-// the same anthropic-style disjoint input, so summed global panels never
-// double-count. The openai wire's prompt_tokens includes the cached
-// reads (a subset of input); the anthropic wire's input_tokens already
-// excludes both cache sides. A provider reporting cached > prompt would
-// poison a cumulative counter with a negative — clamped at zero. The
-// ledger entries stay provider-native raw; this is the golens feed's
-// figure only (the models screen applies the same rule where its pricing
-// math needs it, ui_metrics.go's entryCost).
-func inputTokensExCache(e metricsrelay.Entry) int64 {
-	in := e.InputTokens
-	if e.Wire == metricsrelay.WireOpenAI {
-		in -= e.CacheReadTokens
-		if in < 0 {
-			in = 0
-		}
-	}
-	return in
-}
-
 // feedGolensEntry is the ledger's append observer: one recorded provider
 // request becomes the six global samples plus the per-slice child
 // samples — worker, key alias, run, and priced-model cost. Record never
 // blocks (golens ingests through a bounded queue), so the relay's request
-// path does not wait on the dashboard. The empty model renders as the
-// same unknown bucket the usage tables use: failed calls carry no model
-// name.
+// path does not wait on the dashboard. The input figure is the
+// view-normalized whole input (inputTokensTotal), matching the panels
+// beside which the cache-read samples land. The empty model renders as
+// the same unknown bucket the usage tables use: failed calls carry no
+// model name.
 //
 // Slices outside the boot vocabulary (a second deployment's worker
 // sharing the host daemon, an alias configured after boot) auto-register
@@ -241,7 +230,7 @@ func (s *uiServer) feedGolensEntry(e metricsrelay.Entry) {
 	if model == "" {
 		model = modelUnknown
 	}
-	in := inputTokensExCache(e)
+	in := inputTokensTotal(e)
 	base := []golens.Label{
 		{Name: "worker", Value: e.Worker},
 		{Name: "model", Value: model},

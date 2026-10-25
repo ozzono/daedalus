@@ -433,11 +433,11 @@ func cotOtelUsage(root string) (map[string]otelUsage, bool) {
 
 // fetchCotCapture fetches one round's relay-captured content from the
 // daemon's /capture endpoint. found is false for a capture the daemon
-// does not hold (404 — a toggle-off era round, content aged out of the
-// ring, an otel-staged round) and for any other answered-but-not-served
-// status, which degrades this round to the next source rather than
-// failing the dump; up is false only when the daemon is unreachable,
-// which flips the whole dump's liveness off.
+// does not hold (404 — a round from before metrics was enabled, content
+// aged out of the ring, an otel-staged round) and for any other
+// answered-but-not-served status, which degrades this round to the next
+// source rather than failing the dump; up is false only when the daemon
+// is unreachable, which flips the whole dump's liveness off.
 func fetchCotCapture(root, task, role, round string) (cr metricsrelay.CapturedRound, found, up bool) {
 	resp, err := metricsHTTP.Get(root + "/capture?task=" + url.QueryEscape(task) +
 		"&role=" + url.QueryEscape(role) + "&round=" + url.QueryEscape(round))
@@ -494,8 +494,8 @@ func cotRoundBody(src string, live *bool, otel map[string]otelUsage, task, role,
 			u.in, u.out, u.cacheRead, u.cacheWrite)
 		// The otel stamp is metadata, not a replacement: a completed
 		// round's Temporal result still carries its real CoT (a dead
-		// round walked no result, so only the counts render), and the
-		// toggle must never downgrade the diagnostic surface to four
+		// round walked no result, so only the counts render), and otel
+		// staging must never downgrade the diagnostic surface to four
 		// numbers.
 		if temporal != "" {
 			b += temporal + "\n"

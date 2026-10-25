@@ -1,5 +1,5 @@
 // The OTLP receiver: the /v1/metrics arm of the relay listener (mounted
-// whenever the daemon serves, not toggle-gated — D5; the toggle gates
+// whenever the daemon serves, not gated — D5; metrics.enabled gates
 // agent staging, not the port). OTLP/HTTP-JSON, decoded with plain struct
 // JSON — the proto JSON mapping's shapes, no protobuf dependency. Only
 // claude_code.token.usage delta datapoints fold into the ledger, one Entry
@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -79,6 +80,27 @@ type otlpSum struct {
 type otlpDataPoint struct {
 	Attributes []otlpAttr `json:"attributes"`
 	AsInt      otlpInt    `json:"asInt"`
+	// AsDouble is the value oneof's other arm: real claude exports encode
+	// every counter — integer token counts included — under asDouble (the
+	// proto JSON mapping carries one arm or the other, never both).
+	AsDouble float64 `json:"asDouble"`
+}
+
+// value resolves the point's value from whichever arm the export
+// carried, the double truncated (token counts never leave double's exact
+// integer range). Both arms absent — a malformed point — reads zero, and
+// so does a double this unauthenticated listener has no business
+// folding: NaN or a negative/overflowing magnitude would poison a
+// cumulative sum with implementation-defined garbage, so it clamps to
+// zero.
+func (dp otlpDataPoint) value() int64 {
+	if dp.AsInt != 0 {
+		return int64(dp.AsInt)
+	}
+	if math.IsNaN(dp.AsDouble) || dp.AsDouble < 0 || dp.AsDouble >= 1<<62 {
+		return 0
+	}
+	return int64(dp.AsDouble)
 }
 
 type otlpAttr struct {
@@ -127,10 +149,10 @@ func (r *Relay) serveOTLP(w http.ResponseWriter, req *http.Request) {
 	}
 	at := time.Now()
 	for _, rm := range ex.ResourceMetrics {
-		task, role, round, daedalus := otelProvenance(rm.Resource.Attributes)
+		task, role, round, worker, daedalus := otelProvenance(rm.Resource.Attributes)
 		e := Entry{At: at, Source: SourceOtel}
 		if daedalus {
-			e.Task, e.Role, e.Round = task, role, round
+			e.Task, e.Role, e.Round, e.Worker = task, role, round, worker
 		} else {
 			e.Source = SourceOtelExternal
 		}
@@ -141,8 +163,8 @@ func (r *Relay) serveOTLP(w http.ResponseWriter, req *http.Request) {
 		}
 		if (e.InputTokens | e.OutputTokens | e.CacheReadTokens | e.CacheWriteTokens) != 0 {
 			r.ledger.Append(e)
-			log.Printf("metricsrelay: otel usage source=%s task=%s role=%s round=%s model=%s in=%d out=%d",
-				e.Source, e.Task, e.Role, e.Round, e.Model, e.InputTokens, e.OutputTokens)
+			log.Printf("metricsrelay: otel usage source=%s worker=%s task=%s role=%s round=%s model=%s in=%d out=%d",
+				e.Source, e.Worker, e.Task, e.Role, e.Round, e.Model, e.InputTokens, e.OutputTokens)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -163,23 +185,26 @@ func foldOTLPTokens(e *Entry, m otlpMetric) {
 		}
 		switch typ {
 		case "input":
-			e.InputTokens += int64(dp.AsInt)
+			e.InputTokens += dp.value()
 		case "output":
-			e.OutputTokens += int64(dp.AsInt)
+			e.OutputTokens += dp.value()
 		case "cacheRead":
-			e.CacheReadTokens += int64(dp.AsInt)
+			e.CacheReadTokens += dp.value()
 		case "cacheCreation":
-			e.CacheWriteTokens += int64(dp.AsInt)
+			e.CacheWriteTokens += dp.value()
 		}
 	}
 }
 
 // otelProvenance splits staged identifiers from foreign resource
 // attributes (D4): a claude round exports daedalus.task/role/round — all
-// three present and non-empty is the daedalus signature — while a codex
-// round exports otel.environment="daedalus" and cannot attribute per
-// round. Anything else is foreign traffic, folded as otel-external.
-func otelProvenance(attrs []otlpAttr) (task, role, round string, daedalus bool) {
+// three present and non-empty is the daedalus signature — plus
+// daedalus.worker, the usage-by-worker fold's key, carried alongside
+// them; a codex round exports otel.environment="daedalus" and cannot
+// attribute per round. Anything else is foreign traffic, folded as
+// otel-external — and a foreign batch never adopts the worker name it
+// may name, so only the signature's presence gates the fold.
+func otelProvenance(attrs []otlpAttr) (task, role, round, worker string, daedalus bool) {
 	env := ""
 	for _, a := range attrs {
 		switch a.Key {
@@ -189,14 +214,16 @@ func otelProvenance(attrs []otlpAttr) (task, role, round string, daedalus bool) 
 			role = a.Value.StringValue
 		case "daedalus.round":
 			round = a.Value.StringValue
+		case "daedalus.worker":
+			worker = a.Value.StringValue
 		case "otel.environment":
 			env = a.Value.StringValue
 		}
 	}
 	if task != "" && role != "" && round != "" {
-		return task, role, round, true
+		return task, role, round, worker, true
 	}
-	return "", "", "", env == "daedalus"
+	return "", "", "", "", env == "daedalus"
 }
 
 // otelPointAttrs reads one datapoint's token type and model.

@@ -3,6 +3,7 @@ package metricsrelay
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -65,10 +66,11 @@ func ledgerFold(t *testing.T, l *Ledger) []Entry {
 
 // TestOTLPFoldStampsDaedalusProvenance pins the claude-staged shape end to
 // end: a resource carrying all three daedalus identifiers folds as a
-// single otel entry attributed to the round, its delta datapoints summed
-// by token type, the model read off the first datapoint that names one —
-// and the answer is the empty success body. An otel row carries no
-// request-level signal: no wire, worker, status, or duration.
+// single otel entry attributed to the round — with the daedalus.worker
+// attribute riding beside them, the usage-by-worker fold's key — its delta
+// datapoints summed by token type, the model read off the first datapoint
+// that names one — and the answer is the empty success body. An otel row
+// carries no request-level signal: no wire, status, or duration.
 func TestOTLPFoldStampsDaedalusProvenance(t *testing.T) {
 	ledger := &Ledger{}
 	_, root := startRelay(t, ledger, NewRegistry(time.Minute))
@@ -77,6 +79,7 @@ func TestOTLPFoldStampsDaedalusProvenance(t *testing.T) {
 		"resourceMetrics": []map[string]any{{
 			"resource": map[string]any{"attributes": []map[string]any{
 				{"key": "service.name", "value": map[string]any{"stringValue": "claude-code"}},
+				{"key": "daedalus.worker", "value": map[string]any{"stringValue": "w-otel"}},
 				{"key": "daedalus.task", "value": map[string]any{"stringValue": "wf-otel"}},
 				{"key": "daedalus.role", "value": map[string]any{"stringValue": "dev"}},
 				{"key": "daedalus.round", "value": map[string]any{"stringValue": "3"}},
@@ -121,8 +124,8 @@ func TestOTLPFoldStampsDaedalusProvenance(t *testing.T) {
 		t.Fatalf("ledger holds %d entries, want one folded entry", len(entries))
 	}
 	e := entries[0]
-	if e.Source != SourceOtel || e.Task != "wf-otel" || e.Role != "dev" || e.Round != "3" {
-		t.Errorf("entry attribution = (%s %s %s %s), want the otel source and the staged identifiers", e.Source, e.Task, e.Role, e.Round)
+	if e.Source != SourceOtel || e.Task != "wf-otel" || e.Role != "dev" || e.Round != "3" || e.Worker != "w-otel" {
+		t.Errorf("entry attribution = (%s %s %s %s worker %s), want the otel source and the staged identifiers", e.Source, e.Task, e.Role, e.Round, e.Worker)
 	}
 	if e.InputTokens != 100 || e.OutputTokens != 20 || e.CacheReadTokens != 7 || e.CacheWriteTokens != 3 {
 		t.Errorf("entry usage = %+v, want the delta datapoints summed by type", e)
@@ -135,7 +138,7 @@ func TestOTLPFoldStampsDaedalusProvenance(t *testing.T) {
 	if e.At.Before(before) || e.At.After(time.Now().Add(time.Second)) {
 		t.Errorf("entry stamped %v, want a receipt time near now", e.At)
 	}
-	if e.Worker != "" || e.Wire != "" || e.Status != 0 || e.DurationMS != 0 {
+	if e.Wire != "" || e.Status != 0 || e.DurationMS != 0 {
 		t.Errorf("entry = %+v, want the request-level fields empty (no relay saw this traffic)", e)
 	}
 }
@@ -158,6 +161,7 @@ func TestOTLPExternalProvenance(t *testing.T) {
 	}{
 		{"codex's environment label alone", [][2]string{{"otel.environment", "daedalus"}, {"service.name", "codex"}}, SourceOtel},
 		{"a partial identifier set", [][2]string{{"daedalus.task", "wf-x"}, {"daedalus.role", "dev"}}, SourceOtelExternal},
+		{"a foreign batch naming a worker", [][2]string{{"daedalus.worker", "w-foreign"}, {"service.name", "other"}}, SourceOtelExternal},
 		{"foreign traffic", [][2]string{{"otel.environment", "acme"}, {"service.name", "other"}}, SourceOtelExternal},
 		{"no attributes at all", nil, SourceOtelExternal},
 	}
@@ -199,8 +203,8 @@ func TestOTLPExternalProvenance(t *testing.T) {
 			if e.Source != c.wantSrc {
 				t.Errorf("source = %q, want %q", e.Source, c.wantSrc)
 			}
-			if e.Task != "" || e.Role != "" || e.Round != "" {
-				t.Errorf("entry attributed to (%s %s %s), want no per-round attribution off foreign traffic", e.Task, e.Role, e.Round)
+			if e.Task != "" || e.Role != "" || e.Round != "" || e.Worker != "" {
+				t.Errorf("entry attributed to (%s %s %s worker %s), want no attribution off foreign traffic — a foreign batch never adopts the worker name it may carry", e.Task, e.Role, e.Round, e.Worker)
 			}
 			if e.InputTokens != 50 {
 				t.Errorf("tokens = %d, want the datapoint folded beside the label", e.InputTokens)
@@ -298,5 +302,88 @@ func TestOTLPIntDecodes(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(`"1.5"`), &v); err == nil {
 		t.Errorf("fractional decode = %v, want an error", v)
+	}
+}
+
+// TestOTLPFoldReadsTheDoubleArm pins the value oneof's other arm: real
+// claude exports encode every counter — integer token counts included —
+// under asDouble, so a double-armed export folds its exact integer values
+// (a fractional double truncates; token counts never leave double's exact
+// integer range), and a hostile negative double clamps to zero rather than
+// poisoning a cumulative counter.
+func TestOTLPFoldReadsTheDoubleArm(t *testing.T) {
+	ledger := &Ledger{}
+	_, root := startRelay(t, ledger, NewRegistry(time.Minute))
+
+	body, err := json.Marshal(map[string]any{
+		"resourceMetrics": []map[string]any{{
+			"resource": map[string]any{"attributes": []map[string]any{
+				{"key": "daedalus.task", "value": map[string]any{"stringValue": "wf-d"}},
+				{"key": "daedalus.role", "value": map[string]any{"stringValue": "dev"}},
+				{"key": "daedalus.round", "value": map[string]any{"stringValue": "1"}},
+			}},
+			"scopeMetrics": []map[string]any{{
+				"metrics": []map[string]any{{
+					"name": otelMetricUsage,
+					"sum": map[string]any{
+						"aggregationTemporality": otlpDelta,
+						"dataPoints": []map[string]any{
+							{"asDouble": 1000.0, "attributes": []map[string]any{
+								{"key": "type", "value": map[string]any{"stringValue": "input"}},
+								{"key": "model", "value": map[string]any{"stringValue": "claude-opus-5"}},
+							}},
+							{"asDouble": 20.5, "attributes": []map[string]any{
+								{"key": "type", "value": map[string]any{"stringValue": "output"}},
+							}},
+							{"asDouble": -5, "attributes": []map[string]any{
+								{"key": "type", "value": map[string]any{"stringValue": "cacheRead"}},
+							}},
+						},
+					},
+				}},
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal export: %v", err)
+	}
+
+	if status, _ := postRelay(t, root+"/v1/metrics", http.Header{}, body); status != http.StatusOK {
+		t.Fatalf("status = %d, want the double-armed export accepted", status)
+	}
+	entries := ledgerFold(t, ledger)
+	if len(entries) != 1 {
+		t.Fatalf("ledger holds %d entries, want one folded entry", len(entries))
+	}
+	e := entries[0]
+	if e.InputTokens != 1000 || e.OutputTokens != 20 || e.CacheReadTokens != 0 {
+		t.Errorf("entry usage = in %d out %d read %d, want the doubles folded (1000, 20.5 truncated to 20, the negative clamped to 0)", e.InputTokens, e.OutputTokens, e.CacheReadTokens)
+	}
+}
+
+// TestOTLPDataPointValueResolvesTheArms pins the point's value resolution
+// at the arms themselves: a present asInt wins, a double truncates, and
+// the doubles this unauthenticated listener has no business folding — NaN,
+// a negative, a magnitude past int64's exact range — read zero, as does a
+// malformed point carrying neither arm.
+func TestOTLPDataPointValueResolvesTheArms(t *testing.T) {
+	cases := []struct {
+		name string
+		dp   otlpDataPoint
+		want int64
+	}{
+		{"the int arm", otlpDataPoint{AsInt: 42}, 42},
+		{"the double arm truncates", otlpDataPoint{AsDouble: 10.9}, 10},
+		{"a whole double", otlpDataPoint{AsDouble: 7}, 7},
+		{"a NaN double", otlpDataPoint{AsDouble: math.NaN()}, 0},
+		{"a negative double", otlpDataPoint{AsDouble: -1}, 0},
+		{"an overflowing double", otlpDataPoint{AsDouble: float64(1 << 62)}, 0},
+		{"an infinite double", otlpDataPoint{AsDouble: math.Inf(1)}, 0},
+		{"neither arm", otlpDataPoint{}, 0},
+	}
+	for _, c := range cases {
+		if got := c.dp.value(); got != c.want {
+			t.Errorf("%s: value() = %d, want %d", c.name, got, c.want)
+		}
 	}
 }

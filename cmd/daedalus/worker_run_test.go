@@ -745,14 +745,14 @@ func TestRunWorkerExportsAreScrubbed(t *testing.T) {
 	}
 }
 
-// TestRunWorkerOtelEndpointExport pins the toggle-on otel staging's boot
-// export seam: with metrics on and the toggle on, the OTLP endpoint rides
-// its own var, pointed at the live relay's /v1/metrics — one the override
-// paths never strip, so fallback and override rounds keep telemetry
-// coverage. With the toggle off, an inherited value is unset symmetrically
-// (the worker would otherwise keep staging otel with the toggle off — the
-// stale-export hazard the relay roots' unset path exists to prevent), and
-// metrics off whole unsets it too. runWorker is driven only to observe the
+// TestRunWorkerOtelEndpointExport pins the otel staging's boot export
+// seam: with metrics on, the OTLP endpoint rides its own var, pointed at
+// the live relay's /v1/metrics — one the override paths never strip, so
+// fallback and override rounds keep telemetry coverage. The export is
+// ungated beside the relay roots (the per-round selector, not a config
+// toggle, picks the capture path), so an inherited value is replaced, and
+// metrics off whole unsets it (the stale-export hazard the relay roots'
+// unset path exists to prevent). runWorker is driven only to observe the
 // boot exports: all three land at the boot seam, before registration. The
 // config deliberately names no worker (no WorkerID, no task queue), so
 // registration posts an empty worker name and the relay refuses it with a
@@ -785,29 +785,22 @@ func TestRunWorkerOtelEndpointExport(t *testing.T) {
 	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
 	t.Setenv("OPENAI_API_KEY", "sk-reg")
 
+	// Metrics on: the endpoint exports beside the relay roots, replacing
+	// any stale value the invoking shell carried.
+	t.Setenv(config.MetricsOtelEndpointEnv, "http://stale.example/v1/metrics")
 	cfg := config.Config{
 		Provider: &config.ProviderConfig{Type: config.FallbackTypeOpenAI, URL: "http://127.0.0.1:1/v1", Key: "k"},
-		Metrics:  config.MetricsConfig{Enabled: boolPtr(true), RelayPort: port, Otel: true},
+		Metrics:  config.MetricsConfig{Enabled: boolPtr(true), RelayPort: port},
 	}
 	if err := runWorker(cfg, ""); err == nil {
 		t.Fatal("runWorker with no worker name should fail boot registration, got nil")
 	}
 	want := "http://127.0.0.1:" + strconv.Itoa(port) + "/v1/metrics"
 	if got := os.Getenv(config.MetricsOtelEndpointEnv); got != want {
-		t.Errorf("%s = %q, want %q", config.MetricsOtelEndpointEnv, got, want)
+		t.Errorf("%s = %q, want the stale value replaced with %q", config.MetricsOtelEndpointEnv, got, want)
 	}
 
-	// The toggle off: the stale value must not survive the flip.
-	t.Setenv(config.MetricsOtelEndpointEnv, "http://stale.example/v1/metrics")
-	cfg.Metrics.Otel = false
-	if err := runWorker(cfg, ""); err == nil {
-		t.Fatal("runWorker with no worker name should fail boot registration, got nil")
-	}
-	if got := os.Getenv(config.MetricsOtelEndpointEnv); got != "" {
-		t.Errorf("%s = %q after an otel true→false flip, want it unset", config.MetricsOtelEndpointEnv, got)
-	}
-
-	// Metrics off whole: the same symmetry on the disabled branch.
+	// Metrics off whole: the stale value must not survive.
 	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
