@@ -780,7 +780,9 @@ func TestFlowsParkOnNeedsMaintainer(t *testing.T) {
 // starts — no agent or reviewer round runs, the baseline ran once in the
 // run's own worktree, and the park names the command whose baseline failed.
 // (Investigate's exemption is pinned by its own tests: they complete with
-// no test-phase mocks at all, which a gate there would fail on.)
+// no test-phase mocks at all, which a gate there would fail on. Test-only's
+// identity exemption — the gate opens for it by construction — is pinned by
+// TestTestOnlyWorkflowOpensOnRedBaseline below.)
 func TestFlowsPreflightGateParksOnRedBaseline(t *testing.T) {
 	flows := []struct {
 		name string
@@ -788,7 +790,6 @@ func TestFlowsPreflightGateParksOnRedBaseline(t *testing.T) {
 		flow string
 	}{
 		{"feature-dev", FeatureDevWorkflow, ""},
-		{"test-only", TestOnlyWorkflow, "test-only"},
 		{"refactor", RefactorWorkflow, "refactor"},
 		{"bug-fix", BugFixWorkflow, "bug-fix"},
 	}
@@ -923,6 +924,106 @@ func TestFlowsPreflightSkipOpensOnRedBaseline(t *testing.T) {
 // workflowContext aliases the workflow context type for the flow tables
 // above, keeping the struct literals readable.
 type workflowContext = workflow.Context
+
+// TestTestOnlyWorkflowOpensOnRedBaseline pins the test-only flow's gate
+// exemption: the flow's identity — recorded on the workflow input, not the
+// SkipPreflight flag — opens a red preflight baseline instead of parking,
+// because a test-only run exists to repair the suite and the red baseline
+// is its input. The baseline still runs once in the run's own worktree and
+// stays on record; the flow proceeds into its rounds exactly as the
+// SkipPreflight opt-out's test-only row does, so identity and flag open
+// indistinguishably. The continued subtest is the exemption's live shape: a
+// test-only continue of a never-validated chain re-runs the gate (no
+// BaselineValidated to skip on), the preserved worktree's baseline reads
+// red, and the run must open on it rather than park — parking there would
+// wedge every continue of a red-baselined test-only chain.
+func TestTestOnlyWorkflowOpensOnRedBaseline(t *testing.T) {
+	t.Run("a fresh run opens by flow identity alone, the flag unset", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+			Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+		rec := &agentRecorder{env: env}
+		rec.record()
+		rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+		rev.record()
+		_, suiteRec := stubTestPhase(env)
+		// The red first entry is the preflight gate's baseline; the loop's
+		// round runs on the green fallback.
+		suiteRec.script = []suiteStep{
+			{result: activities.TestResult{Passed: false, Logs: "--- FAIL: TestBase"}},
+		}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/test-only-issue-42-1", nil).Once()
+		env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+		scope := &scopeRecorder{env: env}
+		scope.record()
+
+		// SkipPreflight stays false — the gate must open on the flow's
+		// identity, never on the flag's riders.
+		in := baseInput()
+		in.Flow = "test-only"
+		in.AllowedPaths = activities.TestPathPatterns
+		env.ExecuteWorkflow(TestOnlyWorkflow, in)
+
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v (the test-only flow opens on its red baseline)", err)
+		}
+		var branch string
+		if err := env.GetWorkflowResult(&branch); err != nil {
+			t.Fatalf("workflow result: %v", err)
+		}
+		if branch != "daedalus/test-only-issue-42-1" {
+			t.Errorf("workflow result = %q, want the preserved branch name (the run finalized, it did not park)", branch)
+		}
+		if len(rec.inputs) == 0 {
+			t.Error("agent never ran — the exemption must open the first test round, not stall the run")
+		}
+		if len(suiteRec.runs) < 2 || suiteRec.runs[0].WorktreePath != "/wt/issue-42" {
+			t.Errorf("suite runs = %+v, want the red baseline in the run's own worktree plus the loop's rounds", suiteRec.runs)
+		}
+		env.AssertExpectations(t)
+	})
+
+	// The gate executes on a continued run too — the exemption opens the
+	// gate's red result, it is not the BaselineValidated skip: the baseline
+	// suite ran (the skip would have recorded none), and the round count
+	// proves the re-run gate opened rather than parked.
+	t.Run("a never-validated continue opens on the preserved worktree's red baseline", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+			Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+		rec := &agentRecorder{env: env}
+		rec.record()
+		rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+		rev.record()
+		_, suiteRec := stubTestPhase(env)
+		suiteRec.script = []suiteStep{
+			{result: activities.TestResult{Passed: false, Logs: "--- FAIL: TestBase"}},
+		}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/test-only-issue-42-1", nil).Once()
+		env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+		scope := &scopeRecorder{env: env}
+		scope.record()
+
+		in := baseInput()
+		in.Flow = "test-only"
+		in.AllowedPaths = activities.TestPathPatterns
+		in.BaseBranch = "aborted/test-only-issue-42"
+		env.ExecuteWorkflow(TestOnlyWorkflow, in)
+
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v (a never-validated test-only continue must open on red, not park)", err)
+		}
+		if len(rec.inputs) == 0 {
+			t.Error("agent never ran — the continued run must open its first test round on the red baseline")
+		}
+		if len(suiteRec.runs) != 2 || suiteRec.runs[0].WorktreePath != "/wt/issue-42" {
+			t.Errorf("suite runs = %+v, want the gate's re-run baseline (executed, not skipped) plus the loop's round, in the preserved worktree", suiteRec.runs)
+		}
+		env.AssertExpectations(t)
+	})
+}
 
 // TestFlowsAgentErrorFails pins the shared failure path: an agent-round
 // system error (not a timeout, kill, slot wait, or exhaustion) fails the

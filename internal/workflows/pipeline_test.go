@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -283,6 +284,20 @@ func (r *reviewerRecorder) record() {
 			}
 			return verdict, nil
 		})
+}
+
+// devReviewCount is the number of recorded rounds on the code-review role.
+// The recorder sees every reviewer — the phase-2 test review, claim
+// reviews, the flow-specific ones — and a code-review-loop round count
+// answers only its own role through this filter.
+func (r *reviewerRecorder) devReviewCount() int {
+	n := 0
+	for _, ri := range r.inputs {
+		if ri.Role == activities.RoleDevReview {
+			n++
+		}
+	}
+	return n
 }
 
 func baseInput() PipelineInput {
@@ -3271,8 +3286,11 @@ func TestFeatureDevWorkflowSwiftReviewCarriesVerdictOnUnchangedDiff(t *testing.T
 		{Approved: false, Comments: "fix the dropped error path", DiffDigest: "d1"},
 	}}
 	rev.record()
-	probe := &digestRecorder{env: env, digest: "d1"}
-	probe.record()
+	// probeRecorderFor hands the environment's one recorder out; the field
+	// write lands before execution and the mock's closure reads it at each
+	// dispatch — every probe answers the unchanged digest "d1".
+	probe := probeRecorderFor(env)
+	probe.digest = "d1"
 
 	stubTestPhase(env)
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
@@ -3302,11 +3320,18 @@ func TestFeatureDevWorkflowSwiftReviewCarriesVerdictOnUnchangedDiff(t *testing.T
 	if len(probe.probes) != 2 {
 		t.Errorf("change probe ran %d times, want 2 (rounds two and three)", len(probe.probes))
 	}
-	// Two carried verdicts each drove a fix round before the third count
-	// parked the run, and each fix round's prompt carries the standing
-	// comments with the unchanged-state re-prompt — the re-prompt IS the
-	// changes-request the carried verdict no longer restates.
-	for i, fix := range rec.inputs[1:] {
+	// The first fix round follows the round-one REAL verdict — the standing
+	// comments alone, no re-prompt (the note rides only carried verdicts).
+	// The two carried verdicts each drove a later fix round, and those
+	// prompts carry the standing comments with the unchanged-state
+	// re-prompt — the re-prompt IS the changes-request the carried verdict
+	// no longer restates.
+	if got := rec.inputs[1].Prompt; !strings.Contains(got, "fix the dropped error path") {
+		t.Errorf("first fix prompt = %q, want the standing comments", got)
+	} else if strings.Contains(got, unchangedDiffNote) {
+		t.Errorf("first fix prompt = %q, want no unchanged-diff re-prompt (it follows the real round-one verdict)", got)
+	}
+	for i, fix := range rec.inputs[2:] {
 		if !strings.Contains(fix.Prompt, "fix the dropped error path") {
 			t.Errorf("fix prompt %d = %q, want the standing comments", i, fix.Prompt)
 		}
@@ -3337,11 +3362,13 @@ func TestFeatureDevWorkflowSwiftReviewRunsFullRoundWhenDiffChanged(t *testing.T)
 		{Approved: true},
 	}}
 	rev.record()
-	probe := &digestRecorder{env: env, script: []digestStep{
+	// The scripted digests ride the environment's one recorder, consumed
+	// one per probe dispatch.
+	probe := probeRecorderFor(env)
+	probe.script = []digestStep{
 		{digest: "d1"}, // round two: unchanged — carry.
 		{digest: "d2"}, // round three: the fix landed — a full round.
-	}}
-	probe.record()
+	}
 
 	stubTestPhase(env)
 	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
@@ -3360,8 +3387,11 @@ func TestFeatureDevWorkflowSwiftReviewRunsFullRoundWhenDiffChanged(t *testing.T)
 	if branch != "daedalus/issue-42-1" {
 		t.Errorf("workflow result = %q, want the preserved branch name", branch)
 	}
-	if len(rev.inputs) != 2 {
-		t.Errorf("reviewer ran %d times, want 2 (the first round and the post-fix full round; the middle round carried)", len(rev.inputs))
+	// Two dev-review rounds — the first and the post-fix full round; the
+	// middle round carried. The recorder also sees phase 2's test review,
+	// which the count answers only through the role filter.
+	if got := rev.devReviewCount(); got != 2 {
+		t.Errorf("dev review ran %d times, want 2 (the first round and the post-fix full round; the middle round carried)", got)
 	}
 	if len(rec.inputs) != 4 {
 		t.Errorf("agent ran %d times, want 4 (implement, the carried round's fix, the full round's fix, tests)", len(rec.inputs))
@@ -3418,8 +3448,10 @@ func TestFeatureDevWorkflowConfidentVerdictlessSkipsStrike(t *testing.T) {
 	if branch != "daedalus/issue-42-1" {
 		t.Errorf("workflow result = %q, want the preserved branch name", branch)
 	}
-	if len(rev.inputs) != 4 {
-		t.Errorf("reviewer ran %d times, want 4 (three confidently-classified rounds plus the approval — no strike park at three)", len(rev.inputs))
+	// Four dev-review rounds; the recorder also sees phase 2's test review,
+	// which the count answers only through the role filter.
+	if got := rev.devReviewCount(); got != 4 {
+		t.Errorf("dev review ran %d times, want 4 (three confidently-classified rounds plus the approval — no strike park at three)", got)
 	}
 	if len(rec.inputs) != 5 {
 		t.Errorf("agent ran %d times, want 5 (implement, three fix rounds, tests)", len(rec.inputs))
@@ -3484,8 +3516,10 @@ func TestFeatureDevWorkflowUnchangedDiffVerdictlessSkipsStrike(t *testing.T) {
 	if branch != "daedalus/issue-42-1" {
 		t.Errorf("workflow result = %q, want the preserved branch name", branch)
 	}
-	if len(rev.inputs) != 4 {
-		t.Errorf("reviewer ran %d times, want 4 (three unchanged-diff rounds plus the approval — no strike park at three)", len(rev.inputs))
+	// Four dev-review rounds; the recorder also sees phase 2's test review,
+	// which the count answers only through the role filter.
+	if got := rev.devReviewCount(); got != 4 {
+		t.Errorf("dev review ran %d times, want 4 (three unchanged-diff rounds plus the approval — no strike park at three)", got)
 	}
 	if len(rec.inputs) != 5 {
 		t.Errorf("agent ran %d times, want 5 (implement, three fix rounds, tests)", len(rec.inputs))

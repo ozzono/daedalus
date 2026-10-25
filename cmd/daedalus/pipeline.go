@@ -677,6 +677,18 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		}
 	}
 
+	// The submit-time window gate applies here exactly as at start: the
+	// continue prompt IS the new run's initial task input, and the
+	// continued run dials the CURRENT config's provider channels like the
+	// wire gate above — so a continue onto a config whose staged window
+	// cannot back this prompt is refused here, before the workflow is
+	// created and the aborted branch is staged, not at the first round's
+	// window preflight. Placed after the slim gate so a shrunken prompt is
+	// what gets measured.
+	if err := runstart.WindowGate(cfg, prompt); err != nil {
+		return err
+	}
+
 	// The wire-vs-agent gate applies here exactly as at start: the continued
 	// run carries prev.Agent against the CURRENT config's channels, and a
 	// deployment that flipped its served wire between the abort and this
