@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ozzono/daedalus/internal/config"
@@ -99,16 +100,17 @@ func TestProbeOTelVersionFloors(t *testing.T) {
 	})
 }
 
-// TestClaudeOtelEnvStagesTheEightNames pins the toggle-on claude staging:
+// TestClaudeOtelEnvStagesTheEightNames pins the metrics-on claude staging:
 // the eight documented env names with their exact values — the enable
 // switch, the otlp http/json exporter pointed at the endpoint, the
 // cardinality trim, the explicitly-disabled traces and logs, and the
-// resource attributes the receiver's provenance check reads — staged over
-// the round's env without disturbing anything else, and re-staging
-// replaces rather than duplicates.
+// resource attributes the receiver's provenance check reads, the worker
+// the usage-by-worker fold groups by named beside the attribution parts —
+// staged over the round's env without disturbing anything else, and
+// re-staging replaces rather than duplicates.
 func TestClaudeOtelEnvStagesTheEightNames(t *testing.T) {
 	endpoint := "http://127.0.0.1:7778/v1/metrics"
-	env := claudeOtelEnv([]string{"ANTHROPIC_BASE_URL=https://primary.example", "ANTHROPIC_API_KEY=sk-primary"}, endpoint, "wf-one", "dev", "3")
+	env := claudeOtelEnv([]string{"ANTHROPIC_BASE_URL=https://primary.example", "ANTHROPIC_API_KEY=sk-primary"}, endpoint, "w-one", "wf-one", "dev", "3")
 
 	want := map[string]string{
 		"CLAUDE_CODE_ENABLE_TELEMETRY":        "1",
@@ -118,7 +120,7 @@ func TestClaudeOtelEnvStagesTheEightNames(t *testing.T) {
 		"OTEL_METRICS_INCLUDE_ACCOUNT_UUID":   "false",
 		"OTEL_LOGS_EXPORTER":                  "none",
 		"OTEL_TRACES_EXPORTER":                "none",
-		"OTEL_RESOURCE_ATTRIBUTES":            "service.name=claude-code,daedalus.task=wf-one,daedalus.role=dev,daedalus.round=3",
+		"OTEL_RESOURCE_ATTRIBUTES":            "service.name=claude-code,daedalus.worker=w-one,daedalus.task=wf-one,daedalus.role=dev,daedalus.round=3",
 		"ANTHROPIC_BASE_URL":                  "https://primary.example",
 		"ANTHROPIC_API_KEY":                   "sk-primary",
 	}
@@ -141,7 +143,7 @@ func TestClaudeOtelEnvStagesTheEightNames(t *testing.T) {
 
 	// Re-staging over an already-staged env replaces in place — a retry
 	// over a retry's env must not grow the env — and the new parts win.
-	restaged := claudeOtelEnv(slices.Clone(env), endpoint, "wf-one", "test", "4")
+	restaged := claudeOtelEnv(slices.Clone(env), endpoint, "w-one", "wf-one", "test", "4")
 	for name := range want {
 		n := 0
 		for _, kv := range restaged {
@@ -153,12 +155,41 @@ func TestClaudeOtelEnvStagesTheEightNames(t *testing.T) {
 			t.Errorf("%s appears %d times after re-staging, want one", name, n)
 		}
 	}
-	if got := envValue(restaged, "OTEL_RESOURCE_ATTRIBUTES"); got != "service.name=claude-code,daedalus.task=wf-one,daedalus.role=test,daedalus.round=4" {
+	if got := envValue(restaged, "OTEL_RESOURCE_ATTRIBUTES"); got != "service.name=claude-code,daedalus.worker=w-one,daedalus.task=wf-one,daedalus.role=test,daedalus.round=4" {
 		t.Errorf("re-staged OTEL_RESOURCE_ATTRIBUTES = %q, want the new parts", got)
 	}
 }
 
-// TestCodexOtelArgsStagesTheOverrides pins the toggle-on codex staging:
+// TestMetricsRoundEnvClaudeStagesTheWorker pins the selector's capable-
+// claude branch end to end: with the endpoint staged, the round's claude
+// env names the worker the worker boot exported (DAEDALUS_WORKER_NAME,
+// already on the round env) beside the attribution parts — the usage-by-
+// worker fold's key rides the staging, not just the leaf fn's parameter.
+func TestMetricsRoundEnvClaudeStagesTheWorker(t *testing.T) {
+	writeVersionBin(t, "claude", "2.1.304 (Claude Code)\n")
+	// The probe caches process-wide on first use; reset it so this test's
+	// fake bin is the one probed, and leave the cache pristine afterwards.
+	otelProbeOnce = sync.Once{}
+	otelCapable = nil
+	t.Cleanup(func() { otelProbeOnce = sync.Once{}; otelCapable = nil })
+
+	env := append(metricsRoundBaseEnv(), config.MetricsOtelEndpointEnv+"=http://127.0.0.1:7778/v1/metrics")
+	keyedRoundEnv(t, func(ctx context.Context) []string {
+		task, roleName, round := metricsAttributionParts(ctx, RoleDev)
+		got, args := metricsRoundEnv(ctx, slices.Clone(env), RoleDev, "claude")
+		if args != nil {
+			t.Errorf("otel args = %v, want none (claude stages env, not argv)", args)
+		}
+		want := "service.name=claude-code,daedalus.worker=w-metrics,daedalus.task=" + task +
+			",daedalus.role=" + roleName + ",daedalus.round=" + round
+		if attrs := envValue(got, "OTEL_RESOURCE_ATTRIBUTES"); attrs != want {
+			t.Errorf("OTEL_RESOURCE_ATTRIBUTES = %q, want %q", attrs, want)
+		}
+		return nil
+	})
+}
+
+// TestCodexOtelArgsStagesTheOverrides pins the metrics-on codex staging:
 // the four -c overrides — the otlp-http exporter (which also silences
 // codex's statsig default), its endpoint and protocol sub-keys, and the
 // environment label the receiver's provenance check reads — in argv form,
@@ -219,19 +250,20 @@ func TestMetricsAttributionParts(t *testing.T) {
 	})
 }
 
-// TestMetricsRoundEnvWithoutTheToggle pins the selector's deterministic
-// faces: without the endpoint var the staging is the relay's — for every
-// agent, however capable the binary might be — and a non-otel agent with
-// the toggle on keeps the relay too. The claude/codex capable branches
+// TestMetricsRoundEnvWithoutTheEndpoint pins the selector's deterministic
+// faces: without the endpoint var (metrics off — the worker exports it
+// whenever metrics is on) the staging is the relay's — for every agent,
+// however capable the binary might be — and a non-otel agent with the
+// endpoint staged keeps the relay too. The claude/codex capable branches
 // dispatch on a host binary probe (agentOTelCapable), so they are pinned
 // at their parts instead: claudeOtelEnv, codexOtelArgs, and
 // probeOTelVersion above.
-func TestMetricsRoundEnvWithoutTheToggle(t *testing.T) {
+func TestMetricsRoundEnvWithoutTheEndpoint(t *testing.T) {
 	t.Run("no endpoint stages the relay even for claude", func(t *testing.T) {
 		env := metricsRoundBaseEnv()
 		got, args := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, "claude")
 		if args != nil {
-			t.Errorf("otel args = %v, want none off the toggle", args)
+			t.Errorf("otel args = %v, want none with no endpoint staged", args)
 		}
 		want := metricsrelay.StagedBase("http://127.0.0.1:7778", "w-metrics", metricsrelay.WireAnthropic, "https://primary.example")
 		if gotVal := envValue(got, "ANTHROPIC_BASE_URL"); gotVal != want {
@@ -243,7 +275,7 @@ func TestMetricsRoundEnvWithoutTheToggle(t *testing.T) {
 		env := append(metricsRoundBaseEnv(), config.MetricsOtelEndpointEnv+"=")
 		got, args := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, "claude")
 		if args != nil {
-			t.Errorf("otel args = %v, want none off the toggle", args)
+			t.Errorf("otel args = %v, want none with the endpoint empty", args)
 		}
 		want := metricsrelay.StagedBase("http://127.0.0.1:7778", "w-metrics", metricsrelay.WireOpenAI, "https://oai.example/v1")
 		if gotVal := envValue(got, "OPENAI_BASE_URL"); gotVal != want {
@@ -251,7 +283,7 @@ func TestMetricsRoundEnvWithoutTheToggle(t *testing.T) {
 		}
 	})
 
-	t.Run("a non-otel agent keeps the relay with the toggle on", func(t *testing.T) {
+	t.Run("a non-otel agent keeps the relay with the endpoint staged", func(t *testing.T) {
 		env := append(metricsRoundBaseEnv(), config.MetricsOtelEndpointEnv+"=http://127.0.0.1:7778/v1/metrics")
 		for _, agent := range []string{"aider", "opencode", "amp"} {
 			got, args := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, agent)

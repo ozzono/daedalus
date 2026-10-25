@@ -280,8 +280,8 @@ const (
 	// without it any on-host process could spend a registered worker's
 	// key with a fabricated task-shaped credential.
 	MetricsRelayTokenEnv = "DAEDALUS_METRICS_RELAY_TOKEN"
-	// MetricsOtelEndpointEnv is the toggle-on otel path's staging input:
-	// the worker exports <relay-root>/v1/metrics and the round staging
+	// MetricsOtelEndpointEnv is the otel path's staging input: the worker
+	// exports <relay-root>/v1/metrics and the round staging
 	// (internal/activities) reads it to select agent-native OTLP staging
 	// over relay staging for a capable CLI. It is deliberately not one of
 	// the relay root vars — the failover and reviewer override paths strip
@@ -290,9 +290,9 @@ const (
 	// daemon directly, needing no relay URL: the endpoint survives the
 	// override paths, so fallback and override rounds keep telemetry
 	// coverage too. Worker-side only (roundEnvWorkerSideVars): consumed at
-	// pre-spawn staging, never reaching the sandbox. Exported only while
-	// metrics.otel is on and the worker registered; absent means rounds
-	// stage the relay exactly as before.
+	// pre-spawn staging, never reaching the sandbox. Exported whenever
+	// metrics is enabled and the worker registered; absent — metrics
+	// off — means no round stages any capture path.
 	MetricsOtelEndpointEnv = "DAEDALUS_METRICS_OTEL_ENDPOINT"
 )
 
@@ -927,9 +927,17 @@ func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
 // override) bypasses the relay invisibly: coverage is per-CLI-wiring.
 type MetricsConfig struct {
 	// Enabled turns the subsystem on for this project's rounds — nil
-	// (unset) is on; false opts out. When on, the worker boot verifies
-	// the metrics daemon, registers this worker's upstream mapping with
-	// it, and stages the relay URL into jailed rounds. omitempty is the
+	// (unset) is on; false opts out. One toggle governs every capture
+	// path: when on, the worker boot verifies the metrics daemon,
+	// registers this worker's upstream mapping with it, exports the OTLP
+	// endpoint beside the relay roots, and stages jailed rounds — a
+	// claude or codex CLI at or above its version floor takes the
+	// agent-native OTLP path, every other round the relay (exactly one
+	// capture path per round; below the floor the keyed-only fallback and
+	// its dark corner are internal/activities' staging contract). With
+	// the toggle defaulting on, the boot gate is the fresh-host default:
+	// a host without the dash daemon opts out explicitly with false, or
+	// every worker start/restart fails its daemon probe. omitempty is the
 	// render contract (RenderYAML): an unset key renders absent —
 	// marshaling the nil pointer would print `enabled: null`, a shape
 	// no config line means. Every defaulted pointer key the render can
@@ -945,20 +953,6 @@ type MetricsConfig struct {
 	// serve the LAN; the relay never does). Zero (unset) defaults to
 	// DefaultMetricsRelayPort.
 	RelayPort int `yaml:"relay_port"`
-	// Otel switches the agent-native staging on: when true, the worker
-	// exports MetricsOtelEndpointEnv beside the relay roots and a claude
-	// or codex round whose CLI probes at or above the staged version
-	// floor stages otel — claude's OTLP env vars, codex's -c overrides —
-	// instead of relay staging, keyed or not (otel attribution rides the
-	// staged identifiers, not the credential; replacement semantics:
-	// exactly one capture path per round). Below the floor, a keyed round
-	// stages the relay as before and an unkeyed one stages nothing — the
-	// relay fallback needs a registered key, so that round goes dark. The
-	// OTLP receiver itself mounts on the relay listener whenever the
-	// daemon runs — this toggle gates staging, not the port; foreign
-	// exporters on the host may post to it and their usage folds labeled
-	// otel-external, kept out of the daedalus views.
-	Otel bool `yaml:"otel,omitempty"`
 	// StorageBackend governs all metrics persistence: "sqlite" (the
 	// default when unset) writes the relay ledger rows, the model price
 	// table, and the golens-metrics roll-ups into the shared metrics
@@ -978,6 +972,64 @@ type MetricsConfig struct {
 	// every row forever. A set value under memory is a load error — there
 	// is no ledger on disk to age.
 	LedgerMaxAge *time.Duration `yaml:"ledger_max_age,omitempty"`
+}
+
+// UnmarshalYAML decodes the section field by field with the mapping's
+// keys checked by hand — KnownFields strictness does not reach through a
+// custom unmarshaler, so the hand check is what keeps a typo'd section
+// key failing the load with the yaml-style "field … not found" error
+// (the SlimConfig shape). The hand check exists for one removed key, the
+// otel toggle: `otel: true` loads, because the agent-native path it
+// switched on is now the default and there is nothing to migrate, while
+// `otel: false` fails naming the migration — silently ignoring it would
+// revoke an explicit opt-out without a trace.
+func (m *MetricsConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Tag == "!!null" {
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: cannot unmarshal %s into config.MetricsConfig", value.Line, value.ShortTag())
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key, val := value.Content[i], value.Content[i+1]
+		switch key.Value {
+		case "enabled":
+			if err := val.Decode(&m.Enabled); err != nil {
+				return err
+			}
+		case "port":
+			if err := val.Decode(&m.Port); err != nil {
+				return err
+			}
+		case "relay_port":
+			if err := val.Decode(&m.RelayPort); err != nil {
+				return err
+			}
+		case "otel":
+			var on bool
+			if err := val.Decode(&on); err != nil {
+				return err
+			}
+			if !on {
+				return fmt.Errorf("line %d: metrics.otel was removed — the OTLP path is always on when metrics is enabled; delete the otel line (there is no per-path opt-out; the subsystem's opt-out is enabled: false)", key.Line)
+			}
+		case "storage_backend":
+			if err := val.Decode(&m.StorageBackend); err != nil {
+				return err
+			}
+		case "storage_path":
+			if err := val.Decode(&m.StoragePath); err != nil {
+				return err
+			}
+		case "ledger_max_age":
+			if err := val.Decode(&m.LedgerMaxAge); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("line %d: field %s not found in type config.MetricsConfig", key.Line, key.Value)
+		}
+	}
+	return nil
 }
 
 // Config holds the runtime configuration for a Daedalus process, loaded
@@ -1268,7 +1320,6 @@ type metricsRender struct {
 	Enabled        *bool          `yaml:"enabled,omitempty"`
 	Port           int            `yaml:"port"`
 	RelayPort      int            `yaml:"relay_port"`
-	Otel           bool           `yaml:"otel,omitempty"`
 	StorageBackend string         `yaml:"storage_backend,omitempty"`
 	StoragePath    string         `yaml:"storage_path,omitempty"`
 	LedgerMaxAge   *durationValue `yaml:"ledger_max_age,omitempty"`
@@ -1281,7 +1332,6 @@ func metricsRenderOf(m MetricsConfig) metricsRender {
 		Enabled:        m.Enabled,
 		Port:           m.Port,
 		RelayPort:      m.RelayPort,
-		Otel:           m.Otel,
 		StorageBackend: m.StorageBackend,
 		StoragePath:    m.StoragePath,
 	}
@@ -1902,7 +1952,7 @@ func RoundEnvVars() []string {
 		"OPENCODE_CONFIG",
 		"MAX_THINKING_TOKENS",
 		"CLAUDE_CODE_MAX_OUTPUT_TOKENS",
-		// The toggle-on otel staging's claude exports (the staging writes
+		// The otel staging's claude exports (the staging writes
 		// them onto the round env only when it selected the OTLP path).
 		"CLAUDE_CODE_ENABLE_TELEMETRY",
 		"OTEL_METRICS_EXPORTER",

@@ -42,9 +42,9 @@ func TestBuildPricePreviewFoldsTheWindow(t *testing.T) {
 	if v.Window != "2m0s window" {
 		t.Errorf("window = %q, want the ledger's own span", v.Window)
 	}
-	if v.Calls != 3 || v.In != 4_100_000 || v.Out != 3_000_000 ||
+	if v.Calls != 3 || v.In != 8_600_000 || v.Out != 3_000_000 ||
 		v.CacheRead != 4_000_000 || v.CacheWrite != 500_000 {
-		t.Errorf("totals = %+v, want every call folded, the model-less failure included", v)
+		t.Errorf("totals = %+v, want every call folded (the input whole: 5.5M anthropic, 3M openai, 0.1M), the model-less failure included", v)
 	}
 	// mA only: (1M+0.5M)*$3 + 2M*$2 + 4M*$1 = $12.50 — mB and the
 	// model-less failure price nowhere.
@@ -160,7 +160,7 @@ func TestUIModelsPreviewModal(t *testing.T) {
 			"$12.5000", // the current total at the saved snapshot
 			"$23.8000", // the whole window repriced at mA's rates
 			"$11.3000", // the signed delta
-			">4.10M<",  // the token tiers ride the tables' humanizer
+			">8.60M<",  // the token tiers ride the tables' humanizer
 			">500.0k<",
 		} {
 			if !strings.Contains(out, want) {

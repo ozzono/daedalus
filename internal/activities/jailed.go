@@ -704,7 +704,7 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	env = wireThinkingEnv(env, role)
 	// The CLI resolve is hoisted above the metrics staging: the staging
 	// selector dispatches on the resolved binary (claude/codex stage the
-	// agent-native OTLP path when the toggle is on and the binary is new
+	// agent-native OTLP path when metrics is on and the binary is new
 	// enough — see metricsRoundEnv).
 	selected, headless, _ := jailedAgentCLI(agent)
 	// Metrics staging: select the round's capture path and stage it — the

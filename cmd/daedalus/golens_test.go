@@ -224,7 +224,7 @@ func TestFeedGolensEntryFoldsTheSixMetrics(t *testing.T) {
 	})
 
 	for name, want := range map[string]float64{
-		golensTokensIn:   105,
+		golensTokensIn:   175, // the whole input side: 100 + 30 + 40 anthropic, 5 default
 		golensTokensOut:  206,
 		golensCacheRead:  30,
 		golensCacheWrite: 40,
@@ -360,11 +360,11 @@ func TestUIRoutesServeTheGolensMountBesideTheExactRoutes(t *testing.T) {
 	}
 }
 
-// TestInputTokensExCacheNormalizesTheWire pins the feed's input figure: the
-// anthropic wire reports input and cache reads disjoint, the openai wire's
-// prompt_tokens includes the cached reads — subtracted so summed panels
-// never double-count — and a provider reporting more cached than prompt
-// clamps at zero, never a negative on a cumulative counter.
+// TestInputTokensExCacheNormalizesTheWire pins the pricing-grade input
+// figure (entryCost's): the anthropic wire reports input and cache reads
+// disjoint, the openai wire's prompt_tokens includes the cached reads —
+// subtracted so no token class bills twice — and a provider reporting more
+// cached than prompt clamps at zero, never a negative on a bill.
 func TestInputTokensExCacheNormalizesTheWire(t *testing.T) {
 	e := metricsrelay.Entry{InputTokens: 1000, CacheReadTokens: 300}
 	if got := inputTokensExCache(e); got != 1000 {
@@ -392,10 +392,12 @@ func TestFeedGolensEntryWithoutARegistryIsASilentNoop(t *testing.T) {
 // TestFeedGolensEntrySlicesTheChildMetrics pins the feed's per-slice faces,
 // all fed from one recorded request: the config-known worker's five counters
 // and duration histogram, the key alias's counters, the run's two, and the
-// priced model's cost stamp; the openai wire's input net of its cached
-// reads; a foreign worker auto-registering its counters but never a duration
-// (an auto-register is a plain counter, which would fold a latency into a
-// running total); and an unpriced model recording no cost line.
+// priced model's cost stamp; the input samples carrying the whole input
+// side (inputTokensTotal — the openai wire's reads ride inside its prompt,
+// so nothing is subtracted here); a foreign worker auto-registering its
+// counters but never a duration (an auto-register is a plain counter, which
+// would fold a latency into a running total); and an unpriced model
+// recording no cost line.
 func TestFeedGolensEntrySlicesTheChildMetrics(t *testing.T) {
 	useDaemonDir(t)
 	reg, err := startGolens(golensMemoryConfig())
@@ -419,11 +421,13 @@ func TestFeedGolensEntrySlicesTheChildMetrics(t *testing.T) {
 		InputTokens: 10, OutputTokens: 20, DurationMS: 500, Status: 200,
 	})
 
-	// The globals fold both entries, the openai input net of its reads.
-	awaitCounter(t, reg, golensTokensIn, 710)
+	// The globals fold both entries, the input whole on every wire: the
+	// openai prompt carries its reads inside, the anthropic side names no
+	// cache classes here.
+	awaitCounter(t, reg, golensTokensIn, 1010)
 	awaitCounter(t, reg, golensTokensOut, 220)
 
-	awaitCounter(t, reg, workerMetricName(golensKIn, "w-a"), 700)
+	awaitCounter(t, reg, workerMetricName(golensKIn, "w-a"), 1000)
 	awaitCounter(t, reg, workerMetricName(golensKOut, "w-a"), 200)
 	awaitCounter(t, reg, workerMetricName(golensKRead, "w-a"), 300)
 	awaitCounter(t, reg, workerMetricName(golensKWrite, "w-a"), 40)
@@ -433,12 +437,14 @@ func TestFeedGolensEntrySlicesTheChildMetrics(t *testing.T) {
 		t.Errorf("the worker duration metric = %q, want histogram", dur.Type)
 	}
 
-	awaitCounter(t, reg, aliasMetricName(golensKIn, "k1"), 700)
+	awaitCounter(t, reg, aliasMetricName(golensKIn, "k1"), 1000)
 	awaitCounter(t, reg, aliasMetricName(golensKRequests, "k1"), 1)
 
-	awaitCounter(t, reg, "daedalus_run_w-a_t1_tokens_in_total", 700)
+	awaitCounter(t, reg, "daedalus_run_w-a_t1_input_tokens_total", 1000)
 	awaitCounter(t, reg, "daedalus_run_w-a_t1_tokens_out_total", 200)
 
+	// The cost stamp keeps the pricing-grade figure: the openai input net
+	// of its reads (1000 − 300 + the 40 writes).
 	wantCost := float64(740)/1e6*3 + float64(200)/1e6*2 + float64(300)/1e6*1
 	awaitCounter(t, reg, modelCostMetricName("mA"), wantCost)
 

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -371,14 +372,14 @@ func TestLedgerEntriesReadsTheSQLiteLedgerAscending(t *testing.T) {
 	}
 }
 
-// TestFoldUsageRows pins the usage fold behind both tables: the token sums,
-// the distinct keyed runs, the dev/test/review split, the wire-aware
-// status split and cache-hit ratio (anthropic reports reads beside input —
-// denominator in + read; openai reports them inside prompt_tokens —
-// denominator in), nearest-rank p50/p95, the trailing-hour rate, the
-// render-time cost of the priced models only, and the ordering by calls
-// descending with the key breaking ties. The same entries folded by worker
-// price through each row's own models, not the row key.
+// TestFoldUsageRows pins the usage fold behind both tables: the token sums
+// (input through the whole-input normalization), the distinct keyed runs,
+// the dev/test/review split, the status split and the cache-hit ratio over
+// that same whole input (reads are a subset of the denominator on every
+// wire), nearest-rank p50/p95, the trailing-hour rate, the render-time cost
+// of the priced models only, and the ordering by calls descending with the
+// key breaking ties. The same entries folded by worker price through each
+// row's own models, not the row key.
 func TestFoldUsageRows(t *testing.T) {
 	now := time.Now()
 	entries := []metricsrelay.Entry{
@@ -427,8 +428,8 @@ func TestFoldUsageRows(t *testing.T) {
 	if mA.Key != "mA" {
 		t.Fatalf("first row = %q, want mA (most calls)", mA.Key)
 	}
-	if mA.Calls != 3 || mA.In != 1500 || mA.Out != 2500 || mA.CacheRead != 500 || mA.CacheWrite != 100 {
-		t.Errorf("mA sums = %+v, want 3 calls, 1500 in, 2500 out, 500 read, 100 written", mA)
+	if mA.Calls != 3 || mA.In != 2100 || mA.Out != 2500 || mA.CacheRead != 500 || mA.CacheWrite != 100 {
+		t.Errorf("mA sums = %+v, want 3 calls, 2100 in (the whole side: 1000 + 500 + 100 and 500), 2500 out, 500 read, 100 written", mA)
 	}
 	if mA.Runs != 2 || mA.Dev != 1 || mA.Test != 1 || mA.Review != 1 {
 		t.Errorf("mA splits = %+v, want 2 runs, dev/test/review each 1", mA)
@@ -436,9 +437,10 @@ func TestFoldUsageRows(t *testing.T) {
 	if mA.OK2xx != 2 || mA.R429 != 1 || mA.R4xx != 0 || mA.R5xx != 0 {
 		t.Errorf("mA statuses = %+v, want 2xx=2, 429=1", mA)
 	}
-	// Reads 500 over the anthropic denominator in + read = 2000.
-	if mA.HitPct != "25.0%" {
-		t.Errorf("mA HitPct = %q, want 25.0%%", mA.HitPct)
+	// Reads 500 over the whole-input denominator 2100 — reads are a subset
+	// of it on every wire.
+	if mA.HitPct != "23.8%" {
+		t.Errorf("mA HitPct = %q, want 23.8%%", mA.HitPct)
 	}
 	if mA.P50 != "2s" || mA.P95 != "3s" {
 		t.Errorf("mA durations = %q / %q, want nearest-rank 2s / 3s", mA.P50, mA.P95)
@@ -496,6 +498,24 @@ func TestFoldUsageRows(t *testing.T) {
 	}
 	if wrows[1].Priced || wrows[1].Cost != 0 || wrows[1].Calls != 2 {
 		t.Errorf("w-b row = %+v, want 2 unpriced calls", wrows[1])
+	}
+}
+
+// TestInputTokensTotalNormalizesTheView pins the dash's view normalization:
+// input renders as the whole input side of the call — the openai wire's
+// prompt already carries its cached reads, the anthropic side's
+// input_tokens excludes both cache classes so they fold in — making the
+// cache columns visibly subsets of the input column on every wire, unlike
+// the raw wire-native figures. The pricing figure stays entryCost's
+// inputTokensExCache (pinned beside the golens feed's tests).
+func TestInputTokensTotalNormalizesTheView(t *testing.T) {
+	e := metricsrelay.Entry{InputTokens: 1000, CacheReadTokens: 300, CacheWriteTokens: 50}
+	if got := inputTokensTotal(e); got != 1350 {
+		t.Errorf("anthropic whole input = %d, want 1350 (input plus both cache sides)", got)
+	}
+	e.Wire = metricsrelay.WireOpenAI
+	if got := inputTokensTotal(e); got != 1000 {
+		t.Errorf("openai whole input = %d, want the raw 1000 (the prompt already includes the reads)", got)
 	}
 }
 
@@ -632,13 +652,13 @@ func TestFoldDriftGroupsRounds(t *testing.T) {
 // TestBuildTilesDashUntilDenominated pins the headline row: every tile
 // renders the dash until its denominator exists — tokens per keyed run
 // (unkeyed calls join the totals but name no run), tokens per worker, the
-// two loop averages, and the per-round input drift.
+// two loop averages, the per-round input drift, and the per-round span.
 func TestBuildTilesDashUntilDenominated(t *testing.T) {
 	base := time.Now().Truncate(time.Second)
 	at := func(min int) time.Time { return base.Add(time.Duration(min) * time.Minute) }
 	dev := string(activities.RoleDev)
 
-	if tiles := buildTiles(nil, nil); tiles != (uiDerivedTiles{TokensPerRun: "—", TokensPerWorker: "—", DevLoop: "—", TestLoop: "—", Drift: "—"}) {
+	if tiles := buildTiles(nil, nil); tiles != (uiDerivedTiles{TokensPerRun: "—", TokensPerWorker: "—", DevLoop: "—", TestLoop: "—", Drift: "—", RoundSpan: "—"}) {
 		t.Errorf("buildTiles(empty) = %+v, want all dashes", tiles)
 	}
 
@@ -656,6 +676,9 @@ func TestBuildTilesDashUntilDenominated(t *testing.T) {
 	}
 	if tiles.Drift != "200" {
 		t.Errorf("tiles drift = %q, want 200", tiles.Drift)
+	}
+	if tiles.RoundSpan != "1m0s" {
+		t.Errorf("tiles round span = %q, want 1m0s (t1's first→last minute; t2's single call has no span)", tiles.RoundSpan)
 	}
 	if tiles.DevLoop != "—" || tiles.TestLoop != "—" {
 		t.Errorf("tiles loops = %q / %q, want dashes (no reviews in the window)", tiles.DevLoop, tiles.TestLoop)
@@ -920,8 +943,8 @@ func TestUIModelsTab(t *testing.T) {
 		if n := strings.Count(out, "Nothing relayed yet."); n != 2 {
 			t.Errorf("the empty tables said so %d times, want both (by model and by worker)", n)
 		}
-		if n := strings.Count(out, `>—</div>`); n != 5 {
-			t.Errorf("the tiles rendered %d dashes, want all five", n)
+		if n := strings.Count(out, `>—</div>`); n != 6 {
+			t.Errorf("the tiles rendered %d dashes, want all six", n)
 		}
 		if strings.Contains(out, `name="in[`) {
 			t.Errorf("the form rendered without ledger-known models:\n%s", out)
@@ -1172,11 +1195,12 @@ func TestLedgerEntriesDropsExternalOtel(t *testing.T) {
 }
 
 // TestFoldUsageSplitsOtelEraRows pins the fold's era split: a relay row
-// and an otel row of the same model stay separate rows — pre-toggle relay
-// history sits beside post-toggle otel data, never summed — the otel row
+// and an otel row of the same model stay separate rows — pre-otel relay
+// history sits beside otel-folded rows, never summed — the otel row
 // stamps Src so the template renders the otel- prefix and its em-dash
 // set, same-key-same-calls ties order relay before otel, and the worker
-// fold drops otel entries whole (they carry no worker to fold under).
+// fold drops an unattributed otel entry whole (nothing to fold it under)
+// while an entry carrying its staged worker lists under that worker.
 func TestFoldUsageSplitsOtelEraRows(t *testing.T) {
 	now := time.Now()
 	entries := []metricsrelay.Entry{
@@ -1208,21 +1232,30 @@ func TestFoldUsageSplitsOtelEraRows(t *testing.T) {
 		t.Errorf("tied rows = %+v, want the relay row before its otel twin", rows)
 	}
 
-	// The worker fold has no otel row to show: otel usage carries no
-	// worker attribution, and pooling it under a nameless key would read
-	// as a literal "otel-" worker.
+	// The worker fold drops the unattributed otel row whole — pooling it
+	// under a nameless key would read as a literal "otel-" worker — while
+	// an otel row carrying its staged worker attribute lists under that
+	// worker like any other row.
 	wrows := foldUsage(entries, now, nil, usageWorkerKey)
 	if len(wrows) != 1 || wrows[0].Key != "w-a" {
 		t.Errorf("worker fold = %+v, want only the relay worker", wrows)
 	}
+	attributed := append(slices.Clone(entries), metricsrelay.Entry{
+		At: now.Add(-30 * time.Second), Source: metricsrelay.SourceOtel, Worker: "w-otel",
+		Task: "t2", Role: "dev", Round: "1", Model: "mC", InputTokens: 50,
+	})
+	wrows = foldUsage(attributed, now, nil, usageWorkerKey)
+	if len(wrows) != 2 || wrows[0].Key != "w-a" || wrows[1].Key != "w-otel" || wrows[1].Src != metricsrelay.SourceOtel {
+		t.Errorf("worker fold = %+v, want the relay worker then the otel row under its own worker", wrows)
+	}
 }
 
-// TestFoldLoopsDriftAndTotalsIgnoreOtel pins the tiles' relay-only faces:
-// an otel batch's stamps are export-batch arrivals, not round-end proxies,
-// so the loop, drift, and relay-totals folds skip otel entries whole — a
-// multi-batch toggle-on round would otherwise read the loop through the
-// export interval and invert the drift tile's sign.
-func TestFoldLoopsDriftAndTotalsIgnoreOtel(t *testing.T) {
+// TestFoldLoopsDriftSpanAndTotalsIgnoreOtel pins the tiles' relay-only
+// faces: an otel batch's stamps are export-batch arrivals, not round-end
+// proxies, so the loop, drift, span, and relay-totals folds skip otel
+// entries whole — a multi-batch otel round would otherwise read the loop
+// through the export interval and invert the drift tile's sign.
+func TestFoldLoopsDriftSpanAndTotalsIgnoreOtel(t *testing.T) {
 	base := time.Now().Truncate(time.Second)
 	at := func(min int) time.Time { return base.Add(time.Duration(min) * time.Minute) }
 	dev := string(activities.RoleDev)
@@ -1249,6 +1282,10 @@ func TestFoldLoopsDriftAndTotalsIgnoreOtel(t *testing.T) {
 	if groups != 1 || avg != 100 {
 		t.Errorf("drift = (%d over %d groups), want the relay group's +100 alone", avg, groups)
 	}
+	span, groups := foldRoundSpan(entries)
+	if groups != 1 || span != 11*time.Minute {
+		t.Errorf("round span = (%v over %d groups), want the relay round's 11m alone (the otel t9 pair would add its 1m export interval)", span, groups)
+	}
 
 	totals := foldRelayTotals(entries, base)
 	if totals.Calls != 3 {
@@ -1256,24 +1293,76 @@ func TestFoldLoopsDriftAndTotalsIgnoreOtel(t *testing.T) {
 	}
 }
 
+// TestFoldRoundSpanAveragesKeyedRounds pins the round-length tile's fold:
+// per keyed (task, round) group — one stage round each, round numbers
+// being per-workflow — the span from the earliest call stamp to the
+// latest, min/max so iteration order never matters, averaged over the
+// groups with an actual span. A single call has no span to measure, an
+// unkeyed call has no round, and an otel batch's stamp is not a round end.
+func TestFoldRoundSpanAveragesKeyedRounds(t *testing.T) {
+	base := time.Now().Truncate(time.Second)
+	at := func(sec int) time.Time { return base.Add(time.Duration(sec) * time.Second) }
+	dev, review := string(activities.RoleDev), string(activities.RoleDevReview)
+
+	// Unsorted on purpose: the fold's min/max must not read the ledger's
+	// order. t1's round spans 0s→40s across two roles (round numbers are
+	// per-workflow, so the review call belongs to the same round); t2's
+	// spans 10s→30s. Average = 30s.
+	entries := []metricsrelay.Entry{
+		{At: at(40), Worker: "w", Task: "t1", Role: review, Round: "1"},
+		{At: at(30), Worker: "w", Task: "t2", Role: dev, Round: "1"},
+		{At: at(0), Worker: "w", Task: "t1", Role: dev, Round: "1"},
+		{At: at(10), Worker: "w", Task: "t2", Role: dev, Round: "1"},
+		// Drops: a single-call round, an unkeyed call, otel noise that
+		// would otherwise stretch t2's span to a minute.
+		{At: at(20), Worker: "w", Task: "t3", Role: dev, Round: "1"},
+		{At: at(20), Worker: "w", Role: dev, Round: "1"},
+		{At: at(60), Source: metricsrelay.SourceOtel, Task: "t2", Role: dev, Round: "1"},
+	}
+	avg, groups := foldRoundSpan(entries)
+	if groups != 2 || avg != 30*time.Second {
+		t.Errorf("foldRoundSpan = (%v over %d groups), want 30s over 2 (t1 40s, t2 20s)", avg, groups)
+	}
+	if avg, groups := foldRoundSpan(nil); avg != 0 || groups != 0 {
+		t.Errorf("foldRoundSpan(empty) = (%v, %d), want zero", avg, groups)
+	}
+}
+
 // TestBuildTilesSplitDenominators pins the headline tiles' source split:
 // TokensPerRun is all-source — both its numerator and its distinct-task
 // denominator count otel rounds once, so the populations agree — while
-// TokensPerWorker reads the relay face on both sides, its denominator
-// (the worker fold) carrying no otel row to divide by.
+// TokensPerWorker reads the relay face on both sides: its numerator sums
+// relay entries and its denominator counts the worker fold's relay rows
+// only, so neither an unattributed otel batch nor an otel row naming its
+// worker (a minute-delta, not a request record) dilutes the per-worker
+// figure.
 func TestBuildTilesSplitDenominators(t *testing.T) {
 	base := time.Now()
 	entries := []metricsrelay.Entry{
 		{At: base, Worker: "w-a", Task: "t1", InputTokens: 60, OutputTokens: 40},
 		{At: base, Source: metricsrelay.SourceOtel, Task: "t2", InputTokens: 300, OutputTokens: 100},
+		{At: base, Source: metricsrelay.SourceOtel, Task: "t3", Worker: "w-otel", InputTokens: 900, OutputTokens: 100},
 	}
 	workers := foldUsage(entries, base, nil, usageWorkerKey)
+	// The attributed otel row folds under its worker — but as an otel row.
+	found := false
+	for _, r := range workers {
+		if r.Key == "w-otel" {
+			found = true
+			if r.Src != metricsrelay.SourceOtel {
+				t.Errorf("the w-otel row = %+v, want the otel era stamped", r)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("worker fold = %+v, want the attributed otel row listed under its worker", workers)
+	}
 	tiles := buildTiles(entries, workers)
-	if tiles.TokensPerRun != "250" {
-		t.Errorf("TokensPerRun = %q, want 250 (500 over both tasks)", tiles.TokensPerRun)
+	if tiles.TokensPerRun != "500" {
+		t.Errorf("TokensPerRun = %q, want 500 (1500 over all three tasks)", tiles.TokensPerRun)
 	}
 	if tiles.TokensPerWorker != "100" {
-		t.Errorf("TokensPerWorker = %q, want 100 (the relay face over its one worker)", tiles.TokensPerWorker)
+		t.Errorf("TokensPerWorker = %q, want 100 (the relay face over its one relay worker)", tiles.TokensPerWorker)
 	}
 }
 

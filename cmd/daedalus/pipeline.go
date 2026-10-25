@@ -148,7 +148,10 @@ func ensureWorkerActive(cfg config.Config, configPath string) error {
 // and --folder — collapse to one grant. A glob
 // task file's directory part is taken literally, never globbed, so one
 // carrying metachars is rejected instead of granting a path that does not
-// exist. (The worker re-validates all of this through
+// exist. The grants returned here are not yet split by location —
+// runstart.Start resolves each against the repo root, turning in-repo
+// grants into write-scope extensions (never mounts) and leaving out-of-repo
+// grants to mount. (The worker re-validates all of this through
 // activities.FolderMounts; this is the submit-time mirror.)
 func resolveFolderGrants(flagFolders []string, taskFile string) ([]string, error) {
 	grants := flagFolders
