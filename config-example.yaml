@@ -826,8 +826,13 @@ dependency:
 # or clear it immediately with "daedalus dash restart".
 metrics:
   # false opts this project's rounds out of the subsystem entirely — no
-  # relay staging, no boot-time daemon requirement. Unset (delete this
-  # line) is on.
+  # relay staging, no OTLP staging, no boot-time daemon requirement.
+  # Unset (delete this line) is on, and one toggle then governs both
+  # capture paths: a claude or codex CLI new enough exports its usage
+  # straight to the daemon's OTLP receiver, every other round rides the
+  # relay. With on the default, a host without the dash daemon must opt
+  # out explicitly here — or every worker start/restart fails its
+  # daemon probe.
   enabled: false
   # The dashboard's port, bound on the LAN (no auth — any LAN peer can
   # read run data and start runs; that is a decided, accepted posture for
@@ -837,16 +842,6 @@ metrics:
   # off-host. Must differ from port (one port cannot host both
   # listeners; equality fails the load). 0 (unset) = 7778.
   relay_port: 7778
-  # Agent-native telemetry staging (the OTLP path): when true, claude
-  # and codex rounds whose CLI is new enough export their usage straight
-  # to the daemon's OTLP receiver instead of riding the relay — claude
-  # rounds stage the OTLP env vars, codex rounds stage -c overrides,
-  # keyed or not (otel attribution rides the staged identifiers, not the
-  # credential). A CLI below the staged version floor falls back to
-  # relay staging only when the round has an attributable key; below
-  # floor and unkeyed, the round stages nothing. The receiver itself is
-  # up whenever the daemon runs; this gates the staging only.
-  # otel: false
   # All metrics persistence — one knob for the whole subsystem.
   # "sqlite" (the default when unset) writes the relay ledger's
   # per-request rows, the model price table, the golens-metrics roll-ups,

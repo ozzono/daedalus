@@ -166,4 +166,45 @@ func TestVerifyWriteScopeActivity(t *testing.T) {
 			t.Errorf("violations = %v, want none without a policy", res.Violations)
 		}
 	})
+
+	// The folder-grant split's contract at the gate it feeds: a diff
+	// confined to a granted in-repo directory sits outside the flow's base
+	// policy (the pre-split shape that parked runs at finalize), and the
+	// policy extended by the grant's repo-relative prefix — the exact list
+	// the submit seam ships in the run input — admits exactly that diff.
+	t.Run("a diff under an in-repo grant passes the extended policy", func(t *testing.T) {
+		repo := gitRepoWithCommit(t, map[string]string{
+			"main.go":        "package main\n",
+			"docs/readme.md": "docs\n",
+		})
+		spec := filepath.Join(repo, "specs", "round.md")
+		if err := os.MkdirAll(filepath.Dir(spec), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(spec, []byte("# round\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		base, err := VerifyWriteScopeActivity(context.Background(), ScopeCheckInput{
+			WorktreePath: repo,
+			Allowed:      []string{"docs/"},
+		})
+		if err != nil {
+			t.Fatalf("VerifyWriteScopeActivity(base): %v", err)
+		}
+		if len(base.Violations) != 1 || !strings.Contains(base.Violations[0], "specs/round.md") {
+			t.Fatalf("base-policy violations = %v, want exactly the granted file flagged", base.Violations)
+		}
+
+		extended, err := VerifyWriteScopeActivity(context.Background(), ScopeCheckInput{
+			WorktreePath: repo,
+			Allowed:      []string{"docs/", "specs/"},
+		})
+		if err != nil {
+			t.Fatalf("VerifyWriteScopeActivity(extended): %v", err)
+		}
+		if len(extended.Violations) != 0 {
+			t.Errorf("extended-policy violations = %v, want none — the grant licenses its own directory", extended.Violations)
+		}
+	})
 }

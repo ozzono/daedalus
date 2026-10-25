@@ -716,7 +716,7 @@ func TestRoundEnvVarsCoversServedAndStagedVars(t *testing.T) {
 		"OPENCODE_CONFIG",               // opencode bridge staging
 		"MAX_THINKING_TOKENS",           // claude thinking pin
 		"CLAUDE_CODE_MAX_OUTPUT_TOKENS", // claude output budget
-		// The toggle-on otel staging's claude exports: staging writes them
+		// The otel staging's claude exports: staging writes them
 		// onto the round env only when it selected the OTLP path, and an
 		// unlisted name is stripped by the jail before the CLI reads it.
 		"CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -3632,6 +3632,63 @@ func TestLoadMetricsSection(t *testing.T) {
 	}
 	if !cfg.MetricsEnabled() || cfg.Metrics.Port != 7801 || cfg.Metrics.RelayPort != 7802 {
 		t.Errorf("Metrics = %+v, want enabled with ports 7801/7802", cfg.Metrics)
+	}
+}
+
+// TestLoadMetricsOtelRemoval pins the section's hand-checked mapping, the
+// custom unmarshaler the removed otel key required: `otel: true` loads as
+// the no-op it became (the agent-native path it switched on is the
+// default), while `otel: false` fails naming the migration — silently
+// ignoring it would revoke an explicit opt-out without a trace — a typo'd
+// section key still fails with the yaml-style not-found error KnownFields
+// strictness can no longer catch through the custom unmarshaler, a null
+// section loads as the absent one, and a non-mapping section is rejected.
+func TestLoadMetricsOtelRemoval(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "metrics:\n  otel: true\n  enabled: true\n"))
+	if err != nil {
+		t.Fatalf("Load(otel: true) = %v, want the on-value accepted as the no-op it became", err)
+	}
+	if !cfg.MetricsEnabled() {
+		t.Error("MetricsEnabled() = false, want the section's enabled through beside the dead key")
+	}
+
+	_, err = Load(writeConfig(t, "metrics:\n  otel: false\n"))
+	if err == nil || !strings.Contains(err.Error(), "metrics.otel was removed") {
+		t.Errorf("Load(otel: false) error = %v, want the migration named", err)
+	}
+
+	_, err = Load(writeConfig(t, "metrics:\n  otel2: true\n"))
+	if err == nil || !strings.Contains(err.Error(), "field otel2 not found in type config.MetricsConfig") {
+		t.Errorf("Load(otel2) error = %v, want the yaml-style not-found rejection", err)
+	}
+
+	cfg, err = Load(writeConfig(t, "metrics:\n"))
+	if err != nil {
+		t.Errorf("Load(null section) = %v, want the absent section", err)
+	} else if cfg.Metrics.Enabled != nil {
+		t.Errorf("null section Enabled = %v, want nil", *cfg.Metrics.Enabled)
+	}
+
+	_, err = Load(writeConfig(t, "metrics: nope\n"))
+	if err == nil || !strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Errorf("Load(scalar section) error = %v, want the shape rejection", err)
+	}
+
+	// The render contract: the rendered section carries no otel line, so
+	// an otel-true config renders into a file that loads again.
+	raw, err := LoadRaw(writeConfig(t, "metrics:\n  otel: true\n  enabled: true\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	if strings.Contains(out, "otel") {
+		t.Errorf("RenderYAML =\n%s\nwant the removed key rendered absent", out)
+	}
+	if _, err := Load(writeConfig(t, out)); err != nil {
+		t.Errorf("the rendered file does not load back: %v\n%s", err, out)
 	}
 }
 

@@ -53,7 +53,9 @@ type AgentRunInput struct {
 	// resolved to absolute paths at submit): each is mounted read-write into
 	// this round's jail under <worktree>/.daedalus-folders/<basename>
 	// (FolderMounts), and a fresh conversation's prompt is told where each
-	// landed. Empty — no grants, or a run whose input predates the field —
+	// landed. In-repo grants were split out at submit (they extend the
+	// flow's write scope instead of mounting), so everything arriving here
+	// is mounted. Empty — no grants, or a run whose input predates the field —
 	// mounts nothing, replay-safe like every other input field. Reviewer
 	// rounds carry no grants by design: grants serve the working agent's
 	// task (bookkeeping), not the review.

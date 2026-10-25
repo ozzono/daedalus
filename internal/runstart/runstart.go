@@ -253,6 +253,14 @@ func Start(cfg config.Config, req Request) (Run, error) {
 			return Run{}, err
 		}
 	}
+	// Split the grants against the repo root before anything else touches
+	// them: an in-repo grant is a scope grant (the worktree already
+	// carries the files), never a mount. A bad grant fails here — nothing
+	// started.
+	mountFolders, allowedPaths, err := scopeFolderGrants(repoPath, req.Folders, spec.AllowedPaths)
+	if err != nil {
+		return Run{}, err
+	}
 
 	c, err := NewClient(cfg)
 	if err != nil {
@@ -325,7 +333,7 @@ func Start(cfg config.Config, req Request) (Run, error) {
 		IssueID:         req.IssueID,
 		Prompt:          req.Prompt,
 		Flow:            req.WorkflowName,
-		AllowedPaths:    spec.AllowedPaths,
+		AllowedPaths:    allowedPaths,
 		FrozenPaths:     spec.FrozenPaths,
 		BranchPrefix:    req.BranchPrefix,
 		Agent:           req.Agent,
@@ -336,7 +344,7 @@ func Start(cfg config.Config, req Request) (Run, error) {
 		CleanupTimeout:  cfg.CleanupTimeout,
 		SharedTestQueue: SharedTestQueue(cfg),
 		TestOutputDir:   cfg.TestOutputDir(),
-		Folders:         req.Folders,
+		Folders:         mountFolders,
 		DependsOn:       req.Depends,
 		Dependency:      cfg.Dependency,
 		ReviewSkillList: cfg.ReviewSkillList,
@@ -346,6 +354,48 @@ func Start(cfg config.Config, req Request) (Run, error) {
 		return Run{}, fmt.Errorf("start workflow: %w", err)
 	}
 	return Run{WorkflowID: run.GetID(), RunID: run.GetRunID()}, nil
+}
+
+// scopeFolderGrants splits a run's folder grants against the repo root, at
+// submit. A grant inside the repo is a scope grant, never a mount: the
+// run's worktree already carries its files at their repo-relative paths,
+// and mounting the host copy under .daedalus-folders would let the agent
+// edit the main repo directly, bypassing the worktree commit model. When
+// the flow has an allowed-path policy, the grant extends it by the grant's
+// repo-relative directory prefix ("specs/"), so finalize's write-scope
+// gate passes exactly the diff the grant licenses. A policy-free flow
+// extends nothing — an empty Allowed set means unrestricted, and seeding
+// it would strand every write outside the grant. A grant outside the repo
+// keeps the mount. A grant equal to the repo root is refused: its scope
+// prefix would match no git path, a mount would expose the host repo (.git
+// included) to the jail, and widening the policy to everything would
+// silently neutralize the flow's scope. Redundant prefixes (a nested or
+// duplicate grant) are left as-is — unlike mounts they cannot shadow
+// anything, they only re-match paths an earlier prefix already allows.
+// allowed must never be mutated in place: it aliases the shared Registry
+// spec, so the extended list is a fresh copy.
+func scopeFolderGrants(repoPath string, folders, allowed []string) (mounts, extended []string, err error) {
+	extended = allowed
+	var prefixes []string
+	for _, folder := range folders {
+		abs, err := filepath.Abs(folder)
+		if err != nil {
+			return nil, nil, fmt.Errorf("folder grant %s: %w", folder, err)
+		}
+		rel, err := filepath.Rel(repoPath, abs)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+			mounts = append(mounts, folder)
+			continue
+		}
+		if rel == "." {
+			return nil, nil, fmt.Errorf("folder grant %s is the repo root — the worktree already carries the repo's files; grant a folder inside it instead", abs)
+		}
+		prefixes = append(prefixes, rel+"/")
+	}
+	if len(prefixes) > 0 && len(allowed) > 0 {
+		extended = append(append(make([]string, 0, len(allowed)+len(prefixes)), allowed...), prefixes...)
+	}
+	return mounts, extended, nil
 }
 
 // workflowNames lists the registered workflow names, comma-separated.

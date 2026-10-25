@@ -135,7 +135,11 @@ type PipelineInput struct {
 	// sandbox under <worktree>/.daedalus-folders/<basename>
 	// (activities.FolderMounts) and named in a fresh conversation's opening
 	// prompt, so brief-mandated bookkeeping outside the repo is executable
-	// by the run itself. A continued run keeps the aborted attempt's grants,
+	// by the run itself. A grant inside the repo never reaches this field:
+	// the submit-time split (runstart.scopeFolderGrants) turns it into an
+	// AllowedPaths extension instead — the worktree already carries its
+	// files, so mounting the host copy would bypass the worktree commit
+	// model. A continued run keeps the aborted attempt's grants,
 	// frozen at start like its write-scope policy; reviewer rounds carry
 	// none by design. Empty — no grants, or a run whose input predates the
 	// field — mounts nothing, replay-safe like every other input field.

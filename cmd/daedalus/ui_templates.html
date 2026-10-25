@@ -665,12 +665,13 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 {{end}}
 
 {{define "frag_models"}}{{/* the Models tab's polled region: the read-only aggregates, re-folded each tick. The price form above stays outside it — a poll may never swap editable inputs out from under the operator. */}}
- <div class="grid sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
+ <div class="grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 mb-4">
   <div class="card p-4"><div class="lbl">Tokens / run</div><div class="text-2xl font-semibold mono">{{.Tiles.TokensPerRun}}</div><div class="text-xs text-slate-500 mt-1">in + out over keyed runs</div></div>
   <div class="card p-4"><div class="lbl">Tokens / worker</div><div class="text-2xl font-semibold mono">{{.Tiles.TokensPerWorker}}</div><div class="text-xs text-slate-500 mt-1">in + out over relayed workers</div></div>
-  <div class="card p-4"><div class="lbl">Dev → review</div><div class="text-2xl font-semibold mono">{{.Tiles.DevLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last dev call → first review</div></div>
-  <div class="card p-4"><div class="lbl">Test → review</div><div class="text-2xl font-semibold mono">{{.Tiles.TestLoop}}</div><div class="text-xs text-slate-500 mt-1">avg last test call → first review</div></div>
+  <div class="card p-4"><div class="lbl">Dev → review</div><div class="text-2xl font-semibold mono">{{.Tiles.DevLoop}}</div><div class="text-xs text-slate-500 mt-1">hand-off: last dev call → first review — not round time</div></div>
+  <div class="card p-4"><div class="lbl">Test → review</div><div class="text-2xl font-semibold mono">{{.Tiles.TestLoop}}</div><div class="text-xs text-slate-500 mt-1">hand-off: last test call → first review — not round time</div></div>
   <div class="card p-4"><div class="lbl">Round drift</div><div class="text-2xl font-semibold mono">{{.Tiles.Drift}}</div><div class="text-xs text-slate-500 mt-1">avg input growth within a round</div></div>
+  <div class="card p-4"><div class="lbl">Round span</div><div class="text-2xl font-semibold mono">{{.Tiles.RoundSpan}}</div><div class="text-xs text-slate-500 mt-1">avg first → last call within a keyed round</div></div>
  </div>
 
  <div class="mb-2 font-medium">Usage by model</div>
@@ -680,7 +681,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
  {{template "usage_table" .WorkerTable}}
 
  <div class="card p-4 text-sm text-slate-500">
-  Coverage: the ledger's daedalus rounds — relay-captured and otel-staged (<span class="mono">otel-</span> rows are export batches, so their per-request columns read —) alike; a round dialing its CLI-default upstream with the toggle off bypasses both. External telemetry renders only on <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>. Loop averages span to the first review only and include non-provider time; the loop, drift, and Tokens/worker tiles read the relay face only — otel batches are minute-deltas, not request records. Per-round rows: <span class="mono">daedalus dash list</span>. Charts: <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>.
+  Coverage: the ledger's daedalus rounds — relay-captured and otel-staged (<span class="mono">otel-</span> rows are export batches, so their per-request columns read —) alike; a claude or codex round below its version floor with no attributable key stages nothing and bypasses both. External telemetry renders only on <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>. Loop averages measure the stage hand-off only; the Round span tile is the round-length figure; the loop, span, drift, and Tokens/worker tiles read the relay face only — otel batches are minute-deltas, not request records. Per-round rows: <span class="mono">daedalus dash list</span>. Charts: <a class="text-emerald-700 dark:text-emerald-400 hover:underline" href="/full-metrics" hx-boost="false">/full-metrics</a>.
  </div>
 {{end}}
 

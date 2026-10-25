@@ -76,6 +76,12 @@ func recordedConfigPath(name string) string {
 // persisted, and their revival is untyped, exactly as their spawn always
 // was.
 func writeConfigRecord(confFile, configPath, workerType string) error {
+	// The daemon dir may not exist yet (first-ever start on a fresh host):
+	// this write is the dir's first touch on the workerStart path, which
+	// reaches it before spawnDaemon's own MkdirAll.
+	if err := os.MkdirAll(filepath.Dir(confFile), 0o755); err != nil {
+		return fmt.Errorf("write config record %s: %w", confFile, err)
+	}
 	record := configPath
 	if workerType != "" {
 		record += "\n" + workerType

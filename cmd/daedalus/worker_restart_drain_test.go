@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -202,6 +205,31 @@ func TestConfigRecordRoundTrip(t *testing.T) {
 		writeRecord(t, "w", "  \n")
 		if path, typ := readConfigRecord("w"); path != "" || typ != "" {
 			t.Errorf("readConfigRecord(blank) = (%q, %q), want empty both", path, typ)
+		}
+	})
+
+	t.Run("a fresh host's absent state dir is created by the write", func(t *testing.T) {
+		// First-ever start on a host without the daemon dir: the record
+		// write is the dir's first touch on the start path (it precedes
+		// spawnDaemon's own MkdirAll), so it must create the dir itself —
+		// the bare WriteFile this mkdir guards failed here with ENOENT.
+		reset := t.TempDir()
+		t.Cleanup(func() { daemonDir = reset })
+		daemonDir = filepath.Join(t.TempDir(), "state", "daedalus")
+		_, _, confFile := daemonPaths("w")
+		if err := writeConfigRecord(confFile, "/cfgs/fresh.yaml", ""); err != nil {
+			t.Fatalf("writeConfigRecord on a fresh host: %v", err)
+		}
+		if path, typ := readConfigRecord("w"); path != "/cfgs/fresh.yaml" || typ != "" {
+			t.Errorf("readConfigRecord(fresh host) = (%q, %q), want (/cfgs/fresh.yaml, %q)", path, typ, "")
+		}
+		// A second write onto the now-existing dir keeps working — the
+		// mkdir is a no-op there, and the record still round-trips typed.
+		if err := writeConfigRecord(confFile, "/cfgs/again.yaml", "dev"); err != nil {
+			t.Fatalf("writeConfigRecord(second): %v", err)
+		}
+		if path, typ := readConfigRecord("w"); path != "/cfgs/again.yaml" || typ != "dev" {
+			t.Errorf("readConfigRecord(second) = (%q, %q), want (/cfgs/again.yaml, dev)", path, typ)
 		}
 	})
 }
@@ -680,6 +708,99 @@ func TestRestartArgv(t *testing.T) {
 			t.Errorf("restartArgv(blank record) = %v, want the running invocation %v", got, want)
 		}
 	})
+}
+
+// TestRestartSelfExecEnv pins the re-exec environment of the drain
+// restart: restartSelf execs the fresh daemon on this process's environ
+// scrubbed of every worker-exported variable (envWithoutWorkerVars, the
+// spawnDaemon shape) with the daemon marker re-appended. The scrub is the
+// whole point: the draining daemon's own environ carries the previous
+// config's re-exports, and a plain passthrough would let any value the
+// fresh config stops exporting — a rotated-out key, a retracted fallback —
+// survive the exec and keep serving rounds from stale memory. The child
+// here runs restartSelf in earnest (the syscall.Exec lands): the exec'd
+// image, carrying the dump marker, reports the environment it was actually
+// handed, before any worker code could read a stale value out of it.
+func TestRestartSelfExecEnv(t *testing.T) {
+	home := t.TempDir() // the child's HOME: locates its daemon record, and doubles as the passthrough proof
+	daemonSub := filepath.Join(home, ".local", "state", "daedalus")
+	if err := os.MkdirAll(daemonSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeQueueConfig(t, "drain")
+	record := filepath.Join(daemonSub, "worker-drain.conf")
+	if err := os.WriteFile(record, []byte(cfgPath), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale exports a draining daemon carries in its own environ — the
+	// previous config's re-exports: a rotated-out provider key (the incident
+	// shape), a retracted fallback, a leftover opencode staging path (the
+	// one variable that must never return ambient), and the worker's
+	// self-exported name. Every one sits on config.AllWorkerEnvVars, so the
+	// whole-set sweep below names each of them.
+	stale := [][2]string{
+		{"ANTHROPIC_API_KEY", "sk-stale-rotated-out"},
+		{"DAEDALUS_FALLBACK_API_KEY", "fb-stale-retracted"},
+		{"OPENCODE_CONFIG", "/leftover/other-project.json"},
+		{"DAEDALUS_WORKER_NAME", "drain"},
+	}
+	dumpNames := append(config.AllWorkerEnvVars(), "HOME", "PATH")
+	env := []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		reexecRestartSelfEnv + "=drain",
+		reexecDumpEnvVarsEnv + "=" + strings.Join(dumpNames, "\x1f"),
+	}
+	for _, kv := range stale {
+		env = append(env, kv[0]+"="+kv[1])
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reexecTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe)
+	cmd.Env = env
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("restart-self child: %v (output %q)", err, out.String())
+	}
+
+	// The child's output is restartSelf's banner followed by the exec'd
+	// image's NAME=value dump. Parse tolerantly, then assert per name.
+	got := map[string]string{}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			got[k] = v
+		}
+	}
+	banner := fmt.Sprintf("drain restart: re-executing %q",
+		strings.Join([]string{"worker", "foreground", "-c", cfgPath}, " "))
+	if !strings.Contains(out.String(), banner) {
+		t.Errorf("child output %q lacks the record-driven re-exec banner %q", out.String(), banner)
+	}
+	for _, name := range config.AllWorkerEnvVars() {
+		if name == daemonEnv {
+			if got[name] != "1" {
+				t.Errorf("re-exec env carries %s=%q, want \"1\" — the fresh daemon must clear its own pid file on exit", name, got[name])
+			}
+			continue
+		}
+		if v := got[name]; v != "" {
+			t.Errorf("re-exec env carries %s=%q — a worker-exported variable must never survive the exec (the fresh config's record is its only source)", name, v)
+		}
+	}
+	if got["HOME"] != home {
+		t.Errorf("re-exec env HOME=%q, want %q — a non-worker variable must pass through with its value", got["HOME"], home)
+	}
+	if got["PATH"] == "" {
+		t.Error("re-exec env lost PATH — the scrub must keep non-worker variables")
+	}
 }
 
 // TestMainWorkerRestartForceDispatch pins the dispatch wiring in-process:

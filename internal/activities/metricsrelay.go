@@ -20,16 +20,17 @@
 // upstreams are the primary's, so staging a round dialed elsewhere would
 // silently misroute it back to the primary) and stage nothing.
 //
-// metricsRoundEnv is the selector above it: with metrics.otel on (the
-// worker exported config.MetricsOtelEndpointEnv) a claude or codex round
-// whose binary probes at or above its version floor stages agent-native
-// OTLP instead — claude the eight OTLP env names (claudeOtelEnv), codex
-// the per-invocation -c overrides (codexOtelArgs) — and skips the relay
-// rewrite: exactly one capture path per round, with the receiver folding
-// those exports back into the same ledger (internal/metricsrelay's
-// otel.go). The endpoint var is deliberately not stripped by the override
-// paths (see its config comment): an otel-staged round dials the daemon
-// directly, so fallback and override rounds keep telemetry coverage.
+// metricsRoundEnv is the selector above it: with metrics enabled (the
+// worker exported config.MetricsOtelEndpointEnv beside the relay roots)
+// a claude or codex round whose binary probes at or above its version
+// floor stages agent-native OTLP instead — claude the eight OTLP env
+// names (claudeOtelEnv), codex the per-invocation -c overrides
+// (codexOtelArgs) — and skips the relay rewrite: exactly one capture
+// path per round, with the receiver folding those exports back into the
+// same ledger (internal/metricsrelay's otel.go). The endpoint var is
+// deliberately not stripped by the override paths (see its config
+// comment): an otel-staged round dials the daemon directly, so fallback
+// and override rounds keep telemetry coverage.
 package activities
 
 import (
@@ -47,15 +48,15 @@ import (
 
 // metricsRoundEnv selects and stages the round's capture path: the
 // agent-native OTLP path when the worker exported the otel endpoint
-// (metrics.otel on), the resolved agent is claude or codex, and the
-// binary probes at or above its version floor — one capture path per
-// round, so the staged round skips the relay rewrite entirely (claude's
-// staging rides the env; codex's comes back as -c overrides for the argv
-// build). Everything else stages the relay exactly as before. The one
-// dark corner is the keyed-only fallback's pinned consequence: toggle on,
+// (metrics on), the resolved agent is claude or codex, and the binary
+// probes at or above its version floor — one capture path per round, so
+// the staged round skips the relay rewrite entirely (claude's staging
+// rides the env; codex's comes back as -c overrides for the argv build).
+// Everything else stages the relay exactly as before. The one dark
+// corner is the keyed-only fallback's pinned consequence: metrics on,
 // an otel agent below its floor, and an unkeyed round (no activity
-// identity — the synthetic attribution's contract) stages nothing and the
-// round is invisible to the ledger, exactly as the design accepted.
+// identity — the synthetic attribution's contract) stages nothing and
+// the round is invisible to the ledger, exactly as the design accepted.
 func metricsRoundEnv(ctx context.Context, env []string, role SessionRole, agent string) ([]string, []string) {
 	endpoint := envLookup(env, config.MetricsOtelEndpointEnv)
 	if endpoint == "" || (agent != "claude" && agent != "codex") {
@@ -63,8 +64,9 @@ func metricsRoundEnv(ctx context.Context, env []string, role SessionRole, agent 
 	}
 	if agentOTelCapable(agent) {
 		if agent == "claude" {
+			worker := envLookup(env, "DAEDALUS_WORKER_NAME")
 			task, roleName, round := metricsAttributionParts(ctx, role)
-			return claudeOtelEnv(env, endpoint, task, roleName, round), nil
+			return claudeOtelEnv(env, endpoint, worker, task, roleName, round), nil
 		}
 		return env, codexOtelArgs(endpoint)
 	}
@@ -74,16 +76,17 @@ func metricsRoundEnv(ctx context.Context, env []string, role SessionRole, agent 
 	return metricsRelayEnv(ctx, env, role), nil
 }
 
-// claudeOtelEnv stages the eight documented env names a toggle-on claude
-// round exports to the receiver: the enable switch, the otlp metrics
-// exporter over http/json pointed at the endpoint, the account-uuid
-// cardinality trim, the explicitly-disabled traces and logs (nothing
-// unexpected dials the endpoint), and the resource attributes the
-// receiver's provenance check reads (D4) — the same parts the synthetic
-// attribution key encodes, staged as literal values (the round env is
-// never shell-expanded, so ${}-forms would export unexpanded).
-// Temporality stays at claude's delta default.
-func claudeOtelEnv(env []string, endpoint, task, role, round string) []string {
+// claudeOtelEnv stages the eight documented env names a metrics-on
+// claude round exports to the receiver: the enable switch, the otlp
+// metrics exporter over http/json pointed at the endpoint, the
+// account-uuid cardinality trim, the explicitly-disabled traces and logs
+// (nothing unexpected dials the endpoint), and the resource attributes
+// the receiver's provenance check reads (D4) — the same parts the
+// synthetic attribution key encodes plus the worker the usage-by-worker
+// fold groups by — staged as literal values (the round env is never
+// shell-expanded, so ${}-forms would export unexpanded). Temporality
+// stays at claude's delta default.
+func claudeOtelEnv(env []string, endpoint, worker, task, role, round string) []string {
 	env = setEnvVar(env, "CLAUDE_CODE_ENABLE_TELEMETRY", "1")
 	env = setEnvVar(env, "OTEL_METRICS_EXPORTER", "otlp")
 	env = setEnvVar(env, "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "http/json")
@@ -92,12 +95,12 @@ func claudeOtelEnv(env []string, endpoint, task, role, round string) []string {
 	env = setEnvVar(env, "OTEL_LOGS_EXPORTER", "none")
 	env = setEnvVar(env, "OTEL_TRACES_EXPORTER", "none")
 	env = setEnvVar(env, "OTEL_RESOURCE_ATTRIBUTES",
-		"service.name=claude-code,daedalus.task="+task+",daedalus.role="+role+",daedalus.round="+round)
+		"service.name=claude-code,daedalus.worker="+worker+",daedalus.task="+task+",daedalus.role="+role+",daedalus.round="+round)
 	return env
 }
 
-// codexOtelArgs are the per-invocation -c overrides staging a toggle-on
-// codex round's OTLP export: the otlp-http metrics exporter (which also
+// codexOtelArgs are the per-invocation -c overrides staging a
+// metrics-on codex round's OTLP export: the otlp-http metrics exporter (which also
 // silences codex's statsig default — its release build otherwise ships
 // metrics to OpenAI), its exporter table's endpoint and protocol
 // sub-keys, and the environment label the receiver's provenance check
