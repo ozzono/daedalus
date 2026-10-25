@@ -47,6 +47,19 @@ const reexecDumpEnvVarsEnv = "DAEDALUS_TEST_DUMP_ENV_VARS"
 // identifies — without it the child would re-run the whole test suite.
 const reexecSweepSleepEnv = "DAEDALUS_TEST_SWEEP_SLEEP"
 
+// reexecRestartSelfEnv makes the test binary call restartSelf with the env
+// value as the worker name — a drain restart's re-exec executed in earnest,
+// syscall.Exec included. The re-entered binary is the fresh daemon the exec
+// produced; tests pair the marker with reexecDumpEnvVarsEnv so that image
+// reports the environment the exec actually handed it. The marker unsets
+// itself before the call, and that unset is the only thing breaking the
+// cycle: restartSelf hands the exec this process's environ scrubbed only of
+// config.AllWorkerEnvVars() members — the marker is not one, so the scrub
+// would carry it straight back in. Unset, it cannot survive the exec; the
+// re-entered binary skips this branch and lands in the dump one below
+// instead of restarting forever.
+const reexecRestartSelfEnv = "DAEDALUS_TEST_RESTART_SELF"
+
 // TestMain is the re-exec guard for the exit-code paths: exitf, fail,
 // usageFail, and loadConfig all call os.Exit(1), so they cannot run inside a
 // test process. Tests route them through runMainIn, which execs this same
@@ -58,6 +71,14 @@ func TestMain(m *testing.M) {
 		for {
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+	if name := os.Getenv(reexecRestartSelfEnv); name != "" {
+		os.Unsetenv(reexecRestartSelfEnv)
+		if err := restartSelf(name); err != nil {
+			fmt.Fprintf(os.Stderr, "restartSelf(%s): %v\n", name, err)
+			os.Exit(1)
+		}
+		os.Exit(0) // unreachable: a successful exec never returns
 	}
 	if os.Getenv(reexecDumpArgsEnv) == "1" {
 		fmt.Println(strings.Join(os.Args[1:], "\x1f"))

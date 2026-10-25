@@ -546,11 +546,16 @@ func runWorker(cfg config.Config, workerType string) error {
 // reached only after every poller has joined. Same pid (exec replaces the
 // image in place), so the pid file stays valid; stdin/stdout/stderr still
 // point at the daemon log, so the new start's banner continues the same
-// file; the environment still carries the daemon marker, so a later real
-// exit still clears the pid file. The defers above (client close, relay
-// and status goroutines) do not run — exec never returns on success — and
-// need not: the drains they guard have completed, and the kernel closes
-// what is left.
+// file. The environment is scrubbed of every worker-exported variable
+// (envWithoutWorkerVars, the spawnDaemon shape) with the daemon marker
+// re-appended: this process's own environ carries the previous config's
+// re-exports, and a plain passthrough would let any value the fresh
+// config stops exporting — a rotated-out key, a retracted fallback —
+// survive the exec and keep serving rounds from stale memory, exactly
+// what the spawn-time scrub exists to prevent. The defers above (client
+// close, relay and status goroutines) do not run — exec never returns on
+// success — and need not: the drains they guard have completed, and the
+// kernel closes what is left.
 func restartSelf(name string) error {
 	self, err := os.Executable()
 	if err != nil {
@@ -558,7 +563,7 @@ func restartSelf(name string) error {
 	}
 	argv := restartArgv(self, name)
 	fmt.Printf("drain restart: re-executing %q\n", strings.Join(argv[1:], " "))
-	return syscall.Exec(self, argv, os.Environ())
+	return syscall.Exec(self, argv, append(envWithoutWorkerVars(os.Environ()), daemonEnv+"=1"))
 }
 
 // restartArgv builds the re-exec argv from the worker's config record —
