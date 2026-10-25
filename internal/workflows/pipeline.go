@@ -201,9 +201,30 @@ const maxConsecutiveTimeouts = 3
 // rounds forever, never converging and never parking.
 const maxVerdictlessReviews = 3
 
-// maxIdenticalVerdicts caps how many review rounds in a row — per review
-// role, so a code-review approval between a test reviewer's repeated
-// REBUILD findings does not reset the count — may return a byte-identical
+// confidentVerdictlessSkip is the repair layer's classification confidence
+// at or above which a verdictless review round counts no strike (the
+// 2026-10-14 maintainer decision): a classification that confident names
+// the verdict the reviewer intended, so the round is a real review with a
+// missed marker — the classified verdict and comments deliver to the dev
+// exactly as a parsed round's would. It matches the repair layer's own
+// promotion threshold (activities.repairPromotionThreshold) in value, not
+// in contract: that one promotes an APPROVED classification, this one only
+// spares the strike budget.
+const confidentVerdictlessSkip = 0.9
+
+// unchangedDiffNote is the re-prompt appended to a review round's comments
+// when the worktree's diff is unchanged since the reviewer's previous
+// round (the swift path carries it under the standing verdict; the
+// unchanged verdictless continue appends it to the marker-less round's
+// output). The re-prompt IS the changes-request: the dev is told that
+// changes are still requested and that nothing it produced has landed.
+const unchangedDiffNote = "\n\n---\nDaedalus note: the worktree has not changed since this reviewer's previous round — nothing produced since has landed. Changes are still requested: the comments above remain the open change requests, and the next round must show them addressed in the diff."
+
+// maxIdenticalVerdicts caps how many review rounds in a row — per
+// reviewer (reviewerKey: role plus skill entry), so a code-review
+// approval between a test reviewer's repeated REBUILD findings does not
+// reset the count, and a skill's standing verdict never answers the
+// default reviewer's round — may return a byte-identical
 // comments body (whitespace-normalized) before the run parks: the timeout
 // and verdictless streaks above do not cover a steady stream of well-formed
 // non-approved verdicts, which is the one remaining unbounded review loop —
@@ -212,8 +233,8 @@ const maxVerdictlessReviews = 3
 // that differ in no way round to round, so identical verdicts in a row mean
 // the loop cannot converge and a maintainer must arbitrate. Only verdicts
 // carrying a real marker count; marker-less rounds have
-// maxVerdictlessReviews, and an approval ends that role's loop (and resets
-// its streak) before it could ever park.
+// maxVerdictlessReviews, and an approval ends that reviewer's loop (and
+// resets its streak) before it could ever park.
 const maxIdenticalVerdicts = 3
 
 // quotaHeartbeatInterval is how long a run sleeps when the agent API is
@@ -371,6 +392,19 @@ const dependencyWakeupChangeID = "dependency-gate-wakeup"
 
 func dependencyWakeupEnabled(ctx workflow.Context) bool {
 	return workflow.GetVersion(ctx, dependencyWakeupChangeID, workflow.DefaultVersion, 1) == 1
+}
+
+// swiftReviewChangeID gates the unchanged-diff swift review's diff probe
+// behind its own version marker, for the same replay reason as the
+// markers above: the probe dispatches a DiffDigestActivity command, and a
+// review round replayed from history recorded before the marker must keep
+// issuing exactly the commands that history holds — a pre-marker replay
+// gets DefaultVersion and never probes, so those rounds run a full
+// reviewer every time; old runs never backfill.
+const swiftReviewChangeID = "swift-review-change-probe"
+
+func swiftReviewProbeEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, swiftReviewChangeID, workflow.DefaultVersion, 1) == 1
 }
 
 // preflightSkipChangeID gates the preflight gate's BaselineValidated skip
@@ -900,6 +934,9 @@ testPhase:
 // out (PipelineInput.SkipPreflight, `run --skip-preflight`): the opted-in
 // run still executes the suite and records the red result, then opens on
 // it deliberately, the flow's own suite gating expected to carry the fix.
+// The test-only flow is exempt by identity, not by flag: a `-w test-only`
+// run exists to repair the suite, so a red baseline is its input and the
+// gate opens on it exactly as the opted-out path does.
 // Uses the same discovery and test-queue execution the test session
 // uses, and returns the resolved
 // suite command for flows that keep executing it (slim re-runs the same
@@ -961,6 +998,18 @@ func (r *pipelineRun) preFlightGate() (string, error) {
 	// still requires a green suite round, so the debt cannot slip through.
 	if r.input.SkipPreflight {
 		r.logger.Info("Preflight suite red; the run's input skips the gate — opening on the unvalidated baseline, the flow's own suite gating covers the fix", "Command", command)
+		return command, nil
+	}
+	// A test-only run is a fix-test round by construction: the red suite
+	// is the work's input, not its precondition. The flow's identity —
+	// recorded on the workflow input like SkipPreflight above, so the
+	// branch is replay-stable by the same construction and carries none of
+	// the flag's riders — opens the gate instead of parking, with the
+	// failure output above in the task log feeding the first round as its
+	// target. The done path is unchanged: finalize still requires a green
+	// suite round, so the debt cannot slip through.
+	if r.input.Flow == "test-only" {
+		r.logger.Info("Preflight suite red; the test-only flow opens on it — repairing the suite is the run's task", "Command", command)
 		return command, nil
 	}
 	r.logger.Info("Preflight suite failed; parking before the first session")

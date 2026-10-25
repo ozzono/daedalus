@@ -38,6 +38,17 @@ func FlowScope(flow string) string {
 	return flow
 }
 
+// reviewerKey identifies the reviewer a standing verdict belongs to: the
+// review role plus the skill entry (empty for the default reviewer).
+// Several reviewers share one SessionRole when review_skill_list is
+// non-empty — the default reviewer and every skill all pass RoleDevReview
+// or RoleTestReview — and a standing verdict must answer only rounds by
+// its own author, never a sibling reviewer's.
+type reviewerKey struct {
+	role  activities.SessionRole
+	skill string
+}
+
 // pipelineRun carries one pipeline run's shared machinery: the activity
 // contexts and their timeouts, the worktree lifecycle, and the
 // round/retry/park helpers every flow's loop body is assembled from. Each
@@ -114,6 +125,11 @@ type pipelineRun struct {
 	// park and approve and must stay off pre-marker replays (see vis).
 	suiteGate bool
 
+	// swiftProbe records whether this execution recorded the swift-review
+	// version marker; the unchanged-diff probe dispatches an activity
+	// command and must stay off pre-marker replays (see vis).
+	swiftProbe bool
+
 	// lastEdit is the completion time of this run's last jailed agent
 	// round — any round may have edited the worktree. lastSuite is the
 	// completion time of the last suite execution. The terminal gate
@@ -140,14 +156,38 @@ type pipelineRun struct {
 	// review carrying a real verdict resets it.
 	verdictlessReviews int
 	// lastVerdictBody and identicalVerdicts track consecutive review
-	// rounds returning a whitespace-identical comments body, per review
-	// role (see maxIdenticalVerdicts). Only real verdicts participate; an
-	// approval from that role resets its streak. Per-role is what keeps
-	// the rebuild cycle covered: a test reviewer repeating an identical
-	// REBUILD finding has a code-review approval between its rounds, and
-	// that other conversation's approval must not erase the churn count.
-	lastVerdictBody   map[activities.SessionRole]string
-	identicalVerdicts map[activities.SessionRole]int
+	// rounds returning a whitespace-identical comments body, per reviewer
+	// (reviewerKey; see maxIdenticalVerdicts). Only real verdicts
+	// participate; an approval from that reviewer resets its streak.
+	// Per-reviewer keeps the rebuild cycle covered — a test reviewer
+	// repeating an identical REBUILD finding has a code-review approval
+	// between its rounds, and that other conversation's approval must not
+	// erase the churn count — and keeps a skill's standing verdict from
+	// ever answering the default reviewer's round (several reviewers
+	// share one SessionRole).
+	lastVerdictBody   map[reviewerKey]string
+	identicalVerdicts map[reviewerKey]int
+
+	// lastReviewDigest is each role's most recent review-round diff digest
+	// (ReviewResult.DiffDigest), the "changed since the previous review
+	// round" baseline the strike reforms compare against — keyed by role
+	// alone on purpose: the unchanged-tree rationale is
+	// reviewer-independent. lastVerdictDigest is narrower — the digest of
+	// the round that produced the standing lastVerdictBody, keyed by
+	// reviewer like the body: a round whose diff equals the one the
+	// standing verdict was rendered on takes the swift path — the verdict
+	// carries forward, no provider call. Digests are workflow-local state
+	// like the bodies above: replay re-derives them from recorded results.
+	lastReviewDigest  map[activities.SessionRole]string
+	lastVerdictDigest map[reviewerKey]string
+
+	// lastVerdictRebuild records whether the reviewer's standing verdict
+	// body (lastVerdictBody) was a REBUILD: the swift path must carry the
+	// kind, not just the body — a carried changes-requested routes to the
+	// fix round, a carried REBUILD must route back to the implementation
+	// cycle. Workflow-local like the maps above: replay re-derives it
+	// from recorded results.
+	lastVerdictRebuild map[reviewerKey]bool
 
 	devSession, testSession             string
 	devReviewSession, testReviewSession string
@@ -269,21 +309,24 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func(), 
 		branchScope = flowScope + "-"
 	}
 	r := &pipelineRun{
-		input:             input,
-		logger:            logger,
-		ctx:               ctx,
-		agentCtx:          agentCtx,
-		reviewCtx:         reviewCtx,
-		cleanupCtx:        cleanupCtx,
-		testTimeout:       testTimeout,
-		agentRunTimeout:   agentTimeout,
-		discoverCtx:       discoverCtx,
-		testExecCtx:       testExecCtx,
-		lastVerdictBody:   map[activities.SessionRole]string{},
-		identicalVerdicts: map[activities.SessionRole]int{},
-		guideCh:           workflow.GetSignalChannel(ctx, "guide"),
-		wakeupCh:          workflow.GetSignalChannel(ctx, "wakeup"),
-		branchName:        fmt.Sprintf("feat/%sissue-%s-%d", branchScope, input.IssueID, workflow.Now(ctx).Unix()),
+		input:              input,
+		logger:             logger,
+		ctx:                ctx,
+		agentCtx:           agentCtx,
+		reviewCtx:          reviewCtx,
+		cleanupCtx:         cleanupCtx,
+		testTimeout:        testTimeout,
+		agentRunTimeout:    agentTimeout,
+		discoverCtx:        discoverCtx,
+		testExecCtx:        testExecCtx,
+		lastVerdictBody:    map[reviewerKey]string{},
+		identicalVerdicts:  map[reviewerKey]int{},
+		lastReviewDigest:   map[activities.SessionRole]string{},
+		lastVerdictDigest:  map[reviewerKey]string{},
+		lastVerdictRebuild: map[reviewerKey]bool{},
+		guideCh:            workflow.GetSignalChannel(ctx, "guide"),
+		wakeupCh:           workflow.GetSignalChannel(ctx, "wakeup"),
+		branchName:         fmt.Sprintf("feat/%sissue-%s-%d", branchScope, input.IssueID, workflow.Now(ctx).Unix()),
 		// One reviewer conversation per skill review, per phase.
 		skillDevReviewSessions:  make([]string, len(input.ReviewSkillList)),
 		skillTestReviewSessions: make([]string, len(input.ReviewSkillList)),
@@ -306,6 +349,7 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func(), 
 	r.vis = visibilityEnabled(ctx)
 	r.starvedStatus = starvedStatusEnabled(ctx)
 	r.suiteGate = suiteFreshnessEnabled(ctx)
+	r.swiftProbe = swiftReviewProbeEnabled(ctx)
 	if input.DependsOn != "" {
 		if err := r.awaitDependency(); err != nil {
 			return nil, nil, err
@@ -670,6 +714,10 @@ type reviewOpts struct {
 // ReviewInput.ClaimReview); only the hand-off confirmation passes true.
 func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 	focus, role, session := opts.focus, opts.role, opts.session
+	// The standing verdict is keyed by reviewer, not role alone: a skill
+	// entry and the default reviewer share the role, and only the verdict's
+	// own author may carry or repeat it.
+	key := reviewerKey{role: opts.role, skill: opts.skill}
 	// Same lost-session fallback as the agent rounds: one fresh retry.
 	freshFallback := false
 	// Same api-error latch as the agent rounds (runAgent): once an
@@ -678,6 +726,41 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 	// records no session id back, so *opts.session still names the dead
 	// conversation.
 	freshRetry := false
+	// The unchanged-diff swift review (probe once per round: no agent runs
+	// between this loop's retries, so the diff cannot change mid-round).
+	// When this reviewer's previous round ended changes-requested and the
+	// worktree's collected diff is byte-identical since, a full reviewer
+	// round can only repeat the standing verdict — the standing trio is
+	// keyed by reviewer (reviewerKey), so a verdict never answers a
+	// sibling reviewer's round — the review step takes the cheap path
+	// instead of the provider round: the previous verdict carries forward
+	// with the unchanged-state re-prompt, and the identical-verdict cap
+	// counts the carried repeat (it is the not-acting park this loop
+	// terminates on; unchanged diffs never feed the verdictless strike
+	// budget at all).
+	if r.swiftProbe && !opts.claimReview && r.lastVerdictBody[key] != "" {
+		var digest string
+		if err := workflow.ExecuteActivity(r.reviewCtx, activities.DiffDigestActivity,
+			r.worktree.WorktreePath).Get(r.ctx, &digest); err != nil {
+			return activities.ReviewResult{}, fmt.Errorf("review change probe (focus %q): %w", focus, err)
+		}
+		if digest != "" && digest == r.lastVerdictDigest[key] {
+			body := r.lastVerdictBody[key]
+			r.identicalVerdicts[key]++
+			r.logger.Info("Swift review: worktree unchanged since this reviewer's standing verdict; carrying it forward",
+				"Focus", focus, "Role", role, "Skill", key.skill, "CarriedRepeats", r.identicalVerdicts[key], "Of", maxIdenticalVerdicts)
+			result := activities.ReviewResult{
+				Comments:  body + unchangedDiffNote,
+				Rebuild:   r.lastVerdictRebuild[key],
+				SessionID: *session,
+			}
+			if r.identicalVerdicts[key] >= maxIdenticalVerdicts {
+				return result, r.park(fmt.Sprintf("%d consecutive identical review verdicts (focus %q, role %s) — the implementing agent is not acting on the review comments, so the review loop cannot converge; a maintainer must arbitrate",
+					r.identicalVerdicts[key], focus, role))
+			}
+			return result, nil
+		}
+	}
 	for {
 		var result activities.ReviewResult
 		err := workflow.ExecuteActivity(r.reviewCtx, activities.RunJailedReviewerActivity, activities.ReviewInput{
@@ -715,6 +798,15 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 			r.reviewTimeouts = 0
 			r.quotaHeartbeats = 0
 			r.touch()
+			// The previous round's digest is read before this round's
+			// overwrites it: the verdictless strike accounting below
+			// compares the current round's digest against the previous
+			// round's, never against itself. lastReviewDigest stays the
+			// "changed since the previous review round" baseline; the
+			// verdict-round digest is narrowed in where the standing body
+			// is stored.
+			prevDigest := r.lastReviewDigest[role]
+			r.lastReviewDigest[role] = result.DiffDigest
 			if !r.freshReviews {
 				*session = result.SessionID
 			}
@@ -728,10 +820,33 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 			if result.Approved {
 				// The role's loop ends on approval — progress by definition.
 				r.verdictlessReviews = 0
-				r.lastVerdictBody[role], r.identicalVerdicts[role] = "", 0
+				r.lastVerdictBody[key], r.identicalVerdicts[key] = "", 0
 				return result, nil
 			}
 			if result.NoVerdict {
+				// Strike reform (2026-10-14 maintainer decisions): a
+				// verdictless round counts a strike only when it is the
+				// reviewer infrastructure failing — a confident
+				// classification of the marker-less output is a real
+				// review with a missed marker, and an unchanged diff means
+				// nothing the reviewer could newly rule on. Neither counts;
+				// the round continues as changes-requested either way, the
+				// classified verdict (verdictNote, at the fix round) or
+				// the unchanged-state re-prompt riding the comments to the
+				// dev.
+				confident := result.LikelyConfidence >= confidentVerdictlessSkip
+				unchanged := prevDigest != "" && result.DiffDigest == prevDigest
+				if confident || unchanged {
+					if confident {
+						r.logger.Info("Verdictless round skipped the strike budget: the repair layer classified it confidently",
+							"Focus", focus, "LikelyVerdict", result.LikelyVerdict, "Confidence", result.LikelyConfidence)
+					} else {
+						r.logger.Info("Verdictless round skipped the strike budget: the worktree is unchanged since the previous review round",
+							"Focus", focus)
+						result.Comments += unchangedDiffNote
+					}
+					return result, nil
+				}
 				r.verdictlessReviews++
 				// The reviewer's last non-empty line is what a fold and a
 				// formatting miss share as their only trace here; without
@@ -758,15 +873,17 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 			// implementer did not move that review an inch
 			// (maxIdenticalVerdicts); any different verdict restarts the
 			// count.
-			if body := normalizedVerdictBody(result.Comments); body == r.lastVerdictBody[role] {
-				r.identicalVerdicts[role]++
+			if body := normalizedVerdictBody(result.Comments); body == r.lastVerdictBody[key] {
+				r.identicalVerdicts[key]++
 			} else {
-				r.lastVerdictBody[role] = body
-				r.identicalVerdicts[role] = 1
+				r.lastVerdictBody[key] = body
+				r.lastVerdictDigest[key] = result.DiffDigest
+				r.lastVerdictRebuild[key] = result.Rebuild
+				r.identicalVerdicts[key] = 1
 			}
-			if r.identicalVerdicts[role] >= maxIdenticalVerdicts {
+			if r.identicalVerdicts[key] >= maxIdenticalVerdicts {
 				return result, r.park(fmt.Sprintf("%d consecutive identical review verdicts (focus %q, role %s) — the implementing agent is not acting on the review comments, so the review loop cannot converge; a maintainer must arbitrate",
-					r.identicalVerdicts[role], focus, role))
+					r.identicalVerdicts[key], focus, role))
 			}
 			return result, nil
 		}

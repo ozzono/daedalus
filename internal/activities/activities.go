@@ -8,6 +8,8 @@ package activities
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -243,6 +245,15 @@ type ReviewResult struct {
 	LikelyVerdict string
 	// See LikelyVerdict.
 	LikelyConfidence float64
+	// DiffDigest is the sha256 of the review diff this round collected,
+	// gathered exactly as stagedDiff gathers it (intent-to-add staging,
+	// `git diff HEAD`, index restored) so the workflow can compare one
+	// review round's diff against another's. It feeds the unchanged-diff
+	// swift-review path and the strike reforms (an unchanged worktree
+	// counts no verdictless strike): identical digests mean the reviewer
+	// would be re-reading byte-identical input. Empty on rounds that
+	// predate the field.
+	DiffDigest string
 	// SessionID identifies the reviewer conversation the round ran in, so
 	// the next round of the same review role can resume it (see
 	// ReviewInput.SessionID). Empty when the agent reports none.
@@ -459,6 +470,14 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 			}, nil
 		}
 	}
+	// The round's diff digest, collected before the reviewer runs so it
+	// names the diff under judgment (the verdict's provenance). Rides the
+	// result for the workflow's unchanged-diff swift path and strike
+	// reforms.
+	digest, err := diffDigest(ctx, input.WorktreePath)
+	if err != nil {
+		return ReviewResult{}, err
+	}
 	prompt, err := func() (string, error) {
 		// The configured out-of-scope-bug filing folder, exported at worker
 		// startup iff bug_filing is enabled; empty drops the file-filing
@@ -597,6 +616,7 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	verdict.SessionID = session
 	verdict.Usage = usage
 	verdict.Thinking = thinking
+	verdict.DiffDigest = digest
 	return verdict, nil
 }
 
@@ -886,6 +906,36 @@ func stagedDiff(ctx context.Context, worktreePath string) (string, *template.Dif
 	}
 	_ = os.Remove(filepath.Join(worktreePath, reviewDiffDir))
 	return out, nil, nil
+}
+
+// diffDigest collects the worktree's review diff — the same git sequence
+// stagedDiff runs (intent-to-add staging, `git diff HEAD`, index restored)
+// so the two cannot disagree about what a round's diff is — and returns
+// its sha256 hex. It is the substrate of the workflow's unchanged-diff
+// swift-review path and strike reforms: cheap to run (a git diff, no
+// provider), comparable across rounds, and blind to nothing the reviewer
+// would see.
+func diffDigest(ctx context.Context, worktreePath string) (string, error) {
+	if _, err := runGit(ctx, "-C", worktreePath, "add", "-N", "-A"); err != nil {
+		return "", fmt.Errorf("stage intent-to-add: %w", err)
+	}
+	out, err := gitDiffAgainstHead(ctx, worktreePath)
+	if err != nil {
+		return "", fmt.Errorf("collect diff: %w", err)
+	}
+	if _, err := runGit(ctx, "-C", worktreePath, "reset", "-q"); err != nil {
+		return "", fmt.Errorf("restore index: %w", err)
+	}
+	sum := sha256.Sum256([]byte(out))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// DiffDigestActivity runs diffDigest for the workflow's review step: the
+// cheap change probe that decides, before any reviewer round is paid for,
+// whether the worktree changed since the role's previous review round. It
+// runs no agent and reads nothing but git.
+func DiffDigestActivity(ctx context.Context, worktreePath string) (string, error) {
+	return diffDigest(ctx, worktreePath)
 }
 
 // gitDiffAgainstHead runs `git diff HEAD` (plus any format flags) — the

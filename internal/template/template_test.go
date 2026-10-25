@@ -76,6 +76,7 @@ func TestImplement(t *testing.T) {
 		"If the task as stated cannot be completed — contradictory requirements, something missing from the worktree or outside your reach — say exactly what is impossible and why in your reply, then do the best sound partial work you can. Never silently loop over an impossible goal; your reply is what lets the reviewer halt the run for maintainer input instead of requesting changes forever. Partial delivery is never silent either: name in your reply every change request of the task you skipped — the reviewer reads that reply, and a skip it declares is weighed while one it does not is work you silently dropped. The task text decides what is delivered; the laziness rules below only decide how.\n\n" +
 		"You run sandboxed and git writes are forbidden to every agent: never stage, commit, branch, or restore. Edit files and leave the changes in the working tree — the pipeline commits your work for you once it is approved. Stay scoped: touch only what the task requires, and ignore anything already differing in the worktree that the task did not ask for — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated noise. They are not yours; leave them untouched.\n\n" +
 		"The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.\n\n" +
+		"Verification: if the project builds Go — a go.mod at its root — finish every round with the compile check `go build -o /dev/null ./...` passing; a round whose code does not compile is not done. Building is this phase's whole verification obligation: the test suite is the tester phase's concern, not yours.\n\n" +
 		"Work style — the laziest solution that actually works:\n\n" +
 		"- Question whether each piece needs to exist (YAGNI). Skip speculative generality, flags, and future-proofing.\n" +
 		"- Reuse what already exists in this codebase; prefer the standard library over new dependencies — never add one for what a few lines of stdlib can do.\n" +
@@ -98,6 +99,7 @@ func TestImplementFix(t *testing.T) {
 		"Address the review comments. Do not write, modify, or delete test code; leave every existing test file untouched and pay it no attention.\n\n" +
 		"Git writes are forbidden in this sandbox: never stage, commit, branch, or restore — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: address only the comments about this task's changes; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail, environment files — is unrelated, leave it untouched and ignore it. A comment you cannot satisfy by editing files in this worktree is one to explain in your reply, not to force.\n\n" +
 		"The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.\n\n" +
+		"Verification: if the project builds Go — a go.mod at its root — finish every round with the compile check `go build -o /dev/null ./...` passing; a round whose code does not compile is not done. Building is this phase's whole verification obligation: the test suite is the tester phase's concern, not yours.\n\n" +
 		"Keep it lazy and minimal: shortest working diff, reuse existing helpers, no new abstractions or dependencies unless the comments require them — and never simplify away validation, error handling, or edge cases."
 	if got != want {
 		t.Errorf("ImplementFix = %q, want %q", got, want)
@@ -251,6 +253,7 @@ func TestReview(t *testing.T) {
 	}
 	want := phaseRulesMarker + "\n\n" +
 		"You are a maximally rigorous reviewer. Review the implementation in this repository and let nothing pass.\n\n" +
+		"Verdict contract — your output protocol, before anything else in this prompt. Your response ENDS with exactly one bare verdict word as the final line: APPROVED, CHANGES_REQUESTED, or NEEDS_MAINTAINER (REBUILD exists in test reviews only, below). The verdict word is the ending — no closing note, no summary, nothing after it. Counter-examples, both observed failure shapes: a verdict wrapped in a markdown heading — `### **CHANGES_REQUESTED**:` — is not a verdict line, whatever the word; a `**Note**` (or any other) closing paragraph appended after the verdict line un-ends the response the same way. The correct shape has every review comment above the final line and the bare word — no markdown, no bold, no punctuation, nothing else on that line — as the very last thing you emit.\n\n" +
 		"The full diff of the change under review:\n\nM foo.go\n\n" +
 		"\nCompleteness contract — before judging how the change is built, enumerate what it must deliver: the change requests the task text in the focus above names, each one checked against the diff and the reply. Every change request is delivered by the diff or explicitly declared skipped in the reply; one that is neither is CHANGES_REQUESTED, naming it — absence leaves no diff lines, so silence is never delivery. A declared skip naming a genuine blocker (contradictory requirements, something outside this worktree's reach) is NEEDS_MAINTAINER, exactly as the verdict contract below provides. The laziness rules decide how the work is done, never whether it is.\n\n" +
 		"Review with zero tolerance: read every changed line plus the surrounding code it touches, and verify every claim against the actual code — never trust comments, names, or the author's intent. " +
@@ -263,7 +266,7 @@ func TestReview(t *testing.T) {
 		"Everything here — your review included — runs inside the same sandbox, and git writes are forbidden to every agent: never request a git operation (stage, commit, branch, restore) or a change to anything beyond the implementing agent's reach. Your scope is the diff above and the code it touches, nothing else: changes outside it — sandbox or tooling artifacts such as .ai-jail, environment files, unrelated worktree noise — are not part of this work; ignore them and never flag them, no matter how wrong they look. Every finding must be fixable by editing files in this worktree alone; anything that is not, is not a finding — unless it makes the task itself impossible to complete as stated, which is the one case where you halt instead (see NEEDS_MAINTAINER below).\n\n" +
 		"Tests are out of scope for this review. The test suite is written and reviewed in a separate phase after this one: missing, absent, or thin tests are not findings — do not request changes over test coverage. Judge only the implementation. (You may still build and run the existing suite to verify the change is sound.)\n\n" +
 		"Bug policy — zero tolerance: every bug you find, in the diff or anywhere you looked, is either a finding or recorded in the project's own bug records if it keeps any, with out-of-scope bugs named in your comments — never silently dropped. Every record carries two duties: verified — repro, probe output, or exact lines proving the bug, never \"this might be wrong\" — and deduplicated — the existing records searched first and a matching file extended instead of a duplicate opened; a record without evidence or one duplicating an existing file is itself a finding, and a bug an existing verified record already carries is dropped without re-filing. If it is in scope for this review, make it a finding and request changes — in scope is a finding, never a record: the changes-requested loop is the mechanical in-run path, and filing is for external decisioning. If it is out of scope, do not block approval over it and never widen the diff for it — record it only when it needs a decision outside the flow, otherwise name it in your comments, and move on. A record whose bug blocks the task's primary target is never an approvable paper trail — that is a NEEDS_MAINTAINER blocker: state above the verdict line exactly what the maintainer must decide, provide, or relax. If the project keeps its own bug-record convention (its tracker, folder, or docs), that convention governs where records go — resolve it from the project's own surface; a configured records folder is only the carrier for projects that keep none.\n\n" +
-		"End your response with a final line that is exactly one bare verdict word — no markdown, no bold, no punctuation, nothing else on the line: APPROVED if it is acceptable as-is, " +
+		"End with the verdict contract at the top of this prompt: the final line is exactly one bare verdict word — APPROVED if it is acceptable as-is, " +
 		"CHANGES_REQUESTED if changes are required, " +
 		"or NEEDS_MAINTAINER if the task as stated cannot be completed by editing files in this worktree alone — " +
 		"contradictory or impossible requirements, a missing dependency or resource outside the worktree, " +
@@ -345,8 +348,8 @@ func TestReviewWithAgentReply(t *testing.T) {
 	if strings.Contains(phase1, "The test agent's latest reply") {
 		t.Error("code review must not carry the agent-relay section")
 	}
-	if strings.Contains(phase1, "REBUILD") {
-		t.Error("code review must not offer the REBUILD verdict")
+	if strings.Contains(phase1, "A fourth verdict exists in this phase only") {
+		t.Error("code review must not offer the REBUILD verdict (the contract paragraph may name it as test-reviews-only)")
 	}
 }
 
@@ -546,8 +549,8 @@ func TestReviewRepro(t *testing.T) {
 			t.Errorf("ReviewRepro = %q, want it to contain %q", got, want)
 		}
 	}
-	if strings.Contains(got, "REBUILD") {
-		t.Error("ReviewRepro must not offer the REBUILD verdict")
+	if strings.Contains(got, "A fourth verdict exists in this phase only") {
+		t.Error("ReviewRepro must not offer the REBUILD verdict (the contract paragraph may name it as test-reviews-only)")
 	}
 	if strings.Contains(got, "Tests are out of scope") {
 		t.Error("ReviewRepro must not declare tests out of scope")
@@ -680,8 +683,8 @@ func TestSlimReview(t *testing.T) {
 			t.Errorf("SlimReview = %q, want it to contain %q", got, want)
 		}
 	}
-	if strings.Contains(got, "REBUILD") {
-		t.Error("SlimReview must not offer the REBUILD verdict (the slim loop runs the suite itself)")
+	if strings.Contains(got, "A fourth verdict exists in this phase only") {
+		t.Error("SlimReview must not offer the REBUILD verdict (the slim loop runs the suite itself; the contract paragraph may name it as test-reviews-only)")
 	}
 	// The agentReply param relays the implementing agent's latest reply into
 	// the slim framing, the same section the standard Review renders.
@@ -1025,7 +1028,7 @@ func TestReviewSkillSection(t *testing.T) {
 	if a, b := strings.Index(got, "This round is also a skill review"), strings.Index(got, instructions); a < 0 || b < 0 || a > b {
 		t.Errorf("Review = %q, want the fixed preamble above the skill instructions", got)
 	}
-	if a, b := strings.Index(got, instructions), strings.Index(got, "End your response with a final line"); a < 0 || b < 0 || a > b {
+	if a, b := strings.Index(got, instructions), strings.Index(got, "End with the verdict contract at the top of this prompt"); a < 0 || b < 0 || a > b {
 		t.Errorf("Review = %q, want the skill instructions above the final verdict line", got)
 	}
 

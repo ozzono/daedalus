@@ -316,10 +316,10 @@ exit 0`)
 			t.Error("Approved = false, want true")
 		}
 		calls := readCalls(t, log)
-		if len(calls) != 4 {
-			t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+		if len(calls) != 7 {
+			t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 		}
-		prompt := calls[3].Stdin
+		prompt := calls[6].Stdin
 		for _, want := range []string{
 			"This round is also a skill review",
 			"Keep every comment under three lines.",
@@ -351,11 +351,11 @@ exit 0`)
 			t.Fatalf("RunJailedReviewerActivity: %v", err)
 		}
 		calls := readCalls(t, log)
-		if len(calls) != 4 {
-			t.Fatalf("%d subprocess calls, want 4 (git add, git diff HEAD, git reset, ai-jail)", len(calls))
+		if len(calls) != 7 {
+			t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 		}
-		if !strings.Contains(calls[3].Stdin, "check the error paths by hand") {
-			t.Errorf("reviewer prompt should carry the hand-written text verbatim: %q", calls[3].Stdin)
+		if !strings.Contains(calls[6].Stdin, "check the error paths by hand") {
+			t.Errorf("reviewer prompt should carry the hand-written text verbatim: %q", calls[6].Stdin)
 		}
 	})
 
@@ -374,11 +374,13 @@ exit 0`)
 		if err == nil || !strings.Contains(err.Error(), "no SKILL.md found") {
 			t.Fatalf("RunJailedReviewerActivity = %v, want the not-found rejection", err)
 		}
-		// The jail never ran: the round failed at resolution, not after a
-		// review the configured discipline never gave.
+		// The jail never ran: the round failed at skill resolution — after
+		// the two git collections (the prompt diff's and the digest's, six
+		// calls) but before any reviewer run the configured discipline
+		// never gave.
 		calls := readCalls(t, log)
-		if len(calls) != 3 {
-			t.Errorf("%d subprocess calls, want 3 (git add, git diff HEAD, git reset — no reviewer run)", len(calls))
+		if len(calls) != 6 {
+			t.Errorf("%d subprocess calls, want 6 (the prompt diff's and the digest's add/diff HEAD/reset — skill resolution fails before any reviewer run)", len(calls))
 		}
 	})
 }

@@ -370,6 +370,38 @@ it finishes, and reports the outcome (also works after a run has ended).
 `daedalus list` shows the most recent sessions on this task queue —
 session id, status, and last interaction time.
 
+### Systemd supervision of the worker
+
+A worker that dies mid-run (crash, OOM, reboot) stalls every run it was
+carrying: Temporal retries the lapsed round, but a retry needs a live
+worker polling the queue. `deploy/daedalus-worker.service` ships a systemd
+unit that owns the worker's crashes and boots: `Restart=on-failure`
+revives it with backoff, the start rate limit caps a crash loop (a broken
+config surfaces in `journalctl -u daedalus-worker` and the worker log),
+and `WantedBy=multi-user.target` brings it back at boot so queued runs
+resume. Copy the unit to `/etc/systemd/system/`, edit the `ExecStart`
+binary/config paths and the `User`/`Group` for the host, then
+`systemctl daemon-reload && systemctl enable --now daedalus-worker`.
+
+The lifecycle contract keeps one owner per job. Systemd owns crashes and
+boots. The CLI keeps stop and restart: `worker stop` drains gracefully and
+exits 0, which `Restart=on-failure` leaves alone; `worker restart`
+SIGHUP-drains and re-execs in place, invisible to systemd. The unit sets
+`DAEDALUS_WORKER_DAEMON=1`, so the supervised worker writes and clears its
+own pid file and every pid-file gate (`worker start`'s double-start
+refusal, `worker stop`/`restart`/`status`/`report`) treats it exactly like
+a spawned daemon. What stays unsupervised-mode only: `worker start` while
+the unit is active (it would double-start — the pid-file refusal catches
+the live one) and `worker restart --force` (its replacement spawns outside
+the unit); use systemctl for those on a supervised host. An auto-revived
+worker boots from the unit's `ExecStart`, not through `worker start`: no
+config record is written (the unit is the boot definition) and a drain
+restart re-execs the service's own command line; a supervised boot also
+opens no worker log — output lives in journald (`journalctl -u
+daedalus-worker`). At boot the worker registers the pipeline's search
+attributes itself (no `make custom-columns` step needed on a fresh
+namespace).
+
 ### Steering and resuming
 
 - **Steer a running pipeline**: `daedalus guide <workflow-id> "<message>"`

@@ -28,6 +28,7 @@ import (
 
 	"github.com/ozzono/daedalus/internal/activities"
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/shrink"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
 
@@ -221,6 +222,9 @@ func Validate(cfg config.Config, req Request) error {
 	if err := IssueIDGate(req.IssueID); err != nil {
 		return err
 	}
+	if err := WindowGate(cfg, req.Prompt); err != nil {
+		return err
+	}
 	effectiveAgent := req.Agent
 	if effectiveAgent == "" {
 		effectiveAgent = cfg.Agent
@@ -232,6 +236,51 @@ func Validate(cfg config.Config, req Request) error {
 		return fmt.Errorf("unknown workflow %q (available: %s)", req.WorkflowName, workflowNames())
 	}
 	return nil
+}
+
+// windowReserveTokens is the request-shaping reserve every jailed round's
+// completion budget is computed against: pi sizes each request's max_tokens
+// as the staged context window minus its prompt estimate minus this reserve
+// (pi-ai simple-options.js clampMaxTokensToContext), floored at 1 — the
+// arithmetic the submit gate mirrors.
+const windowReserveTokens = 4096
+
+// WindowGate refuses a submission whose staged context window cannot back
+// the task input plus the reserve: `staged context_tokens − prompt size −
+// 4096` against the staged max_output_tokens (or, with no output cap
+// staged, against the floor — a budget at or below zero is pi's silent
+// 1-token-reply wedge). The round-start windowPreflight fails later — after
+// the run started, the worktree branched, and possibly rounds burned — so
+// the sizing error is named here, at submit, with every number in the
+// arithmetic before anything exists to clean up. The sizing pair is the
+// provider section's wire-agnostic resolution (ProviderChannels: provider
+// context_tokens/max_output_tokens beat the legacy sections'); the prompt
+// is measured with shrink.Estimate, the biased-high estimator class pi's
+// own prompt sizing uses, so the gate cannot under-count. No staged window
+// stays fail-open, like the round-start clamp: unstaged means the serving
+// endpoint's own window stands and nothing here can arithmetic against.
+func WindowGate(cfg config.Config, prompt string) error {
+	anth, _ := cfg.ProviderChannels()
+	window, maxOutput := anth.ContextTokens, anth.MaxOutputTokens
+	if window == 0 {
+		return nil
+	}
+	size := shrink.Estimate(prompt)
+	budget := window - size - windowReserveTokens
+	if maxOutput > 0 && budget >= maxOutput {
+		return nil
+	}
+	if maxOutput <= 0 && budget > 0 {
+		return nil
+	}
+	ceiling := "the minimum usable output (one token)"
+	outputClause := ""
+	if maxOutput > 0 {
+		ceiling = fmt.Sprintf("the staged max_output_tokens (%d)", maxOutput)
+		outputClause = " + max_output_tokens"
+	}
+	return fmt.Errorf("staged context_tokens (%d) is too small for this task input: prompt ≈ %d tokens plus the %d-token request reserve leaves a %d-token output budget, below %s — raise provider.context_tokens (or the serving section's) above prompt + reserve%s, or shrink the task input",
+		window, size, windowReserveTokens, budget, ceiling, outputClause)
 }
 
 // Start validates and dispatches one run: the submit gates (Validate), the

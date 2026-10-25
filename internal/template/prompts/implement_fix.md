@@ -10,4 +10,6 @@ Git writes are forbidden in this sandbox: never stage, commit, branch, or restor
 
 The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.
 
+Verification: if the project builds Go — a go.mod at its root — finish every round with the compile check `go build -o /dev/null ./...` passing; a round whose code does not compile is not done. Building is this phase's whole verification obligation: the test suite is the tester phase's concern, not yours.
+
 Keep it lazy and minimal: shortest working diff, reuse existing helpers, no new abstractions or dependencies unless the comments require them — and never simplify away validation, error handling, or edge cases.

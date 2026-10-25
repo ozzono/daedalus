@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -426,11 +427,46 @@ func runWorker(cfg config.Config, workerType string) error {
 		return fmt.Errorf("worktree preflight: %w", err)
 	}
 
+	// A supervisor-run worker (the systemd unit sets the daemon marker) owns
+	// its pid file itself: the marker's exit cleanup (the dispatch's
+	// removeOwnPidFile) then works as in the spawned-daemon case, and the
+	// CLI's pid-file gates see the supervised worker exactly as a spawned
+	// one — `worker start` refuses a double start, `worker stop`/`restart`
+	// address it, `worker status` lists it. A plain manual `worker
+	// foreground` (no marker) stays pid-file-invisible, as it has always
+	// been. The marker also arms the SIGHUP drain restart, so `worker
+	// restart` on a supervised worker re-execs in place — invisible to
+	// systemd, which only ever sees its ExecStart process exit. The
+	// lifecycle contract: the unit owns crashes and boots
+	// (Restart=on-failure); the CLI owns stop and restart through the same
+	// signals it has always used; a clean SIGTERM drain exits 0 and
+	// Restart=on-failure leaves a clean exit alone.
+	if os.Getenv(daemonEnv) == "1" {
+		pidFile, _, _ := daemonPaths(cfg.WorkerName())
+		if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", daemonDir, err)
+		}
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			return fmt.Errorf("write pid file %s: %w", pidFile, err)
+		}
+		defer removeOwnPidFile(pidFile)
+	}
+
 	c, err := newClient(cfg)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
+
+	// The worker registers its own search attributes before any poller
+	// comes up: the runs it is about to serve upsert them, and an
+	// unregistered attribute fails every workflow task with
+	// BadSearchAttributes forever. Idempotent operator call — a second
+	// boot (or a sibling worker's) is a quiet no-op; a registered-with-
+	// another-type conflict fails the boot.
+	if err := workflows.RegisterSearchAttributes(context.Background(), c); err != nil {
+		return fmt.Errorf("search attribute registration: %w", err)
+	}
 
 	// Each poller gets the same graceful-drain window so a SIGTERM (worker
 	// stop or restart) waits for in-flight activities to report their
@@ -457,6 +493,7 @@ func runWorker(cfg config.Config, workerType string) error {
 		w.RegisterActivity(activities.CreateWorktreeActivity)
 		w.RegisterActivity(activities.RunJailedClaudeActivity)
 		w.RegisterActivity(activities.RunJailedReviewerActivity)
+		w.RegisterActivity(activities.DiffDigestActivity)
 		w.RegisterActivity(activities.RunNativeTestsActivity)
 		w.RegisterActivity(activities.ResolveTestCommandActivity)
 		w.RegisterActivity(activities.FinalizeWorktreeActivity)

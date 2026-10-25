@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,12 +34,37 @@ func registerPipelineActivities(env *testsuite.TestWorkflowEnvironment) {
 	env.RegisterActivity(activities.CreateWorktreeActivity)
 	env.RegisterActivity(activities.RunJailedClaudeActivity)
 	env.RegisterActivity(activities.RunJailedReviewerActivity)
+	env.RegisterActivity(activities.DiffDigestActivity)
 	env.RegisterActivity(activities.ResolveTestCommandActivity)
 	env.RegisterActivity(activities.RunTestSuiteActivity)
 	env.RegisterActivity(activities.ReproFirstGateActivity)
 	env.RegisterActivity(activities.VerifyWriteScopeActivity)
 	env.RegisterActivity(activities.FinalizeWorktreeActivity)
 	env.RegisterActivity(activities.CleanupWorktreeActivity)
+	// The dependency activities ride under their pinned string names (the
+	// worker's registration shape) — the environment refuses an OnActivity
+	// by name for an unregistered activity, and refuses any registration
+	// once a mock exists, so the names belong here. The stand-ins error
+	// without touching a client: a dispatch no test mocks (the terminal
+	// poke of any non-dependency run) fails best-effort exactly as an
+	// unregistered activity always has — the workflow Warns and the
+	// dependents release on the fallback poll — where the real instances
+	// would dereference their nil worker client instead.
+	env.RegisterActivityWithOptions(stubCheckDependency,
+		activity.RegisterOptions{Name: activities.CheckDependencyActivityName})
+	env.RegisterActivityWithOptions(stubNotifyDependents,
+		activity.RegisterOptions{Name: activities.NotifyDependentsActivityName})
+}
+
+// stubCheckDependency and stubNotifyDependents are the name placeholders
+// described at registerPipelineActivities; the dependency tests mock both
+// by name and never reach them.
+func stubCheckDependency(_ context.Context, _ string) (activities.DependencyProbe, error) {
+	return activities.DependencyProbe{}, errors.New("check dependency is not stubbed in this test")
+}
+
+func stubNotifyDependents(_ context.Context, _ string) (int, error) {
+	return 0, errors.New("notify dependents is not stubbed in this test")
 }
 
 // newTestEnv builds an in-process workflow environment with the pipeline's
@@ -55,6 +81,12 @@ func newTestEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	env.RegisterWorkflow(DevOnlyWorkflow)
 	env.RegisterWorkflow(SlimWorkflow)
 	registerPipelineActivities(env)
+	// The swift review probes DiffDigestActivity once per review round
+	// once a standing verdict exists; the inert default (digest "", which
+	// the workflow's `digest != ""` guard never carries) keeps the probe a
+	// paid dispatch that changes nothing unless a test scripts the
+	// recorder probeRecorderFor hands out.
+	probeRecorderFor(env)
 	return env
 }
 
@@ -68,6 +100,8 @@ func newCompleteGreenEnv(t *testing.T) (*testsuite.TestWorkflowEnvironment, stri
 	s := &testsuite.WorkflowTestSuite{}
 	env := s.NewTestWorkflowEnvironment()
 	registerPipelineActivities(env)
+	// The same inert swift-probe default newTestEnv ships (see it there).
+	probeRecorderFor(env)
 	name := WorkflowTypeName(FeatureDevWorkflow)
 	env.RegisterWorkflowWithOptions(CompleteGreen(FeatureDevWorkflow), workflow.RegisterOptions{Name: name})
 	return env, name
@@ -252,6 +286,20 @@ func (r *reviewerRecorder) record() {
 		})
 }
 
+// devReviewCount is the number of recorded rounds on the code-review role.
+// The recorder sees every reviewer — the phase-2 test review, claim
+// reviews, the flow-specific ones — and a code-review-loop round count
+// answers only its own role through this filter.
+func (r *reviewerRecorder) devReviewCount() int {
+	n := 0
+	for _, ri := range r.inputs {
+		if ri.Role == activities.RoleDevReview {
+			n++
+		}
+	}
+	return n
+}
+
 func baseInput() PipelineInput {
 	return PipelineInput{
 		RepoPath:  "/repo",
@@ -259,6 +307,66 @@ func baseInput() PipelineInput {
 		IssueID:   "42",
 		Prompt:    "implement the feature",
 	}
+}
+
+// digestStep is one scripted diff-probe outcome.
+type digestStep struct {
+	digest string
+	err    error
+}
+
+// digestRecorder captures every DiffDigestActivity call — the swift
+// review's cheap change probe — and plays its script in order before
+// falling back to its default digest. The environment's mock answers
+// expectations in registration order, so there is exactly one recorder per
+// environment — probeRecorderFor hands it to tests, whose field writes
+// shape the probes (the mock's closure reads the fields at dispatch).
+type digestRecorder struct {
+	env *testsuite.TestWorkflowEnvironment
+	// probes holds one entry per probe dispatch — the worktree path asked.
+	probes []string
+	script []digestStep
+	// digest is the default outcome once script (if any) is exhausted. The
+	// zero value "" is inert on purpose: the workflow's `digest != ""`
+	// guard never carries an empty probe, so a fresh recorder changes
+	// nothing.
+	digest  string
+	stubErr error
+}
+
+// probeRecorders maps each test environment to the one swift-probe
+// recorder it ships. Entries live as long as the process — fine for test
+// environments, which never outgrow the run.
+var probeRecorders sync.Map
+
+// probeRecorderFor returns the environment's probe recorder, installing
+// the inert default (a Maybe mock — never required by AssertExpectations)
+// on first use. newTestEnv calls it so even non-scripting tests survive
+// the probe's dispatch, and scripting tests call it again to reach the
+// same recorder.
+func probeRecorderFor(env *testsuite.TestWorkflowEnvironment) *digestRecorder {
+	if v, ok := probeRecorders.Load(env); ok {
+		return v.(*digestRecorder)
+	}
+	r := &digestRecorder{env: env}
+	probeRecorders.Store(env, r)
+	r.env.OnActivity(activities.DiffDigestActivity, mock.Anything, mock.Anything).Maybe().
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if p, ok := a.(string); ok {
+					r.probes = append(r.probes, p)
+				}
+			}
+		}).
+		Return(func(_ context.Context, _ string) (string, error) {
+			if len(r.script) > 0 {
+				step := r.script[0]
+				r.script = r.script[1:]
+				return step.digest, step.err
+			}
+			return r.digest, r.stubErr
+		})
+	return r
 }
 
 func TestFeatureDevWorkflowHappyPath(t *testing.T) {
@@ -3155,6 +3263,333 @@ func TestFeatureDevWorkflowIdenticalVerdictsCappedPerRole(t *testing.T) {
 	}
 	if len(rev.inputs) != 6 {
 		t.Errorf("reviewer ran %d times, want 6 (three code rounds, three test rounds)", len(rev.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowSwiftReviewCarriesVerdictOnUnchangedDiff pins the
+// unchanged-diff swift review: once a reviewer holds a changes-requested
+// verdict and the worktree's collected diff is byte-identical since, the
+// next review round takes the cheap path — the standing verdict carries
+// forward with the unchanged-state re-prompt instead of a provider round —
+// and the identical-verdict cap counts the carried repeats, parking at
+// three. The reviewer must run exactly once: a full round on a byte-
+// identical diff can only repeat what it already ruled on.
+func TestFeatureDevWorkflowSwiftReviewCarriesVerdictOnUnchangedDiff(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "fix the dropped error path", DiffDigest: "d1"},
+	}}
+	rev.record()
+	// probeRecorderFor hands the environment's one recorder out; the field
+	// write lands before execution and the mock's closure reads it at each
+	// dispatch — every probe answers the unchanged digest "d1".
+	probe := probeRecorderFor(env)
+	probe.digest = "d1"
+
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	// If the cap regressed off the carried repeats, the loop would never
+	// park — bound the test so the regression fails fast instead of
+	// hanging until the go-test timeout.
+	env.SetTestTimeout(30 * time.Second)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want workflow error from three identical (one real, two carried) review verdicts")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"consecutive identical review verdicts",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if len(rev.inputs) != 1 {
+		t.Errorf("reviewer ran %d times, want 1 (every later round is a carried verdict on an unchanged diff)", len(rev.inputs))
+	}
+	if len(probe.probes) != 2 {
+		t.Errorf("change probe ran %d times, want 2 (rounds two and three)", len(probe.probes))
+	}
+	// The first fix round follows the round-one REAL verdict — the standing
+	// comments alone, no re-prompt (the note rides only carried verdicts).
+	// The two carried verdicts each drove a later fix round, and those
+	// prompts carry the standing comments with the unchanged-state
+	// re-prompt — the re-prompt IS the changes-request the carried verdict
+	// no longer restates.
+	if got := rec.inputs[1].Prompt; !strings.Contains(got, "fix the dropped error path") {
+		t.Errorf("first fix prompt = %q, want the standing comments", got)
+	} else if strings.Contains(got, unchangedDiffNote) {
+		t.Errorf("first fix prompt = %q, want no unchanged-diff re-prompt (it follows the real round-one verdict)", got)
+	}
+	for i, fix := range rec.inputs[2:] {
+		if !strings.Contains(fix.Prompt, "fix the dropped error path") {
+			t.Errorf("fix prompt %d = %q, want the standing comments", i, fix.Prompt)
+		}
+		if !strings.Contains(fix.Prompt, unchangedDiffNote) {
+			t.Errorf("fix prompt %d = %q, want the unchanged-diff re-prompt appended", i, fix.Prompt)
+		}
+	}
+	if len(rec.inputs) != 3 {
+		t.Errorf("agent ran %d times, want 3 (implement plus two fix rounds; none after the park)", len(rec.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowSwiftReviewRunsFullRoundWhenDiffChanged pins the
+// probe's exit: a changed diff never carries — the round pays the full
+// reviewer, whose fresh verdict supersedes the standing one, and the run
+// completes when it approves.
+func TestFeatureDevWorkflowSwiftReviewRunsFullRoundWhenDiffChanged(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "fix the dropped error path", DiffDigest: "d1"},
+		{Approved: true},
+		{Approved: true},
+	}}
+	rev.record()
+	// The scripted digests ride the environment's one recorder, consumed
+	// one per probe dispatch.
+	probe := probeRecorderFor(env)
+	probe.script = []digestStep{
+		{digest: "d1"}, // round two: unchanged — carry.
+		{digest: "d2"}, // round three: the fix landed — a full round.
+	}
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	// Two dev-review rounds — the first and the post-fix full round; the
+	// middle round carried. The recorder also sees phase 2's test review,
+	// which the count answers only through the role filter.
+	if got := rev.devReviewCount(); got != 2 {
+		t.Errorf("dev review ran %d times, want 2 (the first round and the post-fix full round; the middle round carried)", got)
+	}
+	if len(rec.inputs) != 4 {
+		t.Errorf("agent ran %d times, want 4 (implement, the carried round's fix, the full round's fix, tests)", len(rec.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowConfidentVerdictlessSkipsStrike pins the confident
+// half of the verdictless strike reform: a marker-less round the repair
+// layer classified at or above the skip threshold is a real review with a
+// missed marker, not failing infrastructure — it counts no strike, so
+// three (and more) in a row never park. The classified comments still
+// drive every fix round, carrying the repair layer's verdict note; the
+// unchanged-diff re-prompt must stay off them (a confident round does not
+// claim the tree is unchanged).
+func TestFeatureDevWorkflowConfidentVerdictlessSkipsStrike(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	verdictless := activities.ReviewResult{
+		Approved: false, NoVerdict: true,
+		LikelyVerdict: "CHANGES_REQUESTED", LikelyConfidence: 0.9,
+		Comments: "the request folded at the provider timeout",
+	}
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		verdictless,
+		verdictless,
+		verdictless,
+		{Approved: true},
+	}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	// If the skip regressed, three strikes would park at round three —
+	// bound the test so the regression fails fast instead of hanging.
+	env.SetTestTimeout(30 * time.Second)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	// Four dev-review rounds; the recorder also sees phase 2's test review,
+	// which the count answers only through the role filter.
+	if got := rev.devReviewCount(); got != 4 {
+		t.Errorf("dev review ran %d times, want 4 (three confidently-classified rounds plus the approval — no strike park at three)", got)
+	}
+	if len(rec.inputs) != 5 {
+		t.Errorf("agent ran %d times, want 5 (implement, three fix rounds, tests)", len(rec.inputs))
+	}
+	for _, fix := range rec.inputs[1:4] {
+		if !strings.Contains(fix.Prompt, "the request folded at the provider timeout") {
+			t.Errorf("fix prompt %q should carry the classified round's comments", fix.Prompt)
+		}
+		if !strings.Contains(fix.Prompt, "classified it as most likely CHANGES_REQUESTED") {
+			t.Errorf("fix prompt %q should carry the repair layer's verdict note", fix.Prompt)
+		}
+		if strings.Contains(fix.Prompt, unchangedDiffNote) {
+			t.Errorf("fix prompt %q carries the unchanged-diff re-prompt — a confident classification makes no unchanged claim", fix.Prompt)
+		}
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowUnchangedDiffVerdictlessSkipsStrike pins the
+// unchanged half of the verdictless strike reform: a marker-less round
+// whose diff digest equals the previous review round's saw nothing new —
+// it counts no strike and its comments ride the unchanged-state re-prompt
+// to the dev. The first verdictless round still counts (there is no
+// previous digest to compare against), so the run survives exactly the
+// three-round budget the unformed counter would have spent — and the old
+// behavior would have parked at round three.
+func TestFeatureDevWorkflowUnchangedDiffVerdictlessSkipsStrike(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	verdictless := activities.ReviewResult{
+		Approved: false, NoVerdict: true,
+		Comments: "connection reset by peer", DiffDigest: "v1",
+	}
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		verdictless,
+		verdictless,
+		verdictless,
+		{Approved: true},
+	}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.SetTestTimeout(30 * time.Second)
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	// Four dev-review rounds; the recorder also sees phase 2's test review,
+	// which the count answers only through the role filter.
+	if got := rev.devReviewCount(); got != 4 {
+		t.Errorf("dev review ran %d times, want 4 (three unchanged-diff rounds plus the approval — no strike park at three)", got)
+	}
+	if len(rec.inputs) != 5 {
+		t.Errorf("agent ran %d times, want 5 (implement, three fix rounds, tests)", len(rec.inputs))
+	}
+	// The first verdictless round had no previous digest to match, so it
+	// counted its strike and its fix prompt is bare; the unchanged rounds
+	// carry the re-prompt.
+	if strings.Contains(rec.inputs[1].Prompt, unchangedDiffNote) {
+		t.Errorf("first fix prompt %q carries the unchanged-diff re-prompt — the first verdictless round had no previous digest", rec.inputs[1].Prompt)
+	}
+	for _, fix := range rec.inputs[2:4] {
+		if !strings.Contains(fix.Prompt, "connection reset by peer") || !strings.Contains(fix.Prompt, unchangedDiffNote) {
+			t.Errorf("fix prompt %q should carry the unchanged round's comments with the re-prompt", fix.Prompt)
+		}
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowIdenticalVerdictsCappedPerReviewer pins the
+// standing-verdict bookkeeping's reviewer keying: two skill entries and
+// the default reviewer all review on one SessionRole, and a repeated
+// comments body counts per reviewer — the second entry's first round on
+// the same body must start its own streak, never land as strike three of
+// the first entry's. With the streaks shared by role, this exact script
+// parks the run mid-phase-1.
+func TestFeatureDevWorkflowIdenticalVerdictsCappedPerReviewer(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+	sameFinding := activities.ReviewResult{Approved: false, Comments: "fix A"}
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: true}, // default code review
+		sameFinding,      // /style's code review — streak 1
+		sameFinding,      // /style again, byte-identical — streak 2
+		{Approved: true}, // /style approves, clearing its streak
+		sameFinding,      // the hand-written entry on the same body — its own streak 1
+		{Approved: true}, // the hand-written entry approves
+		{Approved: true}, // default test review
+		{Approved: true}, // /style's suite review
+		{Approved: true}, // the hand-written entry's suite review
+	}}
+	rev.record()
+
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	in := baseInput()
+	in.ReviewSkillList = []string{"/style", "audit the error handling in prose"}
+	env.ExecuteWorkflow(FeatureDevWorkflow, in)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	var branch string
+	if err := env.GetWorkflowResult(&branch); err != nil {
+		t.Fatalf("workflow result: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("workflow result = %q, want the preserved branch name", branch)
+	}
+	if len(rev.inputs) != 9 {
+		t.Errorf("reviewer ran %d times, want 9 (code + 2×2 skill code rounds + test + 2 skill test rounds)", len(rev.inputs))
+	}
+	if len(rec.inputs) != 5 {
+		t.Errorf("agent ran %d times, want 5 (implement, one fix per changes-requested round, tests)", len(rec.inputs))
 	}
 	env.AssertExpectations(t)
 }

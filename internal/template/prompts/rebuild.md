@@ -10,4 +10,6 @@ Beyond the inventory this is a tight-scope rebuild: the change was already code-
 
 Git writes are forbidden in this sandbox: never stage, commit, branch, or restore — edit files and leave the changes in the working tree; the pipeline commits approved work. Stay scoped: address only the finding above; anything else already differing in the worktree — sandbox or tooling artifacts such as .ai-jail, environment files — is unrelated, leave it untouched and ignore it.
 
+Verification: if the project builds Go — a go.mod at its root — finish the round with the compile check `go build -o /dev/null ./...` passing; the test suite is the test phase's concern, not yours.
+
 Keep it lazy and minimal: shortest working diff, reuse existing helpers, no new abstractions or dependencies unless the finding requires them — and never simplify away validation, error handling, or edge cases.

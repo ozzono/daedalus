@@ -12,6 +12,8 @@ If the task as stated cannot be completed — contradictory requirements, someth
 
 The diff is the deliverable — heredoc rewrites and edits leave no temp, backup, or paste-buffer files in the worktree. Never write session logs, changelogs, or progress commentary as comments in source files.
 
+Verification: if the project builds Go — a go.mod at its root — finish every round with the compile check `go build -o /dev/null ./...` passing; a round whose code does not compile is not done. Building is this phase's whole verification obligation: the test suite is the tester phase's concern, not yours.
+
 Work style — the laziest solution that actually works:
 
 - Question whether each piece needs to exist (YAGNI). Skip speculative generality, flags, and future-proofing.
