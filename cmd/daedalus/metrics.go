@@ -177,12 +177,23 @@ func metricsStart(cfg config.Config, configPath string) error {
 }
 
 // metricsStop terminates the daemon — the worker stop shape (SIGTERM, 30s
-// poll, pid file cleared). Record-driven: no config involved.
+// poll, pid file cleared). Record-driven: no config involved. On a
+// pid-file miss the orphan sweep below runs first: a live `dash foreground`
+// daemon with no record is absorbed with the same grace, so stop brings
+// the daemon down and restart reaches a free port instead of dying on the
+// orphan's held listeners.
 func metricsStop() error {
 	pidFile, logFile, _ := metricsPaths()
 	pid, ok := readLivePid(pidFile)
 	if !ok {
 		os.Remove(pidFile)
+		absorbed, err := absorbOrphanDash()
+		if err != nil {
+			return err
+		}
+		if absorbed > 0 {
+			return nil
+		}
 		fmt.Println("metrics daemon not running")
 		return nil
 	}
@@ -206,6 +217,95 @@ func metricsStop() error {
 	removePidFileFor(pidFile, pid)
 	fmt.Printf("metrics daemon stopped (pid %d)\n", pid)
 	return nil
+}
+
+// absorbOrphanDash reaps pid-file-less `dash foreground` daemons —
+// sweepStaleWorkers' shape retargeted at the dash, the orphan class the
+// pid-file lifecycle is blind to: a replaced binary's daemon keeps serving
+// with no record, invisible to stop and status, while a fresh start dies
+// on its held ports. It runs only behind the caller's live-pid-file miss,
+// so a candidate the pid file still names is managed and never reaches
+// here. Identification is deliberately precise — the invoking binary's
+// basename AND a consecutive "dash foreground" argv (the daemon's re-exec
+// shape, metricsStart's spawnDaemon args), own pid skipped — so a `worker
+// foreground` process or any non-daedalus process is never touched. Each
+// match gets the sweep's semantics: SIGTERM, one workerStopGrace drain
+// watched through pidAlive, survivors named loudly and left alive —
+// nothing here auto-SIGKILLs. Returns the count absorbed; an error names a
+// survivor and leaves the daemon up. Best-effort: a candidate whose /proc
+// entries cannot be read is skipped.
+func absorbOrphanDash() (int, error) {
+	self := os.Getpid()
+	ownExe, err := os.Executable()
+	if err != nil {
+		return 0, nil
+	}
+	ownName := filepath.Base(strings.TrimSuffix(ownExe, deletedExeSuffix))
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, nil
+	}
+	var orphans []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		if err != nil || filepath.Base(strings.TrimSuffix(exe, deletedExeSuffix)) != ownName {
+			continue
+		}
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(bytes.TrimRight(data, "\x00")), "\x00")
+		if !isDashForegroundArgv(args) {
+			continue
+		}
+		orphans = append(orphans, pid)
+	}
+	_, logFile, _ := metricsPaths()
+	absorbed := 0
+	var survivors []int
+	for _, pid := range orphans {
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+			continue
+		}
+		deadline := time.Now().Add(workerStopGrace)
+		for time.Now().Before(deadline) && pidAlive(pid) {
+			time.Sleep(200 * time.Millisecond)
+		}
+		if pidAlive(pid) {
+			fmt.Printf("metrics daemon orphan pid %d ignored SIGTERM — still alive after %s; kill it by hand\n", pid, workerStopGrace)
+			survivors = append(survivors, pid)
+			continue
+		}
+		absorbed++
+		fmt.Printf("metrics daemon orphan absorbed (pid %d) — was running with no pid file\n", pid)
+	}
+	if len(survivors) > 0 {
+		names := make([]string, len(survivors))
+		for i, pid := range survivors {
+			names[i] = strconv.Itoa(pid)
+		}
+		return absorbed, fmt.Errorf("orphaned metrics daemon pid(s) %s still alive after %s — it may need SIGKILL; log: %s",
+			strings.Join(names, ", "), workerStopGrace, logFile)
+	}
+	return absorbed, nil
+}
+
+// isDashForegroundArgv reports whether args is a `dash foreground` command
+// line — the metrics daemon's re-exec shape (metricsStart's spawnDaemon
+// args). Consecutive tokens, so flag position does not matter — and a
+// `worker foreground` line never matches.
+func isDashForegroundArgv(args []string) bool {
+	for i, a := range args {
+		if a == "dash" && i+1 < len(args) && args[i+1] == "foreground" {
+			return true
+		}
+	}
+	return false
 }
 
 // metricsRestart cycles the daemon with the invoking command's config —
