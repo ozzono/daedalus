@@ -920,6 +920,10 @@ func TestMetricsStartReexecArgv(t *testing.T) {
 	if !reflect.DeepEqual(argv, want) {
 		t.Errorf("daemon argv = %v, want %v", argv, want)
 	}
+	// The spawn released the child; with the argv pinned, gather its exit
+	// — a still-exiting child carries the daemon's exe and argv into the
+	// next test, where the orphan sweep cannot tell it from a real daemon.
+	reapSpawnedDaemon(t, pidFile)
 }
 
 // TestMainMetricsDispatch pins the dispatch-level contracts through the
@@ -998,6 +1002,11 @@ func TestMainMetricsDispatch(t *testing.T) {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err != nil || pid <= 0 {
 			t.Errorf("pid file = %q, want a positive pid", data)
 		}
+		// The spawn released the child; gather its exit like every spawn
+		// site — a still-running child carries the daemon's exe and argv,
+		// the exact shape the orphan sweep absorbs, so leaving it behind
+		// makes any later stop in the suite (or -shuffle) reap the phantom.
+		reapSpawnedDaemon(t, pidFile)
 	})
 
 	t.Run("grammar failures exit 1 with their diagnostics", func(t *testing.T) {
