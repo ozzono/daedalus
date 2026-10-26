@@ -83,6 +83,13 @@ type Request struct {
 	RepoPath     string
 	IssueID      string
 	Prompt       string
+	// TaskFile carries the -f/--file brief path a CLI run started from; the
+	// form has no brief input and leaves it empty. The prompt already
+	// embeds the brief's text, so nothing re-reads the file here — the
+	// field exists because resolveFolderGrants auto-grants the brief's
+	// folder, and a brief sitting in the repo root is a repo-root grant
+	// the operator never typed: the submit-time refusal names it as such.
+	TaskFile     string
 	BranchPrefix string
 	Agent        string
 	Folders      []string
@@ -306,7 +313,7 @@ func Start(cfg config.Config, req Request) (Run, error) {
 	// them: an in-repo grant is a scope grant (the worktree already
 	// carries the files), never a mount. A bad grant fails here — nothing
 	// started.
-	mountFolders, allowedPaths, err := scopeFolderGrants(repoPath, req.Folders, spec.AllowedPaths)
+	mountFolders, allowedPaths, err := scopeFolderGrants(repoPath, req.TaskFile, req.Folders, spec.AllowedPaths)
 	if err != nil {
 		return Run{}, err
 	}
@@ -418,13 +425,27 @@ func Start(cfg config.Config, req Request) (Run, error) {
 // keeps the mount. A grant equal to the repo root is refused: its scope
 // prefix would match no git path, a mount would expose the host repo (.git
 // included) to the jail, and widening the policy to everything would
-// silently neutralize the flow's scope. Redundant prefixes (a nested or
-// duplicate grant) are left as-is — unlike mounts they cannot shadow
-// anything, they only re-match paths an earlier prefix already allows.
-// allowed must never be mutated in place: it aliases the shared Registry
-// spec, so the extended list is a fresh copy.
-func scopeFolderGrants(repoPath string, folders, allowed []string) (mounts, extended []string, err error) {
+// silently neutralize the flow's scope. taskFile is the -f brief whose
+// folder the CLI auto-grants (resolveFolderGrants): when the refused root
+// grant is that brief's folder — a grant the operator never typed — the
+// error names the brief and the placements that work (the brief outside
+// the repo, its folder then mounting like any other grant; or into a
+// subfolder, the folder then extending the run's write scope), while an
+// explicit --folder root grant keeps the plain refusal. Redundant prefixes
+// (a nested or duplicate grant) are left as-is — unlike mounts they cannot
+// shadow anything, they only re-match paths an earlier prefix already
+// allows. allowed must never be mutated in place: it aliases the shared
+// Registry spec, so the extended list is a fresh copy.
+func scopeFolderGrants(repoPath, taskFile string, folders, allowed []string) (mounts, extended []string, err error) {
 	extended = allowed
+	briefAtRoot := false
+	if taskFile != "" {
+		if dir, err := filepath.Abs(filepath.Dir(taskFile)); err == nil {
+			if rel, err := filepath.Rel(repoPath, dir); err == nil {
+				briefAtRoot = rel == "."
+			}
+		}
+	}
 	var prefixes []string
 	for _, folder := range folders {
 		abs, err := filepath.Abs(folder)
@@ -437,6 +458,9 @@ func scopeFolderGrants(repoPath string, folders, allowed []string) (mounts, exte
 			continue
 		}
 		if rel == "." {
+			if briefAtRoot {
+				return nil, nil, fmt.Errorf("-f %s: its folder %s is the repo root — the worktree already carries the repo's files; move the brief outside the repo (its folder mounts like any other grant) or into a subfolder of it (the folder extends the run's write scope)", taskFile, abs)
+			}
 			return nil, nil, fmt.Errorf("folder grant %s is the repo root — the worktree already carries the repo's files; grant a folder inside it instead", abs)
 		}
 		prefixes = append(prefixes, rel+"/")

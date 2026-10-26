@@ -314,7 +314,7 @@ func main() {
 					exitf("%v", err)
 				}
 			}
-			err = startPipelineFolders(cfg, configPath.configPath, workflowName, args[1], args[2], prompt, configPath.detach,
+			err = startPipelineFolders(cfg, configPath.configPath, workflowName, args[1], args[2], prompt, configPath.taskFile, configPath.detach,
 				configPath.skipPreflight, resolveBranchPrefix(configPath.branchPrefix, cfg.BranchPrefix), configPath.agentCLI, folders, configPath.depends)
 			if err != nil {
 				fail("run", err)
