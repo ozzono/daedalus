@@ -43,7 +43,15 @@ const exampleBase1 = `# Daedalus configuration. Copy to config.yaml and edit; ev
 # work needed. The anthropic section stays unbridged (opencode has no
 # ANTHROPIC_* channel), and the jail mounts no opencode config dir, so
 # such a round resolves its own config inside the jail: a repo-committed
-# opencode.json is honored, the host's global one is not.
+# opencode.json is honored, the host's global one is not), or hands (the
+# standalone agentic harness — no host login state and no ambient config:
+# the worker stages a provider-only config (type, url, key, model, window,
+# output cap, thinking) from the provider sections into the worktree's
+# .daedalus-hands/ scratch dir and the jail mounts it onto ~/.config/hands,
+# the openai section winning when both are exported; sessions live in that
+# same per-worktree scratch, so fix rounds resume within their run. hands
+# has no exec surface — the phase prompts drop their in-round build/test
+# obligations and the caller-side suite stays the only ground truth).
 agent: claude
 
 # Thinking toggle for the jailed agents, independent of slim: defaults to

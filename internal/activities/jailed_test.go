@@ -1374,9 +1374,10 @@ func TestOpencodeJailMounts(t *testing.T) {
 }
 
 // TestAgentResumeFlag pins the resume-capability table: claude, pi,
-// opencode, and codex take an id-addressable resume (codex via a
-// subcommand, so its flag is empty — agentResumeArgs composes that shape),
-// while amp and aider have none and their rounds ignore a set SessionID.
+// opencode, codex, and hands take an id-addressable resume (codex and
+// hands via a subcommand, so their flag is empty — agentResumeArgs
+// composes that shape), while amp and aider have none and their rounds
+// ignore a set SessionID.
 func TestAgentResumeFlag(t *testing.T) {
 	for _, c := range []struct {
 		agent string
@@ -1387,6 +1388,7 @@ func TestAgentResumeFlag(t *testing.T) {
 		{"pi", "--session", true},
 		{"opencode", "-s", true},
 		{"codex", "", true},
+		{"hands", "", true},
 		{"amp", "", false},
 		{"aider", "", false},
 	} {
@@ -1398,10 +1400,10 @@ func TestAgentResumeFlag(t *testing.T) {
 }
 
 // TestAgentResumeArgs pins the per-CLI resume compose: claude and pi take
-// the generic [flag, id] prefix ahead of their fixed args, while opencode
-// and codex resume only after their subcommand, so the whole post-`--`
-// argv is composed — subcommand, resume tokens, and the fixed headless set
-// embedded.
+// the generic [flag, id] prefix ahead of their fixed args, while opencode,
+// codex, and hands resume only after their subcommand, so the whole
+// post-`--` argv is composed — subcommand, resume tokens, and the fixed
+// headless set embedded.
 func TestAgentResumeArgs(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -1418,6 +1420,8 @@ func TestAgentResumeArgs(t *testing.T) {
 			[]string{"run", "-s", "oc-3", "--auto", "--standalone"}},
 		{"codex", "codex", "cx-4", nil,
 			[]string{"exec", "resume", "cx-4", "-", "--dangerously-bypass-approvals-and-sandbox"}},
+		{"hands", "hands", "h-5", nil,
+			[]string{"resume", "h-5", "--format", "json"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := agentResumeArgs(c.agent, c.id, c.agentArgs)

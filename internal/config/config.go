@@ -1037,7 +1037,8 @@ func (m *MetricsConfig) UnmarshalYAML(value *yaml.Node) error {
 type Config struct {
 	// Agent selects which jailed CLI runs the implementing and reviewer
 	// agents: "claude" (Claude Code), "opencode", "amp", "pi", "aider"
-	// (deprecated), or "codex" (see agents for the accepted values).
+	// (deprecated), "codex", or "hands" (see agents for the accepted
+	// values).
 	Agent string `yaml:"agent"`
 	// BranchPrefix names the preserved branch carrying a run's approved
 	// work: <prefix>/issue-<id>-<unix timestamp>. It is deliberately
@@ -1446,7 +1447,7 @@ func (c Config) RenderYAML() (string, error) {
 // model wiring (the anthropic half awaits a litellm probe), uv-tools-only
 // install layout. Which wire a round dials is chosen by the agent's selected
 // model, not by daedalus — see FallbackTypeOpenAI.
-var agents = []string{"claude", "opencode", "amp", "pi", "aider", "codex"}
+var agents = []string{"claude", "opencode", "amp", "pi", "aider", "codex", "hands"}
 
 // Agents lists the agent names ValidateAgent accepts — the single source
 // the dashboard's New-Task dropdown renders from, so its options can never
@@ -1625,6 +1626,11 @@ func (c Config) AgentWireConflict(agent string) error {
 	anth, open := c.ProviderChannels()
 	switch agent {
 	case "amp":
+		return nil
+	case "hands":
+		// hands takes either wire through its own staged provider block
+		// (provider.type anthropic|openai — the staging writes whichever
+		// family the round env carries), so every serving shape serves it.
 		return nil
 	case "claude":
 		if open.URL != "" && anth.URL == "" && anth.Key == "" {

@@ -109,6 +109,20 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// state dir the jail must bridge for auth and session tracking is
 		// resolved by codexJailMounts.
 		return "codex", []string{"exec", "--dangerously-bypass-approvals-and-sandbox"}, nil
+	case "hands":
+		// `hands round` is the headless entry: it reads the prompt from
+		// piped stdin like claude -p (probe-verified 2026-10-25 on the
+		// installed binary), and --format json emits hands's own typed
+		// event protocol (parseHandsStream) — terminal delivered/partial/
+		// failed events replacing exit-code inference. hands has no
+		// permission surface to approve: its tool set is fixed no-exec
+		// (list/read/grep/glob/note/edit/write/webfetch/deliver — probed
+		// from the round's own tools array), so the headless set carries
+		// only the subcommand and the format. The provider wiring stages
+		// per round through the jail mount (handsJailMounts +
+		// stageHandsProvider), not through env vars: hands reads its
+		// provider exclusively from $HOME/.config/hands/config.yaml.
+		return "hands", []string{"round", "--format", "json"}, nil
 	case "aider":
 		// DEPRECATED, amp-parity: it keeps working exactly as it does
 		// today, but it is no longer changed or maintained — no new flags,
@@ -328,12 +342,13 @@ func opencodeJailMounts() ([]string, error) {
 // agentResumeFlag returns the flag that resumes a previous conversation on
 // the named CLI — claude: --resume; pi: --session (it takes a session file
 // path or a partial UUID, so the full recorded UUID works); opencode: -s
-// (on its run subcommand). codex has no flag — its resume is a subcommand
-// nested under exec (`codex exec resume <id>`), composed whole by
-// agentResumeArgs, and "" marks that. ok is false for agents with no
-// id-addressable resume (amp, aider — aider's chat history persists to a
-// markdown file, not anything id-addressable), whose rounds ignore a set
-// SessionID and always start fresh.
+// (on its run subcommand). codex and hands have no flag — their resumes
+// are subcommands nested under exec/round (`codex exec resume <id>`,
+// `hands resume <id>`), composed whole by agentResumeArgs, and "" marks
+// that. ok is false for agents with no id-addressable resume (amp, aider —
+// aider's chat history persists to a markdown file, not anything
+// id-addressable), whose rounds ignore a set SessionID and always start
+// fresh.
 func agentResumeFlag(agent string) (flag string, ok bool) {
 	switch agent {
 	case "claude":
@@ -342,7 +357,7 @@ func agentResumeFlag(agent string) (flag string, ok bool) {
 		return "--session", true
 	case "opencode":
 		return "-s", true
-	case "codex":
+	case "codex", "hands":
 		return "", true
 	}
 	return "", false
@@ -351,14 +366,16 @@ func agentResumeFlag(agent string) (flag string, ok bool) {
 // agentResumeArgs composes a resuming round's agent args. claude and pi
 // take their resume flag anywhere before the headless set, so the generic
 // [flag, id] prefix composes ahead of the fixed agentArgs (see
-// jailedAgentCLI) and the headless set still appends at the jail. opencode
-// and codex resume only after their subcommand (opencode: `run -s <id>`;
-// codex: `exec resume <id> -`, the `-` pointing the prompt at stdin after
-// the id), so those two compose the whole post-`--` argv — subcommand and
-// fixed headless flags embedded — and runJailedRoundFolders skips its own
-// headless append for them (a non-empty caller agent-arg list for exactly
-// those two CLIs is always such a precomposed round; their fixed list is
-// empty). Callers gate on agentResumeFlag first: this assumes ok was true.
+// jailedAgentCLI) and the headless set still appends at the jail. opencode,
+// codex, and hands resume only after their subcommand (opencode:
+// `run -s <id>`; codex: `exec resume <id> -`, the `-` pointing the prompt
+// at stdin after the id; hands: `resume <id>`, the round subcommand
+// replaced), so those three compose the whole post-`--` argv — subcommand
+// and fixed headless flags embedded — and runJailedRoundFolders skips its
+// own headless append for them (a non-empty caller agent-arg list for
+// exactly those CLIs is always such a precomposed round; their fixed list
+// is empty except opencode's). Callers gate on agentResumeFlag first: this
+// assumes ok was true.
 func agentResumeArgs(agent, id string, agentArgs []string) []string {
 	flag, _ := agentResumeFlag(agent)
 	switch agent {
@@ -372,6 +389,11 @@ func agentResumeArgs(agent, id string, agentArgs []string) []string {
 		// The resume subcommand nests under exec; the rest of the headless
 		// set trails.
 		return append([]string{headless[0], "resume", id, "-"}, headless[1:]...)
+	case "hands":
+		_, headless, _ := jailedAgentCLI(agent)
+		// resume replaces the round subcommand head; the format flags
+		// trail so the resumed stream stays typed like a fresh one.
+		return append([]string{"resume", id}, headless[1:]...)
 	}
 	return append([]string{flag, id}, agentArgs...)
 }
@@ -714,14 +736,16 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// relay vars are absent — metrics disabled, or an endpoint override
 	// removed them upstream (see metricsRoundEnv).
 	env, otelArgs := metricsRoundEnv(ctx, env, role, selected)
-	// opencode and codex resumed rounds arrive with the whole post-`--`
-	// argv precomposed (agentResumeArgs — their resume tokens follow the
-	// run/exec subcommand, so the fixed headless set is already embedded);
-	// appending the fixed set behind it would repeat it. Their fixed list
-	// is empty, so a non-empty caller list for exactly those two CLIs is
-	// always such a precomposed round — a fresh or one-shot round (no
-	// caller args) takes the fixed set as usual.
-	if len(agentArgs) > 0 && (selected == "opencode" || selected == "codex") {
+	// opencode, codex, and hands resumed rounds arrive with the whole
+	// post-`--` argv precomposed (agentResumeArgs — their resume tokens
+	// follow the subcommand, which replaces or nests under the fresh
+	// round's head, so the fixed headless set is already embedded); appending
+	// the fixed set behind it would repeat it. For opencode and codex the
+	// fixed list is empty, and for hands it is the format flags the composed
+	// argv carries — so a non-empty caller list for exactly those three CLIs
+	// is always such a precomposed round — while a fresh or one-shot round
+	// (no caller args) takes the fixed set as usual.
+	if len(agentArgs) > 0 && (selected == "opencode" || selected == "codex" || selected == "hands") {
 		headless = nil
 	}
 	// pi-served implementing rounds carry a small-model edit-discipline
@@ -860,6 +884,21 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			args = append(args, "--env", "XDG_DATA_HOME")
 		}
 	}
+	// Same for hands: ai-jail's agent-state dirs bridge ~/.claude and ~/.pi,
+	// not ~/.config/hands — and the provider config the child reads must be
+	// the staged per-worktree one, never an ambient host config. The scratch
+	// dir (stageHandsProvider writes into it below) mounts read-write onto
+	// the real path, so the child reads the staged provider and its session
+	// store lands back in the scratch — per-worktree resume state that
+	// survives a worker restart and stays out of git (see handsJailMounts;
+	// no env var hands reads exists, so no --env rides).
+	if selected == "hands" {
+		mounts, err := handsJailMounts(worktreePath)
+		if err != nil {
+			return jailResult{}, err
+		}
+		args = append(args, mounts...)
+	}
 	// The config's openai section is dead config for an unbridged opencode
 	// round — no flag, no staging, the round dials whatever the host's own
 	// opencode.json holds (verified live 2026-10-06: an openai-section round
@@ -882,6 +921,19 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			env = setEnvVar(env, "OPENCODE_CONFIG", cfgPath)
 			args = append(args, "--env", "OPENCODE_CONFIG")
 			opencodeModelArgs = modelArgs
+		}
+	}
+	// hands reads no provider env var at all — no flag, no env channel
+	// (probe-verified against the installed binary): its whole provider
+	// bridge is the staged config file, which handsJailMounts maps in above.
+	// Staged from the round env as the failover/metrics steps at the top of
+	// this function resolved it (a relay-on round stages the relay's URL —
+	// pure staging, no relay change). A half-specified section fails the
+	// round here, before launch (the stagePiProvider posture). No argv
+	// contribution — the file is the whole bridge.
+	if selected == "hands" {
+		if err := stageHandsProvider(env, worktreePath); err != nil {
+			return jailResult{}, err
 		}
 	}
 	// The bug-file mirror (bug_filing.mirror), mounted read-write into the
@@ -1178,7 +1230,10 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// prints may decide anything (see the ErrAgentKilled wrap note below).
 	var known map[string]bool
 	idsFn, recordFn, watchFn := transcriptIDs, recordNewTranscript, watchTranscripts
-	if role != "" {
+	// hands has no transcript face for the watchers: its session id rides
+	// its own stdout stream (the started event), recorded straight from the
+	// captured output after the wait below — no snapshot, no watcher.
+	if role != "" && selected != "hands" {
 		switch selected {
 		case "pi":
 			idsFn, recordFn, watchFn = piTranscriptIDs, recordNewPiTranscript, watchPiTranscripts
@@ -1241,6 +1296,16 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 		recordFn(ctx, known, worktreePath, role)
 	}
 	res := jailResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	// hands's session id is recorded from the round's own stream before any
+	// classification return: the started event is minted before the first
+	// model turn, so even a round killed at its first provider failure
+	// leaves a resumable session behind — exactly the death a fix-round
+	// resume recovers from.
+	if selected == "hands" && role != "" {
+		if id, ok := handsSessionID(res.Stdout); ok {
+			recordSession(ctx, worktreePath, role, id)
+		}
+	}
 	// Task-log round-exit block: the full output, captured before
 	// classification — killed and exhausted rounds included,
 	// whose output the callers otherwise discard.

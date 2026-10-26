@@ -1,0 +1,50 @@
+# Systemd user unit supervising the daedalus dashboard daemon: the
+# supervisor owns crashes and boots (Restart=on-failure revives a dead
+# dash, the start rate limit caps a crash loop, the Install target starts
+# it at boot), so the self-daemonized dash is no longer an orphaned
+# process with no lifecycle owner — the stale-binary class where a `go
+# install` replaces the binary and the old build keeps serving forever.
+#
+# Install: copy to ~/.config/systemd/user/daedalus-dash.service (stop a
+# self-daemonized `daedalus dash` once first — one owner per job), then
+# `systemctl --user daemon-reload && systemctl --user enable --now
+# daedalus-dash`. %h expands to the managing user's home at start time.
+#
+# Lifecycle contract (one owner per job):
+#   crash / reboot  → systemd revives it (Restart=on-failure, backoff,
+#                     StartLimit* caps the loop; boot start via [Install])
+#   after `go install` replaces the binary  → `systemctl --user restart
+#                     daedalus-dash` serves the new build; Restart= never
+#                     fires on a replace (the running old build is healthy
+#                     to systemd — the dash's own stale-binary banner names
+#                     this moment)
+#   `daedalus dash start` / `restart` / `stop`  → superseded on a
+#                     unit-managed host: the pidfile commands fight the
+#                     unit — stop SIGTERMs the unit's process (clean exit
+#                     0, Restart=on-failure keeps the unit down) and
+#                     start/restart spawns an orphan outside the unit.
+#                     Lifecycle moves go through `systemctl --user`; the
+#                     skew banner's `dash restart` advice applies to
+#                     self-daemonized (unit-less) hosts only
+
+[Unit]
+Description=daedalus pipeline dashboard
+# Restart rate limiting lives here, in [Unit] (systemd.unit(5)) — under
+# [Service] both keys are unknown and silently ignored, leaving the crash
+# loop uncapped.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Edit for the host if the install or config paths differ; %h is the
+# managing user's home.
+ExecStart=%h/go/bin/daedalus dash foreground -c %h/.config/daedalus/config.yaml
+# Revive on any failure — crash, OOM kill, nonzero exit — never on a clean
+# stop (a `daedalus dash stop` exits 0, so the dash stays down).
+Restart=on-failure
+# Backoff between revives; the StartLimit* pair in [Unit] caps the loop.
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

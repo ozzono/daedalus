@@ -12,6 +12,4 @@ This sub-task — the only work in scope:
 {{end}}
 Implement exactly this, touching only its target files (plus a companion file a criterion demands). No later sub-task work; no reworking earlier sub-tasks unless this sub-task's criteria force it. Minimal diff. The diff is the deliverable — no temp, backup, or paste-buffer files left in the worktree; no session logs, changelogs, or progress commentary as source comments.
 
-Terminal ground truth: code that looks correct proves nothing. Verify every acceptance criterion against actual CLI output — build the affected packages, run the repository's test suite; if the project builds Go (a go.mod at its root), that build is the compile check `go build -o /dev/null ./...` and the round is not done while it fails. Compiler errors and test failures are the verdict, not your confidence. Failing criterion: fix before replying.
-
-Zero fluff: reply with a short factual summary — what you changed, command outputs proving each criterion. No prose beyond that.
+Zero fluff: reply with a short factual summary of what you changed and how each criterion is met. No prose beyond that.

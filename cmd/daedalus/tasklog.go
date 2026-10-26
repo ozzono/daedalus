@@ -539,6 +539,37 @@ func lastRoundExit(log string) time.Time {
 	return newest
 }
 
+// lastRoundStart parses the newest "jailed … round started" header
+// timestamp from a task log — the in-flight round's age anchor for the
+// restart alert (dash-hardening Q6). Zero when the log carries no started
+// round.
+func lastRoundStart(log string) time.Time {
+	var newest time.Time
+	for line := range strings.SplitSeq(log, "\n") {
+		header, ok := strings.CutPrefix(line, "=== ")
+		if !ok {
+			continue
+		}
+		header, ok = strings.CutSuffix(header, " ===")
+		if !ok {
+			continue
+		}
+		stamp, rest, ok := strings.Cut(header, " ")
+		if !ok {
+			continue
+		}
+		event, _, _ := strings.Cut(rest, " (run ")
+		if !strings.HasPrefix(event, "jailed ") || !strings.Contains(event, " round started: ") {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, stamp)
+		if err == nil && t.After(newest) {
+			newest = t
+		}
+	}
+	return newest
+}
+
 // claudeTranscriptCoT renders a completed claude round's CoT from its
 // host-side session transcript: <claude-projects>/<worktree-slug>/<session
 // id>.jsonl. Empty when the round ran with no worktree or session id on

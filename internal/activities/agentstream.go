@@ -236,16 +236,115 @@ func parsePiUsage(stdout string) (usage Usage) {
 	return usage
 }
 
+// handsEvent is one line of `hands round --format json` output — hands's
+// own protocol, the first agent schema in this package owned end-to-end by
+// the agent itself (shape probe-pinned live 2026-10-25 against the
+// installed binary; no dialect folklore): an envelope carrying the round
+// id, a monotonic seq, a kind, and a kind-shaped payload. Observed kinds:
+// started (payload.session — the conversation UUID hands's own recovery
+// pin and daedalus's resume key, minted by hands before any model turn,
+// so nothing the model says can forge it), usage (one per provider
+// request), tool_call, tool_result, delivered / partial (payload.payload —
+// the forced delivery tool's arguments), and failed (class retriable /
+// no-delivery / terminal + reason). partial's exact payload shape is
+// probe-owed (never observed live); it decodes through the same delivery
+// struct, and a shape drift degrades to an empty summary — the caller's
+// raw-stdout fallback — never a wrong one.
+type handsEvent struct {
+	RoundID string `json:"round_id"`
+	Seq     int    `json:"seq"`
+	Kind    string `json:"kind"`
+	Payload struct {
+		Session string `json:"session"`
+		Class   string `json:"class"`
+		Reason  string `json:"reason"`
+		// Payload is the kind-shaped body: the session id under
+		// started, class/reason under failed, the delivery arguments
+		// under delivered/partial at this one nested level — decoded
+		// per kind. The usage figures ride flat, siblings of these
+		// keys (probed 2026-10-25: usage carries no nested object), so
+		// they sit directly on this struct below.
+		Payload json.RawMessage `json:"payload"`
+
+		InputTokens      int64   `json:"input_tokens"`
+		OutputTokens     int64   `json:"output_tokens"`
+		CacheReadTokens  int64   `json:"cache_read_tokens"`
+		CacheWriteTokens int64   `json:"cache_write_tokens"`
+		CostDollars      float64 `json:"cost_dollars"`
+	} `json:"payload"`
+}
+
+// handsDelivery is the forced delivery tool's argument schema, fixed in
+// this hands build (summary required, files_changed optional — probed
+// live; the fit review's caller-supplied-schema shape did not land), so a
+// round always ends in a structured deliverable instead of free prose.
+type handsDelivery struct {
+	Summary      string   `json:"summary"`
+	FilesChanged []string `json:"files_changed"`
+}
+
+// parseHandsStream is parseAgentStream for hands's --format json event
+// stream: the started event carries the conversation session, and the
+// terminal delivered/partial event's delivery summary is the round's
+// visible text — the forced deliverable, not whatever narration preceded
+// it. hands emits no thinking events (the wire thinking knob stages
+// through its config), so thinking stays empty.
+func parseHandsStream(stdout string) (thinking, text, session string) {
+	for line := range strings.SplitSeq(stdout, "\n") {
+		var e handsEvent
+		if json.Unmarshal([]byte(line), &e) != nil {
+			continue
+		}
+		switch e.Kind {
+		case "started":
+			session = e.Payload.Session
+		case "delivered", "partial":
+			var d handsDelivery
+			if json.Unmarshal(e.Payload.Payload, &d) == nil && d.Summary != "" {
+				text = d.Summary
+			}
+		}
+	}
+	return "", text, session
+}
+
+// parseHandsUsage is parseAgentUsage for hands: usage events ride per
+// provider request, so the round's raw figure is the sum across them (the
+// same total claude's single result event carries). Duration stays zero —
+// hands reports none — and the caller stamps the measured wall time.
+func parseHandsUsage(stdout string) (usage Usage) {
+	for line := range strings.SplitSeq(stdout, "\n") {
+		var e handsEvent
+		if json.Unmarshal([]byte(line), &e) != nil {
+			continue
+		}
+		if e.Kind != "usage" {
+			continue
+		}
+		usage.CostUSD += e.Payload.CostDollars
+		usage.InputTokens += e.Payload.InputTokens
+		usage.OutputTokens += e.Payload.OutputTokens
+		usage.CacheReadTokens += e.Payload.CacheReadTokens
+		usage.CacheWriteTokens += e.Payload.CacheWriteTokens
+	}
+	return usage
+}
+
 // parseRoundOutput extracts a jailed round's chain of thought, visible
 // text, conversation session id, and raw usage metrics from its stdout,
 // dispatching on the CLI: claude and amp share the claude event schema
 // (parseAgentStream); pi emits its own JSON-lines schema (parsePiStream);
-// opencode, codex, and aider print plain text and yield empty fields — the
+// hands emits its own typed event protocol (parseHandsStream); opencode,
+// codex, and aider print plain text and yield empty fields — the
 // caller's cue to take the raw stdout as the text.
 func parseRoundOutput(agent, stdout string) (thinking, text, session string, usage Usage) {
 	if agent == "pi" {
 		thinking, text, session = parsePiStream(stdout)
 		return thinking, text, session, parsePiUsage(stdout)
+	}
+	if agent == "hands" {
+		thinking, text, session = parseHandsStream(stdout)
+		return thinking, text, session, parseHandsUsage(stdout)
 	}
 	thinking, text, session = parseAgentStream(stdout)
 	return thinking, text, session, parseAgentUsage(stdout)
@@ -268,8 +367,37 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // assumption: if the shape differs, amp's face degrades to "" (inert).
 // Agents without a structured stream (opencode, codex, aider) report ""
 // here; their plain-text face is matched separately (apiErrorTextMarkers).
+// hands reports through its terminal failed event, and only the class
+// "retriable" is the API-level report (probe-pinned 2026-10-25: a failed
+// event is always the stream's last line — the process exits 1 right
+// after it — because an internally retried provider failure, two attempts
+// per request under a persistent 500 and under a mid-stream connection
+// drop alike, emits no failed event at all; a refused connection or an
+// exhausted-retry 500 surfaces as class retriable; the other observed
+// classes are round-level — "no-delivery", the loop guard, and
+// "terminal", a response hands could not use — and stay on the generic
+// failure path).
 func agentAPIError(agent, stdout string) string {
 	switch agent {
+	case "hands":
+		apiErr := ""
+		for line := range strings.SplitSeq(stdout, "\n") {
+			var e handsEvent
+			if json.Unmarshal([]byte(line), &e) != nil {
+				continue
+			}
+			// Last retriable wins — a totality guard, not a pi-mirror
+			// standing rule: a failed event is stream-terminal (probe-
+			// pinned 2026-10-25 — hands's internal retries are silent, so
+			// nothing ever follows a failed event, least of all a
+			// delivery), so no later clean event can exist here to clear
+			// it. The other classes are untracked — they stay on the
+			// generic failure path by design.
+			if e.Kind == "failed" && e.Payload.Class == "retriable" {
+				apiErr = "class retriable: " + e.Payload.Reason
+			}
+		}
+		return apiErr
 	case "pi":
 		// The last message_end decides, mirroring parsePiStream's own
 		// authority rule: pi writes an error-stopReason message_end the

@@ -961,7 +961,8 @@ func TestRunJailedGenuineFailureNotRescued(t *testing.T) {
 // TestAgentAPIErrorClassify pins agentAPIError's classification table:
 // only a structured report decides — pi's last message_end (an error still
 // standing at stream end, its errorMessage or a shape fallback), the
-// claude/amp result event — and chat text or unstructured agents never do.
+// claude/amp result event, hands's last retriable failed event — and chat
+// text or unstructured agents never do.
 func TestAgentAPIErrorClassify(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -988,6 +989,35 @@ func TestAgentAPIErrorClassify(t *testing.T) {
 				`{"type":"message_end","message":{}}`, ""},
 		{"pi clean stream", "pi",
 			`{"type":"message_end","message":{"content":[{"type":"text","text":"done"}]}}`, ""},
+		{"hands retriable failure", "hands",
+			`{"kind":"failed","payload":{"class":"retriable","reason":"connection refused"}}`,
+			"class retriable: connection refused"},
+		{"hands last retriable wins", "hands",
+			`{"kind":"failed","payload":{"class":"retriable","reason":"first try"}}` + "\n" +
+				`{"kind":"failed","payload":{"class":"retriable","reason":"second try"}}`,
+			"class retriable: second try"},
+		// hands's failed events are stream-terminal (probe-pinned
+		// 2026-10-25: always the stream's last line, exit 1 — internal
+		// retries are silent, so nothing real ever follows a failed
+		// event), making last-wins the guard's totality semantics, not a
+		// pi-mirror standing rule. This row pins the guard's shape on
+		// that documented-unreachable shape so a future edit that
+		// "mirrors pi" by clearing on a later event fails here
+		// deliberately, and a genuine contract change updates the row
+		// consciously.
+		{"hands last-wins is total past any later event", "hands",
+			`{"kind":"failed","payload":{"class":"retriable","reason":"first try"}}` + "\n" +
+				`{"kind":"started","payload":{"session":"s-9"}}` + "\n" +
+				`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}`,
+			"class retriable: first try"},
+		{"hands no-delivery stays generic", "hands",
+			`{"kind":"failed","payload":{"class":"no-delivery","reason":"loop guard"}}`, ""},
+		{"hands terminal class stays generic", "hands",
+			`{"kind":"failed","payload":{"class":"terminal","reason":"unusable response"}}`, ""},
+		{"hands clean stream", "hands",
+			`{"kind":"started","payload":{"session":"s"}}` + "\n" +
+				`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}`, ""},
+		{"hands non-json lines ignored", "hands", "not json", ""},
 		{"aider has no structured face", "aider", "litellm.apitimeouterror", ""},
 		{"opencode has no structured face", "opencode", "api connection error", ""},
 	}
@@ -4592,9 +4622,9 @@ func TestParsePiUsage(t *testing.T) {
 }
 
 // TestParseRoundOutput pins the per-CLI dispatch: pi reads its own event
-// schema, claude and amp share the claude schema, and the plain-text CLIs
-// (opencode, codex, aider) yield nothing — the caller's cue to take the raw
-// stdout.
+// schema, claude and amp share the claude schema, hands reads its own
+// typed event protocol, and the plain-text CLIs (opencode, codex, aider)
+// yield nothing — the caller's cue to take the raw stdout.
 func TestParseRoundOutput(t *testing.T) {
 	piOut := `{"type":"session","id":"sess-p"}` + "\n" +
 		`{"type":"message_update","usage":{"input":3,"output":4,"cost":{"total":0.5}}}` + "\n" +
@@ -4608,6 +4638,14 @@ func TestParseRoundOutput(t *testing.T) {
 		`{"type":"result","subtype":"success","result":"claude reply","session_id":"sess-c","total_cost_usd":0.2,"duration_ms":900}`)
 	if text != "claude reply" || session != "sess-c" || thinking != "" || usage.CostUSD != 0.2 {
 		t.Errorf("parseRoundOutput(claude) = %q, %q, %q, %+v; want claude's reply, session, and cost", thinking, text, session, usage)
+	}
+
+	handsOut := `{"round_id":"r","seq":0,"kind":"started","payload":{"session":"sess-h"}}` + "\n" +
+		`{"round_id":"r","seq":1,"kind":"usage","payload":{"input_tokens":7,"output_tokens":3,"cost_dollars":0.11}}` + "\n" +
+		`{"round_id":"r","seq":2,"kind":"delivered","payload":{"payload":{"summary":"hands reply"}}}`
+	thinking, text, session, usage = parseRoundOutput("hands", handsOut)
+	if text != "hands reply" || session != "sess-h" || thinking != "" || usage.CostUSD != 0.11 || usage.InputTokens != 7 {
+		t.Errorf("parseRoundOutput(hands) = %q, %q, %q, %+v; want hands's delivery, session, and summed usage", thinking, text, session, usage)
 	}
 
 	for _, agent := range []string{"opencode", "codex", "aider"} {

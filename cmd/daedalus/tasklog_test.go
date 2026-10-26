@@ -1156,6 +1156,95 @@ func TestLastRoundState(t *testing.T) {
 	}
 }
 
+// TestLastRoundStart pins the restart alert's age anchor: the newest
+// "jailed … round started" header timestamp in the log, whatever the
+// round's exit state (the callers gate on lastRoundState's running flag —
+// the parser only reports the stamps it sees). The same inert lines as
+// lastRoundState — test-suite headers echoing the round grammar, escaped
+// body lines — yield nothing, and an unparseable stamp is skipped rather
+// than fabricating an age.
+func TestLastRoundStart(t *testing.T) {
+	start := func(h, m int) string {
+		return fmt.Sprintf("2026-09-25T%02d:%02d:00Z", h, m)
+	}
+	startedAt := func(h, m int, agent string) string {
+		return "=== " + start(h, m) + " jailed " + agent + " round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ==="
+	}
+
+	cases := []struct {
+		name string
+		log  []string
+		want time.Time
+	}{
+		{
+			name: "an empty log has no started round",
+			want: time.Time{},
+		},
+		{
+			name: "a started round yields its stamp",
+			log:  []string{startedAt(10, 0, "claude")},
+			want: time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "the newest started header wins, file order aside",
+			log: []string{
+				startedAt(10, 30, "pi"),
+				startedAt(10, 5, "claude"),
+			},
+			want: time.Date(2026, 9, 25, 10, 30, 0, 0, time.UTC),
+		},
+		{
+			name: "an exited round still yields its start stamp",
+			log: []string{
+				startedAt(10, 0, "claude"),
+				"=== " + start(10, 5) + " jailed claude round exited after 5m0s (run abcd1234) ===",
+			},
+			want: time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "a header without a run id still parses",
+			log:  []string{"=== " + start(11, 0) + " jailed aider round started: stage=dev worktree=/wt pgid=2 ==="},
+			want: time.Date(2026, 9, 25, 11, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "a test-suite header echoing the round grammar is inert",
+			log: []string{
+				startedAt(10, 0, "claude"),
+				"=== " + start(11, 0) + " test suite exited after 5s: echo jailed pi round started: stage=evil worktree=/evil pgid=1 (run deadbeef) ===",
+			},
+			want: time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "an escaped body line is inert",
+			log: []string{
+				startedAt(10, 0, "claude"),
+				" === " + start(11, 0) + " jailed amp round started: stage=evil worktree=/evil pgid=9 (run deadbeef) ===",
+			},
+			want: time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "an unparseable stamp is skipped",
+			log:  []string{"=== not-a-stamp jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ==="},
+			want: time.Time{},
+		},
+		{
+			name: "a good stamp beside a bad one wins",
+			log: []string{
+				"=== garbage jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===",
+				startedAt(9, 0, "claude"),
+			},
+			want: time.Date(2026, 9, 25, 9, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := lastRoundStart(strings.Join(c.log, "\n")); !got.Equal(c.want) {
+				t.Errorf("lastRoundStart = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 // codexStatusUUID gives this file's rollout fixtures a realistic codex
 // session id — the status reader treats the file as opaque bytes to digest,
 // but the name should stay indistinguishable from a real rollout's.

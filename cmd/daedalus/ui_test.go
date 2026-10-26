@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"text/template"
 	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
@@ -33,6 +35,7 @@ import (
 	"github.com/ozzono/daedalus/internal/config"
 	"github.com/ozzono/daedalus/internal/metricsrelay"
 	"github.com/ozzono/daedalus/internal/runstart"
+	"github.com/ozzono/daedalus/internal/version"
 	"github.com/ozzono/daedalus/internal/workflows"
 )
 
@@ -135,16 +138,84 @@ func TestTemporalUILink(t *testing.T) {
 }
 
 // TestUsageRow pins the usage-table row: figures ride named fields, the
-// cost renders at four decimals, and an all-zero capture is the n/a face —
-// not a row of fabricated zeros.
+// cost cell stays empty — the detail walk prices it from the ledger fold,
+// the CLI's self-reported total never rides the row (dash-hardening Q3) —
+// and an all-zero capture is the n/a face, not a row of fabricated zeros.
 func TestUsageRow(t *testing.T) {
 	na := usageRow(1, "implement", "pi", activities.Usage{})
 	if !na.NA {
 		t.Errorf("usageRow(zero) = %+v, want the n/a face", na)
 	}
 	u := usageRow(2, "review", "claude", activities.Usage{InputTokens: 3, OutputTokens: 4, Duration: 90 * time.Second, CostUSD: 0.5})
-	if u.NA || u.In != 3 || u.Out != 4 || u.Duration != "1m30s" || u.Cost != "0.5000" {
+	if u.NA || u.In != 3 || u.Out != 4 || u.Duration != "1m30s" {
 		t.Errorf("usageRow(figures) = %+v, want the round's own numbers", u)
+	}
+	if u.Cost != "" {
+		t.Errorf("usageRow carried a cost %q, want it empty — the CLI's self-reported cost is never displayed", u.Cost)
+	}
+}
+
+// TestUIChromeFor pins the shell data every page carries: the version
+// names the serving build, and a healthy host — this test process, whose
+// executable is still linked — carries no skew banner. The banner's set
+// face is TestUIHeaderChrome's, which crafts the chrome a real skew
+// produces.
+func TestUIChromeFor(t *testing.T) {
+	c := uiChromeFor("runs", "daedalus — runs")
+	if c.Nav != "runs" || c.Title != "daedalus — runs" {
+		t.Errorf("uiChromeFor = %+v, want the nav and title carried", c)
+	}
+	if c.Version != version.String() {
+		t.Errorf("uiChromeFor Version = %q, want the serving build's tag %q", c.Version, version.String())
+	}
+	if c.Skew != "" {
+		t.Errorf("uiChromeFor Skew = %q on a healthy host, want banner-free", c.Skew)
+	}
+}
+
+// TestUIHeaderChrome pins the header shell's faces as markup: the settings
+// panel rides the platform popover primitive (a popovertarget button
+// opening the #cfg popover — dash-hardening Q4), the version badge names
+// the serving build on every page, and the stale-binary banner renders
+// above the chrome only when the chrome carries a skew — rendered here
+// with a crafted skewed chrome, since no healthy host can produce one.
+func TestUIHeaderChrome(t *testing.T) {
+	render := func(t *testing.T, chrome uiChrome) string {
+		t.Helper()
+		tpl := template.Must(template.New("ui").Funcs(template.FuncMap{
+			"div100": func(busy, total int) int {
+				if total <= 0 {
+					return 0
+				}
+				return busy * 100 / total
+			},
+			"tok": fmtTokens,
+			"usd": fmtUSD,
+		}).ParseFS(uiTemplateFS, "ui_templates.html"))
+		var out bytes.Buffer
+		if err := tpl.ExecuteTemplate(&out, "header", chrome); err != nil {
+			t.Fatalf("render the header: %v", err)
+		}
+		return out.String()
+	}
+
+	quiet := render(t, uiChromeFor("runs", "daedalus — runs"))
+	for _, want := range []string{
+		`popovertarget="cfg"`,
+		`<div id="cfg" popover`,
+		`aria-hidden="true">` + version.String() + `</span>`,
+	} {
+		if !strings.Contains(quiet, want) {
+			t.Errorf("the header lacks %q:\n%s", want, quiet)
+		}
+	}
+	if strings.Contains(quiet, "stale binary:") {
+		t.Errorf("a healthy host's header carries a skew banner:\n%s", quiet)
+	}
+
+	skewed := render(t, uiChrome{Nav: "runs", Version: version.String(), Skew: "stale binary: the on-disk executable changed — restart to serve the new build"})
+	if !strings.Contains(skewed, "⚠ stale binary: the on-disk executable changed — restart to serve the new build") {
+		t.Errorf("the skewed chrome lost its banner:\n%s", skewed)
 	}
 }
 
@@ -680,6 +751,95 @@ func TestUIRunsViewFilters(t *testing.T) {
 	}
 }
 
+// TestUIDashMobileRowCards pins the dash tables' mobile re-flow markup:
+// converted tables carry the mtable hook and render their rows as mcards
+// whose cells self-label through data-th with the desktop column's name —
+// the shared usage table's key label riding .Head, so each fold names its
+// own key — empty-state and footer rows join the card flow, and the whole
+// mobile stylesheet lives inside the one max-width query, so at desktop
+// widths none of it applies.
+func TestUIDashMobileRowCards(t *testing.T) {
+	h := newUIHarness(t)
+	started := time.Now().Add(-time.Hour)
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+		uiRow(t, "listq-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started, nil),
+	}
+	h.led.Append(metricsrelay.Entry{At: started, Worker: "w", Model: "mA", InputTokens: 10, Status: 200})
+
+	runs := h.get(t, "/runs")
+	if !strings.Contains(runs, `<table class="mtable card w-full text-sm min-w-[820px]">`) {
+		t.Errorf("the runs table lost its mtable hook:\n%s", runs)
+	}
+	if !strings.Contains(runs, `<tr class="mcard border-b`) {
+		t.Errorf("the runs feed's rows are not mobile cards:\n%s", runs)
+	}
+	// A card's value sits inside its labeled cell: the workflow id's link
+	// under the Workflow id label.
+	if !strings.Contains(runs, `data-th="Workflow id"><a class="mono`) {
+		t.Errorf("the workflow id is not the card's labeled lead cell:\n%s", runs)
+	}
+	for _, col := range []string{"Workflow id", "Status", "Issue", "Repo", "Queue", "Started", "Last interaction", "Last CoT"} {
+		if !strings.Contains(runs, `data-th="`+col+`">`) {
+			t.Errorf("the runs feed's cards lack the %q label:\n%s", col, runs)
+		}
+	}
+
+	empty := h.get(t, "/runs/rows?status=parked")
+	if !strings.Contains(empty, `<tr class="mcard"><td colspan="8"`) {
+		t.Errorf("the empty feed's note row is not a card:\n%s", empty)
+	}
+
+	// The shared usage table takes its key cell's label from .Head: the
+	// models fold names Model, the worker fold Worker — the same define
+	// serving both. The Model cell is byte-identical to the price form's
+	// card above the polled region, so the fold only proves its Head when
+	// both render.
+	models := h.get(t, "/models")
+	if n := strings.Count(models, `<td class="mcell p-3 mono" data-th="Model">mA</td>`); n != 2 {
+		t.Errorf("the models page rendered %d labeled mA cells, want the price form's and the Model fold's:\n%s", n, models)
+	}
+	if !strings.Contains(models, `<td class="mcell p-3 mono" data-th="Worker">w</td>`) {
+		t.Errorf("the worker fold's key cell lost its Worker label:\n%s", models)
+	}
+
+	// The mobile stylesheet is one max-width query and nothing escapes it:
+	// a card rule outside the query would restyle the desktop tables too.
+	src, err := uiTemplateFS.ReadFile("ui_templates.html")
+	if err != nil {
+		t.Fatalf("read the template: %v", err)
+	}
+	style := string(src)
+	style = style[strings.Index(style, "<style"):strings.Index(style, "</style>")]
+	open := strings.Index(style, "@media (max-width: 767px)")
+	if open < 0 {
+		t.Fatalf("the mobile stylesheet lost its max-width query:\n%s", style)
+	}
+	end := -1
+	for i, depth := open, 0; i < len(style) && end < 0; i++ {
+		switch style[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				end = i
+			}
+		}
+	}
+	for _, cls := range []string{".mtable", ".mcard", ".mcell"} {
+		for off := 0; ; {
+			at := strings.Index(style[off:], cls)
+			if at < 0 {
+				break
+			}
+			if off+at < open || off+at > end {
+				t.Errorf("a %s rule escapes the max-width query — desktop rendering would match it", cls)
+				break
+			}
+			off += at + 1
+		}
+	}
+}
+
 // TestUIWorkerProbeTooltips pins the probe badges' hover faces: the title
 // carries the probe's own detail plus the TTL-cached caveat, and differs on
 // whether the probe reached the provider — the roster's "will the next
@@ -995,11 +1155,19 @@ func TestUIRunDetailPage(t *testing.T) {
 		"APPROVED", "ship it",
 		"suite green", "go test ./...",
 		">100</td>", ">50</td>", "1m0s",
-		"1.0000",
+		// No prices are saved here: every cost cell is the dash — the
+		// rounds table priced from the ledger fold or nothing (the CLI's
+		// self-reported figures, 0.25 + 0.75, must never render).
+		">—</td>",
 		"http://127.0.0.1:8233/namespaces/default/workflows/listq-iss9",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("detail page lacks %q", want)
+		}
+	}
+	for _, banned := range []string{"0.2500", "0.7500", "1.0000"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("detail page renders the CLI-reported cost %q; only the ledger fold may price:\n%s", banned, out)
 		}
 	}
 
@@ -1219,6 +1387,16 @@ func TestUIPolledPageFaces(t *testing.T) {
 		}
 		if !strings.Contains(runs, `hx-trigger="every 5s [!document.hidden], change from:#fq, change from:#fs"`) {
 			t.Errorf("the runs region lost its hidden gate or its filter change triggers:\n%s", runs)
+		}
+	})
+
+	t.Run("the runs region's targeting is not inherited", func(t *testing.T) {
+		// The wrapper aims its own poll at #rtbody and carries the filter
+		// fields; its hx-disinherit is what keeps an inner element's own
+		// request from inheriting that targeting and fold the page's nav
+		// swaps into the table body.
+		if !strings.Contains(runs, `hx-get="/runs/rows" hx-trigger="every 5s [!document.hidden], change from:#fq, change from:#fs" hx-include="#fq,#fs" hx-target="#rtbody" hx-disinherit="hx-target hx-include"`) {
+			t.Errorf("the runs wrapper lost its disinherit guard:\n%s", runs)
 		}
 	})
 

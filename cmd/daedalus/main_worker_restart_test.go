@@ -10,7 +10,11 @@ import (
 	"testing"
 	"time"
 
+	enums "go.temporal.io/api/enums/v1"
+	historypb "go.temporal.io/api/history/v1"
+
 	"github.com/ozzono/daedalus/internal/config"
+	"github.com/ozzono/daedalus/internal/workflows"
 )
 
 // useDaemonDir points the package's daemonDir at a fresh temp dir for this
@@ -714,4 +718,160 @@ func TestWorkerRestartNamedRevivesUntyped(t *testing.T) {
 	if !reflect.DeepEqual(got, []string{"worker", "foreground", "-c", cfgPath}) {
 		t.Errorf("daemon argv = %v, want worker foreground -c %s with no -t", got, cfgPath)
 	}
+}
+
+// TestWorkerActiveRounds pins the restart alert's walk (dash-hardening Q6):
+// the queue's running rows, each task log read through the round parser —
+// a running round names workflow, agent, stage, and age; a round whose
+// stage is empty reports unknown; a log with no parseable start stamp
+// reports age unknown; an exited round and a run with no log are not in
+// flight; and the query is the queue's running rows. A walk that cannot
+// run (the frontend is down) is an error, never an empty list — unknown is
+// not idle.
+func TestWorkerActiveRounds(t *testing.T) {
+	useTaskLogDir(t)
+	started := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339)
+	stale := "2026-10-20T09:00:00Z"
+	writeTaskLogFile(t, "wf-run",
+		"=== "+started+" jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd) ===")
+	writeTaskLogFile(t, "wf-empty-stage",
+		"=== "+started+" jailed aider round started: stage= worktree=/wt pgid=2 (run abcd) ===")
+	writeTaskLogFile(t, "wf-no-stamp",
+		"=== no-stamp jailed claude round started: stage=dev worktree=/wt pgid=3 (run abcd) ===")
+	writeTaskLogFile(t, "wf-done",
+		"=== "+stale+" jailed pi round started: stage=dev worktree=/wt pgid=4 (run abcd) ===",
+		"=== "+stale+" jailed pi round exited after 1m0s (run abcd) ===")
+
+	fake := &fakeListServer{history: map[string]*historypb.HistoryEvent{}}
+	for _, id := range []string{"wf-run", "wf-empty-stage", "wf-no-stamp", "wf-done", "wf-logless"} {
+		fake.rows = append(fake.rows, uiRow(t, id, id+"-run", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, "", time.Now(), nil))
+	}
+	cfg := startListServer(t, fake)
+
+	active, err := workerActiveRounds(cfg)
+	if err != nil {
+		t.Fatalf("workerActiveRounds: %v", err)
+	}
+	want := []string{
+		"wf-run — claude, stage dev, started just now",
+		"wf-empty-stage — aider, stage unknown, started just now",
+		"wf-no-stamp — claude, stage dev, age unknown",
+	}
+	if !reflect.DeepEqual(active, want) {
+		t.Errorf("workerActiveRounds = %v, want %v (the exited round and the logless run are not in flight)", active, want)
+	}
+	if len(fake.queries) != 1 || fake.queries[0] != "TaskQueue = 'listq' AND ExecutionStatus = 'Running'" {
+		t.Errorf("the walk queried %q, want the queue's running rows", fake.queries)
+	}
+
+	t.Run("a walk that cannot run is an error, not an empty list", func(t *testing.T) {
+		addr := "127.0.0.1:" + strconv.Itoa(deadRelayPort(t)) // nothing listens: every dial is refused
+		active, err := workerActiveRounds(config.Config{Temporal: config.TemporalConfig{Host: addr, TaskQueue: "listq"}})
+		if err == nil || active != nil {
+			t.Errorf("workerActiveRounds(down frontend) = (%v, %v), want the error and no rounds", active, err)
+		}
+	})
+}
+
+// TestWorkerRestartLiveMessaging pins the ruled restart semantics on a
+// live worker (dash-hardening Q6): the announcement keys off the rounds
+// actually in flight on the worker's queue — an idle worker restarts on
+// the spot, in-flight rounds are named ahead of the drain, and a queue
+// walk that cannot run keeps the drain face (unknown is never idle).
+// Every path re-records the invoking config and signals the live pid.
+func TestWorkerRestartLiveMessaging(t *testing.T) {
+	const queue = "listq"
+	seed := func(t *testing.T) {
+		t.Helper()
+		writePidFile(t, queue, sleepIgnoring(t, "HUP"))
+	}
+	liveCfg := func(t *testing.T, host string) (config.Config, string) {
+		t.Helper()
+		path := writeQueueHostConfig(t, queue, host)
+		return loadTestConfig(t, path), path
+	}
+
+	t.Run("an idle worker restarts immediately", func(t *testing.T) {
+		useDaemonDir(t)
+		host := startListServer(t, &fakeListServer{history: map[string]*historypb.HistoryEvent{}})
+		cfg, path := liveCfg(t, host.Temporal.Host)
+		seed(t)
+
+		out := captureStdout(t, func() {
+			if err := workerRestart(cfg, path, ""); err != nil {
+				t.Errorf("workerRestart: %v", err)
+			}
+		})
+		if !strings.Contains(out, "worker "+queue+" is idle — restarting immediately (pid ") {
+			t.Errorf("restart output %q, want the idle face", out)
+		}
+		if strings.Contains(out, "drains") {
+			t.Errorf("an idle restart still announces a drain: %q", out)
+		}
+		if got := recordedConfigPath(queue); got != path {
+			t.Errorf("restart re-recorded %q, want the invoking config %q", got, path)
+		}
+	})
+
+	t.Run("in-flight rounds are named ahead of the drain", func(t *testing.T) {
+		useDaemonDir(t)
+		useTaskLogDir(t)
+		started := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339)
+		stale := "2026-10-20T09:00:00Z"
+		writeTaskLogFile(t, "listq-iss1",
+			"=== "+started+" jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd) ===")
+		writeTaskLogFile(t, "listq-iss2",
+			"=== "+stale+" jailed pi round started: stage=dev worktree=/wt pgid=2 (run abcd) ===",
+			"=== "+stale+" jailed pi round exited after 1m0s (run abcd) ===")
+		fake := &fakeListServer{history: map[string]*historypb.HistoryEvent{}}
+		fake.rows = append(fake.rows,
+			uiRow(t, "listq-iss1", "run-1", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.RunStatus(""), time.Now(), nil),
+			uiRow(t, "listq-iss2", "run-2", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.RunStatus(""), time.Now(), nil),
+		)
+		host := startListServer(t, fake)
+		cfg, path := liveCfg(t, host.Temporal.Host)
+		seed(t)
+
+		out := captureStdout(t, func() {
+			if err := workerRestart(cfg, path, ""); err != nil {
+				t.Errorf("workerRestart: %v", err)
+			}
+		})
+		for _, want := range []string{
+			"restart scheduled for worker " + queue + " (pid ",
+			"these rounds drain first; use --force to swap immediately:",
+			"  listq-iss1 — claude, stage dev, started just now",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("restart output %q lacks %q", out, want)
+			}
+		}
+		if strings.Contains(out, "listq-iss2") {
+			t.Errorf("the exited round was named as in flight: %q", out)
+		}
+		if got := recordedConfigPath(queue); got != path {
+			t.Errorf("restart re-recorded %q, want the invoking config %q", got, path)
+		}
+	})
+
+	t.Run("a walk that cannot run keeps the drain face", func(t *testing.T) {
+		useDaemonDir(t)
+		cfg, path := liveCfg(t, "127.0.0.1:"+strconv.Itoa(deadRelayPort(t)))
+		seed(t)
+
+		out := captureStdout(t, func() {
+			if err := workerRestart(cfg, path, ""); err != nil {
+				t.Errorf("workerRestart: %v", err)
+			}
+		})
+		if !strings.Contains(out, "restart scheduled (drains current tasks) for worker "+queue+" (pid ") {
+			t.Errorf("restart output %q, want the drain face when liveness cannot be seen", out)
+		}
+		if strings.Contains(out, "is idle") {
+			t.Errorf("an unknown walk announced an idle restart: %q", out)
+		}
+		if got := recordedConfigPath(queue); got != path {
+			t.Errorf("restart re-recorded %q, want the invoking config %q", got, path)
+		}
+	})
 }

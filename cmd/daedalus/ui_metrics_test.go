@@ -1136,9 +1136,9 @@ func TestUIRunDetailLedgerCost(t *testing.T) {
 
 		out := h.get(t, "/runs/listq-iss9")
 		for _, want := range []string{
-			`<td class="py-1 mono">mA</td><td>2</td><td class="mono">$6.5000</td>`,
-			`<td class="py-1 mono">mC</td><td>1</td><td class="mono">$1.0000</td>`,
-			`colspan="2">Total</td><td class="mono">$7.5000</td>`,
+			`<td class="mcell py-1 mono" data-th="Model">mA</td><td class="mcell" data-th="Calls">2</td><td class="mcell mono" data-th="Cost USD">$6.5000</td>`,
+			`<td class="mcell py-1 mono" data-th="Model">mC</td><td class="mcell" data-th="Calls">1</td><td class="mcell mono" data-th="Cost USD">$1.0000</td>`,
+			`colspan="2">Total</td><td class="mcell mono">$7.5000</td>`,
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the priced section lacks %q:\n%s", want, out)
@@ -1166,8 +1166,8 @@ func TestUIRunDetailLedgerCost(t *testing.T) {
 		}
 		out := h.get(t, "/runs/listq-iss-role-a-round-3")
 		// The seed's two mA entries at an out rate of 0: $3.00 + $1.50.
-		if !strings.Contains(out, `<td class="py-1 mono">mA</td><td>2</td><td class="mono">$4.5000</td>`) ||
-			!strings.Contains(out, `colspan="2">Total</td><td class="mono">$4.5000</td>`) {
+		if !strings.Contains(out, `<td class="mcell py-1 mono" data-th="Model">mA</td><td class="mcell" data-th="Calls">2</td><td class="mcell mono" data-th="Cost USD">$4.5000</td>`) ||
+			!strings.Contains(out, `colspan="2">Total</td><td class="mcell mono">$4.5000</td>`) {
 			t.Errorf("the anchored run id did not match its scrubbed Task:\n%s", out)
 		}
 	})
@@ -1402,7 +1402,13 @@ func TestUIUsageTableRendersTheOtelEra(t *testing.T) {
 		Model: "mA", InputTokens: 300, OutputTokens: 100})
 
 	out := h.get(t, "/models")
-	relayAt, otelAt := strings.Index(out, `>mA</td>`), strings.Index(out, `>otel-mA</td>`)
+	// The page's price form cards an mA row of its own above the polled
+	// region, so the ordering scan anchors inside the model fold itself.
+	fold := strings.Index(out, "Usage by model")
+	if fold < 0 {
+		t.Fatalf("the models page lost its usage-by-model fold:\n%s", out)
+	}
+	relayAt, otelAt := strings.Index(out[fold:], `>mA</td>`), strings.Index(out[fold:], `>otel-mA</td>`)
 	if relayAt < 0 || otelAt < 0 {
 		t.Fatalf("usage table lacks the era rows (relay@%d otel@%d):\n%s", relayAt, otelAt, out)
 	}
@@ -1414,7 +1420,140 @@ func TestUIUsageTableRendersTheOtelEra(t *testing.T) {
 	}
 	// The otel row's per-request columns are dashes, not the zeros an
 	// export batch would fabricate.
-	if n := strings.Count(out, `<td class="mono">—</td>`); n < 4 {
-		t.Errorf("the otel row rendered %d dash cells, want the ratio and latency set:\n%s", n, out)
+	for _, col := range []string{"Hit %", "p50", "p95", "req/min"} {
+		if !strings.Contains(out, `<td class="mcell mono" data-th="`+col+`">—</td>`) {
+			t.Errorf("the otel row's %s cell is not the dash:\n%s", col, out)
+		}
 	}
+}
+
+// TestRoundLedgerCostsPinsThePerRoundFold pins the detail walk's per-round
+// pricing fold: entries fold per Round (the scheduled activity id the
+// worker sends as its attribution) and per run's Task only — another run's
+// calls and unpriced models contribute nothing, and calls on one round sum.
+func TestRoundLedgerCostsPinsThePerRoundFold(t *testing.T) {
+	prices := map[string]modelPrice{"mA": {In: 3, Out: 2, Cached: 1}}
+	entries := []metricsrelay.Entry{
+		{Task: "listq-iss9", Round: "4", Model: "mA", InputTokens: 1_000_000, Status: 200},  // $3
+		{Task: "listq-iss9", Round: "4", Model: "mA", OutputTokens: 500_000, Status: 200},   // +$1
+		{Task: "listq-iss9", Round: "6", Model: "mA", InputTokens: 1_000_000, Status: 200},  // $3
+		{Task: "listq-iss9", Round: "4", Model: "mB", InputTokens: 2_000_000, Status: 200},  // unpriced: nothing
+		{Task: "listq-other", Round: "4", Model: "mA", InputTokens: 9_000_000, Status: 200}, // another run: nothing
+	}
+	costs := roundLedgerCosts(entries, prices, "listq-iss9")
+	if len(costs) != 2 || costs["4"] != 4 || costs["6"] != 3 {
+		t.Errorf("roundLedgerCosts = %v, want round 4 at $4 (summed, unpriced dropped) and round 6 at $3", costs)
+	}
+	if costs := roundLedgerCosts(entries, nil, "listq-iss9"); len(costs) != 0 {
+		t.Errorf("roundLedgerCosts(no prices) = %v, want nothing priced", costs)
+	}
+}
+
+// TestRoundCostCellPinsTheDashFaces pins the usage table's Cost cell: the
+// round's priced fold when it has one, and the dash when the operator has
+// no prices at all (the nil gate) or the round has no priced calls — the
+// CLI's self-reported cost is never an input.
+func TestRoundCostCellPinsTheDashFaces(t *testing.T) {
+	if got := roundCostCell(nil, "4"); got != "—" {
+		t.Errorf("roundCostCell(no prices) = %q, want the dash", got)
+	}
+	costs := map[string]float64{"4": 4}
+	if got := roundCostCell(costs, "4"); got != "$4.0000" {
+		t.Errorf("roundCostCell(priced) = %q, want $4.0000", got)
+	}
+	if got := roundCostCell(costs, "9"); got != "—" {
+		t.Errorf("roundCostCell(round with no priced calls) = %q, want the dash", got)
+	}
+}
+
+// TestUIRunDetailRoundsPriceFromTheLedger pins the detail page's priced
+// face end to end: with prices saved, every round's Cost cell prices from
+// the ledger fold keyed by the round's scheduled activity id, the rounds
+// table's total is the ledger's own priced window (never the CLI-reported
+// sum the history payloads carry), and without prices every cell is the
+// dash.
+func TestUIRunDetailRoundsPriceFromTheLedger(t *testing.T) {
+	build := func(t *testing.T) *uiHarness {
+		t.Helper()
+		h := newUIHarness(t)
+		id := "listq-iss9"
+		h.fake.describes[id] = &workflowservice.DescribeWorkflowExecutionResponse{
+			WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+				Execution: &commonpb.WorkflowExecution{WorkflowId: id, RunId: "run-9"},
+				TaskQueue: "listq",
+				Status:    enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+				StartTime: timestamppb.New(time.Now().Add(-time.Hour)),
+			},
+		}
+		at := time.Now().Add(-30 * time.Minute)
+		h.fake.wfHistory[id] = []*historypb.HistoryEvent{
+			uiStartedEvent(t, workflows.PipelineInput{IssueID: "9", RepoPath: "", Flow: "feature-dev"}),
+			uiScheduled(t, 4, at, "RunJailedClaudeActivity", activities.AgentRunInput{Agent: "pi", Role: activities.RoleDev}),
+			completedEvent(t, 4, at.Add(time.Minute), activities.AgentRunResult{Usage: activities.Usage{InputTokens: 100, OutputTokens: 50, CostUSD: 0.25}}),
+			uiScheduled(t, 6, at.Add(2*time.Minute), "RunJailedReviewerActivity", activities.ReviewInput{Agent: "claude"}),
+			completedEvent(t, 6, at.Add(3*time.Minute), activities.ReviewResult{Approved: true, Usage: activities.Usage{CostUSD: 0.75}}),
+		}
+		// The run's priced ledger window: rounds 4 and 6 priced per their
+		// activity ids, a round id no history round carries (a call whose
+		// round left no usage row) that may only surface in the total, and
+		// an unpriced model that may not price anything.
+		base := time.Now().Add(-time.Hour)
+		h.led.Append(metricsrelay.Entry{At: base, Worker: "w", Wire: metricsrelay.WireAnthropic, Task: id,
+			Role: string(activities.RoleDev), Round: "4", Model: "mA", InputTokens: 1_000_000, Status: 200})
+		h.led.Append(metricsrelay.Entry{At: base.Add(time.Minute), Worker: "w", Wire: metricsrelay.WireAnthropic, Task: id,
+			Role: string(activities.RoleDevReview), Round: "6", Model: "mA", OutputTokens: 1_000_000, Status: 200})
+		h.led.Append(metricsrelay.Entry{At: base.Add(2 * time.Minute), Worker: "w", Wire: metricsrelay.WireAnthropic, Task: id,
+			Round: "9", Model: "mA", InputTokens: 100_000, Status: 200})
+		h.led.Append(metricsrelay.Entry{At: base.Add(3 * time.Minute), Worker: "w", Task: id,
+			Round: "4", Model: "mB", InputTokens: 2_000_000, Status: 200})
+		return h
+	}
+
+	t.Run("without prices, every cell is the dash", func(t *testing.T) {
+		h := build(t)
+		out := h.get(t, "/runs/listq-iss9")
+		if n := strings.Count(out, `<td class="mcell mono" data-th="Cost USD">—</td>`); n < 2 {
+			t.Errorf("the unpriced rounds table rendered %d dash cost cells, want both rounds':\n%s", n, out)
+		}
+		if !strings.Contains(out, `<td class="mcell mono">—</td>`) {
+			t.Errorf("the unpriced rounds total is not the dash:\n%s", out)
+		}
+		for _, banned := range []string{"0.2500", "0.7500", "1.0000"} {
+			if strings.Contains(out, banned) {
+				t.Errorf("the unpriced detail rendered the CLI-reported %q:\n%s", banned, out)
+			}
+		}
+	})
+
+	t.Run("with prices, cells price from the ledger fold", func(t *testing.T) {
+		h := build(t)
+		if code, _, _ := postModels(t, h, url.Values{"in[mA]": {"3"}, "out[mA]": {"2"}, "cached[mA]": {"1"}}); code != http.StatusSeeOther {
+			t.Fatalf("the save answered %d", code)
+		}
+
+		out := h.get(t, "/runs/listq-iss9")
+		// Round 1 = activity 4: 1M in at $3. Round 2 = activity 6: 1M out
+		// at $2. The unpriced mB call on activity 4 must not add to it.
+		// (The cells' durations are the usage records' own, not the rail's
+		// history spans.)
+		for _, want := range []string{
+			`<td class="mcell mono" data-th="Tokens in">100</td><td class="mcell mono" data-th="Tokens out">50</td><td class="mcell mono" data-th="Duration">0s</td><td class="mcell mono" data-th="Cost USD">$3.0000</td>`,
+			`<td class="mcell mono" data-th="Tokens in">0</td><td class="mcell mono" data-th="Tokens out">0</td><td class="mcell mono" data-th="Duration">0s</td><td class="mcell mono" data-th="Cost USD">$2.0000</td>`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the usage table lacks the ledger-priced row %q:\n%s", want, out)
+			}
+		}
+		// The rounds total is the ledger's whole priced window for the run
+		// — $3 + $2 + the $0.30 call on the history-less round 9 — never
+		// the CLI's 0.25 + 0.75.
+		if !strings.Contains(out, `colspan="6">Total cost</td><td class="mcell mono">$5.3000</td>`) {
+			t.Errorf("the rounds total is not the ledger's priced window:\n%s", out)
+		}
+		for _, banned := range []string{"0.2500", "0.7500", "1.0000"} {
+			if strings.Contains(out, banned) {
+				t.Errorf("the priced detail still renders the CLI-reported %q:\n%s", banned, out)
+			}
+		}
+	})
 }
