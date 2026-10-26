@@ -3508,9 +3508,10 @@ func TestLoadMid(t *testing.T) {
 // a key alone (the public base with that key); codex, opencode, and aider
 // have no anthropic channel at all; pi is staged on the openai channel only,
 // though a bare anthropic key still reaches it through the exported env; amp
-// authenticates through AMP_API_KEY alone and is exempt. A conflict fires
-// only when a serving endpoint exists and no channel serves the agent — an
-// all-unset config is the ambient posture and never trips it.
+// authenticates through AMP_API_KEY alone and is exempt; hands takes either
+// wire through its own staged provider block and is exempt like amp. A
+// conflict fires only when a serving endpoint exists and no channel serves
+// the agent — an all-unset config is the ambient posture and never trips it.
 func TestAgentWireConflict(t *testing.T) {
 	anthURL := AnthropicConfig{URL: "https://a.example", Key: "sk-a"}
 	anthKey := AnthropicConfig{Key: "sk-a"}
@@ -3532,7 +3533,7 @@ func TestAgentWireConflict(t *testing.T) {
 		{"an openai url beside an anthropic key serves both wires", Config{Anthropic: anthKey, OpenAI: openURL}, nil},
 		{"an anthropic url beside an openai key still leaves the openai-wire agents unserved", Config{Anthropic: anthURL, OpenAI: openKey}, []string{"pi", "codex", "opencode", "aider"}},
 	}
-	agents := []string{"claude", "pi", "codex", "opencode", "aider", "amp"}
+	agents := []string{"claude", "pi", "codex", "opencode", "aider", "amp", "hands"}
 	for _, p := range postures {
 		t.Run(p.name, func(t *testing.T) {
 			for _, agent := range agents {
@@ -3965,6 +3966,20 @@ func TestAgentsAdmitsItsOwnList(t *testing.T) {
 	}
 	if err := ValidateAgent(again[0]); err != nil {
 		t.Errorf("ValidateAgent(%q) = %v after the caller-side mutation", again[0], err)
+	}
+}
+
+// TestAgentsListIncludesHands pins hands's admission to the agent set: the
+// list is the dashboard New-Task dropdown's single source, so dropping the
+// name from it would silently make the agent configurable only by hand —
+// the round-trip above validates whatever the list holds, it cannot catch
+// a name going missing.
+func TestAgentsListIncludesHands(t *testing.T) {
+	if !slices.Contains(Agents(), "hands") {
+		t.Errorf("Agents() = %v, want hands listed", Agents())
+	}
+	if err := ValidateAgent("hands"); err != nil {
+		t.Errorf("ValidateAgent(%q) = %v, want admitted", "hands", err)
 	}
 }
 

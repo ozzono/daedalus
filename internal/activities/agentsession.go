@@ -253,9 +253,10 @@ func recordedPiSession(ctx context.Context, worktree string, role SessionRole) (
 
 // recordedAgentSession dispatches recordedSession per agent: claude and pi
 // get their dedicated wrappers; opencode and codex share the body with
-// their own staleness check; amp and aider have no session state the
-// tracking can address. Every caller is gated on agentResumeFlag, so
-// anything else never reaches here.
+// their own staleness check; hands shares it too, its staleness checked
+// against the session store in the worktree's scratch dir; amp and aider
+// have no session state the tracking can address. Every caller is gated on
+// agentResumeFlag, so anything else never reaches here.
 func recordedAgentSession(ctx context.Context, agent, worktree string, role SessionRole) (string, bool) {
 	switch agent {
 	case "pi":
@@ -264,6 +265,8 @@ func recordedAgentSession(ctx context.Context, agent, worktree string, role Sess
 		return recordedSessionCheck(ctx, worktree, role, opencodeTranscriptExists)
 	case "codex":
 		return recordedSessionCheck(ctx, worktree, role, codexTranscriptExists)
+	case "hands":
+		return recordedSessionCheck(ctx, worktree, role, handsTranscriptExists)
 	}
 	return recordedSession(ctx, worktree, role)
 }

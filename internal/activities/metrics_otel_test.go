@@ -285,7 +285,7 @@ func TestMetricsRoundEnvWithoutTheEndpoint(t *testing.T) {
 
 	t.Run("a non-otel agent keeps the relay with the endpoint staged", func(t *testing.T) {
 		env := append(metricsRoundBaseEnv(), config.MetricsOtelEndpointEnv+"=http://127.0.0.1:7778/v1/metrics")
-		for _, agent := range []string{"aider", "opencode", "amp"} {
+		for _, agent := range []string{"aider", "opencode", "amp", "hands"} {
 			got, args := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, agent)
 			if args != nil {
 				t.Errorf("%s: otel args = %v, want none (the agent has no otel surface)", agent, args)
