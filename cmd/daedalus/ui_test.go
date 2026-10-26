@@ -751,6 +751,95 @@ func TestUIRunsViewFilters(t *testing.T) {
 	}
 }
 
+// TestUIDashMobileRowCards pins the dash tables' mobile re-flow markup:
+// converted tables carry the mtable hook and render their rows as mcards
+// whose cells self-label through data-th with the desktop column's name —
+// the shared usage table's key label riding .Head, so each fold names its
+// own key — empty-state and footer rows join the card flow, and the whole
+// mobile stylesheet lives inside the one max-width query, so at desktop
+// widths none of it applies.
+func TestUIDashMobileRowCards(t *testing.T) {
+	h := newUIHarness(t)
+	started := time.Now().Add(-time.Hour)
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+		uiRow(t, "listq-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started, nil),
+	}
+	h.led.Append(metricsrelay.Entry{At: started, Worker: "w", Model: "mA", InputTokens: 10, Status: 200})
+
+	runs := h.get(t, "/runs")
+	if !strings.Contains(runs, `<table class="mtable card w-full text-sm min-w-[820px]">`) {
+		t.Errorf("the runs table lost its mtable hook:\n%s", runs)
+	}
+	if !strings.Contains(runs, `<tr class="mcard border-b`) {
+		t.Errorf("the runs feed's rows are not mobile cards:\n%s", runs)
+	}
+	// A card's value sits inside its labeled cell: the workflow id's link
+	// under the Workflow id label.
+	if !strings.Contains(runs, `data-th="Workflow id"><a class="mono`) {
+		t.Errorf("the workflow id is not the card's labeled lead cell:\n%s", runs)
+	}
+	for _, col := range []string{"Workflow id", "Status", "Issue", "Repo", "Queue", "Started", "Last interaction", "Last CoT"} {
+		if !strings.Contains(runs, `data-th="`+col+`">`) {
+			t.Errorf("the runs feed's cards lack the %q label:\n%s", col, runs)
+		}
+	}
+
+	empty := h.get(t, "/runs/rows?status=parked")
+	if !strings.Contains(empty, `<tr class="mcard"><td colspan="8"`) {
+		t.Errorf("the empty feed's note row is not a card:\n%s", empty)
+	}
+
+	// The shared usage table takes its key cell's label from .Head: the
+	// models fold names Model, the worker fold Worker — the same define
+	// serving both. The Model cell is byte-identical to the price form's
+	// card above the polled region, so the fold only proves its Head when
+	// both render.
+	models := h.get(t, "/models")
+	if n := strings.Count(models, `<td class="mcell p-3 mono" data-th="Model">mA</td>`); n != 2 {
+		t.Errorf("the models page rendered %d labeled mA cells, want the price form's and the Model fold's:\n%s", n, models)
+	}
+	if !strings.Contains(models, `<td class="mcell p-3 mono" data-th="Worker">w</td>`) {
+		t.Errorf("the worker fold's key cell lost its Worker label:\n%s", models)
+	}
+
+	// The mobile stylesheet is one max-width query and nothing escapes it:
+	// a card rule outside the query would restyle the desktop tables too.
+	src, err := uiTemplateFS.ReadFile("ui_templates.html")
+	if err != nil {
+		t.Fatalf("read the template: %v", err)
+	}
+	style := string(src)
+	style = style[strings.Index(style, "<style"):strings.Index(style, "</style>")]
+	open := strings.Index(style, "@media (max-width: 767px)")
+	if open < 0 {
+		t.Fatalf("the mobile stylesheet lost its max-width query:\n%s", style)
+	}
+	end := -1
+	for i, depth := open, 0; i < len(style) && end < 0; i++ {
+		switch style[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				end = i
+			}
+		}
+	}
+	for _, cls := range []string{".mtable", ".mcard", ".mcell"} {
+		for off := 0; ; {
+			at := strings.Index(style[off:], cls)
+			if at < 0 {
+				break
+			}
+			if off+at < open || off+at > end {
+				t.Errorf("a %s rule escapes the max-width query — desktop rendering would match it", cls)
+				break
+			}
+			off += at + 1
+		}
+	}
+}
+
 // TestUIWorkerProbeTooltips pins the probe badges' hover faces: the title
 // carries the probe's own detail plus the TTL-cached caveat, and differs on
 // whether the probe reached the provider — the roster's "will the next

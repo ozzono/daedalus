@@ -1136,9 +1136,9 @@ func TestUIRunDetailLedgerCost(t *testing.T) {
 
 		out := h.get(t, "/runs/listq-iss9")
 		for _, want := range []string{
-			`<td class="py-1 mono">mA</td><td>2</td><td class="mono">$6.5000</td>`,
-			`<td class="py-1 mono">mC</td><td>1</td><td class="mono">$1.0000</td>`,
-			`colspan="2">Total</td><td class="mono">$7.5000</td>`,
+			`<td class="mcell py-1 mono" data-th="Model">mA</td><td class="mcell" data-th="Calls">2</td><td class="mcell mono" data-th="Cost USD">$6.5000</td>`,
+			`<td class="mcell py-1 mono" data-th="Model">mC</td><td class="mcell" data-th="Calls">1</td><td class="mcell mono" data-th="Cost USD">$1.0000</td>`,
+			`colspan="2">Total</td><td class="mcell mono">$7.5000</td>`,
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the priced section lacks %q:\n%s", want, out)
@@ -1166,8 +1166,8 @@ func TestUIRunDetailLedgerCost(t *testing.T) {
 		}
 		out := h.get(t, "/runs/listq-iss-role-a-round-3")
 		// The seed's two mA entries at an out rate of 0: $3.00 + $1.50.
-		if !strings.Contains(out, `<td class="py-1 mono">mA</td><td>2</td><td class="mono">$4.5000</td>`) ||
-			!strings.Contains(out, `colspan="2">Total</td><td class="mono">$4.5000</td>`) {
+		if !strings.Contains(out, `<td class="mcell py-1 mono" data-th="Model">mA</td><td class="mcell" data-th="Calls">2</td><td class="mcell mono" data-th="Cost USD">$4.5000</td>`) ||
+			!strings.Contains(out, `colspan="2">Total</td><td class="mcell mono">$4.5000</td>`) {
 			t.Errorf("the anchored run id did not match its scrubbed Task:\n%s", out)
 		}
 	})
@@ -1402,7 +1402,13 @@ func TestUIUsageTableRendersTheOtelEra(t *testing.T) {
 		Model: "mA", InputTokens: 300, OutputTokens: 100})
 
 	out := h.get(t, "/models")
-	relayAt, otelAt := strings.Index(out, `>mA</td>`), strings.Index(out, `>otel-mA</td>`)
+	// The page's price form cards an mA row of its own above the polled
+	// region, so the ordering scan anchors inside the model fold itself.
+	fold := strings.Index(out, "Usage by model")
+	if fold < 0 {
+		t.Fatalf("the models page lost its usage-by-model fold:\n%s", out)
+	}
+	relayAt, otelAt := strings.Index(out[fold:], `>mA</td>`), strings.Index(out[fold:], `>otel-mA</td>`)
 	if relayAt < 0 || otelAt < 0 {
 		t.Fatalf("usage table lacks the era rows (relay@%d otel@%d):\n%s", relayAt, otelAt, out)
 	}
@@ -1414,8 +1420,10 @@ func TestUIUsageTableRendersTheOtelEra(t *testing.T) {
 	}
 	// The otel row's per-request columns are dashes, not the zeros an
 	// export batch would fabricate.
-	if n := strings.Count(out, `<td class="mono">—</td>`); n < 4 {
-		t.Errorf("the otel row rendered %d dash cells, want the ratio and latency set:\n%s", n, out)
+	for _, col := range []string{"Hit %", "p50", "p95", "req/min"} {
+		if !strings.Contains(out, `<td class="mcell mono" data-th="`+col+`">—</td>`) {
+			t.Errorf("the otel row's %s cell is not the dash:\n%s", col, out)
+		}
 	}
 }
 
@@ -1504,8 +1512,11 @@ func TestUIRunDetailRoundsPriceFromTheLedger(t *testing.T) {
 	t.Run("without prices, every cell is the dash", func(t *testing.T) {
 		h := build(t)
 		out := h.get(t, "/runs/listq-iss9")
-		if n := strings.Count(out, `<td class="mono">—</td>`); n < 3 {
-			t.Errorf("the unpriced rounds table rendered %d dash cells, want both rounds' cost cells and the total:\n%s", n, out)
+		if n := strings.Count(out, `<td class="mcell mono" data-th="Cost USD">—</td>`); n < 2 {
+			t.Errorf("the unpriced rounds table rendered %d dash cost cells, want both rounds':\n%s", n, out)
+		}
+		if !strings.Contains(out, `<td class="mcell mono">—</td>`) {
+			t.Errorf("the unpriced rounds total is not the dash:\n%s", out)
 		}
 		for _, banned := range []string{"0.2500", "0.7500", "1.0000"} {
 			if strings.Contains(out, banned) {
@@ -1526,8 +1537,8 @@ func TestUIRunDetailRoundsPriceFromTheLedger(t *testing.T) {
 		// (The cells' durations are the usage records' own, not the rail's
 		// history spans.)
 		for _, want := range []string{
-			`<td class="mono">100</td><td class="mono">50</td><td class="mono">0s</td><td class="mono">$3.0000</td>`,
-			`<td class="mono">0</td><td class="mono">0</td><td class="mono">0s</td><td class="mono">$2.0000</td>`,
+			`<td class="mcell mono" data-th="Tokens in">100</td><td class="mcell mono" data-th="Tokens out">50</td><td class="mcell mono" data-th="Duration">0s</td><td class="mcell mono" data-th="Cost USD">$3.0000</td>`,
+			`<td class="mcell mono" data-th="Tokens in">0</td><td class="mcell mono" data-th="Tokens out">0</td><td class="mcell mono" data-th="Duration">0s</td><td class="mcell mono" data-th="Cost USD">$2.0000</td>`,
 		} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the usage table lacks the ledger-priced row %q:\n%s", want, out)
@@ -1536,7 +1547,7 @@ func TestUIRunDetailRoundsPriceFromTheLedger(t *testing.T) {
 		// The rounds total is the ledger's whole priced window for the run
 		// — $3 + $2 + the $0.30 call on the history-less round 9 — never
 		// the CLI's 0.25 + 0.75.
-		if !strings.Contains(out, `colspan="6">Total cost</td><td class="mono">$5.3000</td>`) {
+		if !strings.Contains(out, `colspan="6">Total cost</td><td class="mcell mono">$5.3000</td>`) {
 			t.Errorf("the rounds total is not the ledger's priced window:\n%s", out)
 		}
 		for _, banned := range []string{"0.2500", "0.7500", "1.0000"} {
