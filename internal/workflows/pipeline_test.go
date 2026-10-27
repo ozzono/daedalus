@@ -1446,6 +1446,57 @@ func TestFeatureDevWorkflowDiscoveryErrorFails(t *testing.T) {
 	}
 }
 
+// TestFeatureDevWorkflowDiscoveryStuckParks pins the stuck routing on
+// test-command discovery: the jailed discovery round dying stuck parks the
+// run under the same step-named wrap the other discovery failures carry,
+// and the stuck round itself is never re-queued.
+func TestFeatureDevWorkflowDiscoveryStuckParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	disc, suiteRec := stubTestPhase(env)
+	disc.script = []discoveryStep{
+		{command: "go test ./..."},
+		{err: errStuckStub},
+	}
+
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked when discovery dies stuck")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"resolve test command",
+		"test-command discovery round stuck",
+		errStuckStub.Error(),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if len(disc.agents) != 2 {
+		t.Errorf("discovery ran %d times, want 2 — the stuck round is never re-queued", len(disc.agents))
+	}
+	if len(suiteRec.runs) != 1 {
+		t.Errorf("suite ran %d times, want 1 (only the preflight baseline — the stuck discovery ran no suite)", len(suiteRec.runs))
+	}
+	if len(rec.inputs) != 2 {
+		t.Errorf("agent ran %d times, want 2 (no fix round for a discovery park)", len(rec.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowNoSuitePreflightPassesVacuously pins the NONE side
 // of the preflight gate: a discovery round concluding the repository has no
 // test suite at all (activities.ErrNoSuite) is not a red baseline — the
@@ -1847,6 +1898,159 @@ func TestFeatureDevWorkflowKillOutranksExhaustion(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowAgentStuckParks pins the stuck routing: a round the
+// hands harness killed as stuck parks the run in one step — the
+// api-exhausted family's terminal reached with no heartbeat and no re-run,
+// because a retry would re-enter the very silence the round was killed
+// for — and the deferred cleanup still preserves the attempt's work.
+func TestFeatureDevWorkflowAgentStuckParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { calls++ }).
+		Return(activities.AgentRunResult{}, errStuckStub)
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked after a stuck round")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"agent round stuck",
+		`stage "implement"`,
+		errStuckStub.Error(),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("agent calls = %d, want 1 — a stuck round is never re-run (no heartbeat, no continuation, no fresh start)", calls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowStuckOutranksExhaustion pins the classification
+// order on the stuck face: an error carrying both the stuck sentinel and
+// exhaustion text parks in one step instead of entering the quota
+// heartbeat — the heartbeat would re-queue the very round whose silence
+// the sentinel already named.
+func TestFeatureDevWorkflowStuckOutranksExhaustion(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { calls++ }).
+		Return(activities.AgentRunResult{}, fmt.Errorf("%w: %w", activities.ErrAgentStuck, activities.ErrAPIExhausted))
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked on a stuck+exhausted round")
+	}
+	if !strings.Contains(err.Error(), "agent round stuck") {
+		t.Errorf("stuck+exhaustion error parked in the heartbeat instead: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("agent calls = %d, want 1 — the stuck face must preempt the heartbeat retries", calls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowKillOutranksStuck pins the other precedence edge:
+// a signal kill outranks a stuck report embedded in the same error — the
+// kill routes to the continuation recovery, never to a park, exactly as it
+// outranks the exhaustion markers a killed round may have printed.
+func TestFeatureDevWorkflowKillOutranksStuck(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var prompts []string
+	var calls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.AgentRunInput); ok {
+					prompts = append(prompts, in.Prompt)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			if calls == 1 {
+				return activities.AgentRunResult{}, fmt.Errorf("%w: %w", errKilledStub, activities.ErrAgentStuck)
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("agent calls = %d, want 3 (killed round, continuation, tests round)", calls)
+	}
+	if len(prompts) < 2 || !strings.Contains(prompts[1], "killed mid-round") {
+		t.Errorf("kill+stuck error did not route to kill recovery; retry prompt: %q", prompts[1])
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowAgentStuckOnResumedRoundSurfaces pins the
+// fresh-start exclusion on the routing side: a stuck kill of a resumed
+// round surfaces as the park instead of spending the one fresh-start
+// fallback a generic death gets — the fresh session would re-enter the
+// same silence (brokenResume's workflow-side twin).
+func TestFeatureDevWorkflowAgentStuckOnResumedRoundSurfaces(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	rec := &agentRecorder{env: env, script: []agentStep{
+		{result: activities.AgentRunResult{SessionID: "sess-1", Text: "done"}},
+		{err: errStuckStub},
+	}}
+	rec.record()
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{
+		{Approved: false, Comments: "rename foo to bar"},
+		{Approved: true},
+	}}
+	rev.record()
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked after the resumed fix round died stuck")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"agent round stuck",
+		`stage "implement-fix"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if len(rec.inputs) != 2 {
+		t.Fatalf("agent ran %d times, want 2 — the stuck fix round must surface, not spend the fresh-start fallback on a third attempt", len(rec.inputs))
+	}
+	if rec.inputs[1].SessionID != "sess-1" {
+		t.Errorf("fix round resumed session %q, want sess-1 — the kill hit a resumed round", rec.inputs[1].SessionID)
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowCleanupTimeoutWiring pins that the deferred cleanup
 // runs under its own ceiling: the configured CleanupTimeout reaches the
 // activity as its StartToCloseTimeout, and a zero (a run started by an
@@ -2089,6 +2293,44 @@ func TestFeatureDevWorkflowReviewerKilledRetries(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// TestFeatureDevWorkflowReviewerStuckParks pins the stuck routing on the
+// review loop: a stuck reviewer round parks the run — never re-run, never
+// failed over, never parked in the quota heartbeat — with the focus in the
+// park reason, and the deferred cleanup still preserves the work.
+func TestFeatureDevWorkflowReviewerStuckParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	rec := &agentRecorder{env: env}
+	rec.record()
+	var reviewCalls int
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			reviewCalls++
+			return activities.ReviewResult{}, errStuckStub
+		})
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked after a stuck reviewer round")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"reviewer round stuck",
+		`focus "the implementation. The task:`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if reviewCalls != 1 {
+		t.Errorf("review calls = %d, want 1 — a stuck reviewer round is never re-run", reviewCalls)
+	}
+	env.AssertExpectations(t)
+}
+
 // errQuotaStub mirrors how a quota-exhausted activity round surfaces on the
 // workflow side: the ErrAPIExhausted sentinel wrapped in richer text, matched
 // by substring across the worker→workflow boundary.
@@ -2099,6 +2341,12 @@ var errQuotaStub = fmt.Errorf("run jailed: %w: usage limit reached", activities.
 // it in production (runJailed's own %w here, "review run:"/"discover test
 // command:" prefixes at the other call sites).
 var errSlotStub = fmt.Errorf("%w: no slot freed within 5m0s", activities.ErrAgentSlotsBusy)
+
+// errStuckStub is a hands round the harness itself killed as stuck, as the
+// workflow sees it: the ErrAgentStuck sentinel in runJailedRound's own wrap
+// shape (class plus the harness's silence-window reason, no output),
+// matched by substring across the worker→workflow boundary.
+var errStuckStub = fmt.Errorf("%w: hands round died on a stuck kill: no wire events for 14m0s", activities.ErrAgentStuck)
 
 // TestFeatureDevWorkflowQuotaHeartbeatRecovers pins the pause semantics: an
 // exhausted round is retried unchanged after an hourly heartbeat, the streak

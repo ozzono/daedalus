@@ -604,6 +604,18 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 		// externally killed round may well have printed before it
 		// died — a kill must not park the run in the quota heartbeat.
 		killed := isAgentKilled(err)
+		if !killed && isAgentStuck(err) {
+			// A stuck-classified round parks, per the routing ruling — the
+			// api-exhausted family's terminal (work preserved on the
+			// aborted/ branch, operator restarts via `daedalus continue`)
+			// reached in one step, because the round itself is never
+			// re-run: a watchdog kill means the round went silent, and a
+			// retry re-enters the same silence. No failover either. Same
+			// precedence slot as the checks around it: under the kill,
+			// over the output-text classifications and the fresh-start
+			// fallback below.
+			return activities.AgentRunResult{}, r.park(fmt.Sprintf("agent round stuck (stage %q): %v", stage, err))
+		}
 		if !killed && isAPIExhaustion(err) {
 			if herr := r.heartbeat(err, stage); herr != nil {
 				return activities.AgentRunResult{}, herr
@@ -891,6 +903,12 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 		// reviewer must not park in the quota heartbeat over output
 		// text it printed before dying.
 		killed := isAgentKilled(err)
+		if !killed && isAgentStuck(err) {
+			// Same park as the agent rounds: a stuck reviewer round is
+			// preserved for the operator — never re-run, never failed
+			// over, never parked in the quota heartbeat.
+			return result, r.park(fmt.Sprintf("reviewer round stuck (focus %q): %v", focus, err))
+		}
 		if !killed && isPromptOverflow(err) {
 			// A prompt that cannot fit the serving model's context is a
 			// static failure: the same prompt is re-sent by every retry,
@@ -997,6 +1015,11 @@ func (r *pipelineRun) resolveTestCommand() (string, error) {
 			}
 			r.setStatus(StatusRunning)
 			continue
+		}
+		if isAgentStuck(err) {
+			// Test-command discovery runs a jailed agent round, so the
+			// stuck park covers it too.
+			return "", fmt.Errorf("resolve test command: %w", r.park(fmt.Sprintf("test-command discovery round stuck: %v", err)))
 		}
 		if isAPIExhaustion(err) {
 			// Test-command discovery runs a jailed agent round, so it

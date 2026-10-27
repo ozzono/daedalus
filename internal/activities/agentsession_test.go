@@ -291,8 +291,9 @@ func TestWatchTranscriptsStopsWhenClosed(t *testing.T) {
 // conversation — a killed round (including the ceiling kill), an exhausted
 // provider, a busy slot, a round that never launched, a round the window
 // preflight refused (its prompt size is session-independent, so no fresh
-// start shrinks it), a cancelled or expired context — keeps the round as
-// it is.
+// start shrinks it), a stuck round (the ruled no-retry face: a fresh
+// session would re-enter the very silence the round was killed for), a
+// cancelled or expired context — keeps the round as it is.
 func TestBrokenResume(t *testing.T) {
 	cases := []struct {
 		name string
@@ -306,6 +307,7 @@ func TestBrokenResume(t *testing.T) {
 		{"slots busy", fmt.Errorf("wrap: %w", ErrAgentSlotsBusy), false},
 		{"agent never launched", fmt.Errorf("%w: exec: not found", errAgentStart), false},
 		{"window preflight refusal", fmt.Errorf("run jailed: %w: pi round refused before launch", ErrPromptOverWindow), false},
+		{"stuck round", fmt.Errorf("wrap: %w", ErrAgentStuck), false},
 		{"cancelled", fmt.Errorf("wrap: %w", context.Canceled), false},
 		{"deadline exceeded", context.DeadlineExceeded, false},
 	}

@@ -1327,12 +1327,13 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// still outranks this report, exactly as it outranks the text markers.
 	apiErr := agentAPIError(selected, res.Stdout)
 	// hands's stuck class is a face of its own, parsed beside the api-error
-	// report but never folded into it: the stuck routing (retry fresh, park
-	// to the heartbeat, fail over) is a deliberately open maintainer ruling,
-	// so the face must not inherit ErrAPIExhausted's failover-and-heartbeat
-	// rescue. hands's protocol is the only one carrying a class field, so
-	// only its stream is scanned — another agent's stdout can never mint
-	// this face by printing the event shape.
+	// report but never folded into it: the routing ruling (park to the
+	// preserved branch, no re-run, no failover) needs the face unmixed, so
+	// it must not inherit ErrAPIExhausted's failover-and-heartbeat rescue —
+	// the workflow parks on the bare sentinel instead. hands's protocol is
+	// the only one carrying a class field, so only its stream is scanned —
+	// another agent's stdout can never mint this face by printing the event
+	// shape.
 	stuck := ""
 	if selected == "hands" {
 		stuck = handsStuck(res.Stdout)
@@ -1743,17 +1744,17 @@ var ErrAgentLoop = errors.New("jailed agent stuck in an identical-tool-call loop
 // "stuck": the harness's own verdict that the round produced no wire
 // events for its silence window (prompt-prefill time included), the window
 // in the reason. Machine-parsed from the class field beside the retriable
-// api-error class, never from output text, and its own face on purpose: a
-// stuck death's routing — retry fresh, park to the quota heartbeat, or
-// fail the phase over — is a deliberately open maintainer ruling (the
-// classification lands first so the death is at least named), so it wraps
-// nothing and inherits no remediation family: not ErrAPIExhausted's
-// failover, not the killed face's continuation. Until the ruling the
-// workflow answers it like any unclassified round failure — fatal, with
-// the class and reason in the error the run fails with and the task log's
-// round-exit dump. brokenResume deliberately does not exclude it: a stuck
-// kill of a resumed round keeps the same one fresh-start retry a generic
-// death already gets, behavior-preserving until the ruling says otherwise.
+// api-error class, never from output text, and its own face on purpose:
+// it wraps nothing and inherits no remediation family — not
+// ErrAPIExhausted's failover, not the killed face's continuation — so the
+// ruled routing lands on the bare sentinel alone: the workflow's
+// isAgentStuck branches park the run (work preserved on the aborted/
+// branch, operator restarts via `daedalus continue`), never re-run the
+// round and never fail over. brokenResume excludes it for the same
+// reason: a stuck kill of a resumed round surfaces untouched instead of
+// spending its one fresh start re-entering the silence it was killed
+// for. The class and reason still reach the task log's round-exit dump
+// and the park reason.
 var ErrAgentStuck = errors.New("jailed agent round stuck")
 
 // matchesAny reports whether s contains any marker, case-insensitively.
