@@ -148,3 +148,43 @@ func TestPiToolLoopWatcherPartialLines(t *testing.T) {
 		t.Errorf("after the third identical call: fired = %v, kills = %d, want the kill fired once", w.fired, kills)
 	}
 }
+
+// TestHandsStuckClassify pins handsStuck's classification table: only the
+// failed event's class field decides — "stuck" lands with its reason in the
+// composite, which is never empty on a match (a missing reason must not
+// launder the class back into the generic failure path), every other class
+// stays untracked (retriable belongs to agentAPIError, the rest to the
+// generic path), and last-wins is total past any later event, mirroring
+// agentAPIError's stream-terminal semantics.
+func TestHandsStuckClassify(t *testing.T) {
+	cases := []struct {
+		name   string
+		stdout string
+		want   string
+	}{
+		{"stuck kill with reason", `{"kind":"failed","payload":{"class":"stuck","reason":"no wire events for 14m0s"}}`,
+			"class stuck: no wire events for 14m0s"},
+		{"stuck without a reason is never empty", `{"kind":"failed","payload":{"class":"stuck"}}`,
+			"class stuck: "},
+		{"last stuck wins", `{"kind":"failed","payload":{"class":"stuck","reason":"first"}}` + "\n" +
+			`{"kind":"failed","payload":{"class":"stuck","reason":"second"}}`,
+			"class stuck: second"},
+		{"last-wins is total past any later event", `{"kind":"failed","payload":{"class":"stuck","reason":"first"}}` + "\n" +
+			`{"kind":"started","payload":{"session":"s-9"}}` + "\n" +
+			`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}`,
+			"class stuck: first"},
+		{"retriable belongs to the api-error face", `{"kind":"failed","payload":{"class":"retriable","reason":"connection refused"}}`, ""},
+		{"other classes stay generic", `{"kind":"failed","payload":{"class":"no-delivery","reason":"loop guard"}}` + "\n" +
+			`{"kind":"failed","payload":{"class":"terminal","reason":"unusable response"}}`, ""},
+		{"clean stream", `{"kind":"started","payload":{"session":"s"}}` + "\n" +
+			`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}`, ""},
+		{"non-json lines ignored", "not json", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := handsStuck(c.stdout); got != c.want {
+				t.Errorf("handsStuck(%q) = %q, want %q", c.stdout, got, c.want)
+			}
+		})
+	}
+}

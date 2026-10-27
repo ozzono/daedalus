@@ -821,9 +821,11 @@ func CodexNewestRollout(worktree string) (string, time.Time, bool) {
 // them), worth one fresh-start retry. Everything else keeps the round as
 // it is: a killed round — including the activity-ceiling kill — resumes
 // fine; an exhausted round never really ran; a slots-busy, cancelled, or
-// never-spawned round says nothing about the conversation; and a round the
+// never-spawned round says nothing about the conversation; a round the
 // window preflight refused never launched at all, on a prompt no fresh
-// start shrinks. The
+// start shrinks; and a stuck round is the ruled no-retry face — the
+// workflow parks on its sentinel, so a retry here would spend a fresh
+// round re-entering the very silence the round was killed for. The
 // classification rides the in-package sentinels (errors.Is), never output
 // text — and every excluded class wraps its sentinel with %w across
 // runJailedRound's error paths.
@@ -834,6 +836,7 @@ func brokenResume(err error) bool {
 		!errors.Is(err, ErrAgentSlotsBusy) &&
 		!errors.Is(err, errAgentStart) &&
 		!errors.Is(err, ErrPromptOverWindow) &&
+		!errors.Is(err, ErrAgentStuck) &&
 		!errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded)
 }

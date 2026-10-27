@@ -1133,3 +1133,23 @@ func isSlotWait(err error) bool {
 func isAgentKilled(err error) bool {
 	return err != nil && strings.Contains(err.Error(), activities.ErrAgentKilled.Error())
 }
+
+// isAgentStuck reports whether err is the activities' ErrAgentStuck — a
+// jailed hands round the harness itself killed as stuck (its structured
+// stream's terminal failed event, class "stuck"). Same boundary note as
+// isAPIExhaustion: the sentinel travels as error text, so a substring
+// match carries it. The genuine classification is structured (the
+// activities' handsStuck reads the stream's class field under the
+// hands-only gate), but this match runs on the composed error string and
+// the sibling wraps embed round output verbatim — the generic death path
+// carries stdout+stderr, the exhaustion wraps the same — so a round of
+// any agent can plant the sentinel phrase and mint a park here. ponytail:
+// accepted, symmetric with the api-marker forge in the activities' exit-0
+// classification — the phrase is a daedalus-internal shape an agent has
+// no honest reason to print, a signal kill outranks the match, and the
+// worst case is a bounded park the operator restarts, never silent wrong
+// work. The workflow routes this face to a park — never a retry, never a
+// failover.
+func isAgentStuck(err error) bool {
+	return err != nil && strings.Contains(err.Error(), activities.ErrAgentStuck.Error())
+}

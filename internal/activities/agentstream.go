@@ -443,6 +443,35 @@ func agentAPIError(agent, stdout string) string {
 	return ""
 }
 
+// handsStuck reports a hands round's structured stream declaring its own
+// death stuck, "" when none: the failed event carrying class "stuck" —
+// hands's watchdog verdict that the round went silent, zero wire events
+// for its whole silence window (prompt-prefill time included), with the
+// window in the reason. Returns the "class stuck: <reason>" composite, so
+// a hit is never empty even when the event carries no reason — the caller
+// branches on non-emptiness, and a bare-reason return would let a missing
+// payload field launder the class match back into the generic failure
+// path (the same shape agentAPIError's retriable branch returns). Parsed
+// from the event's class field exactly like that branch reads — the
+// harness's machine report, never raw text — and last-wins for the same
+// totality reason: a failed event is stream-terminal (the process exits
+// right after it), so no later clean event can exist to clear it. Every
+// other class stays untracked here: retriable belongs to agentAPIError,
+// the rest to the generic failure path.
+func handsStuck(stdout string) string {
+	reason := ""
+	for line := range strings.SplitSeq(stdout, "\n") {
+		var e handsEvent
+		if json.Unmarshal([]byte(line), &e) != nil {
+			continue
+		}
+		if e.Kind == "failed" && e.Payload.Class == "stuck" {
+			reason = "class stuck: " + e.Payload.Reason
+		}
+	}
+	return reason
+}
+
 // toolLoopThreshold is the consecutive-identical-call count at which a pi
 // round's loop watcher kills the round: three — one legitimate retry of a
 // flaky command is a single repeat, so two identical calls stay under the

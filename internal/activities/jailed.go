@@ -1326,6 +1326,18 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// runs after the workflow ends touches it. A signaled death below
 	// still outranks this report, exactly as it outranks the text markers.
 	apiErr := agentAPIError(selected, res.Stdout)
+	// hands's stuck class is a face of its own, parsed beside the api-error
+	// report but never folded into it: the routing ruling (park to the
+	// preserved branch, no re-run, no failover) needs the face unmixed, so
+	// it must not inherit ErrAPIExhausted's failover-and-heartbeat rescue —
+	// the workflow parks on the bare sentinel instead. hands's protocol is
+	// the only one carrying a class field, so only its stream is scanned —
+	// another agent's stdout can never mint this face by printing the event
+	// shape.
+	stuck := ""
+	if selected == "hands" {
+		stuck = handsStuck(res.Stdout)
+	}
 	if err != nil && !isWaitDelay(err) {
 		// The loop watcher's own kill lands here as a signal death (it
 		// SIGKILLs the group from the stream), so this check outranks the
@@ -1348,6 +1360,20 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			// above, and embedding output here would let agent text forge
 			// the workflow-side classification.
 			return res, fmt.Errorf("%w: %w", ErrAgentKilled, err)
+		}
+		if stuck != "" {
+			// Checked here — under the signal death, over the api-error
+			// report — for the same reasons as everything above it: the
+			// wait-status-derived death outranks any stream report, and
+			// the two classes cannot coexist (one terminal failed event
+			// per stream, one class per event). The wrap names the class
+			// and the harness's reason (handsStuck's composite is never
+			// empty on a match, so an event without a reason still lands
+			// here, not on the generic path), and deliberately carries no
+			// other output — classification rides the structured event,
+			// never text the round printed.
+			return res, fmt.Errorf("%w: %s round died on a stuck kill: %s",
+				ErrAgentStuck, selected, stuck)
 		}
 		if apiErr != "" {
 			return res, fmt.Errorf("%w: %s round died on an api error: %s", ErrAPIExhausted, selected, apiErr)
@@ -1712,6 +1738,24 @@ var ErrAgentKilled = errors.New("jailed agent killed by signal")
 // fresh-session fallback behind brokenResume never fires for a first
 // round, where the livelock lives.
 var ErrAgentLoop = errors.New("jailed agent stuck in an identical-tool-call loop")
+
+// ErrAgentStuck marks a jailed hands round the hands harness itself killed
+// as stuck — its structured stream's terminal failed event carrying class
+// "stuck": the harness's own verdict that the round produced no wire
+// events for its silence window (prompt-prefill time included), the window
+// in the reason. Machine-parsed from the class field beside the retriable
+// api-error class, never from output text, and its own face on purpose:
+// it wraps nothing and inherits no remediation family — not
+// ErrAPIExhausted's failover, not the killed face's continuation — so the
+// ruled routing lands on the bare sentinel alone: the workflow's
+// isAgentStuck branches park the run (work preserved on the aborted/
+// branch, operator restarts via `daedalus continue`), never re-run the
+// round and never fail over. brokenResume excludes it for the same
+// reason: a stuck kill of a resumed round surfaces untouched instead of
+// spending its one fresh start re-entering the silence it was killed
+// for. The class and reason still reach the task log's round-exit dump
+// and the park reason.
+var ErrAgentStuck = errors.New("jailed agent round stuck")
 
 // matchesAny reports whether s contains any marker, case-insensitively.
 func matchesAny(s string, markers []string) bool {
