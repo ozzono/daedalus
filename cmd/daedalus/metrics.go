@@ -695,6 +695,41 @@ func metricsRegister(cfg config.Config, root, token string) error {
 	return nil
 }
 
+// metricsDeregister removes worker's registration from the relay — the
+// graceful exit's half of the registration handshake, metricsRegister's
+// counterpart. A registration cleared before the process dies lets the
+// next boot of the same name register on its first attempt instead of
+// waiting out the ghost's TTL (the 409 delayed boot), so every path that
+// leaves a ghost avoidably — the drain restart's exec (its defers never
+// run) and the graceful-drain stop — calls this synchronously first.
+// Authenticated with the registering process's own token: a ghost from a
+// SIGKILLed process cannot present one and still ages out through the TTL,
+// which is exactly the recovery the boot retry belt
+// (metricsRegisterBootRetry) remains for. A missing registration
+// deregisters nothing and succeeds — idempotent for the shutdown paths
+// that can hand the token over twice (drain shutdown and pre-exec), and
+// correct for a boot that never registered. Best-effort by contract:
+// callers log a failure and proceed with the exit.
+func metricsDeregister(root, worker, token string) error {
+	if root == "" || token == "" {
+		return nil
+	}
+	body, err := json.Marshal(map[string]string{"worker": worker, "token": token})
+	if err != nil { // unreachable: map of marshalable values
+		return err
+	}
+	resp, err := metricsHTTP.Post(root+"/deregister", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return fmt.Errorf("deregistration refused (%s): %s", resp.Status, strings.TrimSpace(string(b)))
+}
+
 // errRegistrationConflict marks the relay's 409: a registration still
 // holds the worker name — a dead process's entry lingering inside the TTL,
 // or a live squatter, indistinguishable client-side.

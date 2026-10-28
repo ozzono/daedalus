@@ -92,6 +92,21 @@ func runWorker(cfg config.Config, workerType string) error {
 			}
 		}()
 	}
+	// The SIGINT/SIGTERM forwarder, armed beside the SIGHUP lever so the
+	// whole boot is covered — the delayed boot included. The old post-banner
+	// arm left everything before it unhandled: a signal racing the metrics
+	// 409 retry window killed the booting process with nothing drained,
+	// nothing logged, and the pid file unwritten, and each such death left a
+	// fresh relay ghost that stretched the next boot by another TTL — the
+	// failure amplifying itself exactly when an operator retried. The
+	// received signal halts the shared channel (a close, never a send, so a
+	// signal racing halt's close cannot panic the forwarder); during the
+	// boot registration the select beside the retry loop turns it into the
+	// graceful exit. ponytail: like SIGHUP's, the arm cannot cover this
+	// dispatch's config load before runWorker is entered — closing that
+	// means arming in the dispatch and threading the channel down, not
+	// worth the plumbing.
+	go func() { <-worker.InterruptCh(); halt() }()
 	// Export provider settings into the worker's environment — but only the
 	// ones actually set in the config. A missing key is not an error: the
 	// jailed agent may authenticate through the worker's inherited
@@ -203,9 +218,49 @@ func runWorker(cfg config.Config, workerType string) error {
 		// process's entry lingers, and the retry budget outlives that window
 		// (metricsRegisterBootRetry). A failed boot registration is otherwise
 		// fatal here, the wedge the restart-TTL incident rode.
-		if err := metricsRegisterBootRetry(cfg, metricsRoot, metricsToken); err != nil {
-			return fmt.Errorf("register with the metrics relay: %w", err)
+		//
+		// The window must stay interruptible and visible. The marker
+		// publishes the budget for `worker status`, which otherwise reports
+		// the delayed boot as a bare "running" (spawned shape) or a false
+		// "not running" (supervised shape, whose pid file is written after
+		// this very block). And the retry runs beside the signal channels:
+		// the forwarder armed at the top closes interrupt on SIGINT/SIGTERM,
+		// and this select abandons the retry the moment it does, so a signal
+		// during the window honors its intent — a drain restart re-execs at
+		// once, a stop exits cleanly with the pid file cleared — instead of
+		// dying unlogged or trapping the stop inside the loop past
+		// workerStop's 30s wait. The abandoned goroutine's remaining
+		// attempts die with the process; the one race it can lose — a
+		// last-gasp registration landing after the shutdown dereg — leaves
+		// exactly the ghost the boot retry belt exists to absorb.
+		bootFile := bootMarkerPath(cfg.WorkerName())
+		publishBootMarker(bootFile, time.Now().Add(metricsRegistrationRetryWait))
+		defer os.Remove(bootFile)
+		bootReg := make(chan error, 1)
+		go func() { bootReg <- metricsRegisterBootRetry(cfg, metricsRoot, metricsToken) }()
+		select {
+		case err := <-bootReg:
+			if err != nil {
+				return fmt.Errorf("register with the metrics relay: %w", err)
+			}
+		case <-interrupt:
+			os.Remove(bootFile)
+			if restartPending.Load() {
+				return restartSelf(cfg.WorkerName())
+			}
+			// A stop during the boot: hand back a registration the
+			// abandoned attempt may already have landed (idempotent when it
+			// has not), then exit clean — the dispatch's removeOwnPidFile
+			// clears the spawned pid file, and a clean exit keeps the
+			// supervised unit's Restart=on-failure hands off. The line is
+			// the point: the old death here was invisible in the log.
+			fmt.Printf("worker boot: stopped by signal during the boot registration — exiting\n")
+			if err := metricsDeregister(metricsRoot, cfg.WorkerName(), metricsToken); err != nil {
+				fmt.Printf("metrics relay: deregister: %v\n", err)
+			}
+			return nil
 		}
+		os.Remove(bootFile)
 		stopReg := make(chan struct{})
 		defer close(stopReg)
 		go func() {
@@ -547,12 +602,6 @@ func runWorker(cfg config.Config, workerType string) error {
 	fmt.Printf("daedalus worker %s starting %s on task queue %q (temporal %s, UI %s)\n",
 		version.String(), time.Now().Format(time.RFC3339),
 		cfg.Temporal.TaskQueue, cfg.Temporal.Host, cfg.UIURL())
-	// SIGINT/SIGTERM still reach the workers: the forwarder drains the
-	// signal channel and halts the shared channel declared (with the
-	// SIGHUP lever) at the top of runWorker — its close every Run
-	// receives — no send, so a signal racing halt's close cannot panic the
-	// forwarder on a closed channel.
-	go func() { <-worker.InterruptCh(); halt() }()
 	errs := make(chan error, len(workers))
 	for _, wk := range workers {
 		go func(w worker.Worker) { err := w.Run(interrupt); halt(); errs <- err }(wk)
@@ -568,6 +617,18 @@ func runWorker(cfg config.Config, workerType string) error {
 	if restartPending.Load() {
 		if err := restartSelf(cfg.WorkerName()); err != nil {
 			return errors.Join(append(joined, err)...)
+		}
+	}
+	// The stop path's registration handoff — reached only when the daemon
+	// is exiting for good, since the restart above exec'd away with its own
+	// dereg inside restartSelf. Hand the relay the token so the next boot
+	// of this name registers on its first attempt instead of waiting out
+	// this process's ghost (the 409 delayed boot). Best-effort: a failed
+	// dereg leaves the ghost for the boot retry belt
+	// (metricsRegisterBootRetry), the documented recovery.
+	if metricsRoot != "" {
+		if err := metricsDeregister(metricsRoot, cfg.WorkerName(), metricsToken); err != nil {
+			fmt.Printf("metrics relay: deregister: %v\n", err)
 		}
 	}
 	return errors.Join(joined...)
@@ -587,7 +648,15 @@ func runWorker(cfg config.Config, workerType string) error {
 // what the spawn-time scrub exists to prevent. The defers above (client
 // close, relay and status goroutines) do not run — exec never returns on
 // success — and need not: the drains they guard have completed, and the
-// kernel closes what is left.
+// kernel closes what is left. The one deferred cleanup that must happen
+// before the image is replaced is the metrics registration handoff: exec
+// would leave the registration ghosting for a full TTL and delay this
+// same worker's next boot (the 409 delayed boot), so the token goes back
+// synchronously first. Root and token ride the worker's own environment
+// (set at the boot registration); absent either — metrics off, or a boot
+// that never registered — there is nothing to deregister. Best-effort: a
+// failed dereg leaves the ghost for the boot retry belt
+// (metricsRegisterBootRetry), the documented recovery.
 func restartSelf(name string) error {
 	self, err := os.Executable()
 	if err != nil {
@@ -595,6 +664,9 @@ func restartSelf(name string) error {
 	}
 	argv := restartArgv(self, name)
 	fmt.Printf("drain restart: re-executing %q\n", strings.Join(argv[1:], " "))
+	if err := metricsDeregister(os.Getenv(config.MetricsRelayAnthropicEnv), name, os.Getenv(config.MetricsRelayTokenEnv)); err != nil {
+		fmt.Printf("metrics relay: deregister: %v\n", err)
+	}
 	return syscall.Exec(self, argv, append(envWithoutWorkerVars(os.Environ()), daemonEnv+"=1"))
 }
 
@@ -633,6 +705,45 @@ type workerStatus struct {
 	SlotsBusy     int       `json:"slots_busy"`
 	SlotsTotal    int       `json:"slots_total"`
 	RoundsWaiting int       `json:"rounds_waiting"`
+}
+
+// bootMarkerPath is the boot marker's file, beside the pid and status
+// files: worker-<name>.booting while the worker is inside the boot
+// registration's retry window (the delayed boot). Deliberately not the
+// status file itself: the status file's first publish is the run path's
+// readiness signal (ensureWorkerActive — "up" means about to poll), and a
+// document published during the retry window would lie to it.
+func bootMarkerPath(name string) string {
+	return filepath.Join(daemonDir, "worker-"+name+".booting")
+}
+
+// workerBootState is the boot marker's document: the mid-boot process's
+// pid and the time its registration retry budget
+// (metricsRegistrationRetryWait) lapses. The deadline doubles as the
+// marker's freshness — past it the boot either resolved (the file was
+// removed) or the process is gone — so a marker left by a crash expires
+// itself instead of showing a booting worker that is not there.
+type workerBootState struct {
+	PID      int       `json:"pid"`
+	Deadline time.Time `json:"deadline"`
+}
+
+// publishBootMarker writes the boot marker best-effort, write-then-rename
+// like the status publisher: a failed write only costs `worker status`'s
+// booting state, never the boot itself.
+func publishBootMarker(path string, deadline time.Time) {
+	if err := os.MkdirAll(daemonDir, 0o755); err != nil {
+		return
+	}
+	data, err := json.Marshal(workerBootState{PID: os.Getpid(), Deadline: deadline.UTC()})
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 // publishWorkerStatus rewrites the worker's status file every

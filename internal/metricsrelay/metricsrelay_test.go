@@ -388,6 +388,58 @@ func TestRegistryResolveAndTokenGate(t *testing.T) {
 	}
 }
 
+// TestRegistryDeregister pins the graceful exit's half of the registration
+// handshake: the registered secret clears the name, so the next boot of the
+// same worker registers on its first attempt instead of waiting out the
+// ghost's TTL (the 409 delayed boot); a wrong or missing secret refuses
+// without touching the live registration — a ghost from a SIGKILLed process
+// presents nothing and still ages out through the TTL sweep alone; and an
+// unknown name deregisters nothing and succeeds, idempotent for the
+// shutdown paths that can hand the token over twice.
+func TestRegistryDeregister(t *testing.T) {
+	reg := NewRegistry(time.Minute)
+	up := map[string]*url.URL{"openai": {Scheme: "https", Host: "u.example"}}
+	tok := NewToken()
+	if err := reg.Register("w", "q7", up, nil, nil, tok); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Nothing presented on the loopback can clear a live registration —
+	// not an empty secret, not a near-miss, not a guess.
+	for _, presented := range []string{"", tok + "0", "guessed"} {
+		if err := reg.Deregister("w", presented); err == nil {
+			t.Errorf("Deregister(presented %q) = nil, want the refusal", presented)
+		}
+	}
+	if _, _, _, _, _, ok := reg.Resolve("w", "openai"); !ok {
+		t.Fatal("a refused deregistration removed the live registration")
+	}
+	if err := reg.Deregister("never-registered", tok); err != nil {
+		t.Errorf("Deregister(unknown worker) = %v, want nil", err)
+	}
+
+	// The secret itself clears the name — and the second handover is a
+	// no-op success, the idempotency the double shutdown paths lean on.
+	if err := reg.Deregister("w", tok); err != nil {
+		t.Fatalf("Deregister with the registered secret: %v", err)
+	}
+	if _, _, _, _, _, ok := reg.Resolve("w", "openai"); ok {
+		t.Error("the deregistered registration still resolves an upstream")
+	}
+	if err := reg.Deregister("w", tok); err != nil {
+		t.Errorf("the second dereg = %v, want nil (idempotent)", err)
+	}
+
+	// The window this closes: the successor boot registers on its first
+	// attempt, under a fresh secret.
+	if err := reg.Register("w", "q7", up, nil, nil, "fresh-secret"); err != nil {
+		t.Errorf("the successor boot's registration = %v, want accepted on the first attempt", err)
+	}
+	if _, _, _, _, got, ok := reg.Resolve("w", "openai"); !ok || got != "fresh-secret" {
+		t.Errorf("Resolve after the successor boot = (ok %v, token %q), want the fresh secret stored", ok, got)
+	}
+}
+
 // stubUpstream records every request and answers status with body.
 func stubUpstream(rec *recorder, status int, body []byte) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -956,6 +1008,87 @@ func TestServeRegister(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("GET /nope = %d, want 404", resp.StatusCode)
+		}
+	}
+}
+
+// TestServeDeregister pins the endpoint's face end to end: a deregistration
+// presenting the registered secret answers 204 with no body and the freed
+// name re-registers on its first attempt — the restart orphan window shut
+// on the wire; an unknown worker is a 204 no-op; a wrong secret is a 401
+// that leaves the registration serving; a missing field or an unreadable
+// body is a 400 naming the problem; and GET is not the method.
+func TestServeDeregister(t *testing.T) {
+	registry := NewRegistry(time.Minute)
+	_, root := startRelay(t, &Ledger{}, registry)
+	registerRelay(t, root, "w", map[string]string{"openai": "https://u.example/v1"}, nil, nil)
+
+	post := func(body string) (int, string) {
+		resp, err := http.Post(root+"/deregister", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /deregister: %v", err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	if status, body := post(`{"worker":"w","token":"not-the-secret"}`); status != http.StatusUnauthorized || !strings.Contains(body, "refuses this token") {
+		t.Errorf("wrong-secret dereg = (%d) %q, want 401 naming the refusal", status, body)
+	}
+	if _, _, _, _, _, ok := registry.Resolve("w", "openai"); !ok {
+		t.Fatal("a refused deregistration removed the live registration")
+	}
+
+	for _, c := range []struct {
+		name, body, want string
+	}{
+		{"bad json", `{`, "bad deregistration body"},
+		{"no worker", `{"token":"t"}`, "needs worker and token"},
+		{"no token", `{"worker":"w"}`, "needs worker and token"},
+	} {
+		if status, body := post(c.body); status != http.StatusBadRequest || !strings.Contains(body, c.want) {
+			t.Errorf("%s: (%d) %q, want 400 naming %q", c.name, status, body, c.want)
+		}
+	}
+
+	// A boot that never registered has nothing to clean: still a success.
+	if status, body := post(`{"worker":"ghost","token":"whatever"}`); status != http.StatusNoContent || body != "" {
+		t.Errorf("unknown-worker dereg = (%d) %q, want 204 with no body", status, body)
+	}
+
+	// The handoff itself, and the win it buys: 204, no body — then the
+	// restart's next boot registers under a fresh secret on its first
+	// attempt instead of the 409.
+	if status, body := post(`{"worker":"w","token":"` + testToken + `"}`); status != http.StatusNoContent || body != "" {
+		t.Fatalf("dereg with the registered secret = (%d) %q, want 204 with no body", status, body)
+	}
+	if _, _, _, _, _, ok := registry.Resolve("w", "openai"); ok {
+		t.Fatal("the deregistered name still resolves")
+	}
+	body, err := json.Marshal(registerRequest{Worker: "w", Queue: "q7", Upstreams: map[string]string{"openai": "https://u.example/v1"}, Token: "fresh-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(root+"/register", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("successor boot's register: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("successor boot's register = %d, want 204 on the first attempt (no 409 delayed boot)", resp.StatusCode)
+	}
+	if _, _, _, _, got, ok := registry.Resolve("w", "openai"); !ok || got != "fresh-secret" {
+		t.Errorf("Resolve after the successor boot = (ok %v, token %q), want the fresh secret stored", ok, got)
+	}
+
+	// Wrong method fails loudly, like every other endpoint.
+	if resp, err := http.Get(root + "/deregister"); err != nil {
+		t.Fatalf("GET /deregister: %v", err)
+	} else {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET /deregister = %d, want 404", resp.StatusCode)
 		}
 	}
 }

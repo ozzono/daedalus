@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -11,6 +13,34 @@ import (
 	"testing"
 	"time"
 )
+
+// reapedChildPid returns the pid of an exited-and-reaped child — the
+// cheapest process that is certainly gone (TestPidAlive's shape): pidAlive
+// must answer false for it, zombie included.
+func reapedChildPid(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("reap the stand-in child: %v", err)
+	}
+	return pid
+}
+
+// writeBootMarker seeds name's boot marker naming pid with deadline.
+func writeBootMarker(t *testing.T, name string, pid int, deadline time.Time) {
+	t.Helper()
+	data, err := json.Marshal(workerBootState{PID: pid, Deadline: deadline.UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bootMarkerPath(name), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // TestWorkerStatusAll pins the record-driven roster listing: every recorded
 // queue — plus any live stray running without a record, marked "(no config
@@ -140,6 +170,131 @@ func TestWorkerStatusAll(t *testing.T) {
 		}
 		if r := row("mis"); !strings.Contains(r, "(unknown)") || strings.Contains(r, "v0.0-wrong") {
 			t.Errorf("row %q should distrust the mismatched file's version", r)
+		}
+	})
+}
+
+// TestWorkerBootingPhase pins the boot marker's read side: a marker naming
+// a live process with retry budget left reports the booting phase with the
+// remaining budget; a lapsed budget or a dead process — the crash's
+// leftover marker — reports nothing, so a dead worker never shows as
+// booting; a corrupt marker reads as not booting too.
+func TestWorkerBootingPhase(t *testing.T) {
+	useDaemonDir(t)
+	fresh := time.Now().Add(metricsRegistrationRetryWait)
+
+	if _, _, ok := workerBootingPhase("ghost"); ok {
+		t.Error("a worker with no boot marker reported a booting phase")
+	}
+
+	writeBootMarker(t, "booting", os.Getpid(), fresh)
+	pid, left, ok := workerBootingPhase("booting")
+	if !ok || pid != os.Getpid() || left <= 0 || left > metricsRegistrationRetryWait {
+		t.Errorf("workerBootingPhase(live marker) = (%d, %s, %v), want this pid with budget left inside the retry wait", pid, left, ok)
+	}
+
+	// The budget lapsed while the process is still alive: expired.
+	writeBootMarker(t, "lapsed", os.Getpid(), time.Now().Add(-time.Second))
+	if _, _, ok := workerBootingPhase("lapsed"); ok {
+		t.Error("a marker past its deadline still reported booting")
+	}
+
+	// The process died with budget left: a crash's leftover marker expires
+	// itself on the read.
+	writeBootMarker(t, "dead", reapedChildPid(t), fresh)
+	if _, _, ok := workerBootingPhase("dead"); ok {
+		t.Error("a marker naming a dead process still reported booting")
+	}
+
+	if err := os.WriteFile(bootMarkerPath("bad"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := workerBootingPhase("bad"); ok {
+		t.Error("a corrupt boot marker reported a booting phase")
+	}
+}
+
+// TestWorkerStatusBootPhase pins the roster row's booting state: a live
+// boot marker outranks the pid file — the delayed boot shows as booting
+// with its retry budget instead of a bare "running" (the spawned shape,
+// whose pid file is written early) or a false "not running" (the
+// supervised shape, whose pid file is written after the boot) — and the
+// booting pid serves the version lookup, so the row never pairs "booting
+// (pid N)" with "n/a (not running)". A marker that expired itself — lapsed
+// budget or dead process — leaves the plain shapes standing.
+func TestWorkerStatusBootPhase(t *testing.T) {
+	fresh := time.Now().Add(metricsRegistrationRetryWait)
+
+	t.Run("a live marker outranks the pid file and serves the version", func(t *testing.T) {
+		useDaemonDir(t)
+		writeLivePidFile(t, "spawned") // spawned shape: pid file already written, boot still inside the window
+		writeBootMarker(t, "spawned", os.Getpid(), fresh)
+		// The supervised shape reaches the roster through its config record:
+		// `worker start` records it before the daemon's boot writes a pid file.
+		writeRecord(t, "supervised", writeQueueConfig(t, "supervised"))
+		writeBootMarker(t, "supervised", os.Getpid(), fresh)
+		writeRecord(t, "ver", writeQueueConfig(t, "ver"))
+		writeBootMarker(t, "ver", os.Getpid(), fresh)
+		writeStatusFile(t, "ver", workerStatus{PID: os.Getpid(), Updated: time.Now().UTC(), Version: "v0.0-test"})
+
+		out := captureStdout(t, func() {
+			if err := workerStatusAll(); err != nil {
+				t.Errorf("workerStatusAll: %v", err)
+			}
+		})
+		row := func(name string) string {
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, name) {
+					return line
+				}
+			}
+			t.Fatalf("status output %q has no row for %s", out, name)
+			return ""
+		}
+
+		booting := "booting (pid " + strconv.Itoa(os.Getpid()) + ", metrics relay registration retry"
+		for _, name := range []string{"spawned", "supervised", "ver"} {
+			if r := row(name); !strings.Contains(r, booting) {
+				t.Errorf("%s row %q should show the delayed boot", name, r)
+			}
+		}
+		if r := row("spawned"); strings.Contains(r, "running (pid ") {
+			t.Errorf("spawned row %q still reads as bare running inside the boot window", r)
+		}
+		if r := row("supervised"); strings.Contains(r, "not running") {
+			t.Errorf("supervised row %q reads as not running inside the boot window", r)
+		}
+		if r := row("ver"); !strings.Contains(r, "v0.0-test") || strings.Contains(r, "n/a (not running)") {
+			t.Errorf("ver row %q should carry the published version via the booting pid, never the not-running n/a", r)
+		}
+	})
+
+	t.Run("an expired marker leaves the plain shapes", func(t *testing.T) {
+		useDaemonDir(t)
+		writeRecord(t, "lapsed", writeQueueConfig(t, "lapsed"))
+		writeBootMarker(t, "lapsed", os.Getpid(), time.Now().Add(-time.Second)) // budget gone, no pid file: not running
+		writeLivePidFile(t, "deadpid")                                          // live pid file outranked only by a live marker
+		writeBootMarker(t, "deadpid", reapedChildPid(t), fresh)
+
+		out := captureStdout(t, func() {
+			if err := workerStatusAll(); err != nil {
+				t.Errorf("workerStatusAll: %v", err)
+			}
+		})
+		row := func(name string) string {
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, name) {
+					return line
+				}
+			}
+			t.Fatalf("status output %q has no row for %s", out, name)
+			return ""
+		}
+		if r := row("lapsed"); !strings.Contains(r, "not running") || strings.Contains(r, "booting") {
+			t.Errorf("lapsed row %q should read as the plain not running", r)
+		}
+		if r := row("deadpid"); !strings.Contains(r, "running (pid ") || strings.Contains(r, "booting") {
+			t.Errorf("dead-marker row %q should fall back to the pid file's running", r)
 		}
 	})
 }

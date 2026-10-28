@@ -6,14 +6,20 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -80,6 +86,35 @@ func TestPublishWorkerStatusRecordsVersion(t *testing.T) {
 	}
 	if st.PID != os.Getpid() {
 		t.Errorf("published pid = %d, want this process's %d", st.PID, os.Getpid())
+	}
+}
+
+// TestPublishBootMarker pins the boot marker's document: the file lands
+// beside the pid and status files as worker-<name>.booting, naming this
+// process's pid and the registration retry deadline in UTC — the deadline
+// doubling as the marker's freshness for the status reader.
+func TestPublishBootMarker(t *testing.T) {
+	dir := useDaemonDir(t)
+	if got, want := bootMarkerPath("w1"), filepath.Join(dir, "worker-w1.booting"); got != want {
+		t.Fatalf("bootMarkerPath = %q, want %q", got, want)
+	}
+
+	deadline := time.Now().Add(metricsRegistrationRetryWait)
+	publishBootMarker(bootMarkerPath("w1"), deadline)
+
+	data, err := os.ReadFile(bootMarkerPath("w1"))
+	if err != nil {
+		t.Fatalf("read boot marker: %v", err)
+	}
+	var bs workerBootState
+	if err := json.Unmarshal(data, &bs); err != nil {
+		t.Fatalf("parse boot marker %s: %v", data, err)
+	}
+	if bs.PID != os.Getpid() {
+		t.Errorf("marker pid = %d, want this process's %d", bs.PID, os.Getpid())
+	}
+	if !bs.Deadline.Equal(deadline.UTC()) {
+		t.Errorf("marker deadline = %v, want the published budget %v", bs.Deadline, deadline.UTC())
 	}
 }
 
@@ -406,6 +441,127 @@ func TestRunWorkerRelayProviderUpstream(t *testing.T) {
 	}
 	if staged.Path != "/v1" {
 		t.Errorf("staged relay URL %q, want the legacy openai upstream's /v1 prefix", staged)
+	}
+}
+
+// TestRunWorkerBootRegistrationInterruptible pins the boot window's
+// interruptibility: SIGTERM during the metrics registration retry — the
+// window the post-banner signal arm left unhandled, where the signal killed
+// the booting process with nothing drained, nothing logged, and a fresh
+// relay ghost stretching the next boot by another TTL — exits the worker
+// cleanly instead: the stop line is logged, the boot marker is cleared, and
+// the registration the abandoned attempt may have landed is handed back to
+// the relay. runWorker runs here in earnest, up to the select beside the
+// retry loop; the signal travels the same OS channel the forwarder arms.
+func TestRunWorkerBootRegistrationInterruptible(t *testing.T) {
+	useDaemonDir(t)
+	restoreProcessEnv(t, config.AllWorkerEnvVars()...)
+	t.Setenv("ANTHROPIC_BASE_URL", "https://a.example") // one staged upstream, so the boot registration actually dials
+
+	// The stub relay: /register holds the contested name until the test
+	// releases it — the delayed boot's 409, stretched across the test — and
+	// then refuses with a non-conflict so the abandoned attempt exits
+	// without a retry loop or a token export; /deregister records the
+	// shutdown handoff.
+	release := make(chan struct{})
+	handoff := struct {
+		Worker string `json:"worker"`
+		Token  string `json:"token"`
+	}{}
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/register":
+			<-release
+			http.Error(w, "metricsrelay: boot aborted", http.StatusBadRequest)
+		case "/deregister":
+			var d struct {
+				Worker string `json:"worker"`
+				Token  string `json:"token"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&d)
+			mu.Lock()
+			handoff = d
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+	port, err := strconv.Atoi(srv.URL[strings.LastIndex(srv.URL, ":")+1:])
+	if err != nil {
+		t.Fatalf("parse relay port from %s: %v", srv.URL, err)
+	}
+
+	// Pre-arm SIGTERM so a send racing the forwarder's own registration can
+	// never meet the default disposition — the lost race would kill the
+	// suite, not just fail this test. The forwarder's channel receives the
+	// same signal beside this one.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM)
+	t.Cleanup(func() { signal.Stop(sig) })
+
+	// runWorker logs the stop to stdout, so the pipe holds it until the
+	// worker returns.
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	realStdout := os.Stdout
+	os.Stdout = stdoutW
+	t.Cleanup(func() {
+		os.Stdout = realStdout
+		stdoutW.Close()
+	})
+	outCh := make(chan string, 1)
+	go func() { b, _ := io.ReadAll(stdoutR); outCh <- string(b) }()
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- runWorker(config.Config{
+			WorkerID: "bootw",
+			Metrics:  config.MetricsConfig{Enabled: boolPtr(true), RelayPort: port},
+		}, "")
+	}()
+
+	// The marker's appearance means the worker is at the select beside the
+	// retry loop — the forwarder armed at the top of runWorker holds its
+	// signal registration by then.
+	bootFile := bootMarkerPath("bootw")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(bootFile); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("runWorker never entered the boot registration window — no boot marker appeared")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	syscall.Kill(os.Getpid(), syscall.SIGTERM)
+
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatalf("runWorker after SIGTERM = %v, want the clean exit", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runWorker stayed inside the boot registration past SIGTERM")
+	}
+	os.Stdout = realStdout
+	stdoutW.Close()
+	out := <-outCh
+	if !strings.Contains(out, "stopped by signal during the boot registration") {
+		t.Errorf("worker output %q lacks the stop line — the old death was invisible in the log", out)
+	}
+	if _, err := os.Stat(bootFile); !os.IsNotExist(err) {
+		t.Errorf("boot marker still on disk after the interrupted boot: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if handoff.Worker != "bootw" || handoff.Token == "" {
+		t.Errorf("relay saw the shutdown handoff %+v, want one dereg for bootw carrying the minted token", handoff)
 	}
 }
 
