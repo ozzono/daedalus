@@ -44,8 +44,7 @@ type stagedHandsFile struct {
 		Import []string `yaml:"import"`
 	} `yaml:"context"`
 	Run struct {
-		BudgetUSDCents int     `yaml:"budget_usd_cents"`
-		WarnFrac       float64 `yaml:"warn_frac"`
+		WarnFrac float64 `yaml:"warn_frac"`
 	} `yaml:"run"`
 }
 
@@ -181,8 +180,13 @@ func TestStageHandsProviderStagesOpenaiConfig(t *testing.T) {
 		if len(f.Context.Import) != 0 {
 			t.Errorf("context.import = %v, want the empty list hands's schema expects", f.Context.Import)
 		}
-		if f.Run.BudgetUSDCents != 0 {
-			t.Errorf("budget_usd_cents = %d, want 0 — cost accounting stays with the caller's usage figures", f.Run.BudgetUSDCents)
+		// The run section stages only keys the hands schema still carries:
+		// its loader decodes strictly, so a since-deleted key —
+		// budget_usd_cents — is a load error failing every round before
+		// its first token. Absence on the bytes is the contract; a decoded
+		// zero cannot distinguish a dropped key from a staged one.
+		if strings.Contains(raw, "budget_usd_cents") {
+			t.Errorf("staged config carries budget_usd_cents — hands's strict loader rejects the key and the round fails at load: %s", raw)
 		}
 		if f.Run.WarnFrac != 0.70 {
 			t.Errorf("warn_frac = %v, want hands's own default 0.70", f.Run.WarnFrac)
@@ -199,6 +203,15 @@ func TestStageHandsProviderStagesOpenaiConfig(t *testing.T) {
 		}
 		if keys := keysOf(top); !slices.Equal(slices.Sorted(slices.Values(keys)), []string{"context", "provider", "run"}) {
 			t.Errorf("staged top-level keys = %v, want exactly [context provider run]", keys)
+		}
+		// The same strictness at depth: run carries exactly the one key
+		// the schema still has.
+		run, ok := top["run"].(map[string]any)
+		if !ok {
+			t.Fatalf("staged run section = %v, want a mapping", top["run"])
+		}
+		if keys := keysOf(run); !slices.Equal(slices.Sorted(slices.Values(keys)), []string{"warn_frac"}) {
+			t.Errorf("staged run keys = %v, want exactly [warn_frac]", keys)
 		}
 		assertHandsScratchExcluded(t, wt)
 	})

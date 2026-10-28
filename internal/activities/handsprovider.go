@@ -141,7 +141,12 @@ func stageHandsProvider(env []string, worktreePath string) error {
 	if envLookup(env, config.WireThinkingEnv) == "off" {
 		b.WriteString("  thinking: off\n")
 	}
-	b.WriteString("context:\n  import: []\nrun:\n  budget_usd_cents: 0\n  warn_frac: " + handsDefaultWarnFrac + "\n")
+	// The run section stages only keys the hands schema still carries:
+	// its config loader decodes strictly, so an unknown key — e.g. the
+	// since-deleted budget_usd_cents — fails the whole staged config at
+	// load and every round with it. warn_frac is silent unless caps are
+	// set; timeout_ms stays staged (unset would now default unlimited).
+	b.WriteString("context:\n  import: []\nrun:\n  warn_frac: " + handsDefaultWarnFrac + "\n")
 	if err := excludeAgentArtifacts(worktreePath, handsScratchDir); err != nil {
 		return fmt.Errorf("prepare hands scratch dir: %w", err)
 	}

@@ -66,7 +66,10 @@ func TestProbeAnthropicShape(t *testing.T) {
 }
 
 // TestProbeOpenAIShape pins the OpenAI-style request: path, Bearer auth,
-// and thinking disabled — the minimal chat-completions call.
+// thinking disabled, and the max_tokens bound — without one the server
+// applies its own generation ceiling and a landed probe holds a serving
+// slot for hours past this client's timeout (the anthropic shape has
+// always pinned one).
 func TestProbeOpenAIShape(t *testing.T) {
 	srv, got := probeServer(t, 200, `{}`)
 	res := Probe(context.Background(), Spec{
@@ -84,6 +87,9 @@ func TestProbeOpenAIShape(t *testing.T) {
 	th, _ := got.Body["thinking"].(map[string]any)
 	if th["type"] != "disabled" {
 		t.Errorf("thinking = %v, want disabled", got.Body["thinking"])
+	}
+	if mt, _ := got.Body["max_tokens"].(float64); mt != 16 {
+		t.Errorf("max_tokens = %v, want 16 — an unbounded probe becomes the server's longest legal generation", got.Body["max_tokens"])
 	}
 }
 

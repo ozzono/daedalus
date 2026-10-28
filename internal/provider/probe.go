@@ -127,10 +127,15 @@ func Probe(ctx context.Context, spec Spec) Result {
 	case StyleOpenAI:
 		url = strings.TrimSuffix(spec.URL, "/") + "/chat/completions"
 		authKey, authVal = "Authorization", "Bearer "+spec.Key
+		// max_tokens bounds the generation: without it the server applies
+		// its own --ngen ceiling, and a probe that lands becomes a legal
+		// hours-long generation holding a serving slot past this client's
+		// timeout (the Anthropic shape below has always pinned one).
 		body, err = json.Marshal(map[string]any{
-			"model":    spec.Model,
-			"thinking": map[string]string{"type": "disabled"},
-			"messages": []map[string]string{{"role": "user", "content": "hi"}},
+			"model":      spec.Model,
+			"max_tokens": 16,
+			"thinking":   map[string]string{"type": "disabled"},
+			"messages":   []map[string]string{{"role": "user", "content": "hi"}},
 		})
 	}
 	if err != nil {
