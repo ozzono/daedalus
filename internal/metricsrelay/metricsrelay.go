@@ -302,6 +302,31 @@ func (r *Registry) Register(worker, queue string, upstreams map[string]*url.URL,
 	return nil
 }
 
+// Deregister removes a worker's registration when the caller presents the
+// registered secret — the graceful exit's handshake, closing the restart
+// orphan window: a successor boot of the same name then registers on its
+// first attempt instead of waiting out this entry's TTL (the 409 delayed
+// boot). The secret is the one Register stored, so only the process that
+// registered can clear the name — a stale ghost from a SIGKILLed process
+// presents nothing and still ages out through the TTL sweep alone, and a
+// loopback peer cannot clear a live worker's staged paths by guessing. An
+// unknown or already-removed name is a no-op success: the dereg is
+// idempotent (a restart can hand the token over twice — drain shutdown
+// and pre-exec), and a boot that never registered has nothing to clean.
+func (r *Registry) Deregister(worker, token string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	reg, known := r.m[worker]
+	if !known {
+		return nil
+	}
+	if !tokenPresented(token, reg.Token) {
+		return fmt.Errorf("worker %q registration refuses this token", worker)
+	}
+	delete(r.m, worker)
+	return nil
+}
+
 // NewToken mints a worker's registration secret: 128 bits of crypto/rand,
 // hex. "" on rand failure — the minting caller refuses a tokenless
 // registration rather than register one nothing could ever match.
@@ -400,6 +425,8 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	switch {
 	case req.URL.Path == "/register" && req.Method == http.MethodPost:
 		r.serveRegister(w, req)
+	case req.URL.Path == "/deregister" && req.Method == http.MethodPost:
+		r.serveDeregister(w, req)
 	case req.URL.Path == "/status" && req.Method == http.MethodGet:
 		r.serveStatus(w)
 	case req.URL.Path == "/ledger" && req.Method == http.MethodGet:
@@ -491,6 +518,34 @@ func (r *Relay) serveRegister(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	// No body: the secret came from the caller and goes nowhere.
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deregisterRequest is one worker's graceful-exit body: its name and the
+// secret that registered it (registerRequest's token, presented one last
+// time to clear the entry).
+type deregisterRequest struct {
+	Worker string `json:"worker"`
+	Token  string `json:"token"`
+}
+
+func (r *Relay) serveDeregister(w http.ResponseWriter, req *http.Request) {
+	var dr deregisterRequest
+	if err := json.NewDecoder(req.Body).Decode(&dr); err != nil {
+		http.Error(w, "metricsrelay: bad deregistration body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if dr.Worker == "" || dr.Token == "" {
+		http.Error(w, "metricsrelay: deregistration needs worker and token", http.StatusBadRequest)
+		return
+	}
+	if err := r.registry.Deregister(dr.Worker, dr.Token); err != nil {
+		// The name exists but the secret does not match it — the same
+		// unauthorized shape a keyed round's token gate answers with.
+		http.Error(w, "metricsrelay: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+	// No body: removal says everything.
 	w.WriteHeader(http.StatusNoContent)
 }
 

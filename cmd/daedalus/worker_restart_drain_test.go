@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -836,6 +840,123 @@ func TestRestartSelfExecEnv(t *testing.T) {
 	if got["PATH"] == "" {
 		t.Error("re-exec env lost PATH — the scrub must keep non-worker variables")
 	}
+}
+
+// TestRestartSelfDeregistersBeforeExec pins the drain restart's
+// registration handoff: the token goes back to the relay synchronously
+// before the exec replaces the image — exec's defers never run, so a dereg
+// left to them would never happen and the restart would leave the ghost its
+// own next boot waits out. The credentials ride the worker's own
+// environment; absent either (metrics off, a boot that never registered)
+// nothing is dialed, and a refused handoff is logged while the exec
+// proceeds — best-effort by contract. Each subtest runs restartSelf in
+// earnest (the syscall.Exec lands) through the reexecRestartSelfEnv
+// harness, the exec'd image reporting through the dump marker like
+// TestRestartSelfExecEnv.
+func TestRestartSelfDeregistersBeforeExec(t *testing.T) {
+	type deregBody struct {
+		Worker string `json:"worker"`
+		Token  string `json:"token"`
+	}
+	// startStub starts the loopback relay stand-in the child hands its
+	// registration back to: every /deregister body is recorded and answered
+	// with status. seen returns the bodies under the stub's mutex.
+	startStub := func(t *testing.T, status int) (root string, seen func() []deregBody) {
+		t.Helper()
+		var mu sync.Mutex
+		var dergs []deregBody
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var d deregBody
+			_ = json.NewDecoder(r.Body).Decode(&d)
+			mu.Lock()
+			dergs = append(dergs, d)
+			mu.Unlock()
+			w.WriteHeader(status)
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL, func() []deregBody { mu.Lock(); defer mu.Unlock(); return dergs }
+	}
+	// runChild spawns the test binary calling restartSelf("drainreg") with
+	// env stacked on the harness basics, and returns its output. The
+	// exec'd image lands in the dump branch and exits, so the child always
+	// exits 0 on this path.
+	runChild := func(t *testing.T, env ...string) string {
+		t.Helper()
+		home := t.TempDir() // the child's HOME: locates its daemon record
+		daemonSub := filepath.Join(home, ".local", "state", "daedalus")
+		if err := os.MkdirAll(daemonSub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfgPath := writeQueueConfig(t, "drainreg")
+		record := filepath.Join(daemonSub, "worker-drainreg.conf")
+		if err := os.WriteFile(record, []byte(cfgPath), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		env = append([]string{
+			"HOME=" + home,
+			"PATH=" + os.Getenv("PATH"),
+			reexecRestartSelfEnv + "=drainreg",
+			reexecDumpEnvVarsEnv + "=HOME",
+		}, env...)
+
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatalf("resolve test binary: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), reexecTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, exe)
+		cmd.Env = env
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("restart-self child: %v (output %q)", err, out.String())
+		}
+		if !strings.Contains(out.String(), `drain restart: re-executing "worker foreground -c `+cfgPath+`"`) {
+			t.Errorf("child output %q lacks the record-driven re-exec banner", out.String())
+		}
+		// The exec landed: the fresh image answered the dump.
+		if !strings.Contains(out.String(), "\nHOME=") {
+			t.Errorf("child output %q shows no exec'd image dump — the exec never landed", out.String())
+		}
+		return out.String()
+	}
+
+	t.Run("the handoff rides the worker env before the exec", func(t *testing.T) {
+		root, seen := startStub(t, http.StatusNoContent)
+		runChild(t,
+			config.MetricsRelayAnthropicEnv+"="+root,
+			config.MetricsRelayOpenAIEnv+"="+root,
+			config.MetricsRelayTokenEnv+"=handoff-tok",
+		)
+		dergs := seen()
+		if len(dergs) != 1 || dergs[0].Worker != "drainreg" || dergs[0].Token != "handoff-tok" {
+			t.Errorf("relay saw %+v, want one dereg carrying the worker and its env-presented token", dergs)
+		}
+	})
+
+	t.Run("nothing to hand back dials nothing", func(t *testing.T) {
+		_, seen := startStub(t, http.StatusNoContent)
+		runChild(t) // no metrics env: metrics off, or a boot that never registered
+		if dergs := seen(); len(dergs) != 0 {
+			t.Errorf("relay saw %+v, want nothing dialed without credentials", dergs)
+		}
+	})
+
+	t.Run("a refused handoff is logged and the exec proceeds", func(t *testing.T) {
+		root, seen := startStub(t, http.StatusUnauthorized)
+		out := runChild(t,
+			config.MetricsRelayAnthropicEnv+"="+root,
+			config.MetricsRelayTokenEnv+"=wrong-tok",
+		)
+		if !strings.Contains(out, "metrics relay: deregister:") || !strings.Contains(out, "deregistration refused (401 Unauthorized)") {
+			t.Errorf("child output %q should log the refused handoff and proceed", out)
+		}
+		if dergs := seen(); len(dergs) != 1 {
+			t.Errorf("relay saw %d requests, want the one refused attempt", len(dergs))
+		}
+	})
 }
 
 // TestMainWorkerRestartForceDispatch pins the dispatch wiring in-process:

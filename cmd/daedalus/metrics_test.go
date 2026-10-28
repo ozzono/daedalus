@@ -551,6 +551,71 @@ func TestMetricsRegister(t *testing.T) {
 	})
 }
 
+// TestMetricsDeregister pins the exit path's half of the registration
+// handshake at the client: the worker and its minted secret travel the
+// POST's body and a 204 succeeds, an empty root or token (metrics off, or a
+// boot that never registered) succeeds without dialing anything, a refusal
+// surfaces with the relay's words, and an unreachable daemon fails — the
+// callers log and proceed with the exit either way.
+func TestMetricsDeregister(t *testing.T) {
+	t.Run("the handoff carries worker and token, 204 succeeds", func(t *testing.T) {
+		var gotPath, gotMethod string
+		var gotBody map[string]string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath, gotMethod = r.URL.Path, r.Method
+			if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+				t.Errorf("decode deregistration body: %v", err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+		if err := metricsDeregister(srv.URL, "w1", "worker-minted-tok"); err != nil {
+			t.Fatalf("metricsDeregister: %v", err)
+		}
+		if gotPath != "/deregister" || gotMethod != http.MethodPost {
+			t.Errorf("handoff = %s %s, want POST /deregister", gotMethod, gotPath)
+		}
+		if gotBody["worker"] != "w1" || gotBody["token"] != "worker-minted-tok" {
+			t.Errorf("handoff body = %v, want the worker and the presented secret", gotBody)
+		}
+	})
+
+	t.Run("nothing to hand back dials nothing", func(t *testing.T) {
+		hits := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+		if err := metricsDeregister("", "w1", "worker-minted-tok"); err != nil {
+			t.Errorf("metricsDeregister(no root): %v", err)
+		}
+		if err := metricsDeregister(srv.URL, "w1", ""); err != nil {
+			t.Errorf("metricsDeregister(no token): %v", err)
+		}
+		if hits != 0 {
+			t.Errorf("the guard let %d requests through, want none dialed", hits)
+		}
+	})
+
+	t.Run("a refusal surfaces with the relay's words", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `metricsrelay: worker "w1" registration refuses this token`, http.StatusUnauthorized)
+		}))
+		defer srv.Close()
+		err := metricsDeregister(srv.URL, "w1", "wrong-tok")
+		if err == nil || !strings.Contains(err.Error(), "deregistration refused") || !strings.Contains(err.Error(), "refuses this token") {
+			t.Errorf("metricsDeregister = %v, want the refusal surfaced", err)
+		}
+	})
+
+	t.Run("an unreachable daemon fails", func(t *testing.T) {
+		if err := metricsDeregister("http://127.0.0.1:1", "w1", "worker-minted-tok"); err == nil {
+			t.Error("metricsDeregister against a dead daemon: nil, want the dial error")
+		}
+	})
+}
+
 // TestMetricsRegisterBootRetry pins the restart-TTL wedge's fix at the boot
 // call site: a 409 name conflict — a worker restarted inside the
 // registration TTL, the dead process's entry still held — no longer exits

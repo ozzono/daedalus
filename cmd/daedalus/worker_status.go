@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"go.temporal.io/api/workflowservice/v1"
 
@@ -45,12 +46,24 @@ func workerStatusAll() error {
 		if live {
 			state = fmt.Sprintf("running (pid %d)", pid)
 		}
+		// A boot marker with a live pid and budget left outranks both: the
+		// delayed boot is the one state an operator is actively staring at
+		// (a restart issued inside the relay's registration TTL), and the
+		// pid file alone misreports it — a spawned daemon as a bare
+		// "running" with no pollers, a supervised one as a false "not
+		// running". The booting pid serves the version lookup too, so the
+		// row never says "booting (pid N)" and "n/a (not running)" at once.
+		versionPid, versionLive := pid, live
+		if bpid, left, booting := workerBootingPhase(name); booting {
+			state = fmt.Sprintf("booting (pid %d, metrics relay registration retry, ~%s left)", bpid, left.Round(time.Second))
+			versionPid, versionLive = bpid, true
+		}
 		conf := recordedConfigPath(name)
 		shown := conf
 		if conf == "" {
 			shown = "(no config record)"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, state, workerVersion(name, pid, live), providerStatus(conf), shown, workerCodePath(conf), logFile)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, state, workerVersion(name, versionPid, versionLive), providerStatus(conf), shown, workerCodePath(conf), logFile)
 	}
 	if err := w.Flush(); err != nil {
 		return err
@@ -86,6 +99,28 @@ func workerVersion(name string, pid int, live bool) string {
 		return "(unknown)"
 	}
 	return st.Version
+}
+
+// workerBootingPhase reports a worker's boot-retry state from its boot
+// marker (worker-<name>.booting): the pid and the remaining retry budget
+// while the marker names a live process with budget left. ok is false when
+// there is no marker, its process is gone, or its budget has lapsed — a
+// crash's leftover marker expires itself (workerBootState), so a dead
+// worker never shows as booting.
+func workerBootingPhase(name string) (pid int, remaining time.Duration, ok bool) {
+	data, err := os.ReadFile(bootMarkerPath(name))
+	if err != nil {
+		return 0, 0, false
+	}
+	var bs workerBootState
+	if json.Unmarshal(data, &bs) != nil || bs.PID <= 0 || !pidAlive(bs.PID) {
+		return 0, 0, false
+	}
+	remaining = time.Until(bs.Deadline)
+	if remaining <= 0 {
+		return 0, 0, false
+	}
+	return bs.PID, remaining, true
 }
 
 // workerCodePath reports the code a worker is reading to accomplish its
