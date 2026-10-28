@@ -151,8 +151,10 @@ func ensureWorkerActive(cfg config.Config, configPath string) error {
 // exist. The grants returned here are not yet split by location —
 // runstart.Start resolves each against the repo root, turning in-repo
 // grants into write-scope extensions (never mounts) and leaving out-of-repo
-// grants to mount. (The worker re-validates all of this through
-// activities.FolderMounts; this is the submit-time mirror.)
+// grants to mount. A brief dropped in the repo root makes its auto-grant
+// the repo root, which the split refuses at submit with an error naming
+// the brief (scopeFolderGrants). (The worker re-validates all of this
+// through activities.FolderMounts; this is the submit-time mirror.)
 func resolveFolderGrants(flagFolders []string, taskFile string) ([]string, error) {
 	grants := flagFolders
 	if taskFile != "" {
@@ -265,11 +267,13 @@ func issueIDGate(issueID string) error {
 // -cli/--cli, overrides the config's jailed agent for this run. Unless
 // detach is set, it then blocks until the pipeline finishes.
 func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach bool, branchPrefix, agent string) error {
-	return startPipelineFolders(cfg, configPath, workflowName, repoPath, issueID, prompt, detach, false, branchPrefix, agent, nil, "")
+	return startPipelineFolders(cfg, configPath, workflowName, repoPath, issueID, prompt, "", detach, false, branchPrefix, agent, nil, "")
 }
 
 // startPipelineFolders is startPipeline with the run's validated folder
-// grants (resolveFolderGrants) and, when set, the workflow id the run is
+// grants (resolveFolderGrants), the -f task file those grants partly
+// derive from (Request.TaskFile; it feeds only the brief-origin wording of
+// the repo-root refusal), and, when set, the workflow id the run is
 // chained behind (-dep/--depends). (Split so startPipeline's existing
 // signature — and the tests pinning it — stays untouched.) The dispatch
 // itself is internal/runstart.Start (htmx-ui pt2's Q4=C seam, shared with
@@ -279,7 +283,7 @@ func startPipeline(cfg config.Config, configPath, workflowName, repoPath, issueI
 // run instead of dead-ending on the seam's refusal — and the worker
 // daemon auto-start, in the same order the preflights always ran — repo
 // confirm before anything touches a daemon file.
-func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt string, detach, skipPreflight bool, branchPrefix, agent string, folders []string, depends string) error {
+func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath, issueID, prompt, taskFile string, detach, skipPreflight bool, branchPrefix, agent string, folders []string, depends string) error {
 	// The cheap submit gates first, exactly where they always ran: a bad
 	// issue id or wire conflict must not cost a repo prompt or spawn a
 	// worker daemon.
@@ -288,6 +292,7 @@ func startPipelineFolders(cfg config.Config, configPath, workflowName, repoPath,
 		RepoPath:      repoPath,
 		IssueID:       issueID,
 		Prompt:        prompt,
+		TaskFile:      taskFile,
 		BranchPrefix:  branchPrefix,
 		Agent:         agent,
 		Folders:       folders,

@@ -572,6 +572,23 @@ func TestStartDispatch(t *testing.T) {
 			t.Errorf("the repo-root refusal dispatched %d starts, want 0", len(fake.starts))
 		}
 	})
+
+	t.Run("a -f brief dropped in the repo root names the brief in the refusal", func(t *testing.T) {
+		repo := gitRepo(t, "main")
+		fake := &fakeFrontend{}
+		cfg := startFake(t, fake)
+
+		req := valid(repo)
+		req.TaskFile = filepath.Join(repo, "brief.md") // the CLI's auto-grant of its folder is the repo root
+		req.Folders = []string{repo}
+		_, err := Start(cfg, req)
+		if err == nil || !strings.Contains(err.Error(), req.TaskFile) || !strings.Contains(err.Error(), "outside the repo") || !strings.Contains(err.Error(), "subfolder") {
+			t.Fatalf("Start(brief at repo root) = %v, want the refusal naming the brief and both placements", err)
+		}
+		if len(fake.starts) != 0 {
+			t.Errorf("the brief-origin refusal dispatched %d starts, want 0", len(fake.starts))
+		}
+	})
 }
 
 // TestScopeFolderGrants pins the submit-time split of folder grants against
@@ -580,7 +597,10 @@ func TestStartDispatch(t *testing.T) {
 // never mounts (the worktree already carries the files, and a mount would
 // let the agent edit the host repo past the worktree commit model); a grant
 // outside the repo keeps the mount and extends nothing; a grant equal to
-// the repo root is refused; nested, duplicate, and trailing-slash
+// the repo root is refused — an explicit --folder spelling with the plain
+// message, a -f brief sitting in the repo root with one naming the brief
+// and the placements that work (the taskFile argument only ever rewords
+// this refusal); nested, duplicate, and trailing-slash
 // spellings are left as-is; a policy-free flow is never seeded (an empty
 // allowed set means unrestricted, and seeding it would strand every write
 // outside the grant); and the caller's policy slice is never mutated in
@@ -590,7 +610,7 @@ func TestScopeFolderGrants(t *testing.T) {
 	policy := []string{"*.md", "docs/"}
 
 	t.Run("an in-repo grant extends the policy and mounts nothing", func(t *testing.T) {
-		mounts, extended, err := scopeFolderGrants(repo, []string{filepath.Join(repo, "specs")}, policy)
+		mounts, extended, err := scopeFolderGrants(repo, "", []string{filepath.Join(repo, "specs")}, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
@@ -606,7 +626,7 @@ func TestScopeFolderGrants(t *testing.T) {
 	})
 
 	t.Run("a trailing-slash spelling normalizes to the same prefix", func(t *testing.T) {
-		_, extended, err := scopeFolderGrants(repo, []string{filepath.Join(repo, "specs") + "/"}, policy)
+		_, extended, err := scopeFolderGrants(repo, "", []string{filepath.Join(repo, "specs") + "/"}, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
@@ -617,7 +637,7 @@ func TestScopeFolderGrants(t *testing.T) {
 
 	t.Run("a grant outside the repo keeps the mount and extends nothing", func(t *testing.T) {
 		outside := filepath.Join(t.TempDir(), "shared")
-		mounts, extended, err := scopeFolderGrants(repo, []string{outside}, policy)
+		mounts, extended, err := scopeFolderGrants(repo, "", []string{outside}, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
@@ -631,7 +651,7 @@ func TestScopeFolderGrants(t *testing.T) {
 
 	t.Run("mixed grants split by location in submission order", func(t *testing.T) {
 		outside := filepath.Join(t.TempDir(), "notes")
-		mounts, extended, err := scopeFolderGrants(repo, []string{outside, filepath.Join(repo, "specs")}, policy)
+		mounts, extended, err := scopeFolderGrants(repo, "", []string{outside, filepath.Join(repo, "specs")}, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
@@ -645,9 +665,9 @@ func TestScopeFolderGrants(t *testing.T) {
 
 	t.Run("the repo root is refused", func(t *testing.T) {
 		for _, spelling := range []string{repo, repo + "/"} {
-			mounts, extended, err := scopeFolderGrants(repo, []string{spelling}, policy)
-			if err == nil || !strings.Contains(err.Error(), "is the repo root") {
-				t.Errorf("scopeFolderGrants(%s) err = %v, want the repo-root refusal", spelling, err)
+			mounts, extended, err := scopeFolderGrants(repo, "", []string{spelling}, policy)
+			if err == nil || !strings.Contains(err.Error(), "is the repo root") || !strings.Contains(err.Error(), "grant a folder inside it instead") {
+				t.Errorf("scopeFolderGrants(%s) err = %v, want the explicit root refusal", spelling, err)
 			}
 			if mounts != nil || extended != nil {
 				t.Errorf("scopeFolderGrants(%s) = %v, %v, want nothing back on a refusal", spelling, mounts, extended)
@@ -655,8 +675,60 @@ func TestScopeFolderGrants(t *testing.T) {
 		}
 	})
 
+	t.Run("a -f brief in the repo root names itself and both placements", func(t *testing.T) {
+		brief := filepath.Join(repo, "brief.md")
+		for _, spelling := range []string{repo, repo + "/"} {
+			mounts, extended, err := scopeFolderGrants(repo, brief, []string{spelling}, policy)
+			for _, want := range []string{"-f " + brief, "its folder " + repo + " is the repo root", "outside the repo", "subfolder"} {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Errorf("scopeFolderGrants(%s) err = %v, want the brief-origin refusal naming %q", spelling, err, want)
+				}
+			}
+			if mounts != nil || extended != nil {
+				t.Errorf("scopeFolderGrants(%s) = %v, %v, want nothing back on a refusal", spelling, mounts, extended)
+			}
+		}
+	})
+
+	t.Run("a brief away from the root keeps the explicit refusal plain", func(t *testing.T) {
+		brief := filepath.Join(repo, "specs", "brief.md")
+		_, _, err := scopeFolderGrants(repo, brief, []string{repo}, policy)
+		if err == nil || !strings.Contains(err.Error(), "grant a folder inside it instead") || strings.Contains(err.Error(), "-f ") {
+			t.Errorf("scopeFolderGrants(brief in a subfolder) err = %v, want the plain explicit refusal — only a brief at the root rewords it", err)
+		}
+	})
+
+	t.Run("a brief outside the repo mounts its folder like any grant", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "shared")
+		brief := filepath.Join(outside, "brief.md")
+		mounts, extended, err := scopeFolderGrants(repo, brief, []string{outside}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if !slices.Equal(mounts, []string{outside}) {
+			t.Errorf("mounts = %v, want [%s] — the placement the brief-origin refusal names first", mounts, outside)
+		}
+		if !slices.Equal(extended, policy) {
+			t.Errorf("extended = %v, want the flow's policy unchanged %v", extended, policy)
+		}
+	})
+
+	t.Run("a brief in a repo subfolder extends the scope like any grant", func(t *testing.T) {
+		brief := filepath.Join(repo, "notes", "brief.md")
+		mounts, extended, err := scopeFolderGrants(repo, brief, []string{filepath.Join(repo, "notes")}, policy)
+		if err != nil {
+			t.Fatalf("scopeFolderGrants: %v", err)
+		}
+		if mounts != nil {
+			t.Errorf("mounts = %v, want none — the subfolder grant rides as scope", mounts)
+		}
+		if want := []string{"*.md", "docs/", "notes/"}; !slices.Equal(extended, want) {
+			t.Errorf("extended = %v, want %v — the placement the brief-origin refusal names second", extended, want)
+		}
+	})
+
 	t.Run("nested and duplicate grants are left as-is", func(t *testing.T) {
-		mounts, extended, err := scopeFolderGrants(repo, []string{
+		mounts, extended, err := scopeFolderGrants(repo, "", []string{
 			filepath.Join(repo, "specs"),
 			filepath.Join(repo, "specs", "deep"),
 			filepath.Join(repo, "specs"),
@@ -673,7 +745,7 @@ func TestScopeFolderGrants(t *testing.T) {
 	})
 
 	t.Run("a policy-free flow is never seeded", func(t *testing.T) {
-		mounts, extended, err := scopeFolderGrants(repo, []string{filepath.Join(repo, "specs")}, nil)
+		mounts, extended, err := scopeFolderGrants(repo, "", []string{filepath.Join(repo, "specs")}, nil)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
@@ -686,18 +758,18 @@ func TestScopeFolderGrants(t *testing.T) {
 	})
 
 	t.Run("no grants is a no-op", func(t *testing.T) {
-		mounts, extended, err := scopeFolderGrants(repo, nil, policy)
+		mounts, extended, err := scopeFolderGrants(repo, "", nil, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
 		if mounts != nil || !slices.Equal(extended, policy) {
-			t.Errorf("scopeFolderGrants(repo, nil, policy) = %v, %v, want nil mounts and the policy unchanged", mounts, extended)
+			t.Errorf("scopeFolderGrants with no grants = %v, %v, want nil mounts and the policy unchanged", mounts, extended)
 		}
 	})
 
 	t.Run("a relative grant resolves against the process cwd", func(t *testing.T) {
 		t.Chdir(repo)
-		mounts, extended, err := scopeFolderGrants(repo, []string{"specs"}, policy)
+		mounts, extended, err := scopeFolderGrants(repo, "", []string{"specs"}, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
@@ -711,7 +783,7 @@ func TestScopeFolderGrants(t *testing.T) {
 
 	t.Run("a parent of the repo is a mount, not a refusal", func(t *testing.T) {
 		parent := filepath.Dir(repo)
-		mounts, _, err := scopeFolderGrants(repo, []string{parent}, policy)
+		mounts, _, err := scopeFolderGrants(repo, "", []string{parent}, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
@@ -722,7 +794,7 @@ func TestScopeFolderGrants(t *testing.T) {
 
 	t.Run("a traversal spelling that resolves inside is a scope grant", func(t *testing.T) {
 		winding := filepath.Join(repo, "..", filepath.Base(repo), "specs")
-		mounts, extended, err := scopeFolderGrants(repo, []string{winding}, policy)
+		mounts, extended, err := scopeFolderGrants(repo, "", []string{winding}, policy)
 		if err != nil {
 			t.Fatalf("scopeFolderGrants: %v", err)
 		}
