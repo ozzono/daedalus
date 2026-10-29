@@ -106,24 +106,29 @@ worker_id: ""
 # budget, so it is wider than the 15-minute ceiling the other activities
 # use. The jailed agent and worktree cleanup each get their own, wider
 # ceilings below; every remaining activity keeps the fixed 15-minute
-# StartToClose.
+# StartToClose. An explicit 0s sets no ceiling — the round runs unbounded,
+# under operator supervision only.
 tests_timeout: 30m
 # Ceiling for one jailed agent round — the implementation, fix, and
 # rebuild rounds (RunJailedClaudeActivity), a Go duration string. Agent
 # rounds legitimately run long, so this is wider than the fixed 15-minute
-# StartToClose the other activities use.
+# StartToClose the other activities use. An explicit 0s sets no ceiling —
+# the round runs unbounded, under operator supervision only.
 agent_run_timeout: 45m
 # Ceiling for one jailed reviewer round (RunJailedReviewerActivity), a Go
 # duration string. The code and test reviewers are jailed rounds like the
 # implementer — a whole-repo review legitimately runs long. A review cut
 # off at this ceiling retries with its conversation resumed, so
-# consecutive windows accumulate instead of restarting.
+# consecutive windows accumulate instead of restarting. An explicit 0s
+# sets no ceiling — the review runs unbounded, under operator supervision
+# only.
 review_timeout: 15m
 # Ceiling for one CleanupWorktreeActivity — committing the aborted-work
 # snapshot, unregistering the worktree, and removing its directory — a Go
 # duration string. Wider than the shared 15-minute activity ceiling:
 # removing a large worktree (e.g. one holding a build tree) is
 # filesystem-bound work that has burned the full 15 minutes in practice.
+# An explicit 0s sets no ceiling.
 cleanup_timeout: 30m
 # How many jailed-agent rounds may run at once on this worker; further
 # rounds queue until a slot frees (heartbeating while they wait).
