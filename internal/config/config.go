@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ozzono/daedalus/internal/provider"
 )
 
 // Defaults applied when the corresponding config.yaml field is unset.
@@ -392,6 +394,10 @@ type FallbackConfig struct {
 	// HeartbeatModel mirrors AnthropicConfig.HeartbeatModel for fallback
 	// rounds; empty falls back to Model, then to the agent's default.
 	HeartbeatModel string `yaml:"heartbeat_model"`
+	// Heartbeat is ProviderConfig.Heartbeat's counterpart for the fallback
+	// probe — probed only when the main probe misses. Same values, and the
+	// same unset default resolved per the fallback's own wire.
+	Heartbeat string `yaml:"heartbeat"`
 }
 
 // RoleOverrideConfig is one jailed-round role's optional provider override
@@ -610,6 +616,17 @@ type ProviderConfig struct {
 	// load error — a knob on the wire without a consumer must fail loud,
 	// never silently no-op. Empty means the agent's own default.
 	HeartbeatModel string `yaml:"heartbeat_model"`
+	// Heartbeat names the request `worker status` spends to learn the
+	// backend behind url is alive — one of provider.HeartbeatFormats. It is
+	// a property of the backend (which liveness surface it exposes), not of
+	// the wire rounds speak, so it is legal on both types. Empty (the
+	// default) resolves at the probe per this section's wire: the
+	// count_tokens check on the anthropic wire, the model list on the
+	// openai wire; the token-costing generation probe — what every config
+	// probed before this field existed — runs only when named explicitly
+	// as "gen-heartbeat", so hosted-wire configs that want the old
+	// completion-proof-and-quota-classification probe set it.
+	Heartbeat string `yaml:"heartbeat"`
 	// TimeoutMS bounds the jailed agent's API requests, exported as
 	// API_TIMEOUT_MS — both wire styles need it. Set, it wins over either
 	// legacy section's timeout_ms; zero (unset) falls through to the legacy
@@ -667,6 +684,9 @@ func (p ProviderConfig) validate() error {
 	}
 	if !slices.Contains(fallbackTypes, p.Type) {
 		return fmt.Errorf("unknown type %q (available: %s)", p.Type, strings.Join(fallbackTypes, ", "))
+	}
+	if p.Heartbeat != "" && !slices.Contains(provider.HeartbeatFormats, p.Heartbeat) {
+		return fmt.Errorf("unknown heartbeat %q (available: %s)", p.Heartbeat, strings.Join(provider.HeartbeatFormats, ", "))
 	}
 	if p.ContextTokens < 0 {
 		return fmt.Errorf("context_tokens: must not be negative")
@@ -2337,6 +2357,10 @@ func (c Config) validate(path string) error {
 	if !slices.Contains(fallbackTypes, c.Fallback.Type) {
 		return fmt.Errorf("config %s: fallback: unknown type %q (available: %s)",
 			path, c.Fallback.Type, strings.Join(fallbackTypes, ", "))
+	}
+	if c.Fallback.Heartbeat != "" && !slices.Contains(provider.HeartbeatFormats, c.Fallback.Heartbeat) {
+		return fmt.Errorf("config %s: fallback: unknown heartbeat %q (available: %s)",
+			path, c.Fallback.Heartbeat, strings.Join(provider.HeartbeatFormats, ", "))
 	}
 	// Path safety matters only when filing is on: an off toggle never
 	// renders a dir anywhere.

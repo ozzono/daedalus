@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ozzono/daedalus/internal/provider"
 )
 
 // configSource is this package's own production source, embedded at
@@ -565,6 +567,56 @@ func TestLoadFallbackType(t *testing.T) {
 	_, err = Load(writeConfig(t, "fallback:\n  type: azure\n"))
 	if err == nil || !strings.Contains(err.Error(), `unknown type "azure"`) {
 		t.Fatalf("want unknown-fallback-type error, got %v", err)
+	}
+}
+
+// TestLoadHeartbeatFormat pins the heartbeat field's load contract on both
+// sections that carry it: every listed format loads on either wire type
+// (the probe's shape is a property of the backend, not of the wire rounds
+// speak), unset loads everywhere with the default resolving at the probe,
+// and an unknown value is rejected at load with the accepted choices named
+// — a probe format no backend serves must fail loud, never sit inert. The
+// legacy sections carry no heartbeat knob: strict decoding keeps an
+// attempt there a load error too, the format being the provider section's
+// alone.
+func TestLoadHeartbeatFormat(t *testing.T) {
+	for _, typ := range fallbackTypes {
+		for _, hb := range provider.HeartbeatFormats {
+			cfg, err := Load(writeConfig(t, "provider:\n  type: "+typ+"\n  key: k\n  heartbeat: "+hb+"\n"))
+			if err != nil {
+				t.Fatalf("Load(provider type %s, heartbeat %s): %v", typ, hb, err)
+			}
+			if cfg.Provider == nil || cfg.Provider.Heartbeat != hb {
+				t.Errorf("provider type %s: Heartbeat = %q, want %q", typ, cfg.Provider.Heartbeat, hb)
+			}
+		}
+	}
+
+	cfg, err := Load(writeConfig(t, "provider:\n  type: anthropic\n  key: k\n"))
+	if err != nil || cfg.Provider.Heartbeat != "" {
+		t.Errorf("unset provider heartbeat = %q (err %v), want empty (the default resolves at the probe)", cfg.Provider.Heartbeat, err)
+	}
+
+	_, err = Load(writeConfig(t, "provider:\n  type: openai\n  heartbeat: bogus\n"))
+	if err == nil || !strings.Contains(err.Error(), `unknown heartbeat "bogus"`) ||
+		!strings.Contains(err.Error(), "gen-heartbeat") {
+		t.Errorf("Load(provider heartbeat bogus) error = %v, want the unknown-format rejection naming the choices", err)
+	}
+
+	// The fallback carries the same field with the same rule; its probe
+	// runs only when the main probe misses.
+	if _, err := Load(writeConfig(t, "fallback:\n  heartbeat: "+provider.HeartbeatGen+"\n")); err != nil {
+		t.Errorf("Load(fallback heartbeat gen-heartbeat): %v, want accepted", err)
+	}
+	_, err = Load(writeConfig(t, "fallback:\n  heartbeat: bogus\n"))
+	if err == nil || !strings.Contains(err.Error(), "fallback: unknown heartbeat") ||
+		!strings.Contains(err.Error(), "gen-heartbeat") {
+		t.Errorf("Load(fallback heartbeat bogus) error = %v, want the fallback's unknown-format rejection", err)
+	}
+
+	_, err = Load(writeConfig(t, "anthropic:\n  url: https://x.example\n  key: k\n  model: m\n  heartbeat: gen-heartbeat\n"))
+	if err == nil || !strings.Contains(err.Error(), "heartbeat") {
+		t.Errorf("Load(legacy anthropic heartbeat) error = %v, want the field-not-found rejection", err)
 	}
 }
 
@@ -1190,8 +1242,14 @@ func TestExampleYAML(t *testing.T) {
 		cfg.Provider.ContextTokens != 0 || cfg.Provider.MaxOutputTokens != 0 ||
 		cfg.Provider.TopP != 0 || cfg.Provider.Temperature != 0 || cfg.Provider.PresencePenalty != 0 ||
 		cfg.Provider.TopK != 0 || cfg.Provider.MinP != 0 || cfg.Provider.RepetitionPenalty != 0 ||
-		cfg.Provider.KeyAlias != "" || cfg.Provider.DisableThinking {
+		cfg.Provider.KeyAlias != "" || cfg.Provider.DisableThinking ||
+		cfg.Provider.Heartbeat != "" {
 		t.Errorf("ExampleYAML provider section = %+v, want the typed-but-inert defaults", cfg.Provider)
+	}
+	// The fallback section ships the same way: armed-off, typed at the
+	// default, every value empty.
+	if fb := cfg.Fallback; fb != (FallbackConfig{Type: DefaultFallbackType}) {
+		t.Errorf("ExampleYAML fallback section = %+v, want the typed-but-inert defaults", fb)
 	}
 	// The per-role provider override groups document every field but ship
 	// inert: an example-file deployment shares the serving endpoint, model,

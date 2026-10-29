@@ -763,12 +763,36 @@ CONFIGURATION REFERENCE
                         (it rides the wire-agnostic exports), heartbeat_model
                         on anthropic only, and the sampler knobs on openai
                         only — a knob on the wire without a consumer is a
-                        load error, never inert. Per-field precedence (role
+                        load error, never inert. heartbeat (both types)
+                        names the "worker status" probe's wire shape.
+                        Per-field precedence (role
                         overrides > provider > legacy): a field the provider
                         section sets wins over the legacy sections', an
                         unset one falls through to the legacy value; the
                         legacy anthropic:/openai: sections are compatibility
                         and keep working unchanged
+  provider.heartbeat    Which request "worker status" spends to learn the
+                        backend is alive — a property of the backend behind
+                        url, not of the wire rounds speak: openai (GET
+                        {url}/models, no token spent), anthropic (POST
+                        count_tokens — validates the key, bills nothing),
+                        ollama (GET /api/ps at the server root; the /v1
+                        suffix the url carries is trimmed), colibri (GET
+                        /status — alive-and-serving vs serving-wedged),
+                        omlx (POST /tokenize), or gen-heartbeat (the real
+                        minimal generation — costs tokens, holds a serving
+                        slot, parses the 429 quota-reset stamp). Unset,
+                        the probe picks the non-token check matching the
+                        wire it dials: count_tokens on anthropic, the
+                        model list on openai. The default changed: every
+                        config probed gen-heartbeat before this field
+                        existed, so hosted-wire configs (z.ai) wanting
+                        the old completion proof set gen-heartbeat. The
+                        field lives on the provider: and fallback:
+                        sections — a legacy-only config reaches it by
+                        adding a minimal provider: section naming just
+                        type and heartbeat (its unset url/key/model fall
+                        through to the legacy sections)
   fallback.enabled/url/key/model/heartbeat_model
                         Independent secondary provider: when a jailed round
                         fails with the primary's quota exhausted, the worker
@@ -782,6 +806,9 @@ CONFIGURATION REFERENCE
                         pi and aider dial whichever provider their selected
                         model uses, and codex dials OpenAI wire formats only,
                         so an openai fallback is exactly what serves it
+  fallback.heartbeat    The fallback probe's format — same values as
+                        provider.heartbeat; probed only when the main probe
+                        misses and a fallback is armed
 `,
 	"config": `daedalus config — print the active configuration.
 

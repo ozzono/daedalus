@@ -184,11 +184,14 @@ type providerProbes struct {
 // The main provider is probed — the provider: section's endpoint in the
 // wire style its type names when set, the legacy anthropic: section, or
 // the legacy openai: section when the anthropic side is unset (the served
-// channel of an openai-only config); when it is not ok and the config arms
-// a fallback, the fallback is probed too — mirroring the worker's own
-// failover choice. Values that cannot be determined (no record, unloadable
-// config, provider not fully configured) come back as NA text rather than
-// as failures.
+// channel of an openai-only config) — and the probe's wire shape is the
+// section's heartbeat format; unset, the non-token check matching the
+// probed wire's style (count_tokens on the anthropic wire, model list on
+// the openai wire). When the main probe is not ok and the config arms a
+// fallback, the fallback is probed too — mirroring the worker's own
+// failover choice, under the fallback's own heartbeat format. Values that
+// cannot be determined (no record, unloadable config, provider not fully
+// configured) come back as NA text rather than as failures.
 func probeProvider(confPath string) providerProbes {
 	if confPath == "" {
 		return providerProbes{NA: "n/a (no config record)"}
@@ -200,6 +203,13 @@ func probeProvider(confPath string) providerProbes {
 	anth, open := cfg.ProviderChannels()
 	url, key, model := anth.URL, anth.Key, heartbeatOrDefault(anth.HeartbeatModel, anth.Model)
 	style := provider.StyleAnthropic
+	// The heartbeat format is the provider section's alone (the legacy
+	// sections carry none); empty resolves at the probe to the non-token
+	// check matching the probed wire's style.
+	var format string
+	if cfg.Provider != nil {
+		format = cfg.Provider.Heartbeat
+	}
 	if cfg.Provider != nil && cfg.Provider.Type == config.FallbackTypeOpenAI {
 		// The openai-typed provider is the primary: probe its endpoint in
 		// its own wire style (heartbeat_model cannot be set on it — load
@@ -216,26 +226,29 @@ func probeProvider(confPath string) providerProbes {
 		return providerProbes{NA: "n/a (provider not configured)"}
 	}
 	p := providerProbes{Main: provider.Probe(context.Background(), provider.Spec{
-		URL:   url,
-		Key:   key,
-		Model: model,
-		Style: style,
+		URL:    url,
+		Key:    key,
+		Model:  model,
+		Style:  style,
+		Format: format,
 	})}
 	if !cfg.Fallback.Active() || p.Main.OK {
 		return p
 	}
 	// The fallback's type picks its probe's wire style, matching what
-	// failover rounds speak; anthropic is the default (also for a Type
-	// built without Load, which cannot happen here but costs nothing).
+	// failover rounds speak, and its own heartbeat names the format;
+	// anthropic is the default (also for a Type built without Load, which
+	// cannot happen here but costs nothing).
 	fbStyle := provider.StyleAnthropic
 	if cfg.Fallback.Type == config.FallbackTypeOpenAI {
 		fbStyle = provider.StyleOpenAI
 	}
 	p.Fb = provider.Probe(context.Background(), provider.Spec{
-		URL:   cfg.Fallback.URL,
-		Key:   cfg.Fallback.Key,
-		Model: heartbeatOrDefault(cfg.Fallback.HeartbeatModel, cfg.Fallback.Model),
-		Style: fbStyle,
+		URL:    cfg.Fallback.URL,
+		Key:    cfg.Fallback.Key,
+		Model:  heartbeatOrDefault(cfg.Fallback.HeartbeatModel, cfg.Fallback.Model),
+		Style:  fbStyle,
+		Format: cfg.Fallback.Heartbeat,
 	})
 	p.FbArmed = true
 	return p

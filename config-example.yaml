@@ -513,6 +513,23 @@ provider:
   # openai-typed provider carrying it is a load error. Empty means the
   # agent's own default.
   heartbeat_model: ""
+  # Which request "worker status" spends to learn the backend behind url is
+  # alive — a property of the backend, not of the wire rounds speak, so it
+  # is legal on both types: openai (a non-token GET {url}/models),
+  # anthropic (a non-billed POST count_tokens that validates the key),
+  # ollama (GET /api/ps at the server root), colibri (GET /status), omlx
+  # (POST /tokenize), or gen-heartbeat — the real minimal generation every
+  # config probed before this field existed, costing tokens and holding a
+  # serving slot, but the only format that proves an end-to-end completion
+  # and parses the 429 quota-reset stamp. Unset, the probe picks the
+  # non-token check matching this section's wire: count_tokens on
+  # anthropic, the model list on openai. The default moved off
+  # gen-heartbeat deliberately: hosted-wire configs (e.g. z.ai) that want
+  # the old probe set gen-heartbeat here. The field lives on this section
+  # and fallback: only — a legacy-only config reaches it by adding a
+  # minimal provider: section naming just type and heartbeat (its unset
+  # url/key/model fall through to the legacy sections).
+  heartbeat: ""
   # API request timeout for the jailed agent, in milliseconds, exported as
   # API_TIMEOUT_MS — both wire styles need it. Set, it wins over either
   # legacy section's timeout_ms; zero/unset falls through to the legacy
@@ -593,6 +610,10 @@ fallback:
   key: ""
   model: ""
   heartbeat_model: ""
+  # The fallback probe's format — same values as provider.heartbeat above;
+  # probed only when the main probe misses and failover is armed. Empty
+  # resolves per the fallback's own wire, like the provider's unset above.
+  heartbeat: ""
 
 # The dev rounds' own provider overrides — the implementing agent's
 # rounds: the slim flow's plan, parse, step, and fix rounds among them.
