@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ozzono/daedalus/internal/provider"
 )
 
 // Defaults applied when the corresponding config.yaml field is unset.
@@ -71,6 +73,15 @@ const (
 	// bound work that has burned the full 15 minutes in practice, and a
 	// timed-out cleanup risks losing the aborted-work snapshot.
 	DefaultCleanupTimeout = 30 * time.Minute
+	// UnlimitedTimeout is the ceiling an explicit 0 round timeout resolves
+	// to. Temporal has no unlimited StartToCloseTimeout: a zero is rejected
+	// outright server-side (BadScheduleActivityAttributes, "a valid
+	// StartToCloseTimeout or ScheduleToCloseTimeout must be set on the
+	// activity"), so "no ceiling" is this effectively-never sentinel:
+	// 100 years, chosen clear of every duration bound on the way (Go's
+	// time.Time caps at year 2155, protobuf Duration at ~10000 years).
+	// Operator supervision stays the only real net.
+	UnlimitedTimeout = 100 * 365 * 24 * time.Hour
 	// DefaultMaxConcurrentAgentRuns caps how many jailed-agent rounds run at
 	// once on this worker when config max_concurrent_agent_runs is unset.
 	// Concurrent cold sessions share one provider account's throughput, so
@@ -383,6 +394,10 @@ type FallbackConfig struct {
 	// HeartbeatModel mirrors AnthropicConfig.HeartbeatModel for fallback
 	// rounds; empty falls back to Model, then to the agent's default.
 	HeartbeatModel string `yaml:"heartbeat_model"`
+	// Heartbeat is ProviderConfig.Heartbeat's counterpart for the fallback
+	// probe — probed only when the main probe misses. Same values, and the
+	// same unset default resolved per the fallback's own wire.
+	Heartbeat string `yaml:"heartbeat"`
 }
 
 // RoleOverrideConfig is one jailed-round role's optional provider override
@@ -601,6 +616,17 @@ type ProviderConfig struct {
 	// load error — a knob on the wire without a consumer must fail loud,
 	// never silently no-op. Empty means the agent's own default.
 	HeartbeatModel string `yaml:"heartbeat_model"`
+	// Heartbeat names the request `worker status` spends to learn the
+	// backend behind url is alive — one of provider.HeartbeatFormats. It is
+	// a property of the backend (which liveness surface it exposes), not of
+	// the wire rounds speak, so it is legal on both types. Empty (the
+	// default) resolves at the probe per this section's wire: the
+	// count_tokens check on the anthropic wire, the model list on the
+	// openai wire; the token-costing generation probe — what every config
+	// probed before this field existed — runs only when named explicitly
+	// as "gen-heartbeat", so hosted-wire configs that want the old
+	// completion-proof-and-quota-classification probe set it.
+	Heartbeat string `yaml:"heartbeat"`
 	// TimeoutMS bounds the jailed agent's API requests, exported as
 	// API_TIMEOUT_MS — both wire styles need it. Set, it wins over either
 	// legacy section's timeout_ms; zero (unset) falls through to the legacy
@@ -658,6 +684,9 @@ func (p ProviderConfig) validate() error {
 	}
 	if !slices.Contains(fallbackTypes, p.Type) {
 		return fmt.Errorf("unknown type %q (available: %s)", p.Type, strings.Join(fallbackTypes, ", "))
+	}
+	if p.Heartbeat != "" && !slices.Contains(provider.HeartbeatFormats, p.Heartbeat) {
+		return fmt.Errorf("unknown heartbeat %q (available: %s)", p.Heartbeat, strings.Join(provider.HeartbeatFormats, ", "))
 	}
 	if p.ContextTokens < 0 {
 		return fmt.Errorf("context_tokens: must not be negative")
@@ -1062,26 +1091,30 @@ type Config struct {
 	// TestsTimeout bounds one execution of the repo's native test suite
 	// (RunNativeTestsActivity): test-command discovery and the suite itself
 	// share this budget. A time.ParseDuration string in YAML ("30m");
-	// DefaultTestsTimeout when unset.
-	TestsTimeout time.Duration `yaml:"tests_timeout"`
+	// DefaultTestsTimeout when unset (nil); an explicit 0s is unlimited —
+	// the round answers to no ceiling, resolving to UnlimitedTimeout.
+	TestsTimeout *time.Duration `yaml:"tests_timeout"`
 	// AgentRunTimeout bounds one jailed agent round — the implementation,
 	// fix, and rebuild rounds (RunJailedClaudeActivity). A
 	// time.ParseDuration string in YAML ("45m"); DefaultAgentRunTimeout
-	// when unset.
-	AgentRunTimeout time.Duration `yaml:"agent_run_timeout"`
+	// when unset (nil); an explicit 0s is unlimited, resolving to
+	// UnlimitedTimeout.
+	AgentRunTimeout *time.Duration `yaml:"agent_run_timeout"`
 	// ReviewTimeout bounds one jailed reviewer round
 	// (RunJailedReviewerActivity) — the code and test reviewers are jailed
 	// rounds like the implementer, and a whole-repo review legitimately
 	// runs long. A review cut off at this ceiling retries with its
 	// conversation resumed, so consecutive windows accumulate instead of
 	// restarting. A time.ParseDuration string in YAML ("15m");
-	// DefaultReviewTimeout when unset.
-	ReviewTimeout time.Duration `yaml:"review_timeout"`
+	// DefaultReviewTimeout when unset (nil); an explicit 0s is unlimited,
+	// resolving to UnlimitedTimeout.
+	ReviewTimeout *time.Duration `yaml:"review_timeout"`
 	// CleanupTimeout bounds one CleanupWorktreeActivity: committing the
 	// aborted-work snapshot, unregistering the worktree, and removing its
 	// directory. A time.ParseDuration string in YAML ("15m");
-	// DefaultCleanupTimeout when unset.
-	CleanupTimeout time.Duration `yaml:"cleanup_timeout"`
+	// DefaultCleanupTimeout when unset (nil); an explicit 0s is unlimited,
+	// resolving to UnlimitedTimeout.
+	CleanupTimeout *time.Duration `yaml:"cleanup_timeout"`
 	// MaxConcurrentAgentRuns caps how many jailed-agent rounds run at once
 	// on this worker; further rounds queue until a slot frees. Concurrent
 	// cold agent sessions share one provider account, so unbounded
@@ -1303,14 +1336,30 @@ func (c Config) TestOutputDir() string {
 
 // durationValue marshals a time.Duration the way config files express them:
 // a canonical duration string ("30m0s"), never the raw nanosecond count a
-// plain re-marshal would emit. Zero — the unset marker a pre-defaults view
-// renders — prints as "0s", zero's own canonical string: a plain 0 would be
-// an !!int scalar, which yaml.v3 refuses to decode into a time.Duration
+// plain re-marshal would emit. A zero prints as "0s", zero's own canonical
+// string — an explicit-0 round timeout's unlimited marker: a plain 0 would
+// be an !!int scalar, which yaml.v3 refuses to decode into a time.Duration
 // ("cannot unmarshal !!int `0`"), so the rendered file would not load.
 type durationValue time.Duration
 
 func (d durationValue) MarshalYAML() (any, error) {
 	return time.Duration(d).String(), nil
+}
+
+// durationPtr lifts a duration into its Config field's pointer form.
+func durationPtr(d time.Duration) *time.Duration {
+	return &d
+}
+
+// timeoutRender lifts a round timeout into the render's loadable pointer
+// form (see durationValue); nil stays nil — an absent key renders absent,
+// so an explicit 0 renders as its own "0s", distinct from unset.
+func timeoutRender(d *time.Duration) *durationValue {
+	if d == nil {
+		return nil
+	}
+	v := durationValue(*d)
+	return &v
 }
 
 // metricsRender mirrors MetricsConfig for the render: the ledger age
@@ -1345,16 +1394,18 @@ func metricsRenderOf(m MetricsConfig) metricsRender {
 
 // renderConfig mirrors Config field-for-field so a re-marshal prints every
 // field in struct order with the durations carried by durationValue; the
-// nested sections marshal as themselves.
+// nested sections marshal as themselves. The round timeouts ride *durationValue
+// (the omitempty family): a nil — the key was absent — renders absent, so an
+// explicit 0 ("0s", unlimited) stays distinct from unset on the round-trip.
 type renderConfig struct {
 	Agent                  string              `yaml:"agent"`
 	BranchPrefix           string              `yaml:"branch_prefix"`
 	Authorship             bool                `yaml:"authorship"`
 	WorkerID               string              `yaml:"worker_id"`
-	TestsTimeout           durationValue       `yaml:"tests_timeout"`
-	AgentRunTimeout        durationValue       `yaml:"agent_run_timeout"`
-	ReviewTimeout          durationValue       `yaml:"review_timeout"`
-	CleanupTimeout         durationValue       `yaml:"cleanup_timeout"`
+	TestsTimeout           *durationValue      `yaml:"tests_timeout,omitempty"`
+	AgentRunTimeout        *durationValue      `yaml:"agent_run_timeout,omitempty"`
+	ReviewTimeout          *durationValue      `yaml:"review_timeout,omitempty"`
+	CleanupTimeout         *durationValue      `yaml:"cleanup_timeout,omitempty"`
 	MaxConcurrentAgentRuns int                 `yaml:"max_concurrent_agent_runs"`
 	MaxRequestsPerMinute   int                 `yaml:"max_requests_per_minute"`
 	MaxConcurrentTests     int                 `yaml:"max_concurrent_tests"`
@@ -1382,7 +1433,9 @@ type renderConfig struct {
 // in struct order: set values verbatim, unset fields as their zero value
 // ("what the file says", not what applyDefaults would fill in). A
 // defaulted pointer key (the omitempty family) renders absent when unset —
-// `key: null` is a shape no config line means. Intended
+// `key: null` is a shape no config line means. The round timeouts join that
+// family: an absent key renders absent, an explicit 0 as "0s", so the
+// unlimited marker survives the round-trip. Intended
 // for a LoadRaw result — rendering a defaulted Config would misrepresent
 // absent fields as set. Keys print unredacted by design: the command shows
 // the operator their own file.
@@ -1392,10 +1445,10 @@ func (c Config) RenderYAML() (string, error) {
 		BranchPrefix:           c.BranchPrefix,
 		Authorship:             c.Authorship,
 		WorkerID:               c.WorkerID,
-		TestsTimeout:           durationValue(c.TestsTimeout),
-		AgentRunTimeout:        durationValue(c.AgentRunTimeout),
-		ReviewTimeout:          durationValue(c.ReviewTimeout),
-		CleanupTimeout:         durationValue(c.CleanupTimeout),
+		TestsTimeout:           timeoutRender(c.TestsTimeout),
+		AgentRunTimeout:        timeoutRender(c.AgentRunTimeout),
+		ReviewTimeout:          timeoutRender(c.ReviewTimeout),
+		CleanupTimeout:         timeoutRender(c.CleanupTimeout),
 		MaxConcurrentAgentRuns: c.MaxConcurrentAgentRuns,
 		MaxRequestsPerMinute:   c.MaxRequestsPerMinute,
 		MaxConcurrentTests:     c.MaxConcurrentTests,
@@ -2009,9 +2062,10 @@ func Load(path string) (Config, error) {
 
 // LoadRaw is Load's pre-defaults view: the same read, parse, and validation
 // (identical diagnostics), but the returned Config holds the file's own
-// values — fields absent from it stay at their zero value instead of the
-// applied default. `daedalus config` renders this view, so the operator can
-// tell what the file says from what the code injects.
+// values — fields absent from it stay nil instead of carrying the applied
+// default, and an explicit 0 round timeout stays 0 where Load resolves it
+// to UnlimitedTimeout. `daedalus config` renders this view, so the operator
+// can tell what the file says from what the code injects.
 func LoadRaw(path string) (Config, error) {
 	c, err := parse(path)
 	if err != nil {
@@ -2019,9 +2073,10 @@ func LoadRaw(path string) (Config, error) {
 	}
 	// Validation sees the defaulted values (an unset fallback.type loads as
 	// "anthropic", an unset agent as "claude"), so validate a copy — the
-	// returned view must stay raw. The copy is shallow because applyDefaults
-	// writes no pointer fields: the provider section is only ever read
-	// (ProviderChannels merges from it at resolution time).
+	// returned view must stay raw. The copy is shallow but safe: applyDefaults
+	// only ever replaces fields and pointers on the copy, never writes
+	// through a pointer both views share (the provider section is only ever
+	// read — ProviderChannels merges from it at resolution time).
 	d := c
 	d.applyDefaults()
 	return c, d.validate(path)
@@ -2133,16 +2188,16 @@ func (c Config) validate(path string) error {
 		return fmt.Errorf("config %s: temporal.task_queue: %q must not carry the \"-test\" suffix — suites for %q derive the queue %q, colliding with this deployment's own main queue",
 			path, c.Temporal.TaskQueue, stem, TestQueueFor(stem))
 	}
-	if c.TestsTimeout < 0 {
+	if c.TestsTimeout != nil && *c.TestsTimeout < 0 {
 		return fmt.Errorf("config %s: tests_timeout: must not be negative", path)
 	}
-	if c.AgentRunTimeout < 0 {
+	if c.AgentRunTimeout != nil && *c.AgentRunTimeout < 0 {
 		return fmt.Errorf("config %s: agent_run_timeout: must not be negative", path)
 	}
-	if c.ReviewTimeout < 0 {
+	if c.ReviewTimeout != nil && *c.ReviewTimeout < 0 {
 		return fmt.Errorf("config %s: review_timeout: must not be negative", path)
 	}
-	if c.CleanupTimeout < 0 {
+	if c.CleanupTimeout != nil && *c.CleanupTimeout < 0 {
 		return fmt.Errorf("config %s: cleanup_timeout: must not be negative", path)
 	}
 	if c.MaxConcurrentAgentRuns < 0 {
@@ -2302,6 +2357,10 @@ func (c Config) validate(path string) error {
 	if !slices.Contains(fallbackTypes, c.Fallback.Type) {
 		return fmt.Errorf("config %s: fallback: unknown type %q (available: %s)",
 			path, c.Fallback.Type, strings.Join(fallbackTypes, ", "))
+	}
+	if c.Fallback.Heartbeat != "" && !slices.Contains(provider.HeartbeatFormats, c.Fallback.Heartbeat) {
+		return fmt.Errorf("config %s: fallback: unknown heartbeat %q (available: %s)",
+			path, c.Fallback.Heartbeat, strings.Join(provider.HeartbeatFormats, ", "))
 	}
 	// Path safety matters only when filing is on: an off toggle never
 	// renders a dir anywhere.
@@ -2469,17 +2528,30 @@ func (c *Config) applyDefaults() {
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS
 	}
-	if c.TestsTimeout == 0 {
-		c.TestsTimeout = DefaultTestsTimeout
+	// The round timeouts carry their own third state: nil (key absent)
+	// takes the default, an explicit 0 resolves to UnlimitedTimeout —
+	// Temporal rejects a zero StartToCloseTimeout outright, so "no ceiling"
+	// is the sentinel (see it). Assignments replace the pointer, never
+	// write through one: LoadRaw's shallow raw view stays raw.
+	if c.TestsTimeout == nil {
+		c.TestsTimeout = durationPtr(DefaultTestsTimeout)
+	} else if *c.TestsTimeout == 0 {
+		c.TestsTimeout = durationPtr(UnlimitedTimeout)
 	}
-	if c.AgentRunTimeout == 0 {
-		c.AgentRunTimeout = DefaultAgentRunTimeout
+	if c.AgentRunTimeout == nil {
+		c.AgentRunTimeout = durationPtr(DefaultAgentRunTimeout)
+	} else if *c.AgentRunTimeout == 0 {
+		c.AgentRunTimeout = durationPtr(UnlimitedTimeout)
 	}
-	if c.ReviewTimeout == 0 {
-		c.ReviewTimeout = DefaultReviewTimeout
+	if c.ReviewTimeout == nil {
+		c.ReviewTimeout = durationPtr(DefaultReviewTimeout)
+	} else if *c.ReviewTimeout == 0 {
+		c.ReviewTimeout = durationPtr(UnlimitedTimeout)
 	}
-	if c.CleanupTimeout == 0 {
-		c.CleanupTimeout = DefaultCleanupTimeout
+	if c.CleanupTimeout == nil {
+		c.CleanupTimeout = durationPtr(DefaultCleanupTimeout)
+	} else if *c.CleanupTimeout == 0 {
+		c.CleanupTimeout = durationPtr(UnlimitedTimeout)
 	}
 	if c.MaxConcurrentAgentRuns == 0 {
 		c.MaxConcurrentAgentRuns = DefaultMaxConcurrentAgentRuns
@@ -2498,8 +2570,5 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Anthropic.TimeoutMS == 0 {
 		c.Anthropic.TimeoutMS = DefaultAnthropicTimeoutMS
-	}
-	if c.TestsTimeout == 0 {
-		c.TestsTimeout = DefaultTestsTimeout
 	}
 }

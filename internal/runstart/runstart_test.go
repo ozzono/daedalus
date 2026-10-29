@@ -312,6 +312,15 @@ func (f *fakeFrontend) ListWorkflowExecutions(_ context.Context, req *workflowse
 // at it; Dial connects eagerly, so the server listens before any caller
 // runs.
 func startFake(t *testing.T, fake *fakeFrontend) config.Config {
+	return startFakeConfig(t, fake, "")
+}
+
+// startFakeConfig serves fake on a loopback port and returns a
+// Load-resolved config pointing at it, extraYAML's overrides carried.
+// Start's input contract is a resolved config — the round-timeout fields
+// are non-nil pointers only after Load — so the harness builds its config
+// the way production does, never as a bare literal.
+func startFakeConfig(t *testing.T, fake *fakeFrontend, extraYAML string) config.Config {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -321,7 +330,17 @@ func startFake(t *testing.T, fake *fakeFrontend) config.Config {
 	workflowservice.RegisterWorkflowServiceServer(srv, fake)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
-	return config.Config{Temporal: config.TemporalConfig{Host: lis.Addr().String(), TaskQueue: "startq"}}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(extraYAML), 0o600); err != nil {
+		t.Fatalf("write the harness config: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load the harness config: %v", err)
+	}
+	cfg.Temporal.Host = lis.Addr().String()
+	cfg.Temporal.TaskQueue = "startq"
+	return cfg
 }
 
 // dispatchInput decodes the PipelineInput a captured start carried.
@@ -587,6 +606,38 @@ func TestStartDispatch(t *testing.T) {
 		}
 		if len(fake.starts) != 0 {
 			t.Errorf("the brief-origin refusal dispatched %d starts, want 0", len(fake.starts))
+		}
+	})
+
+	t.Run("the resolved round ceilings ride the dispatch input", func(t *testing.T) {
+		repo := gitRepo(t, "main")
+		fake := &fakeFrontend{}
+		cfg := startFake(t, fake)
+
+		if _, err := Start(cfg, valid(repo)); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		in := dispatchInput(t, fake.starts[0])
+		if in.TestTimeout != config.DefaultTestsTimeout || in.AgentRunTimeout != config.DefaultAgentRunTimeout ||
+			in.ReviewTimeout != config.DefaultReviewTimeout || in.CleanupTimeout != config.DefaultCleanupTimeout {
+			t.Errorf("dispatched round timeouts = %v/%v/%v/%v, want Load's defaults — an unset key dispatches the default ceiling, never zero",
+				in.TestTimeout, in.AgentRunTimeout, in.ReviewTimeout, in.CleanupTimeout)
+		}
+	})
+
+	t.Run("an explicit 0s dispatches the unlimited sentinel", func(t *testing.T) {
+		repo := gitRepo(t, "main")
+		fake := &fakeFrontend{}
+		cfg := startFakeConfig(t, fake, "tests_timeout: 0s\nagent_run_timeout: 0s\nreview_timeout: 0s\ncleanup_timeout: 0s\n")
+
+		if _, err := Start(cfg, valid(repo)); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		in := dispatchInput(t, fake.starts[0])
+		if in.TestTimeout != config.UnlimitedTimeout || in.AgentRunTimeout != config.UnlimitedTimeout ||
+			in.ReviewTimeout != config.UnlimitedTimeout || in.CleanupTimeout != config.UnlimitedTimeout {
+			t.Errorf("dispatched round timeouts = %v/%v/%v/%v, want the UnlimitedTimeout sentinel for every explicit 0s",
+				in.TestTimeout, in.AgentRunTimeout, in.ReviewTimeout, in.CleanupTimeout)
 		}
 	})
 }

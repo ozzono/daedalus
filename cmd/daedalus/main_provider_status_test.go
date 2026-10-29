@@ -148,34 +148,49 @@ func TestProviderStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("probe names the heartbeat model when configured", func(t *testing.T) {
-		url, model := providerModelServer(t)
-		cfg := writeProviderConfig(t, url, "k", "  heartbeat_model: hb-air\n")
+	t.Run("a legacy heartbeat_model names the token-free count_tokens probe", func(t *testing.T) {
+		var path, key, model string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path, key = r.URL.Path, r.Header.Get("x-api-key")
+			var b struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			model = b.Model
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(srv.Close)
+		// The legacy sections carry no heartbeat field: even with a
+		// heartbeat_model configured, the probe stays the anthropic wire's
+		// token-free count_tokens check — the unset format resolves per
+		// Style — and the heartbeat model names its body. A generation
+		// probe needs the provider section to name gen-heartbeat.
+		cfg := writeProviderConfig(t, srv.URL, "k", "  heartbeat_model: hb-air\n")
 		if got := providerStatus(cfg); !strings.Contains(got, "ok (http 200)") {
 			t.Errorf("providerStatus = %q, want ok", got)
 		}
-		if *model != "hb-air" {
-			t.Errorf("probe model = %q, want the configured heartbeat model", *model)
+		if path != "/v1/messages/count_tokens" {
+			t.Errorf("probe path = %q, want /v1/messages/count_tokens (no legacy heartbeat field exists to name a generation)", path)
 		}
-	})
-
-	t.Run("probe names the main model without a heartbeat model", func(t *testing.T) {
-		url, model := providerModelServer(t)
-		if got := providerStatus(writeProviderConfig(t, url, "k", "")); !strings.Contains(got, "ok (http 200)") {
-			t.Errorf("providerStatus = %q, want ok", got)
+		if key != "k" {
+			t.Errorf("probe x-api-key = %q, want the legacy section's key", key)
 		}
-		if *model != "m" {
-			t.Errorf("probe model = %q, want the main model", *model)
+		if model != "hb-air" {
+			t.Errorf("probe model = %q, want the configured heartbeat model", model)
 		}
 	})
 
 	t.Run("quota-exhausted main with live fallback reports the fallback active", func(t *testing.T) {
+		// Even a z.ai 429 stamp stays unclassified under the default probe:
+		// only the gen-heartbeat parses quota windows (pinned with a
+		// provider section below).
 		main := providerServer(t, 429, `Usage limit reached for 5 hour. Your limit will reset at 2099-01-01 09:13:00`)
 		fallback := providerServer(t, 200, `{}`)
 		extra := "fallback:\n  enabled: true\n  url: " + fallback + "\n  key: fb\n  model: fbm\n"
 		cfg := writeProviderConfig(t, main, "k", extra)
 		got := providerStatus(cfg)
-		for _, want := range []string{"main: 429 quota (resets", "fallback: ok (http 200)", "[active: fallback]"} {
+		for _, want := range []string{"main: http 429", "fallback: ok (http 200)", "[active: fallback]"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("providerStatus = %q, want it to contain %q", got, want)
 			}
@@ -188,7 +203,7 @@ func TestProviderStatus(t *testing.T) {
 		extra := "fallback:\n  enabled: true\n  url: " + fallback + "\n  key: fb\n  model: fbm\n"
 		cfg := writeProviderConfig(t, main, "k", extra)
 		got := providerStatus(cfg)
-		for _, want := range []string{"main: 429 rate limited", "fallback: 401 auth rejected", "[active: none]"} {
+		for _, want := range []string{"main: http 429", "fallback: 401 auth rejected", "[active: none]"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("providerStatus = %q, want it to contain %q", got, want)
 			}
@@ -204,7 +219,9 @@ func TestProviderStatus(t *testing.T) {
 			_, _ = w.Write([]byte(`{}`))
 		}))
 		t.Cleanup(fb.Close)
-		extra := "fallback:\n  enabled: true\n  type: openai\n  url: " + fb.URL + "\n  key: fb\n  model: fbm\n"
+		// The fallback's own gen-heartbeat is what makes its type pick the
+		// wire: the generation rides chat/completions for an openai type.
+		extra := "fallback:\n  enabled: true\n  type: openai\n  url: " + fb.URL + "\n  key: fb\n  model: fbm\n  heartbeat: gen-heartbeat\n"
 		got := providerStatus(writeProviderConfig(t, main, "k", extra))
 		if !strings.Contains(got, "fallback: ok (http 200)") || !strings.Contains(got, "[active: fallback]") {
 			t.Errorf("providerStatus = %q, want the openai fallback reported active", got)
@@ -226,8 +243,8 @@ func TestProviderStatus(t *testing.T) {
 			_, _ = w.Write([]byte(`{}`))
 		}))
 		t.Cleanup(fb.Close)
-		// No type field: the anthropic default must pick the probe's wire.
-		extra := "fallback:\n  enabled: true\n  url: " + fb.URL + "\n  key: fb\n  model: fbm\n"
+		// No type field: the anthropic default picks the gen probe's wire.
+		extra := "fallback:\n  enabled: true\n  url: " + fb.URL + "\n  key: fb\n  model: fbm\n  heartbeat: gen-heartbeat\n"
 		if got := providerStatus(writeProviderConfig(t, main, "k", extra)); !strings.Contains(got, "fallback: ok (http 200)") {
 			t.Errorf("providerStatus = %q, want the fallback reported ok", got)
 		}
@@ -245,39 +262,32 @@ func TestProviderStatus(t *testing.T) {
 		extra := "fallback:\n  enabled: false\n  url: " + fallback + "\n  key: fb\n  model: fbm\n"
 		cfg := writeProviderConfig(t, main, "k", extra)
 		got := providerStatus(cfg)
-		if !strings.Contains(got, "429 rate limited") || strings.Contains(got, "fallback") {
+		if !strings.Contains(got, "http 429") || strings.Contains(got, "fallback") {
 			t.Errorf("providerStatus = %q, want main's detail only", got)
 		}
 	})
 
-	t.Run("openai-only config probes the openai wire", func(t *testing.T) {
-		var path, auth, model string
+	t.Run("openai-only config probes the default check", func(t *testing.T) {
+		var path, auth string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			path = r.URL.Path
 			auth = r.Header.Get("Authorization")
-			var b struct {
-				Model string `json:"model"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&b)
-			model = b.Model
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
 		}))
 		t.Cleanup(srv.Close)
 		// No anthropic section at all: the openai section is the served
 		// channel, so reporting n/a here would call a working worker
-		// unconfigured.
+		// unconfigured. The legacy section carries no heartbeat field, so
+		// the probe is the default model-list check.
 		if got := providerStatus(writeOpenAILegacyConfig(t, srv.URL, "k", "")); !strings.Contains(got, "ok (http 200)") {
 			t.Errorf("providerStatus = %q, want ok", got)
 		}
-		if path != "/chat/completions" {
-			t.Errorf("probe path = %q, want /chat/completions", path)
+		if path != "/models" {
+			t.Errorf("probe path = %q, want /models", path)
 		}
 		if auth != "Bearer k" {
 			t.Errorf("probe auth = %q, want the Bearer scheme with the openai key", auth)
-		}
-		if model != "m" {
-			t.Errorf("probe model = %q, want the openai section's model", model)
 		}
 	})
 
@@ -296,15 +306,15 @@ func TestProviderStatus(t *testing.T) {
 			_, _ = w.Write([]byte(`{}`))
 		}))
 		t.Cleanup(anth.Close)
-		// Both legacy sections configured: the anthropic wire stays the
+		// Both legacy sections configured: the anthropic side stays the
 		// primary — the openai section is probed only when the anthropic
 		// side is unset, never alongside it.
 		extra := "openai:\n  url: " + open.URL + "\n  key: sk-oa\n  model: gpt-x\n"
 		if got := providerStatus(writeProviderConfig(t, anth.URL, "k", extra)); !strings.Contains(got, "ok (http 200)") {
 			t.Errorf("providerStatus = %q, want ok", got)
 		}
-		if path != "/v1/messages" || key != "k" {
-			t.Errorf("probe = %q with x-api-key %q, want the anthropic wire with the anthropic key", path, key)
+		if path != "/v1/messages/count_tokens" || key != "k" {
+			t.Errorf("probe = %q with x-api-key %q, want the anthropic wire's token-free check carrying the anthropic key", path, key)
 		}
 		if hits != 0 {
 			t.Errorf("openai endpoint hit %d times, want 0 (anthropic is the primary)", hits)
@@ -341,7 +351,7 @@ func TestProviderStatus(t *testing.T) {
 		fallback := providerServer(t, 200, `{}`)
 		extra := "fallback:\n  enabled: true\n  url: " + fallback + "\n  key: fb\n  model: fbm\n"
 		got := providerStatus(writeOpenAILegacyConfig(t, main, "k", extra))
-		for _, want := range []string{"main: 429 rate limited", "fallback: ok (http 200)", "[active: fallback]"} {
+		for _, want := range []string{"main: http 429", "fallback: ok (http 200)", "[active: fallback]"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("providerStatus = %q, want it to contain %q", got, want)
 			}
@@ -364,13 +374,15 @@ func writeProviderSectionConfig(t *testing.T, typ, url, key, extra string) strin
 }
 
 // TestProviderStatusProviderSection pins the status probe's primary
-// dispatch through the provider section: an anthropic-typed provider is
-// probed on the anthropic wire (with its heartbeat model naming the probe),
-// an openai-typed provider on the chat-completions wire — and the
-// openai-typed provider is the primary even when a legacy anthropic section
-// also stands, so an unconfigured provider section still reports n/a rather
-// than probing the legacy channel. The fallback handoff keeps working with
-// a provider-served primary.
+// dispatch through the provider section: its heartbeat field names the
+// probe's shape — the gen-heartbeat rides the wire the type names
+// (anthropic /v1/messages with its heartbeat model, openai
+// /chat/completions), the unset default resolving per Style to either
+// wire's token-free check — and the openai-typed provider is the primary
+// even when a legacy anthropic section also stands, so an unconfigured
+// provider section still reports n/a rather than probing the legacy
+// channel. The fallback handoff keeps working with a provider-served
+// primary.
 func TestProviderStatusProviderSection(t *testing.T) {
 	t.Run("anthropic-typed provider probes the anthropic wire", func(t *testing.T) {
 		var path, key string
@@ -380,7 +392,8 @@ func TestProviderStatusProviderSection(t *testing.T) {
 			_, _ = w.Write([]byte(`{}`))
 		}))
 		t.Cleanup(srv.Close)
-		if got := providerStatus(writeProviderSectionConfig(t, "anthropic", srv.URL, "k", "")); !strings.Contains(got, "ok (http 200)") {
+		// The named gen-heartbeat rides the wire the type names.
+		if got := providerStatus(writeProviderSectionConfig(t, "anthropic", srv.URL, "k", "  heartbeat: gen-heartbeat\n")); !strings.Contains(got, "ok (http 200)") {
 			t.Errorf("providerStatus = %q, want ok", got)
 		}
 		if path != "/v1/messages" {
@@ -393,7 +406,7 @@ func TestProviderStatusProviderSection(t *testing.T) {
 
 	t.Run("provider heartbeat model names the probe", func(t *testing.T) {
 		url, model := providerModelServer(t)
-		cfg := writeProviderSectionConfig(t, "anthropic", url, "k", "  heartbeat_model: hb-air\n")
+		cfg := writeProviderSectionConfig(t, "anthropic", url, "k", "  heartbeat_model: hb-air\n  heartbeat: gen-heartbeat\n")
 		if got := providerStatus(cfg); !strings.Contains(got, "ok (http 200)") {
 			t.Errorf("providerStatus = %q, want ok", got)
 		}
@@ -416,7 +429,7 @@ func TestProviderStatusProviderSection(t *testing.T) {
 			_, _ = w.Write([]byte(`{}`))
 		}))
 		t.Cleanup(srv.Close)
-		if got := providerStatus(writeProviderSectionConfig(t, "openai", srv.URL, "k", "")); !strings.Contains(got, "ok (http 200)") {
+		if got := providerStatus(writeProviderSectionConfig(t, "openai", srv.URL, "k", "  heartbeat: gen-heartbeat\n")); !strings.Contains(got, "ok (http 200)") {
 			t.Errorf("providerStatus = %q, want ok", got)
 		}
 		if path != "/chat/completions" {
@@ -460,10 +473,18 @@ func TestProviderStatusProviderSection(t *testing.T) {
 		fallback := providerServer(t, 200, `{}`)
 		extra := "fallback:\n  enabled: true\n  url: " + fallback + "\n  key: fb\n  model: fbm\n"
 		got := providerStatus(writeProviderSectionConfig(t, "openai", main, "k", extra))
-		for _, want := range []string{"main: 429 rate limited", "fallback: ok (http 200)", "[active: fallback]"} {
+		for _, want := range []string{"main: http 429", "fallback: ok (http 200)", "[active: fallback]"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("providerStatus = %q, want it to contain %q", got, want)
 			}
+		}
+	})
+
+	t.Run("gen-heartbeat main renders the quota reset window", func(t *testing.T) {
+		main := providerServer(t, 429, `Usage limit reached for 5 hour. Your limit will reset at 2099-01-01 09:13:00`)
+		cfg := writeProviderSectionConfig(t, "anthropic", main, "k", "  heartbeat: gen-heartbeat\n")
+		if got := providerStatus(cfg); !strings.Contains(got, "429 quota (resets") {
+			t.Errorf("providerStatus = %q, want the gen probe's quota window", got)
 		}
 	})
 }

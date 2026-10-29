@@ -643,6 +643,16 @@ func (f *continueFrontend) GetWorkflowExecutionHistory(_ context.Context, req *w
 // config pointing at it; Dial connects eagerly, so the server listens
 // before continuePipeline runs.
 func serveContinueFake(t *testing.T, fake *continueFrontend) config.Config {
+	return serveContinueFakeConfig(t, fake, "")
+}
+
+// serveContinueFakeConfig serves fake on a loopback port and returns a
+// Load-resolved config pointing at it, extraYAML's overrides carried.
+// continuePipeline's input contract is a resolved config — the
+// round-timeout fields are non-nil pointers only after Load — so the
+// harness builds its config the way production does, never as a bare
+// literal.
+func serveContinueFakeConfig(t *testing.T, fake *continueFrontend, extraYAML string) config.Config {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -652,7 +662,17 @@ func serveContinueFake(t *testing.T, fake *continueFrontend) config.Config {
 	workflowservice.RegisterWorkflowServiceServer(srv, fake)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
-	return config.Config{Temporal: config.TemporalConfig{Host: lis.Addr().String(), TaskQueue: "continue-q"}}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(extraYAML), 0o600); err != nil {
+		t.Fatalf("write the harness config: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load the harness config: %v", err)
+	}
+	cfg.Temporal.Host = lis.Addr().String()
+	cfg.Temporal.TaskQueue = "continue-q"
+	return cfg
 }
 
 // dispatchedInput decodes the PipelineInput a captured continue start carried.
@@ -700,8 +720,10 @@ func TestContinuePipelineSkipPreflightThreading(t *testing.T) {
 	// carries a prior input with (or without) the recorded flag and, for
 	// the skipped chain, its red baseline — the
 	// died-before-any-green-round shape — and returns the input the
-	// restart was dispatched with.
-	continueRun := func(t *testing.T, skip bool) workflows.PipelineInput {
+	// restart was dispatched with. cfgYAML is the harness config's body:
+	// "" means defaults, the load path resolution production continues run
+	// under.
+	continueRun := func(t *testing.T, skip bool, cfgYAML string) workflows.PipelineInput {
 		t.Helper()
 		in := workflows.PipelineInput{RepoPath: repo, IssueID: "42", Prompt: "implement the feature", BaseBranch: "aborted/issue-42"}
 		in.SkipPreflight = skip
@@ -712,7 +734,7 @@ func TestContinuePipelineSkipPreflightThreading(t *testing.T) {
 				completedEvent(t, 2, at, activities.TestResult{Passed: false, Logs: "--- FAIL: TestBase"}))
 		}
 		fake := &continueFrontend{histories: map[string][]*historypb.HistoryEvent{"wf": history}}
-		cfg := serveContinueFake(t, fake)
+		cfg := serveContinueFakeConfig(t, fake, cfgYAML)
 		captureStdout(t, func() {
 			if err := continuePipeline(cfg, "wf", "carry on", true); err != nil {
 				t.Fatalf("continuePipeline: %v", err)
@@ -725,7 +747,7 @@ func TestContinuePipelineSkipPreflightThreading(t *testing.T) {
 	}
 
 	t.Run("the skipped chain's flag lands in the restarted input", func(t *testing.T) {
-		got := continueRun(t, true)
+		got := continueRun(t, true, "")
 		if !got.SkipPreflight {
 			t.Error("dispatched SkipPreflight = false, want true — the recorded flag must ride the restarted run's input")
 		}
@@ -735,8 +757,26 @@ func TestContinuePipelineSkipPreflightThreading(t *testing.T) {
 	})
 
 	t.Run("a plain prior continues without the skip", func(t *testing.T) {
-		if got := continueRun(t, false); got.SkipPreflight {
+		if got := continueRun(t, false, ""); got.SkipPreflight {
 			t.Error("dispatched SkipPreflight = true, want false — a chain without the flag continues gated, as before")
+		}
+	})
+
+	t.Run("the resolved round ceilings ride the restarted input", func(t *testing.T) {
+		got := continueRun(t, false, "")
+		if got.TestTimeout != config.DefaultTestsTimeout || got.AgentRunTimeout != config.DefaultAgentRunTimeout ||
+			got.ReviewTimeout != config.DefaultReviewTimeout || got.CleanupTimeout != config.DefaultCleanupTimeout {
+			t.Errorf("dispatched round timeouts = %v/%v/%v/%v, want Load's defaults — the continue seam resolves the config like start, never dispatching zero ceilings",
+				got.TestTimeout, got.AgentRunTimeout, got.ReviewTimeout, got.CleanupTimeout)
+		}
+	})
+
+	t.Run("an explicit 0s restarts under the unlimited sentinel", func(t *testing.T) {
+		got := continueRun(t, false, "tests_timeout: 0s\nagent_run_timeout: 0s\nreview_timeout: 0s\ncleanup_timeout: 0s\n")
+		if got.TestTimeout != config.UnlimitedTimeout || got.AgentRunTimeout != config.UnlimitedTimeout ||
+			got.ReviewTimeout != config.UnlimitedTimeout || got.CleanupTimeout != config.UnlimitedTimeout {
+			t.Errorf("dispatched round timeouts = %v/%v/%v/%v, want the UnlimitedTimeout sentinel for every explicit 0s",
+				got.TestTimeout, got.AgentRunTimeout, got.ReviewTimeout, got.CleanupTimeout)
 		}
 	})
 }

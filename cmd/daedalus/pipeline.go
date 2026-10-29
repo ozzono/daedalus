@@ -745,10 +745,12 @@ func continuePipeline(cfg config.Config, workflowID, prompt string, detach bool)
 		// continues with none.
 		ReviewSkillList: prev.ReviewSkillList,
 		Authorship:      cfg.Authorship,
-		TestTimeout:     cfg.TestsTimeout,
-		AgentRunTimeout: cfg.AgentRunTimeout,
-		ReviewTimeout:   cfg.ReviewTimeout,
-		CleanupTimeout:  cfg.CleanupTimeout,
+		// Resolved by Load like startPipeline's: concrete ceiling, or the
+		// UnlimitedTimeout sentinel for an explicit config 0.
+		TestTimeout:     *cfg.TestsTimeout,
+		AgentRunTimeout: *cfg.AgentRunTimeout,
+		ReviewTimeout:   *cfg.ReviewTimeout,
+		CleanupTimeout:  *cfg.CleanupTimeout,
 		SharedTestQueue: sharedTestQueueInput(cfg),
 		TestOutputDir:   cfg.TestOutputDir(),
 		BaseBranch:      base,

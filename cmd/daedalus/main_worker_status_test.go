@@ -395,10 +395,14 @@ func TestProbeProviderNAPaths(t *testing.T) {
 }
 
 // TestProbeProviderLive pins the wired probes against httptest stand-ins:
-// the primary is probed in the wire style its section names (anthropic
-// /v1/messages, openai /chat/completions); a failing primary with a
-// configured fallback probes that fallback too and the row renders the
-// failover arrow — active fallback when it answers, none when it does not.
+// the probe's wire shape is the section's heartbeat format — a legacy-only
+// config (whose sections carry no heartbeat field) rides the token-free
+// check its wire resolves to (count_tokens on the anthropic side), while a
+// section-named format names the request on the provider and the fallback
+// alike, the gen-heartbeat returning to a real generation only when named.
+// A failing primary with a configured fallback probes that fallback too
+// and the row renders the failover arrow — active fallback when it
+// answers, none when it does not.
 func TestProbeProviderLive(t *testing.T) {
 	// stand serves every path with code and records what was hit.
 	stand := func(code int) (*httptest.Server, func() []string) {
@@ -424,7 +428,7 @@ func TestProbeProviderLive(t *testing.T) {
 		return conf
 	}
 
-	t.Run("a healthy primary probes ok in its own wire style", func(t *testing.T) {
+	t.Run("a legacy-only primary probes its wire's token-free check", func(t *testing.T) {
 		srv, hits := stand(http.StatusOK)
 		conf := writeCfg("agent: claude\nanthropic:\n  url: " + srv.URL + "\n  key: k\n  model: m\n")
 		p := probeProvider(conf)
@@ -436,12 +440,12 @@ func TestProbeProviderLive(t *testing.T) {
 		}
 		n := 0
 		for _, path := range hits() {
-			if path == "/v1/messages" {
+			if path == "/v1/messages/count_tokens" {
 				n++
 			}
 		}
 		if n != 1 {
-			t.Errorf("the anthropic-style probe hit %v, want exactly one /v1/messages", hits())
+			t.Errorf("the default probe hit %v, want exactly one /v1/messages/count_tokens", hits())
 		}
 		if got := providerStatus(conf); got != "ok (http 200)" {
 			t.Errorf("providerStatus = %q, want the main detail alone", got)
@@ -460,12 +464,36 @@ func TestProbeProviderLive(t *testing.T) {
 		if !p.FbArmed || !p.Fb.OK {
 			t.Errorf("Fb armed/ok = %v/%v, want the armed fallback probed ok", p.FbArmed, p.Fb.OK)
 		}
-		if !saw(downHits(), "/v1/messages") || !saw(okHits(), "/chat/completions") {
-			t.Errorf("wire styles wrong: main hit %v, fallback hit %v", downHits(), okHits())
+		// The format-less main resolves per its anthropic wire; the
+		// openai-typed fallback resolves per its own, to the model list.
+		if !saw(downHits(), "/v1/messages/count_tokens") || !saw(okHits(), "/models") {
+			t.Errorf("wire shapes wrong: main hit %v, fallback hit %v, want the token-free checks each wire resolves to", downHits(), okHits())
 		}
 		got := providerStatus(conf)
 		if !strings.Contains(got, "main: http 500") || !strings.Contains(got, "→ fallback: ok (http 200) [active: fallback]") {
 			t.Errorf("providerStatus = %q, want the failover arrow with the fallback active", got)
+		}
+	})
+
+	t.Run("the sections' heartbeat fields name the probe's shape", func(t *testing.T) {
+		downSrv, downHits := stand(http.StatusInternalServerError)
+		okSrv, okHits := stand(http.StatusOK)
+		conf := writeCfg("agent: claude\n" +
+			"provider:\n  type: anthropic\n  url: " + downSrv.URL + "\n  key: k\n  model: m\n  heartbeat: gen-heartbeat\n" +
+			"fallback:\n  enabled: true\n  type: openai\n  url: " + okSrv.URL + "\n  key: fk\n  model: fbm\n  heartbeat: anthropic\n")
+		p := probeProvider(conf)
+		if p.Main.OK {
+			t.Errorf("the 500-serving primary probed ok")
+		}
+		if !p.FbArmed || !p.Fb.OK {
+			t.Errorf("Fb armed/ok = %v/%v, want the armed fallback probed ok", p.FbArmed, p.Fb.OK)
+		}
+		// The provider section's gen-heartbeat generates over the wire its
+		// type names (/v1/messages), while the fallback's named anthropic
+		// format ignores its openai type and counts tokens instead: the
+		// format is the backend's property, not the wire's.
+		if !saw(downHits(), "/v1/messages") || !saw(okHits(), "/v1/messages/count_tokens") {
+			t.Errorf("heartbeat shapes wrong: main hit %v, fallback hit %v", downHits(), okHits())
 		}
 	})
 

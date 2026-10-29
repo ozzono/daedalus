@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ozzono/daedalus/internal/provider"
 )
 
 // configSource is this package's own production source, embedded at
@@ -66,10 +68,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Anthropic.TimeoutMS != DefaultAnthropicTimeoutMS {
 		t.Errorf("Anthropic.TimeoutMS = %d, want %d", cfg.Anthropic.TimeoutMS, DefaultAnthropicTimeoutMS)
 	}
-	if cfg.TestsTimeout != DefaultTestsTimeout {
+	if cfg.TestsTimeout == nil || *cfg.TestsTimeout != DefaultTestsTimeout {
 		t.Errorf("TestsTimeout = %v, want %v", cfg.TestsTimeout, DefaultTestsTimeout)
 	}
-	if cfg.AgentRunTimeout != DefaultAgentRunTimeout {
+	if cfg.AgentRunTimeout == nil || *cfg.AgentRunTimeout != DefaultAgentRunTimeout {
 		t.Errorf("AgentRunTimeout = %v, want %v", cfg.AgentRunTimeout, DefaultAgentRunTimeout)
 	}
 	if cfg.MaxConcurrentAgentRuns != DefaultMaxConcurrentAgentRuns {
@@ -107,7 +109,7 @@ func TestLoadTestsTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.TestsTimeout != 90*time.Minute {
+	if cfg.TestsTimeout == nil || *cfg.TestsTimeout != 90*time.Minute {
 		t.Errorf("TestsTimeout = %v, want 1h30m", cfg.TestsTimeout)
 	}
 
@@ -125,7 +127,7 @@ func TestLoadAgentRunTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.AgentRunTimeout != 90*time.Minute {
+	if cfg.AgentRunTimeout == nil || *cfg.AgentRunTimeout != 90*time.Minute {
 		t.Errorf("AgentRunTimeout = %v, want 1h30m", cfg.AgentRunTimeout)
 	}
 	_, err = Load(writeConfig(t, "agent_run_timeout: -5m\n"))
@@ -143,10 +145,10 @@ func TestLoadReviewTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.ReviewTimeout != 25*time.Minute {
+	if cfg.ReviewTimeout == nil || *cfg.ReviewTimeout != 25*time.Minute {
 		t.Errorf("ReviewTimeout = %v, want 25m", cfg.ReviewTimeout)
 	}
-	if cfg, err := Load(writeConfig(t, "")); err != nil || cfg.ReviewTimeout != DefaultReviewTimeout {
+	if cfg, err := Load(writeConfig(t, "")); err != nil || cfg.ReviewTimeout == nil || *cfg.ReviewTimeout != DefaultReviewTimeout {
 		t.Errorf("unset ReviewTimeout = %v (err %v), want %v", cfg.ReviewTimeout, err, DefaultReviewTimeout)
 	}
 	_, err = Load(writeConfig(t, "review_timeout: -5m\n"))
@@ -163,15 +165,40 @@ func TestLoadCleanupTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.CleanupTimeout != 30*time.Minute {
+	if cfg.CleanupTimeout == nil || *cfg.CleanupTimeout != 30*time.Minute {
 		t.Errorf("CleanupTimeout = %v, want 30m", cfg.CleanupTimeout)
 	}
-	if cfg, err := Load(writeConfig(t, "")); err != nil || cfg.CleanupTimeout != DefaultCleanupTimeout {
+	if cfg, err := Load(writeConfig(t, "")); err != nil || cfg.CleanupTimeout == nil || *cfg.CleanupTimeout != DefaultCleanupTimeout {
 		t.Errorf("unset CleanupTimeout = %v (err %v), want %v", cfg.CleanupTimeout, err, DefaultCleanupTimeout)
 	}
 	_, err = Load(writeConfig(t, "cleanup_timeout: -1m\n"))
 	if err == nil || !strings.Contains(err.Error(), "cleanup_timeout") {
 		t.Fatalf("want cleanup_timeout error, got %v", err)
+	}
+}
+
+// TestLoadZeroRoundTimeouts pins the explicit-0 resolution: "0s" — the only
+// loadable spelling, since a bare 0 is an !!int scalar the decoder refuses
+// for a duration field — resolves every round timeout to the
+// UnlimitedTimeout sentinel, the ceiling standing in for "no ceiling"
+// (Temporal rejects a zero StartToClose outright). An absent key keeps the
+// default; that is pinned by the per-key unset cases above.
+func TestLoadZeroRoundTimeouts(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "tests_timeout: 0s\nagent_run_timeout: 0s\nreview_timeout: 0s\ncleanup_timeout: 0s\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for name, got := range map[string]*time.Duration{
+		"tests_timeout": cfg.TestsTimeout, "agent_run_timeout": cfg.AgentRunTimeout,
+		"review_timeout": cfg.ReviewTimeout, "cleanup_timeout": cfg.CleanupTimeout,
+	} {
+		if got == nil || *got != UnlimitedTimeout {
+			t.Errorf("%s = %v, want the UnlimitedTimeout sentinel (an explicit 0s is unlimited)", name, got)
+		}
+	}
+
+	if _, err := Load(writeConfig(t, "tests_timeout: 0\n")); err == nil {
+		t.Error("Load(tests_timeout: 0) = nil error, want the !!int-into-duration refusal — \"0s\" is the only loadable unlimited spelling")
 	}
 }
 
@@ -437,10 +464,10 @@ agent_run_timeout: 30m
 	if cfg.OpenAI.Model != "gpt-test" {
 		t.Errorf("OpenAI.Model = %q, want gpt-test", cfg.OpenAI.Model)
 	}
-	if cfg.TestsTimeout != 45*time.Minute {
+	if cfg.TestsTimeout == nil || *cfg.TestsTimeout != 45*time.Minute {
 		t.Errorf("TestsTimeout = %v, want 45m", cfg.TestsTimeout)
 	}
-	if cfg.AgentRunTimeout != 30*time.Minute {
+	if cfg.AgentRunTimeout == nil || *cfg.AgentRunTimeout != 30*time.Minute {
 		t.Errorf("AgentRunTimeout = %v, want 30m", cfg.AgentRunTimeout)
 	}
 
@@ -540,6 +567,56 @@ func TestLoadFallbackType(t *testing.T) {
 	_, err = Load(writeConfig(t, "fallback:\n  type: azure\n"))
 	if err == nil || !strings.Contains(err.Error(), `unknown type "azure"`) {
 		t.Fatalf("want unknown-fallback-type error, got %v", err)
+	}
+}
+
+// TestLoadHeartbeatFormat pins the heartbeat field's load contract on both
+// sections that carry it: every listed format loads on either wire type
+// (the probe's shape is a property of the backend, not of the wire rounds
+// speak), unset loads everywhere with the default resolving at the probe,
+// and an unknown value is rejected at load with the accepted choices named
+// — a probe format no backend serves must fail loud, never sit inert. The
+// legacy sections carry no heartbeat knob: strict decoding keeps an
+// attempt there a load error too, the format being the provider section's
+// alone.
+func TestLoadHeartbeatFormat(t *testing.T) {
+	for _, typ := range fallbackTypes {
+		for _, hb := range provider.HeartbeatFormats {
+			cfg, err := Load(writeConfig(t, "provider:\n  type: "+typ+"\n  key: k\n  heartbeat: "+hb+"\n"))
+			if err != nil {
+				t.Fatalf("Load(provider type %s, heartbeat %s): %v", typ, hb, err)
+			}
+			if cfg.Provider == nil || cfg.Provider.Heartbeat != hb {
+				t.Errorf("provider type %s: Heartbeat = %q, want %q", typ, cfg.Provider.Heartbeat, hb)
+			}
+		}
+	}
+
+	cfg, err := Load(writeConfig(t, "provider:\n  type: anthropic\n  key: k\n"))
+	if err != nil || cfg.Provider.Heartbeat != "" {
+		t.Errorf("unset provider heartbeat = %q (err %v), want empty (the default resolves at the probe)", cfg.Provider.Heartbeat, err)
+	}
+
+	_, err = Load(writeConfig(t, "provider:\n  type: openai\n  heartbeat: bogus\n"))
+	if err == nil || !strings.Contains(err.Error(), `unknown heartbeat "bogus"`) ||
+		!strings.Contains(err.Error(), "gen-heartbeat") {
+		t.Errorf("Load(provider heartbeat bogus) error = %v, want the unknown-format rejection naming the choices", err)
+	}
+
+	// The fallback carries the same field with the same rule; its probe
+	// runs only when the main probe misses.
+	if _, err := Load(writeConfig(t, "fallback:\n  heartbeat: "+provider.HeartbeatGen+"\n")); err != nil {
+		t.Errorf("Load(fallback heartbeat gen-heartbeat): %v, want accepted", err)
+	}
+	_, err = Load(writeConfig(t, "fallback:\n  heartbeat: bogus\n"))
+	if err == nil || !strings.Contains(err.Error(), "fallback: unknown heartbeat") ||
+		!strings.Contains(err.Error(), "gen-heartbeat") {
+		t.Errorf("Load(fallback heartbeat bogus) error = %v, want the fallback's unknown-format rejection", err)
+	}
+
+	_, err = Load(writeConfig(t, "anthropic:\n  url: https://x.example\n  key: k\n  model: m\n  heartbeat: gen-heartbeat\n"))
+	if err == nil || !strings.Contains(err.Error(), "heartbeat") {
+		t.Errorf("Load(legacy anthropic heartbeat) error = %v, want the field-not-found rejection", err)
 	}
 }
 
@@ -1165,8 +1242,14 @@ func TestExampleYAML(t *testing.T) {
 		cfg.Provider.ContextTokens != 0 || cfg.Provider.MaxOutputTokens != 0 ||
 		cfg.Provider.TopP != 0 || cfg.Provider.Temperature != 0 || cfg.Provider.PresencePenalty != 0 ||
 		cfg.Provider.TopK != 0 || cfg.Provider.MinP != 0 || cfg.Provider.RepetitionPenalty != 0 ||
-		cfg.Provider.KeyAlias != "" || cfg.Provider.DisableThinking {
+		cfg.Provider.KeyAlias != "" || cfg.Provider.DisableThinking ||
+		cfg.Provider.Heartbeat != "" {
 		t.Errorf("ExampleYAML provider section = %+v, want the typed-but-inert defaults", cfg.Provider)
+	}
+	// The fallback section ships the same way: armed-off, typed at the
+	// default, every value empty.
+	if fb := cfg.Fallback; fb != (FallbackConfig{Type: DefaultFallbackType}) {
+		t.Errorf("ExampleYAML fallback section = %+v, want the typed-but-inert defaults", fb)
 	}
 	// The per-role provider override groups document every field but ship
 	// inert: an example-file deployment shares the serving endpoint, model,
@@ -1278,7 +1361,7 @@ func TestLoadRawRawView(t *testing.T) {
 		t.Fatalf("LoadRaw(empty): %v", err)
 	}
 	if raw.Agent != "" || raw.BranchPrefix != "" || raw.Temporal.Host != "" ||
-		raw.Temporal.TaskQueue != "" || raw.TestsTimeout != 0 || raw.MaxConcurrentAgentRuns != 0 {
+		raw.Temporal.TaskQueue != "" || raw.TestsTimeout != nil || raw.MaxConcurrentAgentRuns != 0 {
 		t.Errorf("LoadRaw(empty) = %+v, want the file's own zero values, not the defaults", raw)
 	}
 
@@ -1289,7 +1372,7 @@ func TestLoadRawRawView(t *testing.T) {
 	if raw.Agent != "pi" {
 		t.Errorf("Agent = %q, want %q", raw.Agent, "pi")
 	}
-	if raw.TestsTimeout != 45*time.Minute {
+	if raw.TestsTimeout == nil || *raw.TestsTimeout != 45*time.Minute {
 		t.Errorf("TestsTimeout = %v, want 45m", raw.TestsTimeout)
 	}
 	if raw.BranchPrefix != "" {
@@ -1347,6 +1430,39 @@ func TestLoadRawValidatesDefaultsCopy(t *testing.T) {
 	_, err = LoadRaw(writeConfig(t, "fallback:\n  enabled: true\n  type: bogus\n  url: https://backup.example\n  key: k\n  model: m\n"))
 	if err == nil || !strings.Contains(err.Error(), "unknown type") {
 		t.Errorf("LoadRaw(bogus fallback type) error = %v, want unknown-type rejection", err)
+	}
+}
+
+// TestLoadRawZeroRoundTimeouts pins the raw view's third state — the thing
+// that keeps the render's unset/explicit-0 distinction possible: an absent
+// round-timeout key stays nil, and an explicit 0s stays 0. The sentinel
+// substitution is applyDefaults', never the raw view's, or `config render`
+// could not keep an unset key apart from an explicit unlimited marker.
+func TestLoadRawZeroRoundTimeouts(t *testing.T) {
+	raw, err := LoadRaw(writeConfig(t, ""))
+	if err != nil {
+		t.Fatalf("LoadRaw(empty): %v", err)
+	}
+	for name, got := range map[string]*time.Duration{
+		"tests_timeout": raw.TestsTimeout, "agent_run_timeout": raw.AgentRunTimeout,
+		"review_timeout": raw.ReviewTimeout, "cleanup_timeout": raw.CleanupTimeout,
+	} {
+		if got != nil {
+			t.Errorf("LoadRaw(empty) %s = %v, want nil (an absent key stays unset)", name, *got)
+		}
+	}
+
+	raw, err = LoadRaw(writeConfig(t, "tests_timeout: 0s\nagent_run_timeout: 0s\nreview_timeout: 0s\ncleanup_timeout: 0s\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	for name, got := range map[string]*time.Duration{
+		"tests_timeout": raw.TestsTimeout, "agent_run_timeout": raw.AgentRunTimeout,
+		"review_timeout": raw.ReviewTimeout, "cleanup_timeout": raw.CleanupTimeout,
+	} {
+		if got == nil || *got != 0 {
+			t.Errorf("LoadRaw(%s: 0s) = %v, want the file's own 0 — the raw view never substitutes the sentinel", name, got)
+		}
 	}
 }
 
@@ -1537,12 +1653,10 @@ func TestRenderYAMLMetricsEnabledContract(t *testing.T) {
 }
 
 // TestRenderYAMLUnsetFields pins the pre-defaults view of an empty config:
-// unset durations print as "0s" — zero's own canonical string, still the
-// "documented default applies" marker rather than an actual zero ceiling —
-// unset strings print empty, and the inactive fallback prints disabled.
-// The s matters: a plain 0 is an !!int scalar, which the yaml decoder
-// refuses to read into a time.Duration, so the rendered file would not
-// load back — pinned below by parsing the render.
+// the round timeouts render ABSENT — unset and explicit 0 must stay
+// distinguishable on the round-trip, and an absent key is what takes the
+// documented default on load — while unset strings print empty and the
+// inactive fallback prints disabled.
 func TestRenderYAMLUnsetFields(t *testing.T) {
 	raw, err := LoadRaw(writeConfig(t, ""))
 	if err != nil {
@@ -1553,23 +1667,22 @@ func TestRenderYAMLUnsetFields(t *testing.T) {
 		t.Fatalf("RenderYAML: %v", err)
 	}
 	for _, want := range []string{
-		"tests_timeout: 0s", "agent_run_timeout: 0s", "review_timeout: 0s", "cleanup_timeout: 0s",
 		`agent: ""`, "authorship: false", "enabled: false", "mid: false", `prompt: ""`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderYAML(empty) output is missing %q:\n%s", want, out)
 		}
 	}
-	for _, leaked := range []string{"tests_timeout: 0\n", "600000000000"} {
-		if strings.Contains(out, leaked) {
-			t.Errorf("RenderYAML(empty) printed a duration as %q instead of its canonical string:\n%s", leaked, out)
+	for _, key := range []string{"tests_timeout", "agent_run_timeout", "review_timeout", "cleanup_timeout"} {
+		if strings.Contains(out, key) {
+			t.Errorf("RenderYAML(empty) printed the unset %s — an absent key renders absent, never \"0s\" or null:\n%s", key, out)
 		}
 	}
 
 	// The render must load: a rendered config file the decoder rejects is
 	// worse than no render at all. Re-rendering the parse must reproduce
-	// the output byte for byte — "0s" decodes to zero and marshals right
-	// back to "0s", so the file is idempotent under `config render`.
+	// the output byte for byte — the absent keys stay absent, so the file
+	// is idempotent under `config render`.
 	back, err := LoadRaw(writeConfig(t, out))
 	if err != nil {
 		t.Fatalf("parse RenderYAML(empty) output: %v\n%s", err, out)
@@ -1580,6 +1693,58 @@ func TestRenderYAMLUnsetFields(t *testing.T) {
 	}
 	if roundTrip != out {
 		t.Errorf("RenderYAML(empty) round-trip =\n%s\nwant\n%s", roundTrip, out)
+	}
+}
+
+// TestRenderYAMLZeroRoundTimeouts pins the explicit-0 render, the mirror of
+// TestLoadRawZeroRoundTimeouts: the key was present, so it renders — as
+// "0s", its own loadable unlimited marker, never the sentinel's duration
+// string — staying distinct from an unset key's absence. The render
+// round-trips byte for byte, and Load resolves the rendered 0s back to the
+// sentinel: the file an operator renders is the unlimited config they run.
+func TestRenderYAMLZeroRoundTimeouts(t *testing.T) {
+	raw, err := LoadRaw(writeConfig(t, "tests_timeout: 0s\nagent_run_timeout: 0s\nreview_timeout: 0s\ncleanup_timeout: 0s\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	for _, want := range []string{
+		"tests_timeout: 0s", "agent_run_timeout: 0s", "review_timeout: 0s", "cleanup_timeout: 0s",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderYAML output is missing %q:\n%s", want, out)
+		}
+	}
+	if leaked := UnlimitedTimeout.String(); strings.Contains(out, leaked) {
+		t.Errorf("RenderYAML output leaked the sentinel %q:\n%s", leaked, out)
+	}
+
+	back, err := LoadRaw(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("parse RenderYAML output: %v\n%s", err, out)
+	}
+	roundTrip, err := back.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML round-trip: %v", err)
+	}
+	if roundTrip != out {
+		t.Errorf("RenderYAML round-trip =\n%s\nwant\n%s", roundTrip, out)
+	}
+
+	resolved, err := Load(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("Load(RenderYAML output): %v\n%s", err, out)
+	}
+	for name, got := range map[string]*time.Duration{
+		"tests_timeout": resolved.TestsTimeout, "agent_run_timeout": resolved.AgentRunTimeout,
+		"review_timeout": resolved.ReviewTimeout, "cleanup_timeout": resolved.CleanupTimeout,
+	} {
+		if got == nil || *got != UnlimitedTimeout {
+			t.Errorf("Load(render) %s = %v, want the sentinel (the rendered 0s loads unlimited)", name, got)
+		}
 	}
 }
 

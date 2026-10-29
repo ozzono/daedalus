@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -51,7 +52,8 @@ func ParseQuotaReset(s string) time.Time {
 	return t
 }
 
-// Style selects the probe's wire shape.
+// Style selects the wire the generation heartbeat speaks. The non-gen
+// formats derive their whole request from Spec.Format alone.
 type Style int
 
 const (
@@ -63,15 +65,64 @@ const (
 	StyleOpenAI
 )
 
+// Heartbeat formats — the wire shape one probe request takes, named by
+// the config's provider.heartbeat / fallback.heartbeat. The format is a
+// property of the backend behind the endpoint (which liveness surface it
+// exposes), not of the wire rounds speak, so any format pairs with either
+// Style. Every format but HeartbeatGen spends no tokens and holds no
+// serving slot.
+const (
+	// HeartbeatOpenAI GETs {url}/models — the OpenAI-shaped model list:
+	// the openai-wire default, a process-up check that costs nothing.
+	HeartbeatOpenAI = "openai"
+	// HeartbeatAnthropic POSTs {url}/v1/messages/count_tokens — creates no
+	// message and bills nothing, but the key is validated (401 otherwise),
+	// the hosted wire's reachability+auth check without a generation.
+	HeartbeatAnthropic = "anthropic"
+	// HeartbeatOllama GETs {root}/api/ps — ollama's currently-loaded model
+	// list, the closest non-gen answer to "would a round succeed now".
+	HeartbeatOllama = "ollama"
+	// HeartbeatColibri GETs {root}/status — the control-plane endpoint that
+	// stays instant while the serving path wedges: the one check that
+	// separates "server alive, serving wedged" from "server dead".
+	HeartbeatColibri = "colibri"
+	// HeartbeatOMLX POSTs {url}/tokenize — tokenizes a one-word prompt with
+	// the loaded model's tokenizer: no slot, no generation, and unlike a
+	// process-up check the model itself is exercised.
+	HeartbeatOMLX = "omlx"
+	// HeartbeatGen is the generation probe — Spec.Style's minimal "hi"
+	// request. Costs tokens and holds a serving slot, but it is the only
+	// format proving an end-to-end completion and the only one parsing
+	// z.ai's 429 quota-reset stamp.
+	HeartbeatGen = "gen-heartbeat"
+)
+
+// HeartbeatFormats lists the accepted heartbeat values, for the config's
+// load-time validation. Empty (the config field unset) is legal everywhere
+// and resolves at the probe per the probed wire's Style: HeartbeatAnthropic
+// on an anthropic-wire base, HeartbeatOpenAI on an openai-wire one.
+var HeartbeatFormats = []string{
+	HeartbeatOpenAI, HeartbeatAnthropic, HeartbeatOllama,
+	HeartbeatColibri, HeartbeatOMLX, HeartbeatGen,
+}
+
 // Spec names one provider to probe. URL is the base (e.g.
 // https://api.z.ai/api/anthropic or an OpenAI-style .../v4 base); the
-// style-appropriate path is appended. Model is what the probe names —
+// format-appropriate path is appended. Model is what the probe names —
 // callers pass the heartbeat model when configured, else the main model.
 type Spec struct {
 	URL   string
 	Key   string
 	Model string
+	// Style is consumed only by HeartbeatGen.
 	Style Style
+	// Format names the heartbeat's wire shape — one of the Heartbeat*
+	// constants. Empty is the default, resolved per Style (the one backend
+	// signal an unset format has): an anthropic-wire base gets
+	// HeartbeatAnthropic's non-token count_tokens check, an openai-wire
+	// base HeartbeatOpenAI's model list. The generation probe runs only
+	// when the config names gen-heartbeat explicitly.
+	Format string
 }
 
 // Result is one probe outcome. Detail is safe to print: it never carries
@@ -104,10 +155,81 @@ func rootPool() *x509.CertPool {
 	return pool
 }
 
-// Probe sends one minimal message ("hi") through the provider and
-// classifies the response. It is deliberately cheap — a handful of tokens
-// — and side-effect free.
+// Probe sends one provider's configured heartbeat and classifies the
+// response: by default a non-generation liveness check, the token-costing
+// generation probe only when the config names gen-heartbeat.
 func Probe(ctx context.Context, spec Spec) Result {
+	if spec.URL == "" || spec.Key == "" || spec.Model == "" {
+		return Result{Detail: "n/a (provider not fully configured)"}
+	}
+	if spec.Format == HeartbeatGen {
+		return probeGen(ctx, spec)
+	}
+	// An unset format resolves per Style — the probed wire is the one
+	// signal the default has, and an OpenAI-shaped request does not exist
+	// on an anthropic wire.
+	if spec.Format == "" && spec.Style == StyleAnthropic {
+		spec.Format = HeartbeatAnthropic
+	}
+	var (
+		url  string
+		body []byte
+		err  error
+	)
+	authKey, authVal := "Authorization", "Bearer "+spec.Key
+	switch spec.Format {
+	case HeartbeatAnthropic:
+		url = strings.TrimSuffix(spec.URL, "/") + "/v1/messages/count_tokens"
+		authKey, authVal = "x-api-key", spec.Key
+		body, err = json.Marshal(map[string]any{
+			"model":    spec.Model,
+			"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		})
+	case HeartbeatOllama:
+		url = rootURL(spec.URL) + "/api/ps"
+	case HeartbeatColibri:
+		url = rootURL(spec.URL) + "/status"
+	case HeartbeatOMLX:
+		url = strings.TrimSuffix(spec.URL, "/") + "/tokenize"
+		body, err = json.Marshal(map[string]any{"model": spec.Model, "prompt": "hi"})
+	default: // HeartbeatOpenAI — named, or empty on an openai-wire base
+		url = strings.TrimSuffix(spec.URL, "/") + "/models"
+	}
+	if err != nil {
+		return Result{Detail: "build request: " + err.Error()}
+	}
+
+	method := http.MethodGet
+	var reqBody io.Reader
+	if body != nil {
+		method = http.MethodPost
+		reqBody = strings.NewReader(string(body))
+	}
+	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+	if err != nil {
+		return Result{Detail: "unreachable: " + err.Error()}
+	}
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set(authKey, authVal)
+	if authKey == "x-api-key" {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		return Result{Detail: "unreachable: " + err.Error()}
+	}
+	defer resp.Body.Close()
+	return classify(resp.StatusCode, drain(resp), false)
+}
+
+// probeGen is HeartbeatGen's implementation — the request every config's
+// probe made before formats existed, preserved verbatim: a real (tiny)
+// generation through the Style-named wire.
+func probeGen(ctx context.Context, spec Spec) Result {
 	var (
 		url     string
 		authKey string
@@ -141,9 +263,6 @@ func Probe(ctx context.Context, spec Spec) Result {
 	if err != nil {
 		return Result{Detail: "build request: " + err.Error()}
 	}
-	if spec.URL == "" || spec.Key == "" || spec.Model == "" {
-		return Result{Detail: "n/a (provider not fully configured)"}
-	}
 
 	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout)
 	defer cancel()
@@ -161,7 +280,15 @@ func Probe(ctx context.Context, spec Spec) Result {
 		return Result{Detail: "unreachable: " + err.Error()}
 	}
 	defer resp.Body.Close()
-	return classify(resp.StatusCode, drain(resp))
+	return classify(resp.StatusCode, drain(resp), true)
+}
+
+// rootURL strips a trailing slash and /v1 suffix, giving the server root
+// the control-plane paths hang off: the config's openai-side URLs carry
+// the OpenAI-style version prefix, which ollama's and colibri's own
+// addressing does not use.
+func rootURL(u string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(u, "/"), "/v1")
 }
 
 // drain reads (bounded) the response body so quota messages with their
@@ -172,14 +299,18 @@ func drain(resp *http.Response) string {
 	return string(buf[:n])
 }
 
-// classify turns a probe response into the status column's text.
-func classify(status int, body string) Result {
+// classify turns a probe response into the status column's text. The
+// quota-reset parse is gen-only by decision: the generation probe is the
+// check whose 429 is the one a round would hit, so its reset stamp is the
+// one parsed into a hold; a non-gen format's 429 reports plain failure
+// detail and leaves reset-stamp parsing to the round-failure path.
+func classify(status int, body string, gen bool) Result {
 	switch {
 	case status >= 200 && status < 300:
 		return Result{OK: true, Detail: fmt.Sprintf("ok (http %d)", status)}
 	case status == http.StatusUnauthorized, status == http.StatusForbidden:
 		return Result{Detail: fmt.Sprintf("%d auth rejected", status)}
-	case status == http.StatusTooManyRequests:
+	case status == http.StatusTooManyRequests && gen:
 		if reset := ParseQuotaReset(body); !reset.IsZero() {
 			return Result{Detail: "429 quota (resets " + reset.Local().Format("15:04") + ")"}
 		}

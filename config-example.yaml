@@ -96,24 +96,29 @@ worker_id: ""
 # budget, so it is wider than the 15-minute ceiling the other activities
 # use. The jailed agent and worktree cleanup each get their own, wider
 # ceilings below; every remaining activity keeps the fixed 15-minute
-# StartToClose.
+# StartToClose. An explicit 0s sets no ceiling — the round runs unbounded,
+# under operator supervision only.
 tests_timeout: 30m
 # Ceiling for one jailed agent round — the implementation, fix, and
 # rebuild rounds (RunJailedClaudeActivity), a Go duration string. Agent
 # rounds legitimately run long, so this is wider than the fixed 15-minute
-# StartToClose the other activities use.
+# StartToClose the other activities use. An explicit 0s sets no ceiling —
+# the round runs unbounded, under operator supervision only.
 agent_run_timeout: 45m
 # Ceiling for one jailed reviewer round (RunJailedReviewerActivity), a Go
 # duration string. The code and test reviewers are jailed rounds like the
 # implementer — a whole-repo review legitimately runs long. A review cut
 # off at this ceiling retries with its conversation resumed, so
-# consecutive windows accumulate instead of restarting.
+# consecutive windows accumulate instead of restarting. An explicit 0s
+# sets no ceiling — the review runs unbounded, under operator supervision
+# only.
 review_timeout: 15m
 # Ceiling for one CleanupWorktreeActivity — committing the aborted-work
 # snapshot, unregistering the worktree, and removing its directory — a Go
 # duration string. Wider than the shared 15-minute activity ceiling:
 # removing a large worktree (e.g. one holding a build tree) is
 # filesystem-bound work that has burned the full 15 minutes in practice.
+# An explicit 0s sets no ceiling.
 cleanup_timeout: 30m
 # How many jailed-agent rounds may run at once on this worker; further
 # rounds queue until a slot frees (heartbeating while they wait).
@@ -508,6 +513,23 @@ provider:
   # openai-typed provider carrying it is a load error. Empty means the
   # agent's own default.
   heartbeat_model: ""
+  # Which request "worker status" spends to learn the backend behind url is
+  # alive — a property of the backend, not of the wire rounds speak, so it
+  # is legal on both types: openai (a non-token GET {url}/models),
+  # anthropic (a non-billed POST count_tokens that validates the key),
+  # ollama (GET /api/ps at the server root), colibri (GET /status), omlx
+  # (POST /tokenize), or gen-heartbeat — the real minimal generation every
+  # config probed before this field existed, costing tokens and holding a
+  # serving slot, but the only format that proves an end-to-end completion
+  # and parses the 429 quota-reset stamp. Unset, the probe picks the
+  # non-token check matching this section's wire: count_tokens on
+  # anthropic, the model list on openai. The default moved off
+  # gen-heartbeat deliberately: hosted-wire configs (e.g. z.ai) that want
+  # the old probe set gen-heartbeat here. The field lives on this section
+  # and fallback: only — a legacy-only config reaches it by adding a
+  # minimal provider: section naming just type and heartbeat (its unset
+  # url/key/model fall through to the legacy sections).
+  heartbeat: ""
   # API request timeout for the jailed agent, in milliseconds, exported as
   # API_TIMEOUT_MS — both wire styles need it. Set, it wins over either
   # legacy section's timeout_ms; zero/unset falls through to the legacy
@@ -588,6 +610,10 @@ fallback:
   key: ""
   model: ""
   heartbeat_model: ""
+  # The fallback probe's format — same values as provider.heartbeat above;
+  # probed only when the main probe misses and failover is armed. Empty
+  # resolves per the fallback's own wire, like the provider's unset above.
+  heartbeat: ""
 
 # The dev rounds' own provider overrides — the implementing agent's
 # rounds: the slim flow's plan, parse, step, and fix rounds among them.
