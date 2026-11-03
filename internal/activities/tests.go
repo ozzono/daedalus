@@ -449,7 +449,11 @@ func ResolveTestCommandActivity(ctx context.Context, worktreePath, agent string)
 //     explicit word, always winning;
 //  2. static detection: a plain Makefile test: rule, then the language
 //     marker files (go.mod, package.json with a test script, pytest
-//     config), then Makefile test-ui/test-api targets;
+//     config), then Makefile test-ui/test-api targets — every detected
+//     candidate probed for runner existence before it is trusted
+//     (probeTestCommand), a failed probe degrading to ErrSuiteRunnerMissing
+//     rather than a command-not-found that would reach the gate dressed as
+//     a red baseline;
 //  3. an AI discovery round — a short jailed agent run that answers with
 //     the command — for repositories none of the above recognize.
 //
@@ -459,7 +463,12 @@ func nativeTestCommand(ctx context.Context, worktreePath, agent string) ([]strin
 	if declared, ok := declaredTestCommand(worktreePath); ok {
 		return []string{"sh", "-c", declared}, nil
 	}
-	if argv, ok := detectedTestCommand(worktreePath); ok {
+	if argv, marker, ok := detectedTestCommand(worktreePath); ok {
+		cmd := strings.Join(argv, " ")
+		if !probeTestCommand(ctx, worktreePath, cmd) {
+			return nil, fmt.Errorf("%w: %q resolved from %s — declare a runnable suite in .daedalus.yaml (tests: <command>)",
+				ErrSuiteRunnerMissing, cmd, marker)
+		}
 		return argv, nil
 	}
 	return discoverTestCommand(ctx, worktreePath, agent)
@@ -486,13 +495,15 @@ func declaredTestCommand(worktreePath string) (string, bool) {
 // detectedTestCommand recognizes the common test entrypoints from marker
 // files. A plain Makefile test: rule wins over the single-language defaults
 // — a repo that declares its own test composition means to run it, not the
-// bare default its primary language would suggest.
-func detectedTestCommand(worktreePath string) ([]string, bool) {
+// bare default its primary language would suggest. marker names the file
+// (and rule/script) the command resolved from, so a failed existence probe
+// can name it in the resolution error.
+func detectedTestCommand(worktreePath string) (argv []string, marker string, ok bool) {
 	if mk, err := os.ReadFile(filepath.Join(worktreePath, "Makefile")); err == nil && makefileHasTarget(string(mk), "test") {
-		return []string{"make", "test"}, true
+		return []string{"make", "test"}, "Makefile (test: rule)", true
 	}
 	if _, err := os.Stat(filepath.Join(worktreePath, "go.mod")); err == nil {
-		return []string{"go", "test", "./..."}, true
+		return []string{"go", "test", "./..."}, "go.mod", true
 	}
 	if pkg, err := os.ReadFile(filepath.Join(worktreePath, "package.json")); err == nil {
 		var p struct {
@@ -501,12 +512,12 @@ func detectedTestCommand(worktreePath string) ([]string, bool) {
 			} `json:"scripts"`
 		}
 		if json.Unmarshal(pkg, &p) == nil && strings.TrimSpace(p.Scripts.Test) != "" {
-			return []string{"npm", "test"}, true
+			return []string{"npm", "test"}, "package.json (test script)", true
 		}
 	}
 	for _, marker := range []string{"pyproject.toml", "pytest.ini", "setup.cfg"} {
 		if _, err := os.Stat(filepath.Join(worktreePath, marker)); err == nil {
-			return []string{"pytest", "-q"}, true
+			return []string{"pytest", "-q"}, marker, true
 		}
 	}
 	if mk, err := os.ReadFile(filepath.Join(worktreePath, "Makefile")); err == nil {
@@ -517,10 +528,10 @@ func detectedTestCommand(worktreePath string) ([]string, bool) {
 			}
 		}
 		if len(targets) > 0 {
-			return append([]string{"make"}, targets...), true
+			return append([]string{"make"}, targets...), "Makefile (test-ui/test-api rules)", true
 		}
 	}
-	return nil, false
+	return nil, "", false
 }
 
 // makefileHasTarget reports whether the Makefile declares target as a
@@ -597,6 +608,21 @@ func makefileHasTarget(mk, target string) bool {
 // flows that need a suite to gate on surface it as the run error it is
 // there.
 var ErrNoSuite = errors.New("no test suite exists in this repository")
+
+// ErrSuiteRunnerMissing is the sentinel static detection returns when the
+// marker it matched resolves a command whose runner the existence probe
+// cannot run (probeTestCommand) — a resolution error, not a suite verdict:
+// a command-not-found let through to the gate comes back exit-127 as a red
+// baseline nothing could ever pass, indistinguishable from a real suite
+// failure, which is exactly the fabricated-runner outcome the discovery
+// path's probe exists to prevent. A failed probe degrades nowhere else —
+// not to the next marker (the tier ordering picks the repo's primary
+// language, not the first runnable default) and not to a discovery round
+// (whose NONE on a repo carrying a test marker would vacuously drop the
+// gate) — it parks with the wrapped reason, whose escape hatch is a repo
+// declaration (.daedalus.yaml tests: or a Makefile test: rule), which
+// stays unprobed as the repo owner's word.
+var ErrSuiteRunnerMissing = errors.New("detected test command does not run on this host")
 
 // discoverTestCommand asks a short jailed agent run for the repository's
 // test entrypoint — the general, AI-led fallback. agent is the run's
