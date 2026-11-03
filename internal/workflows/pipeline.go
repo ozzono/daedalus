@@ -975,6 +975,14 @@ func (r *pipelineRun) preFlightGate() (string, error) {
 			r.logger.Info("No suite discovered; gate passes vacuously")
 			return "", nil
 		}
+		if isSuiteRunnerMissing(err) {
+			// Static detection resolved a marker whose runner cannot run:
+			// a resolution error, never a red baseline — parking with the
+			// error's reason (resolved command, marker source, and the
+			// .daedalus.yaml tests: escape hatch, all in the text) instead
+			// of gating on a command nothing could execute.
+			return "", r.park(fmt.Sprintf("preflight gate: %v", err))
+		}
 		return "", err
 	}
 	if r.input.BaselineValidated && baselineValidatedSkipEnabled(r.ctx) {
@@ -1111,6 +1119,15 @@ func isAPIExhaustion(err error) bool {
 // substring match covers every case.
 func isNoSuite(err error) bool {
 	return err != nil && strings.Contains(err.Error(), activities.ErrNoSuite.Error())
+}
+
+// isSuiteRunnerMissing reports whether err is the activities'
+// ErrSuiteRunnerMissing — static detection resolved a marker whose runner
+// the existence probe cannot run. Same boundary note as isNoSuite: across
+// the worker→workflow boundary an activity error survives only as the
+// application error's message text, so a plain substring match covers it.
+func isSuiteRunnerMissing(err error) bool {
+	return err != nil && strings.Contains(err.Error(), activities.ErrSuiteRunnerMissing.Error())
 }
 
 // isSlotWait reports whether err is the activities' ErrAgentSlotsBusy — a

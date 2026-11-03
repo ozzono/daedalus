@@ -1543,6 +1543,74 @@ func TestFeatureDevWorkflowNoSuitePreflightPassesVacuously(t *testing.T) {
 	env.AssertExpectations(t)
 }
 
+// errSuiteRunnerMissingStub mimics the worker→workflow boundary shape of
+// activities.ErrSuiteRunnerMissing: the activity error crosses as message
+// text alone (a temporal ApplicationError carries no wrapped sentinel), so
+// the gate's classifier must match the sentinel's message, not its
+// identity — this stub interpolates the message with %v and wraps nothing.
+var errSuiteRunnerMissingStub = fmt.Errorf("%s: %q resolved from %s — declare a runnable suite in .daedalus.yaml (tests: <command>)",
+	activities.ErrSuiteRunnerMissing.Error(), "make test", "Makefile (test: rule)")
+
+// TestFeatureDevWorkflowSuiteRunnerMissingParks pins the third
+// classification of the preflight gate's discovery error: static detection
+// resolving a marker whose runner cannot run (activities.ErrSuiteRunnerMissing)
+// is a resolution error, not a suite verdict — parking beats both gating on
+// it (a command-not-found comes back exit-127 as a red baseline nothing
+// could pass) and passing vacuously (a discovery NONE on a repo carrying a
+// test marker would drop the gate). The park reason carries the resolved
+// command, the marker it came from, and the .daedalus.yaml escape hatch;
+// nothing runs — no baseline suite, no session — and the error is terminal,
+// never re-queued.
+func TestFeatureDevWorkflowSuiteRunnerMissingParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	// The park precedes the first session, so agent and reviewer may never
+	// run — their mocks must not require calls.
+	var agentCalls, reviewCalls int
+	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { agentCalls++ }).
+		Return(activities.AgentRunResult{}, nil).Maybe()
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { reviewCalls++ }).
+		Return(activities.ReviewResult{}, nil).Maybe()
+
+	disc, suiteRec := stubTestPhase(env)
+	disc.script = []discoveryStep{{err: errSuiteRunnerMissingStub}}
+
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked when the detected suite runner cannot run")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"preflight gate",
+		activities.ErrSuiteRunnerMissing.Error(),
+		`"make test"`,
+		"Makefile (test: rule)",
+		".daedalus.yaml",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if len(disc.agents) != 1 {
+		t.Errorf("discovery ran %d times, want 1 — a missing-runner resolution error is terminal, never retried", len(disc.agents))
+	}
+	if len(suiteRec.runs) != 0 {
+		t.Errorf("suite ran %d times, want 0 — the parked gate never executes a baseline", len(suiteRec.runs))
+	}
+	if agentCalls != 0 || reviewCalls != 0 {
+		t.Errorf("agent ran %d times, reviewer %d; want 0/0 — parking precedes the first session", agentCalls, reviewCalls)
+	}
+	env.AssertExpectations(t)
+}
+
 // TestFeatureDevWorkflowTestActivityError covers the system-error branch of
 // the suite execution itself: a failing RunTestSuiteActivity (e.g. the shell
 // missing on the test worker) must fail the workflow instead of being

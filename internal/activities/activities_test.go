@@ -2504,7 +2504,10 @@ func goWorktree(t *testing.T) string {
 }
 
 // TestNativeTestsDeclaredCommand pins the precedence: a .daedalus.yaml
-// declaration wins over every detection.
+// declaration wins over every detection, and stays unprobed — the repo
+// owner's word carries no existence check, so the single recorded call is
+// the suite run itself (a probe would add a `command -v` call ahead of
+// it, and a runner missing from the worker's PATH could not veto it).
 func TestNativeTestsDeclaredCommand(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "sh", "echo 'suite green'; exit 0")
@@ -2556,17 +2559,18 @@ func TestNativeTestsMakefileTargets(t *testing.T) {
 		t.Errorf("Command = %q, want make test-ui test-api", result.Command)
 	}
 	calls := readCalls(t, log)
-	if len(calls) != 1 {
-		t.Fatalf("make called %d times, want 1", len(calls))
+	if len(calls) != 2 {
+		t.Fatalf("make called %d times, want 2 (the -n existence probe, then the suite)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{"test-ui", "test-api"}, "make")
+	assertArgs(t, calls[0].Args, []string{"-n", "test-ui", "test-api"}, "probe")
+	assertArgs(t, calls[1].Args, []string{"test-ui", "test-api"}, "suite")
 
 	// A Makefile with only test-api runs only that target.
 	wt2 := t.TempDir()
 	if err := os.WriteFile(filepath.Join(wt2, "Makefile"), []byte("test-api:\n\tpytest api\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	argv, ok := detectedTestCommand(wt2)
+	argv, _, ok := detectedTestCommand(wt2)
 	if !ok || strings.Join(argv, " ") != "make test-api" {
 		t.Errorf("detectedTestCommand = %v, %v; want make test-api", argv, ok)
 	}
@@ -2601,12 +2605,13 @@ func TestNativeTestsMakefileTestRuleWins(t *testing.T) {
 		t.Errorf("Command = %q, want make test — the repo's own composition", result.Command)
 	}
 	calls := readCalls(t, log)
-	if len(calls) != 1 {
-		t.Fatalf("make called %d times, want 1", len(calls))
+	if len(calls) != 2 {
+		t.Fatalf("make called %d times, want 2 (the -n existence probe, then the suite)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{"test"}, "make")
-	if !samePath(calls[0].Cwd, wt) {
-		t.Errorf("make cwd = %q, want %q", calls[0].Cwd, wt)
+	assertArgs(t, calls[0].Args, []string{"-n", "test"}, "probe")
+	assertArgs(t, calls[1].Args, []string{"test"}, "suite")
+	if !samePath(calls[1].Cwd, wt) {
+		t.Errorf("suite cwd = %q, want %q", calls[1].Cwd, wt)
 	}
 }
 
@@ -2631,7 +2636,7 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(wt, marker.name), []byte(marker.content), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if argv, ok := detectedTestCommand(wt); !ok || strings.Join(argv, " ") != "make test" {
+		if argv, _, ok := detectedTestCommand(wt); !ok || strings.Join(argv, " ") != "make test" {
 			t.Errorf("%s + test: rule → detectedTestCommand = %v, %v; want make test", marker.name, argv, ok)
 		}
 	}
@@ -2649,7 +2654,7 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:=\ntest::=\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if argv, ok := detectedTestCommand(wt); !ok || strings.Join(argv, " ") != "go test ./..." {
+	if argv, _, ok := detectedTestCommand(wt); !ok || strings.Join(argv, " ") != "go test ./..." {
 		t.Errorf("test:= Makefile → detectedTestCommand = %v, %v; want go test ./...", argv, ok)
 	}
 	// The spaced-colon spelling is the same declared rule: a Go repo whose
@@ -2661,7 +2666,7 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wtSpaced, "Makefile"), []byte("test :\n\tgo test ./...\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if argv, ok := detectedTestCommand(wtSpaced); !ok || strings.Join(argv, " ") != "make test" {
+	if argv, _, ok := detectedTestCommand(wtSpaced); !ok || strings.Join(argv, " ") != "make test" {
 		t.Errorf("spaced `test :` Makefile → detectedTestCommand = %v, %v; want make test", argv, ok)
 	}
 	// `test` named among several targets on one rule line is the same
@@ -2674,14 +2679,14 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wtMulti, "Makefile"), []byte("lint test:\n\tnpm test\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if argv, ok := detectedTestCommand(wtMulti); !ok || strings.Join(argv, " ") != "make test" {
+	if argv, _, ok := detectedTestCommand(wtMulti); !ok || strings.Join(argv, " ") != "make test" {
 		t.Errorf("multi-name `lint test:` Makefile → detectedTestCommand = %v, %v; want make test", argv, ok)
 	}
 	assignOnly := t.TempDir()
 	if err := os.WriteFile(filepath.Join(assignOnly, "Makefile"), []byte("test: X := 3\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if argv, ok := detectedTestCommand(assignOnly); ok {
+	if argv, _, ok := detectedTestCommand(assignOnly); ok {
 		t.Errorf("target-specific-assignment Makefile → detectedTestCommand = %v, %v; want no detection", argv, ok)
 	}
 
@@ -2694,9 +2699,186 @@ func TestDetectedTestCommandMakefilePrecedence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt2, "Makefile"), []byte("test-ui:\n\tnpx vitest run\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if argv, ok := detectedTestCommand(wt2); !ok || strings.Join(argv, " ") != "go test ./..." {
+	if argv, _, ok := detectedTestCommand(wt2); !ok || strings.Join(argv, " ") != "go test ./..." {
 		t.Errorf("go.mod + test-ui Makefile → detectedTestCommand = %v, %v; want go test ./...", argv, ok)
 	}
+}
+
+// TestDetectedTestCommandMarkers pins the marker each detection tier
+// reports: the file (and rule/script) the command resolved from, carried
+// so a failed existence probe can name its source in the resolution
+// error. The marker text is operator-facing — it lands verbatim in the
+// park reason a maintainer reads.
+func TestDetectedTestCommandMarkers(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		files      map[string]string
+		wantArgv   string
+		wantMarker string
+	}{
+		{
+			name:       "Makefile test rule",
+			files:      map[string]string{"Makefile": "test:\n\tnpm test\n"},
+			wantArgv:   "make test",
+			wantMarker: "Makefile (test: rule)",
+		},
+		{
+			name:       "go.mod",
+			files:      map[string]string{"go.mod": "module example.com/x\n"},
+			wantArgv:   "go test ./...",
+			wantMarker: "go.mod",
+		},
+		{
+			name:       "package.json test script",
+			files:      map[string]string{"package.json": `{"scripts":{"test":"vitest run"}}`},
+			wantArgv:   "npm test",
+			wantMarker: "package.json (test script)",
+		},
+		{
+			name:       "pyproject.toml",
+			files:      map[string]string{"pyproject.toml": "[tool.pytest.ini_options]\n"},
+			wantArgv:   "pytest -q",
+			wantMarker: "pyproject.toml",
+		},
+		{
+			name:       "pytest.ini",
+			files:      map[string]string{"pytest.ini": "[pytest]\n"},
+			wantArgv:   "pytest -q",
+			wantMarker: "pytest.ini",
+		},
+		{
+			name:       "setup.cfg",
+			files:      map[string]string{"setup.cfg": "[tool:pytest]\n"},
+			wantArgv:   "pytest -q",
+			wantMarker: "setup.cfg",
+		},
+		{
+			name:       "Makefile split targets",
+			files:      map[string]string{"Makefile": "test-api:\n\tpytest api\n"},
+			wantArgv:   "make test-api",
+			wantMarker: "Makefile (test-ui/test-api rules)",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			wt := t.TempDir()
+			for name, content := range c.files {
+				if err := os.WriteFile(filepath.Join(wt, name), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			argv, marker, ok := detectedTestCommand(wt)
+			if !ok || strings.Join(argv, " ") != c.wantArgv || marker != c.wantMarker {
+				t.Errorf("detectedTestCommand = %v, %q, %v; want %q from %q", argv, marker, ok, c.wantArgv, c.wantMarker)
+			}
+		})
+	}
+	// No marker anywhere: detection misses, the marker empty with it.
+	wt := t.TempDir()
+	if argv, marker, ok := detectedTestCommand(wt); ok || marker != "" || argv != nil {
+		t.Errorf("bare repo → detectedTestCommand = %v, %q, %v; want no detection", argv, marker, ok)
+	}
+}
+
+// TestNativeTestsDetectedCommandProbed pins the existence probe on the
+// static path: a detected command is trusted only after probeTestCommand
+// verifies its runner — a make candidate dry-run probed (`make -n` ahead
+// of its arguments, in the worktree), every other candidate resolved from
+// the worktree's PATH the way a shell would — and a failed probe is a
+// resolution error wrapping ErrSuiteRunnerMissing that names the command,
+// the marker it resolved from, and the .daedalus.yaml escape hatch. The
+// error ends resolution: no suite runs (a command-not-found let through
+// would gate as a red exit-127 baseline nothing could pass) and no
+// discovery round runs (a NONE there would vacuously drop the gate).
+func TestNativeTestsDetectedCommandProbed(t *testing.T) {
+	t.Run("passing probe runs the suite", func(t *testing.T) {
+		log := newStubLog(t)
+		stubBin(t, "make", "echo 'suite green'; exit 0")
+		wt := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\tnpm test\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := RunNativeTestsActivity(context.Background(), wt, "")
+		if err != nil {
+			t.Fatalf("RunNativeTestsActivity: %v", err)
+		}
+		if !result.Passed {
+			t.Error("Passed = false, want true")
+		}
+		if result.Command != "make test" {
+			t.Errorf("Command = %q, want make test", result.Command)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 2 {
+			t.Fatalf("make called %d times, want 2 (the -n existence probe, then the suite)", len(calls))
+		}
+		assertArgs(t, calls[0].Args, []string{"-n", "test"}, "probe")
+		if !samePath(calls[0].Cwd, wt) {
+			t.Errorf("probe cwd = %q, want the worktree", calls[0].Cwd)
+		}
+		assertArgs(t, calls[1].Args, []string{"test"}, "suite")
+		if !samePath(calls[1].Cwd, wt) {
+			t.Errorf("suite cwd = %q, want the worktree", calls[1].Cwd)
+		}
+	})
+
+	t.Run("failing probe is ErrSuiteRunnerMissing, never a suite or a discovery round", func(t *testing.T) {
+		log := newStubLog(t)
+		stubBin(t, "make", "exit 3")
+		// Discovery must never be reached on a failed probe; the stub makes
+		// a degradation visible in the log instead of launching a real round.
+		stubBin(t, "ai-jail", "exit 0")
+		wt := t.TempDir()
+		if err := os.WriteFile(filepath.Join(wt, "Makefile"), []byte("test:\n\tnpm test\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := RunNativeTestsActivity(context.Background(), wt, "")
+		if !errors.Is(err, ErrSuiteRunnerMissing) {
+			t.Fatalf("err = %v, want ErrSuiteRunnerMissing — a missing runner is a resolution error, not a red suite", err)
+		}
+		for _, want := range []string{
+			`"make test"`,
+			"Makefile (test: rule)",
+			".daedalus.yaml",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err %q should contain %q", err, want)
+			}
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("%d stub calls, want 1 (the probe alone — no suite run, no discovery round)", len(calls))
+		}
+		assertArgs(t, calls[0].Args, []string{"-n", "test"}, "probe")
+	})
+
+	t.Run("bare-name marker probes the PATH-resolved runner", func(t *testing.T) {
+		log := newStubLog(t)
+		stubBin(t, "go", "echo 'suite green'; exit 0")
+		// No sh stub: the existence probe must hit the real shell — a blind
+		// sh stub would pass the probe vacuously for any runner.
+		wt := goWorktree(t)
+
+		result, err := RunNativeTestsActivity(context.Background(), wt, "")
+		if err != nil {
+			t.Fatalf("RunNativeTestsActivity: %v", err)
+		}
+		if !result.Passed {
+			t.Error("Passed = false, want true")
+		}
+		if result.Command != "go test ./..." {
+			t.Errorf("Command = %q, want go test ./...", result.Command)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("go called %d times, want 1 (the suite alone — the probe resolves the runner through the unstubbed shell)", len(calls))
+		}
+		assertArgs(t, calls[0].Args, []string{"test", "./..."}, "suite")
+		if !samePath(calls[0].Cwd, wt) {
+			t.Errorf("suite cwd = %q, want the worktree", calls[0].Cwd)
+		}
+	})
 }
 
 // TestMakefileHasTarget pins the rule recognition itself: `test:` at line
