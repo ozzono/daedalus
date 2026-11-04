@@ -130,6 +130,19 @@ type pipelineRun struct {
 	// command and must stay off pre-marker replays (see vis).
 	swiftProbe bool
 
+	// slimScopeGate records whether this execution recorded the slim
+	// sub-task write-scope version marker; the parse round's target-files
+	// contract and the acceptance gate's scope activity both issue new
+	// commands on it and must stay off pre-marker replays (see vis).
+	slimScopeGate bool
+
+	// slimScopeAccepted accumulates the target files of every accepted
+	// slim sub-task. The gate's diff is against HEAD — nothing commits
+	// before finalize — so it is cumulative: each check compares against
+	// this union plus the current sub-task's targets, and accepted work is
+	// never retro-flagged (see pipelineRun.slimScopeCheck).
+	slimScopeAccepted []string
+
 	// lastEdit is the completion time of this run's last jailed agent
 	// round — any round may have edited the worktree. lastSuite is the
 	// completion time of the last suite execution. The terminal gate
@@ -1103,19 +1116,30 @@ func (r *pipelineRun) reproGate(command string) (activities.ReproResult, error) 
 // for the maintainer, with the offending paths in the message. Flows
 // without a policy (feature-dev, bug-fix) skip the activity entirely.
 func (r *pipelineRun) checkWriteScope() error {
-	if len(r.input.AllowedPaths) == 0 && len(r.input.FrozenPaths) == 0 {
+	return r.checkWriteScopeIn(r.input.AllowedPaths, r.input.FrozenPaths,
+		"write-scope violation — the diff leaves this flow's write scope, and stripping files silently is not an option")
+}
+
+// checkWriteScopeIn is checkWriteScope against an explicit policy: the
+// activity executes, and a violating diff parks the run with parkReason and
+// the offending paths named. The flow-level form passes the flow's own
+// policy; the slim flow's per-sub-task gate builds its allowed set from the
+// sub-task's declared targets (plus the accepted union) and parks with its
+// own reason.
+func (r *pipelineRun) checkWriteScopeIn(allowed, frozen []string, parkReason string) error {
+	if len(allowed) == 0 && len(frozen) == 0 {
 		return nil
 	}
 	var res activities.ScopeResult
 	if err := workflow.ExecuteActivity(r.ctx, activities.VerifyWriteScopeActivity, activities.ScopeCheckInput{
 		WorktreePath: r.worktree.WorktreePath,
-		Allowed:      r.input.AllowedPaths,
-		Frozen:       r.input.FrozenPaths,
+		Allowed:      allowed,
+		Frozen:       frozen,
 	}).Get(r.ctx, &res); err != nil {
 		return fmt.Errorf("write-scope check: %w", err)
 	}
 	if len(res.Violations) > 0 {
-		return r.park("write-scope violation — the diff leaves this flow's write scope, and stripping files silently is not an option:\n" +
+		return r.park(parkReason + ":\n" +
 			strings.Join(res.Violations, "\n"))
 	}
 	return nil

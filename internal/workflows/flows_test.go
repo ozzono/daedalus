@@ -34,7 +34,12 @@ func TestFlowScope(t *testing.T) {
 }
 
 // scopeRecorder captures every VerifyWriteScopeActivity call — the run's
-// structural write-scope gate — and answers with its preset result.
+// structural write-scope gate — and answers with its preset result, read at
+// dispatch time so a test may set res after record() (the slim stub hands
+// the recorder out of stubSlimRun, whose tests script violations then).
+// Maybe: flows and runs with no gate on their path legitimately never call
+// the activity, and the call-count pins live in the tests' explicit
+// len(inputs) assertions.
 type scopeRecorder struct {
 	env    *testsuite.TestWorkflowEnvironment
 	res    activities.ScopeResult
@@ -50,7 +55,9 @@ func (r *scopeRecorder) record() {
 				}
 			}
 		}).
-		Return(r.res, nil)
+		Return(func(ctx context.Context, in activities.ScopeCheckInput) (activities.ScopeResult, error) {
+			return r.res, nil
+		})
 }
 
 // reproGateRecorder captures every ReproFirstGateActivity call and plays
