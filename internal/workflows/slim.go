@@ -113,7 +113,8 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 		return "", fmt.Errorf("parse round: %w", err)
 	}
 	repairOK := slimParseRepairEnabled(ctx)
-	subtasks, repaired, perr := parseSlimPlan(parseReply.Text, repairOK)
+	run.slimScopeGate = slimScopeGateEnabled(ctx)
+	subtasks, repaired, perr := parseSlimPlan(parseReply.Text, repairOK, run.slimScopeGate)
 	if perr != nil {
 		// One strict re-ask, resumed in the parse round's own
 		// conversation: the model sees its previous reply and corrects it
@@ -130,7 +131,7 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parse retry round: %w", err)
 		}
-		if subtasks, repaired, perr = parseSlimPlan(parseReply.Text, repairOK); perr != nil {
+		if subtasks, repaired, perr = parseSlimPlan(parseReply.Text, repairOK, run.slimScopeGate); perr != nil {
 			return "", run.park(fmt.Sprintf("parse round could not produce a parseable subtask queue: %v", perr))
 		}
 	}
@@ -236,6 +237,17 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 				st.ID, verdict.Comments))
 		}
 		if result.Passed && verdict.Approved {
+			// The structural half of the sub-task's write fencing, at the
+			// same acceptance point the suite and the reviewer just
+			// cleared: a diff that leaves the declared scope parks, never
+			// strips (slimScopeCheck). The check runs only here — a red
+			// suite blocks first, whatever the diff touches.
+			if r.slimScopeGate {
+				if err := r.slimScopeCheck(st, index, total); err != nil {
+					return err
+				}
+				r.slimScopeAccepted = append(r.slimScopeAccepted, st.TargetFiles...)
+			}
 			r.logger.Info("Slim subtask accepted", "ID", st.ID, "Index", index, "Of", total)
 			return nil
 		}
@@ -260,6 +272,26 @@ func (r *pipelineRun) slimStep(st template.SlimSubtask, index, total int, comman
 	}
 }
 
+// slimScopeCheck runs a sub-task's structural write-scope gate at the
+// acceptance point, on the shared checkWriteScope machinery. The diff is
+// taken against HEAD and nothing commits before finalize, so it is
+// cumulative: the allowed set is this sub-task's declared target files plus
+// every earlier accepted sub-task's — accepted work is never retro-flagged
+// — and the final sub-task, whose diff carries the whole plan's accepted
+// work, adds the run's AllowedPaths policy on top. A violating diff parks
+// the run for the maintainer with the offending paths named; the gate never
+// strips.
+func (r *pipelineRun) slimScopeCheck(st template.SlimSubtask, index, total int) error {
+	allowed := make([]string, 0, len(r.slimScopeAccepted)+len(st.TargetFiles)+len(r.input.AllowedPaths))
+	allowed = append(allowed, r.slimScopeAccepted...)
+	allowed = append(allowed, st.TargetFiles...)
+	if index == total {
+		allowed = append(allowed, r.input.AllowedPaths...)
+	}
+	return r.checkWriteScopeIn(allowed, r.input.FrozenPaths,
+		fmt.Sprintf("slim subtask %d left its write scope — its target files plus every earlier accepted sub-task's — and stripping files silently is not an option", st.ID))
+}
+
 // slimParseRepairChangeID gates the parse round's bracket-closure repair
 // behind its own version marker, for the same replay reason as the
 // pipeline.go markers (visibilityChangeID and friends): the repair changes
@@ -274,6 +306,24 @@ const slimParseRepairChangeID = "slim-parse-closer-repair"
 
 func slimParseRepairEnabled(ctx workflow.Context) bool {
 	return workflow.GetVersion(ctx, slimParseRepairChangeID, workflow.DefaultVersion, 1) == 1
+}
+
+// slimScopeChangeID gates the slim sub-task write-scope contract behind its
+// own version marker, for the same replay reason as slimParseRepairChangeID:
+// the contract changes which commands the workflow issues, in two places at
+// once. The parse round's validation now rejects a subtask without target
+// files, routing a reply that pre-marker history accepted into the re-ask;
+// and the acceptance gate now dispatches the write-scope activity per
+// sub-task and can park where that history recorded an accept. A run whose
+// history was recorded before the marker and replayed by an upgraded worker
+// would issue commands that history does not hold and wedge at the next
+// worker upgrade, so both halves switch together: pre-marker replays parse
+// with the old contract and accept without a scope check, exactly as the
+// code that recorded them did.
+const slimScopeChangeID = "slim-subtask-scope-gate"
+
+func slimScopeGateEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, slimScopeChangeID, workflow.DefaultVersion, 1) == 1
 }
 
 // parseSlimPlan extracts the parse round's subtask queue from its reply.
@@ -301,9 +351,13 @@ func slimParseRepairEnabled(ctx workflow.Context) bool {
 // and keeps spending the re-ask (appendImpliedClosers carries the full
 // rationale). repair gates the closure for replay — a history predating
 // slimParseRepairChangeID must decide the parse exactly as the code that
-// recorded it did. Pure string/JSON work — deterministic, so it is safe to
-// call from workflow code.
-func parseSlimPlan(text string, repair bool) ([]template.SlimSubtask, bool, error) {
+// recorded it did. targets gates the target-files contract the same way
+// (slimScopeChangeID): a subtask with no target files has nothing for the
+// acceptance gate to enforce, so the gated-on parse rejects it into the
+// parse round's re-ask, while a pre-marker replay accepts the queue exactly
+// as the code that recorded it did. Pure string/JSON work —
+// deterministic, so it is safe to call from workflow code.
+func parseSlimPlan(text string, repair, targets bool) ([]template.SlimSubtask, bool, error) {
 	if s := stripCodeFence(strings.TrimSpace(text)); s != "" {
 		text = s
 	}
@@ -334,6 +388,9 @@ func parseSlimPlan(text string, repair bool) ([]template.SlimSubtask, bool, erro
 		}
 		if len(st.AcceptanceCriteria) == 0 {
 			return nil, false, fmt.Errorf("subtask %d (id %d) carries no acceptance criteria", i+1, st.ID)
+		}
+		if targets && len(st.TargetFiles) == 0 {
+			return nil, false, fmt.Errorf("subtask %d (id %d) carries no target files", i+1, st.ID)
 		}
 	}
 	return out, closed, nil

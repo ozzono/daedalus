@@ -1,6 +1,7 @@
 package workflows
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -20,9 +21,10 @@ const twoSubtaskProsePlan = "Sub-task 1 (implement, adder.go): add the adder —
 const twoSubtaskPlan = `[{"id":1,"type":"implement","target_files":["adder.go"],"description":"add the adder","acceptance_criteria":["adder.go defines Add","Add(2,2) returns 4"]},{"id":2,"type":"implement","target_files":["mul.go"],"description":"multiply the adder","acceptance_criteria":["mul.go defines Mul","Mul(3,2) returns 6"]}]`
 
 // stubSlimRun wires the shared happy-path defaults for a slim run: a
-// worktree, green-discovered suite, finalize, and cleanup. Tests script the
-// recorders they care about.
-func stubSlimRun(t *testing.T) (*testsuite.TestWorkflowEnvironment, *agentRecorder, *reviewerRecorder, *suiteRecorder) {
+// worktree, green-discovered suite, an in-scope write-scope gate, finalize,
+// and cleanup. Tests script the recorders they care about — a violating
+// scope result is `scope.res` set after the stub.
+func stubSlimRun(t *testing.T) (*testsuite.TestWorkflowEnvironment, *agentRecorder, *reviewerRecorder, *suiteRecorder, *scopeRecorder) {
 	t.Helper()
 	env := newTestEnv(t)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
@@ -32,8 +34,10 @@ func stubSlimRun(t *testing.T) (*testsuite.TestWorkflowEnvironment, *agentRecord
 	reviews := &reviewerRecorder{env: env}
 	reviews.record()
 	_, suites := stubTestPhase(env)
+	scope := &scopeRecorder{env: env}
+	scope.record()
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
-	return env, agents, reviews, suites
+	return env, agents, reviews, suites, scope
 }
 
 // TestParseSlimPlan pins the parse round's reply contract: strict — the
@@ -244,9 +248,21 @@ func TestParseSlimPlan(t *testing.T) {
 		name:    "subtask without acceptance criteria",
 		text:    `[{"id":1,"description":"do it"}]`,
 		wantErr: "carries no acceptance criteria",
+	}, {
+		// The acceptance gate enforces the declared scope, so a subtask
+		// with nothing declared for it cannot run: the missing field and
+		// the explicit empty array both reject into the parse round's
+		// re-ask (the gate side is pinned in TestParseSlimPlanTargetGate).
+		name:    "subtask without target files",
+		text:    `[{"id":1,"type":"implement","description":"do it","acceptance_criteria":["a.go exists"]}]`,
+		wantErr: "carries no target files",
+	}, {
+		name:    "subtask with empty target files",
+		text:    `[{"id":1,"type":"implement","target_files":[],"description":"do it","acceptance_criteria":["a.go exists"]}]`,
+		wantErr: "carries no target files",
 	}} {
 		t.Run(c.name, func(t *testing.T) {
-			got, repaired, err := parseSlimPlan(c.text, true)
+			got, repaired, err := parseSlimPlan(c.text, true, true)
 			if c.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 					t.Fatalf("parseSlimPlan(%q) err = %v, want it to contain %q", c.text, err, c.wantErr)
@@ -267,7 +283,7 @@ func TestParseSlimPlan(t *testing.T) {
 			}
 		})
 	}
-	if got, _, err := parseSlimPlan(valid, true); err != nil || got[1].Description != "multiply the adder" ||
+	if got, _, err := parseSlimPlan(valid, true, true); err != nil || got[1].Description != "multiply the adder" ||
 		len(got[1].AcceptanceCriteria) != 2 || got[1].TargetFiles[0] != "mul.go" {
 		t.Errorf("parseSlimPlan fields = %+v (err %v), want the wire schema's named fields carried through", got, err)
 	}
@@ -279,15 +295,33 @@ func TestParseSlimPlan(t *testing.T) {
 // recorded pre-marker history did — the closure is off (a missing-closer
 // reply fails and spends the re-ask), while the comma strip predates the
 // marker and stays on, repairing without reporting a repair (only the
-// closure is ever reported; the run memo rides that report alone).
+// closure is ever reported; the run memo rides that report alone). Both
+// markers off: targets=false beside repair=false is the full pre-marker
+// parse.
 func TestParseSlimPlanRepairGate(t *testing.T) {
 	closable := twoSubtaskPlan[:len(twoSubtaskPlan)-1] // every element complete, the final "]" dropped
-	if _, repaired, err := parseSlimPlan(closable, false); err == nil || repaired {
+	if _, repaired, err := parseSlimPlan(closable, false, false); err == nil || repaired {
 		t.Errorf("parseSlimPlan(closable reply, repair=false) = repaired %v, err %v, want the gated-off closure to reject the reply", repaired, err)
 	}
-	got, repaired, err := parseSlimPlan(closable+",]", false)
+	got, repaired, err := parseSlimPlan(closable+",]", false, false)
 	if err != nil || repaired || len(got) != 2 {
 		t.Errorf("parseSlimPlan(trailing-comma reply, repair=false) = (%d subtasks, repaired %v, err %v), want the ungated comma strip to repair without reporting", len(got), repaired, err)
+	}
+}
+
+// TestParseSlimPlanTargetGate pins the replay gate around the target-files
+// contract: parseSlimPlan's targets flag carries the slim scope marker, so
+// the false side must decide exactly as the code that recorded pre-marker
+// history did — a subtask without target files was a valid queue then and
+// parses there still — while the gated-on side rejects it into the parse
+// round's re-ask (the acceptance gate has nothing to enforce without it).
+func TestParseSlimPlanTargetGate(t *testing.T) {
+	noTargets := `[{"id":1,"type":"implement","description":"do it","acceptance_criteria":["a.go exists"]}]`
+	if got, _, err := parseSlimPlan(noTargets, false, false); err != nil || len(got) != 1 {
+		t.Errorf("parseSlimPlan(no-targets reply, targets=false) = (%d subtasks, err %v), want the gated-off contract to accept the queue as pre-marker history recorded it", len(got), err)
+	}
+	if _, _, err := parseSlimPlan(noTargets, false, true); err == nil || !strings.Contains(err.Error(), "carries no target files") {
+		t.Errorf("parseSlimPlan(no-targets reply, targets=true) err = %v, want the target-files rejection that spends the re-ask", err)
 	}
 }
 
@@ -299,10 +333,13 @@ func TestParseSlimPlanRepairGate(t *testing.T) {
 // conversation while every review is a
 // fresh session judged against exactly that sub-task's acceptance criteria,
 // a red suite blocks approval even under an approving review (its logs ride
-// the fix prompt, green logs stay out of the review prompt), and an
-// accepted queue finalizes.
+// the fix prompt, green logs stay out of the review prompt), each acceptance
+// clears the structural write-scope gate on the sub-task's targets stacked
+// on every accepted sub-task's (checked only at the acceptance point, so
+// in-scope work costs no new rounds or prompts), and an accepted queue
+// finalizes.
 func TestSlimWorkflowHappyPath(t *testing.T) {
-	env, agents, reviews, suites := stubSlimRun(t)
+	env, agents, reviews, suites, scope := stubSlimRun(t)
 
 	agents.script = []agentStep{
 		{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
@@ -439,6 +476,25 @@ func TestSlimWorkflowHappyPath(t *testing.T) {
 	if got := suites.runs[0].Command; got != "go test ./..." {
 		t.Errorf("suite command = %q, want the discovered command re-run per round", got)
 	}
+
+	// The write-scope gate runs exactly at each acceptance point — two
+	// calls for two sub-tasks, never on the red or comment-rejected
+	// rounds between them — each against the diff's cumulative scope: the
+	// sub-task's own targets plus every earlier accepted sub-task's
+	// (nothing commits before finalize, so the final check carries the
+	// whole plan's union). In-scope work pays no new rounds or prompts:
+	// the agent, review, and suite counts above are unchanged by the gate.
+	if len(scope.inputs) != 2 {
+		t.Fatalf("write-scope gate ran %d times, want 2 (one per acceptance point — never on a red or comment-rejected round)", len(scope.inputs))
+	}
+	for i, want := range [][]string{{"adder.go"}, {"adder.go", "mul.go"}} {
+		if !reflect.DeepEqual(scope.inputs[i].Allowed, want) {
+			t.Errorf("scope check %d Allowed = %v, want %v (the sub-task's targets on top of every accepted sub-task's)", i, scope.inputs[i].Allowed, want)
+		}
+		if len(scope.inputs[i].Frozen) != 0 {
+			t.Errorf("scope check %d Frozen = %v, want empty (the slim flow declares no frozen paths)", i, scope.inputs[i].Frozen)
+		}
+	}
 	env.AssertExpectations(t)
 }
 
@@ -450,7 +506,7 @@ func TestSlimWorkflowHappyPath(t *testing.T) {
 func TestSlimWorkflowParseRetry(t *testing.T) {
 	oneSubtaskQueue := `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]}]`
 	t.Run("second reply parses", func(t *testing.T) {
-		env, agents, reviews, _ := stubSlimRun(t)
+		env, agents, reviews, _, _ := stubSlimRun(t)
 		agents.script = []agentStep{
 			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
 			{result: activities.AgentRunResult{Text: "a chatty reply, no array in sight.", SessionID: "dev-2"}},
@@ -481,7 +537,7 @@ func TestSlimWorkflowParseRetry(t *testing.T) {
 		}
 	})
 	t.Run("second reply parks", func(t *testing.T) {
-		env, agents, reviews, suites := stubSlimRun(t)
+		env, agents, reviews, suites, _ := stubSlimRun(t)
 		garbage := activities.AgentRunResult{Text: "still just chatting."}
 		agents.script = []agentStep{
 			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
@@ -503,6 +559,49 @@ func TestSlimWorkflowParseRetry(t *testing.T) {
 			t.Errorf("suite ran %d times, want 1 (preflight only)", len(suites.runs))
 		}
 	})
+	t.Run("a targetless reply re-asks, and a second one parks", func(t *testing.T) {
+		// The scope gate's parse contract routes through the same re-ask:
+		// a reply that unmarshals fine but declares no target files spends
+		// the re-ask with the specific failure quoted (the model can fix
+		// exactly that), and a second one parks the run. The re-asked
+		// parseSlimPlan call must carry the flag too — a retry that forgot
+		// it would accept a targetless queue, whose acceptance then runs
+		// the gate on an empty allowed set: a check that short-circuits
+		// without an activity, silently fencing nothing.
+		env, agents, reviews, suites, _ := stubSlimRun(t)
+		targetless := `[{"id":1,"type":"implement","description":"do it","acceptance_criteria":["a.go exists"]}]`
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+			{result: activities.AgentRunResult{Text: targetless}},
+			{result: activities.AgentRunResult{Text: targetless}},
+		}
+		err := runSlimErr(t, env)
+		for _, want := range []string{
+			ErrAwaitingMaintainer.Error(),
+			"parse round could not produce a parseable subtask queue",
+			"carries no target files",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if len(agents.inputs) != 3 {
+			t.Fatalf("agent ran %d times, want 3 (plan, parse, one re-ask — the targetless queue never ran)", len(agents.inputs))
+		}
+		if retry := agents.inputs[2].Prompt; !strings.Contains(retry, "carries no target files") || strings.Contains(retry, "PLANNER") {
+			t.Errorf("re-ask prompt should carry the target-files failure inside the parse round's own conversation, got:\n%s", retry)
+		}
+		if len(reviews.inputs) != 0 {
+			t.Errorf("reviewer ran %d times, want 0 (nothing to review without a queue)", len(reviews.inputs))
+		}
+		if len(suites.runs) != 1 {
+			t.Errorf("suite ran %d times, want 1 (preflight only)", len(suites.runs))
+		}
+		// No AssertExpectations: the reviewer recorder's minimum-call
+		// expectation can never be met on a park path that runs no review
+		// (the "second reply parks" subtest above omits it for the same
+		// reason).
+	})
 }
 
 // TestSlimWorkflowParseRepair pins the closure repair's run-level surface:
@@ -520,7 +619,7 @@ func TestSlimWorkflowParseRepair(t *testing.T) {
 	oneClosableQueue := `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]`
 
 	t.Run("closed queue finalizes and stamps the run memo", func(t *testing.T) {
-		env, agents, reviews, _ := stubSlimRun(t)
+		env, agents, reviews, _, _ := stubSlimRun(t)
 		env.OnUpsertMemo(map[string]interface{}{"ParseQueueRepaired": true}).Return(nil).Once()
 		agents.script = []agentStep{
 			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
@@ -547,7 +646,7 @@ func TestSlimWorkflowParseRepair(t *testing.T) {
 	})
 
 	t.Run("the comma strip is not a repair", func(t *testing.T) {
-		env, agents, reviews, _ := stubSlimRun(t)
+		env, agents, reviews, _, _ := stubSlimRun(t)
 		env.OnUpsertMemo(map[string]interface{}{"ParseQueueRepaired": true}).Never()
 		agents.script = []agentStep{
 			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
@@ -568,7 +667,7 @@ func TestSlimWorkflowParseRepair(t *testing.T) {
 	})
 
 	t.Run("a pre-marker replay spends the re-ask", func(t *testing.T) {
-		env, agents, reviews, _ := stubSlimRun(t)
+		env, agents, reviews, _, scope := stubSlimRun(t)
 		env.OnUpsertMemo(map[string]interface{}{"ParseQueueRepaired": true}).Never()
 		env.OnGetVersion(slimParseRepairChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
 		agents.script = []agentStep{
@@ -597,6 +696,12 @@ func TestSlimWorkflowParseRepair(t *testing.T) {
 		}
 		if got := agents.inputs[3].SessionID; got != "dev-1" {
 			t.Errorf("worker step SessionID = %q, want %q (the step resumes the plan's dev conversation — the parse round's session is abandoned once the queue parses)", got, "dev-1")
+		}
+		// The two markers are independent: this replay pins only the parse
+		// repair off, so the scope gate still fires at the acceptance of
+		// the corrected queue.
+		if len(scope.inputs) != 1 {
+			t.Errorf("write-scope gate ran %d times, want 1 (the scope marker is independent of the parse-repair marker)", len(scope.inputs))
 		}
 		env.AssertExpectations(t)
 	})
@@ -652,7 +757,7 @@ func TestSlimWorkflowNoSuiteParks(t *testing.T) {
 // every continued slim run parks; the count here also catches a skip that
 // regressed into executing the baseline.
 func TestSlimWorkflowContinuedPreflightGate(t *testing.T) {
-	env, agents, reviews, suites := stubSlimRun(t)
+	env, agents, reviews, suites, _ := stubSlimRun(t)
 
 	agents.script = []agentStep{
 		{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
@@ -694,7 +799,7 @@ func TestSlimWorkflowContinuedPreflightGate(t *testing.T) {
 // that declares the sub-task impossible as stated parks the run with the
 // sub-task's identity and the reviewer's reason, instead of looping.
 func TestSlimWorkflowReviewHaltsParks(t *testing.T) {
-	env, agents, reviews, _ := stubSlimRun(t)
+	env, agents, reviews, _, _ := stubSlimRun(t)
 	agents.script = []agentStep{
 		{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
 		{result: activities.AgentRunResult{Text: `[{"id":1,"type":"implement","target_files":["a.go"],"description":"do it","acceptance_criteria":["a.go exists"]}]`}},
@@ -719,7 +824,7 @@ func TestSlimWorkflowReviewHaltsParks(t *testing.T) {
 // and the reviewer both stay live through every round, and the counter
 // counts rounds, not agent calls.
 func TestSlimWorkflowSubtaskRoundCapParks(t *testing.T) {
-	env, agents, reviews, suites := stubSlimRun(t)
+	env, agents, reviews, suites, _ := stubSlimRun(t)
 	agents.script = []agentStep{
 		{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
 		{result: activities.AgentRunResult{Text: `[{"id":7,"type":"fix","target_files":["a.go"],"description":"the stubborn one","acceptance_criteria":["a.go compiles"]}]`}},
@@ -750,6 +855,199 @@ func TestSlimWorkflowSubtaskRoundCapParks(t *testing.T) {
 	// plan + parse + step + one fix per capped round.
 	if len(agents.inputs) != 3+maxSlimStepRounds {
 		t.Errorf("agent ran %d times, want %d (plan, parse, step, one fix per round)", len(agents.inputs), 3+maxSlimStepRounds)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestSlimWorkflowScopeGateParks pins the hard write-scope gate's park: a
+// worktree diff that leaves the sub-task's declared write scope parks the
+// run at the acceptance point — the same point the suite and the reviewer
+// just cleared — for the maintainer, with the offending paths named, and
+// never spends a fix round on work the gate has already rejected. The suite
+// stays in charge of ordering: a red round is never consulted (its fix loop
+// runs first), so the gate only ever judges a diff that is already green
+// and approved.
+func TestSlimWorkflowScopeGateParks(t *testing.T) {
+	violating := activities.ScopeResult{Violations: []string{"extra.go: outside this flow's allowed paths"}}
+	t.Run("out-of-scope diff parks at the acceptance gate", func(t *testing.T) {
+		env, agents, reviews, suites, scope := stubSlimRun(t)
+		scope.res = violating
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+			{result: activities.AgentRunResult{Text: twoSubtaskPlan}},
+			{result: activities.AgentRunResult{Text: "step one done"}},
+		}
+		reviews.script = []reviewStep{{result: activities.ReviewResult{Approved: true}}}
+		suites.script = []suiteStep{
+			{result: activities.TestResult{Passed: true, Logs: "ok"}},
+			{result: activities.TestResult{Passed: true, Logs: "ok"}},
+		}
+
+		err := runSlimErr(t, env)
+		for _, want := range []string{
+			ErrAwaitingMaintainer.Error(),
+			"slim subtask 1 left its write scope",
+			"extra.go: outside this flow's allowed paths",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if len(agents.inputs) != 3 {
+			t.Errorf("agent ran %d times, want 3 (plan, parse, step — no fix round for work the gate has rejected)", len(agents.inputs))
+		}
+		if len(scope.inputs) != 1 {
+			t.Errorf("write-scope gate ran %d times, want 1 (the first sub-task's acceptance)", len(scope.inputs))
+		}
+		if len(reviews.inputs) != 1 {
+			t.Errorf("reviewer ran %d times, want 1 (the gate judges only after the reviewer approves)", len(reviews.inputs))
+		}
+		if len(suites.runs) != 2 {
+			t.Errorf("suite ran %d times, want 2 (preflight + the green acceptance round)", len(suites.runs))
+		}
+		env.AssertExpectations(t)
+	})
+
+	t.Run("a red suite blocks ahead of the scope check", func(t *testing.T) {
+		env, agents, reviews, suites, scope := stubSlimRun(t)
+		scope.res = violating
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+			{result: activities.AgentRunResult{Text: twoSubtaskPlan}},
+			{result: activities.AgentRunResult{Text: "step one done"}},
+			{result: activities.AgentRunResult{Text: "fixed the failure"}},
+		}
+		reviews.script = []reviewStep{
+			{result: activities.ReviewResult{Approved: true}},
+			{result: activities.ReviewResult{Approved: true}},
+		}
+		suites.script = []suiteStep{
+			{result: activities.TestResult{Passed: true, Logs: "ok"}},
+			{result: activities.TestResult{Passed: false, Logs: "--- FAIL: TestAdd"}},
+			{result: activities.TestResult{Passed: true, Logs: "ok"}},
+		}
+
+		err := runSlimErr(t, env)
+		for _, want := range []string{ErrAwaitingMaintainer.Error(), "slim subtask 1 left its write scope", "extra.go"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if len(agents.inputs) != 4 {
+			t.Errorf("agent ran %d times, want 4 (plan, parse, step, fix — the red round ran its fix loop before the gate judged)", len(agents.inputs))
+		}
+		if len(scope.inputs) != 1 {
+			t.Errorf("write-scope gate ran %d times, want 1 (only after the green round — the red round was never consulted)", len(scope.inputs))
+		}
+		env.AssertExpectations(t)
+	})
+}
+
+// TestSlimWorkflowScopeGateRunPolicy pins the run-level policy
+// interaction: the flow's own AllowedPaths ride the final sub-task's check
+// — the one whose diff carries the whole run's accepted work — as an
+// additive widening of the accepted union, never a second restriction on
+// the declared targets. A policy narrower than the union cannot reject a
+// target, and an overlapping one is simply absorbed into it. The frozen
+// policy is the other half: it rides every check unchanged, mid-plan and
+// final — the gate stacks target files onto the allowed set, it never
+// lifts the run's frozen paths. The recorder answers clean on both runs,
+// so the pin is the exact allowed and frozen sets the activity receives:
+// the matching itself is VerifyWriteScopeActivity's own tested contract.
+func TestSlimWorkflowScopeGateRunPolicy(t *testing.T) {
+	run := func(t *testing.T, allowedPaths []string) *scopeRecorder {
+		t.Helper()
+		env, agents, reviews, _, scope := stubSlimRun(t)
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+			{result: activities.AgentRunResult{Text: twoSubtaskPlan}},
+			{result: activities.AgentRunResult{Text: "step one done"}},
+			{result: activities.AgentRunResult{Text: "step two done"}},
+		}
+		reviews.stub = []activities.ReviewResult{{Approved: true}}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+		in := baseInput()
+		in.Flow = "slim"
+		in.AllowedPaths = allowedPaths
+		in.FrozenPaths = []string{".ai-jail/"}
+		env.ExecuteWorkflow(SlimWorkflow, in)
+		if err := env.GetWorkflowError(); err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		var branch string
+		if err := env.GetWorkflowResult(&branch); err != nil {
+			t.Fatalf("workflow result: %v", err)
+		}
+		return scope
+	}
+
+	t.Run("a policy narrower than the declared targets cannot reject them", func(t *testing.T) {
+		scope := run(t, []string{"adder.go"})
+		if len(scope.inputs) != 2 {
+			t.Fatalf("write-scope gate ran %d times, want 2", len(scope.inputs))
+		}
+		want := []string{"adder.go", "mul.go", "adder.go"}
+		if !reflect.DeepEqual(scope.inputs[1].Allowed, want) {
+			t.Errorf("final scope check Allowed = %v, want %v (accepted union plus the run's policy, appended as declared)", scope.inputs[1].Allowed, want)
+		}
+		for i := range scope.inputs {
+			if !reflect.DeepEqual(scope.inputs[i].Frozen, []string{".ai-jail/"}) {
+				t.Errorf("scope check %d Frozen = %v, want the run's frozen policy riding every check, mid-plan and final", i, scope.inputs[i].Frozen)
+			}
+		}
+	})
+
+	t.Run("an overlapping policy widens the final union", func(t *testing.T) {
+		scope := run(t, []string{"mul.go", "docs/extra.md"})
+		if len(scope.inputs) != 2 {
+			t.Fatalf("write-scope gate ran %d times, want 2", len(scope.inputs))
+		}
+		want := []string{"adder.go", "mul.go", "mul.go", "docs/extra.md"}
+		if !reflect.DeepEqual(scope.inputs[1].Allowed, want) {
+			t.Errorf("final scope check Allowed = %v, want %v (the run-level paths ride only the final check)", scope.inputs[1].Allowed, want)
+		}
+		if !reflect.DeepEqual(scope.inputs[0].Allowed, []string{"adder.go"}) {
+			t.Errorf("first scope check Allowed = %v, want %v (the run-level policy never widens a mid-plan check)", scope.inputs[0].Allowed, []string{"adder.go"})
+		}
+	})
+}
+
+// TestSlimWorkflowScopeGateReplay pins the scope marker's replay side: a
+// history recorded before the marker replays with the old parse contract —
+// a queue without target files parses and runs without spending the re-ask
+// — and without the acceptance gate's activity dispatch or its park. Both
+// halves switch together (slimScopeChangeID), so the one pinned marker
+// covers both.
+func TestSlimWorkflowScopeGateReplay(t *testing.T) {
+	env, agents, reviews, suites, scope := stubSlimRun(t)
+	env.OnGetVersion(slimScopeChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+	// The queue the old contract accepted: no target_files at all.
+	preMarkerQueue := `[{"id":1,"type":"implement","description":"do it","acceptance_criteria":["a.go exists"]}]`
+	agents.script = []agentStep{
+		{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+		{result: activities.AgentRunResult{Text: preMarkerQueue}},
+		{result: activities.AgentRunResult{Text: "step one done"}},
+	}
+	reviews.stub = []activities.ReviewResult{{Approved: true}}
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+
+	branch, err := runSlim(t, env)
+	if err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if branch != "daedalus/issue-42-1" {
+		t.Errorf("branch = %q, want the finalize deliverable", branch)
+	}
+	if len(agents.inputs) != 3 {
+		t.Errorf("agent ran %d times, want 3 (plan, parse, step — the pre-marker parse contract accepted the queue without a re-ask)", len(agents.inputs))
+	}
+	if len(scope.inputs) != 0 {
+		t.Errorf("write-scope gate ran %d times, want 0 (a pre-marker replay never dispatches the gate's activity)", len(scope.inputs))
+	}
+	if len(suites.runs) != 2 {
+		t.Errorf("suite ran %d times, want 2 (preflight + the accepted round — the suite gate predates this marker and stays on)", len(suites.runs))
 	}
 	env.AssertExpectations(t)
 }
