@@ -295,6 +295,14 @@ if(!window.__ddWired){
    var d=document.getElementById('preview-dlg');
    if(d&&!d.open)d.showModal();
   }
+  /* the CoT box's poll holds its fetches while its details is closed: the
+     poller keeps ticking under the collapsed caret, but nothing is asked
+     for until a reader opens it — reopening mid-round resumes the stream
+     at the next tick. */
+  if(/\/cot$/.test(ev.detail.requestConfig.path)){
+   var cb=ev.detail.elt.closest('details');
+   if(!cb||!cb.open){ev.preventDefault();return;}
+  }
  });
 }
 /* the runs filters re-render the rows immediately (the poll region's
@@ -558,7 +566,7 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 <details class="card p-4 mb-4">
  <summary class="text-sm font-medium">Last round CoT</summary>
  <div hx-get="/runs/{{.WorkflowID}}/cot" hx-trigger="toggle once from:closest details" hx-swap="innerHTML">
-  <p class="text-sm text-slate-500 mt-2">Loads on first open — the CoT walk reads the run's whole Temporal history, so it stays out of the polled body.</p>
+  <p class="text-sm text-slate-500 mt-2">Loads on first open — the CoT walk reads the run's whole Temporal history, so it stays out of the polled body; a round in flight keeps the box on its own 5s poll until the round ends.</p>
  </div>
 </details>
 {{end}}
@@ -567,14 +575,16 @@ document.querySelectorAll('input[name=mode]').forEach(function(r){
 <div class="card p-4 text-sm text-red-600 dark:text-red-400">{{.}}</div>
 {{end}}
 
-{{define "frag_cot"}}
+{{define "frag_cot"}}{{/* .Poll arms the box's own poll on the wrapper, or on the placeholder <p> when the walk found no sections yet (hx-swap outerHTML keeps the arm self-replacing): a live section re-fetches until its round ends so the `last write` stamp advances, and a lagging idle serve re-fetches until the walk catches up. The client holds the fetches while the box is closed (the foot script's beforeRequest veto). */}}
 {{if .Err}}
 <div class="text-sm text-red-600 dark:text-red-400">{{.Err}}</div>
 {{else if .Body}}
+<div{{if .Poll}} hx-get="/runs/{{.ID}}/cot" hx-trigger="every 5s [!document.hidden]" hx-swap="outerHTML"{{end}}>
 <div class="mono text-xs text-slate-500 mb-1">{{.Head}}</div>
 <pre class="mono text-xs whitespace-pre-wrap break-words max-h-96 overflow-y-auto text-slate-700 dark:text-slate-300">{{.Body}}</pre>
+</div>
 {{else}}
-<p class="text-sm text-slate-500 mt-2">No jailed agent rounds in this run's history yet.</p>
+<p class="text-sm text-slate-500 mt-2"{{if .Poll}} hx-get="/runs/{{.ID}}/cot" hx-trigger="every 5s [!document.hidden]" hx-swap="outerHTML"{{end}}>No jailed agent rounds in this run's history yet.</p>
 {{end}}
 {{end}}
 
