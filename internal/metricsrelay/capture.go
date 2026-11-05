@@ -140,14 +140,38 @@ func (c *cappedBuffer) String() string {
 // — from a buffered response body, either wire's plain-JSON shape or its
 // SSE chunk stream: the same bodies applyUsage reads the usage block from.
 // A shape it does not recognize extracts to "" (an error page carries no
-// assistant text to find). ponytail: only the four documented shapes are
-// walked — the wires' canonical completions shapes; anything else was
-// never assistant text.
+// assistant text to find). Distinct content blocks join with a blank line;
+// deltas within one streamed run concatenate directly — a token stream is
+// a single text run, not one paragraph per token. ponytail: only the four
+// documented shapes are walked — the wires' canonical completions shapes;
+// anything else was never assistant text.
 func assistantText(body []byte) string {
 	var pieces []string
 	add := func(s string) {
 		if s != "" {
 			pieces = append(pieces, s)
+		}
+	}
+	// Streamed deltas accumulate into one run per kind; fragments
+	// concatenate directly and a kind switch — thinking to answer or
+	// back — closes the run so the two stay separable blocks.
+	var run string
+	runThinking := false
+	delta := func(s string, thinking bool) {
+		if s == "" {
+			return
+		}
+		if run != "" && runThinking != thinking {
+			add(run)
+			run = ""
+		}
+		runThinking = thinking
+		run += s
+	}
+	flush := func() {
+		if run != "" {
+			add(run)
+			run = ""
 		}
 	}
 	// Plain JSON first, either wire.
@@ -159,7 +183,8 @@ func assistantText(body []byte) string {
 		} `json:"content"`
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
@@ -169,6 +194,7 @@ func assistantText(body []byte) string {
 			add(b.Thinking)
 		}
 		for _, c := range plain.Choices {
+			add(c.Message.ReasoningContent)
 			add(c.Message.Content)
 		}
 		if len(pieces) > 0 {
@@ -176,7 +202,8 @@ func assistantText(body []byte) string {
 		}
 	}
 	// SSE: anthropic reports text and thinking in content_block_delta
-	// events; openai streams choices[].delta.content.
+	// events; openai streams choices[].delta.content plus
+	// choices[].delta.reasoning_content thinking deltas.
 	for _, line := range strings.Split(string(body), "\n") {
 		payload, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
 		if !ok {
@@ -196,7 +223,8 @@ func assistantText(body []byte) string {
 			} `json:"delta"`
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
@@ -204,12 +232,14 @@ func assistantText(body []byte) string {
 			continue
 		}
 		if chunk.Type == "content_block_delta" {
-			add(chunk.Delta.Text)
-			add(chunk.Delta.Thinking)
+			delta(chunk.Delta.Text, false)
+			delta(chunk.Delta.Thinking, true)
 		}
 		for _, c := range chunk.Choices {
-			add(c.Delta.Content)
+			delta(c.Delta.ReasoningContent, true)
+			delta(c.Delta.Content, false)
 		}
 	}
+	flush()
 	return strings.Join(pieces, "\n\n")
 }

@@ -146,9 +146,12 @@ func TestCappedBuffer(t *testing.T) {
 }
 
 // TestAssistantText pins the response-side extraction: the assistant text —
-// thinking plus answer — out of the four documented wire shapes, joined
-// with blank lines in arrival order, and "" for anything that is not one
-// of them (an error page carries no assistant text to find).
+// thinking plus answer — out of the four documented wire shapes, and ""
+// for anything that is not one of them (an error page carries no
+// assistant text to find). Streamed deltas of one kind concatenate
+// directly — a token stream is a single text run, never one paragraph per
+// token — while genuinely distinct blocks (plain-JSON content blocks, a
+// thinking run beside an answer run) still join with a blank line.
 func TestAssistantText(t *testing.T) {
 	t.Run("plain anthropic content blocks", func(t *testing.T) {
 		got := assistantText([]byte(`{"content":[{"type":"text","text":"answer"},{"type":"thinking","thinking":"thought"}]}`))
@@ -164,6 +167,13 @@ func TestAssistantText(t *testing.T) {
 		}
 	})
 
+	t.Run("plain openai reasoning_content beside the answer", func(t *testing.T) {
+		got := assistantText([]byte(`{"choices":[{"message":{"reasoning_content":"thought","content":"answer"}}]}`))
+		if got != "thought\n\nanswer" {
+			t.Errorf("assistantText = %q, want reasoning captured beside the content as distinct blocks", got)
+		}
+	})
+
 	t.Run("both shapes in one body concatenate", func(t *testing.T) {
 		got := assistantText([]byte(`{"content":[{"type":"text","text":"one"}],"choices":[{"message":{"content":"two"}}]}`))
 		if got != "one\n\ntwo" {
@@ -171,22 +181,51 @@ func TestAssistantText(t *testing.T) {
 		}
 	})
 
-	t.Run("anthropic sse deltas", func(t *testing.T) {
+	t.Run("anthropic sse deltas concatenate per run", func(t *testing.T) {
 		body := "event: content_block_delta\n" +
 			`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"step "}}` + "\n\n" +
-			`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"final"}}` + "\n\n" +
+			`data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"one"}}` + "\n\n" +
+			`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"fi"}}` + "\n\n" +
+			`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"nal"}}` + "\n\n" +
 			`data: {"type":"message_stop"}` + "\n\n"
-		if got := assistantText([]byte(body)); got != "step \n\nfinal" {
-			t.Errorf("assistantText = %q, want the deltas joined", got)
+		if got := assistantText([]byte(body)); got != "step one\n\nfinal" {
+			t.Errorf("assistantText = %q, want each kind's deltas concatenated and thinking kept apart from the answer", got)
 		}
 	})
 
-	t.Run("openai sse chunks", func(t *testing.T) {
+	t.Run("openai sse chunks concatenate", func(t *testing.T) {
 		body := `data: {"choices":[{"delta":{"content":"hel"}}]}` + "\n\n" +
 			`data: {"choices":[{"delta":{"content":"lo"}}]}` + "\n\n" +
 			"data: [DONE]\n\n"
-		if got := assistantText([]byte(body)); got != "hel\n\nlo" {
-			t.Errorf("assistantText = %q, want the chunk contents joined past [DONE]", got)
+		if got := assistantText([]byte(body)); got != "hello" {
+			t.Errorf("assistantText = %q, want the chunk fragments concatenated into one run past [DONE]", got)
+		}
+	})
+
+	t.Run("token-level fragments stay one contiguous string", func(t *testing.T) {
+		// The live fragmentation: openai-wire upstreams stream token-level
+		// deltas a few characters each, so a captured reply must read as
+		// the sentence the upstream wrote, not one paragraph per token.
+		body := `data: {"choices":[{"delta":{"content":"Goo"}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"content":"d. "}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"content":"Now le"}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"content":"t me"}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"content":" che"}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"content":"ck."}}]}` + "\n\n" +
+			"data: [DONE]\n\n"
+		if got := assistantText([]byte(body)); got != "Good. Now let me check." {
+			t.Errorf("assistantText = %q, want the token stream contiguous", got)
+		}
+	})
+
+	t.Run("openai sse reasoning deltas capture as thinking", func(t *testing.T) {
+		body := `data: {"choices":[{"delta":{"reasoning_content":"thi"}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"reasoning_content":"nk"}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"content":"an"}}]}` + "\n\n" +
+			`data: {"choices":[{"delta":{"content":"swer"}}]}` + "\n\n" +
+			"data: [DONE]\n\n"
+		if got := assistantText([]byte(body)); got != "think\n\nanswer" {
+			t.Errorf("assistantText = %q, want reasoning deltas captured as thinking, separable from the answer", got)
 		}
 	})
 
@@ -266,8 +305,8 @@ func TestProxyCaptureTeesKeyedRounds(t *testing.T) {
 		if status, body := postRelay(t, stagedURL+"/chat/completions", h, prompt); status != http.StatusOK || !bytes.Equal(body, []byte(sse)) {
 			t.Fatalf("relayed reply = (%d) %s, want the stream bytes verbatim", status, body)
 		}
-		if cr, ok := r.captures.Get("w2", "test", "1"); !ok || cr.Response != "hel\n\nlo" {
-			t.Errorf("capture = (%+v, %v), want the deltas joined", cr, ok)
+		if cr, ok := r.captures.Get("w2", "test", "1"); !ok || cr.Response != "hello" {
+			t.Errorf("capture = (%+v, %v), want the stream concatenated into one run", cr, ok)
 		}
 	})
 
