@@ -846,6 +846,82 @@ func TestLastRoundExit(t *testing.T) {
 	}
 }
 
+// TestRoundStarts pins the round-count parse the CoT box's lag arm answers
+// against: only the writer's own "jailed … round started" headers count —
+// the same strict grammar lastRoundState walks, never a raw substring
+// count — so a suite block whose embedded test command echoes the round
+// grammar, an escaped body line replaying a header, and plain stdout
+// quoting the phrase must all stay inert, while exits, verdicts, and
+// submit notes never count as starts.
+func TestRoundStarts(t *testing.T) {
+	started := func(ts, agent, stage string) string {
+		return "=== " + ts + " jailed " + agent + " round started: stage=" + stage +
+			" worktree=/wt pgid=4242 (run abcd1234) ==="
+	}
+	exited := func(ts, agent string) string {
+		return "=== " + ts + " jailed " + agent + " round exited after 5m0s (run abcd1234) ==="
+	}
+
+	t.Run("every started header counts once", func(t *testing.T) {
+		log := strings.Join([]string{
+			started("2026-10-22T10:00:00Z", "claude", "dev"),
+			started("2026-10-22T10:05:00Z", "pi", "test-review"),
+		}, "\n")
+		if got := roundStarts(log); got != 2 {
+			t.Errorf("roundStarts = %d, want one per started header (2)", got)
+		}
+	})
+
+	t.Run("a started-and-exited round counts once", func(t *testing.T) {
+		log := started("2026-10-22T10:00:00Z", "claude", "dev") + "\n" +
+			exited("2026-10-22T10:05:00Z", "claude")
+		if got := roundStarts(log); got != 1 {
+			t.Errorf("roundStarts = %d, want the paired exit ignored (1)", got)
+		}
+	})
+
+	t.Run("everything that is not a started round is inert", func(t *testing.T) {
+		log := strings.Join([]string{
+			"run started: issue 42",
+			started("2026-10-22T10:00:00Z", "claude", "dev"),
+			"=== 2026-10-22T10:01:00Z reviewer: CHANGES_REQUESTED (run abcd1234) ===",
+			"=== 2026-10-22T10:02:00Z native test run finished: go test ./... (run abcd1234) ===",
+			exited("2026-10-22T10:03:00Z", "claude"),
+			"waiting on dependency: issue 7",
+		}, "\n")
+		if got := roundStarts(log); got != 1 {
+			t.Errorf("roundStarts = %d, want only the writer's started header (1)", got)
+		}
+	})
+
+	t.Run("a test command echoing the round grammar cannot inflate", func(t *testing.T) {
+		// The corruption the strict parse exists to resist: a suite event
+		// embeds the test command in a writer header, the writer escapes
+		// suite output lines that begin header-shaped, and stdout quoting
+		// the phrase carries no header at all — a substring count would
+		// read all three as rounds.
+		log := strings.Join([]string{
+			started("2026-10-22T10:00:00Z", "claude", "dev"),
+			exited("2026-10-22T10:05:00Z", "claude"),
+			`=== 2026-10-22T10:06:00Z test suite exited after 5s: echo "jailed claude round started: stage=dev worktree=/wt pgid=9 (run deadbeef)" (run abcd1234) ===`,
+			" === 2026-10-22T10:07:00Z jailed pi round started: stage=test worktree=/wt pgid=8 (run deadbeef) ===",
+			"progress: jailed pi round started: stage=test worktree=/wt pgid=8",
+		}, "\n")
+		if got := roundStarts(log); got != 1 {
+			t.Errorf("roundStarts = %d, want only the writer's own header (1)", got)
+		}
+	})
+
+	t.Run("a log without headers counts zero", func(t *testing.T) {
+		if got := roundStarts("output only\nno headers"); got != 0 {
+			t.Errorf("roundStarts = %d, want 0", got)
+		}
+		if got := roundStarts(""); got != 0 {
+			t.Errorf("roundStarts(empty) = %d, want 0", got)
+		}
+	})
+}
+
 // TestLastCoTAge pins the runs feed's Last-CoT cell: the age of the log's
 // newest exited round, and the dash for a run with no readable log —
 // relTime renders the zero time as a dash, so a run that never completed a

@@ -1316,6 +1316,10 @@ func TestUIRunDetailCauseCard(t *testing.T) {
 // stays out (a dead round is not in flight).
 func TestUIRunCotBoxTailsTheKilledRound(t *testing.T) {
 	h := newUIHarness(t)
+	// The box probes the live section first — the probe reads the task log —
+	// so the log dir moves aside: no wf-kill log exists there, the probe
+	// answers no round in flight, and the pinned tail-1 walk is what serves.
+	useTaskLogDir(t)
 	dc := converter.GetDefaultDataConverter()
 	started := time.Now().Add(-time.Hour)
 	closed := started.Add(30 * time.Minute)
@@ -1348,10 +1352,225 @@ func TestUIRunCotBoxTailsTheKilledRound(t *testing.T) {
 	}
 }
 
+// TestUIRunCotBoxPollArm pins the box's own poll as the responses arm and
+// disarm it. A round in flight wins the box over every finished section and
+// arms the poll (live-first); a caught-up idle face stays fetch-once; the
+// exactly-one-round-behind walk — a round whose task-log line landed while
+// its history event had not — arms the poll on the body face, and the same
+// lag shape on an empty history arms it on the placeholder; a wider mismatch
+// and a visibility miss are permanent degradations whose faces stay
+// fetch-once, arming there would re-walk forever.
+func TestUIRunCotBoxPollArm(t *testing.T) {
+	startedLine := func(ts, worktree string) string {
+		return "=== " + ts + " jailed claude round started: stage=dev worktree=" + worktree +
+			" pgid=4242 (run abcd1234) ==="
+	}
+	exitedLine := func(ts string) string {
+		return "=== " + ts + " jailed claude round exited after 5m0s (run abcd1234) ==="
+	}
+	pollAttrs := func(id string) string {
+		return `hx-get="/runs/` + id + `/cot" hx-trigger="every 5s [!document.hidden]" hx-swap="outerHTML"`
+	}
+
+	t.Run("a round in flight wins the box and arms the poll", func(t *testing.T) {
+		h := newUIHarness(t)
+		useTaskLogDir(t)
+		dc := converter.GetDefaultDataConverter()
+		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+		// A finished round in history — the walk's tail would render it, so
+		// its absence from the box is what shows live-first winning.
+		h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+			uiRow(t, "wf-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, at, nil),
+		}
+		h.fake.wfHistory["run-live"] = cotRound(t, dc, 1, at.Add(5*time.Minute), "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			activities.AgentRunResult{Thinking: "finished reasoning", Text: "answer"})
+		// The round in flight: an unpaired started block, its transcript
+		// under the worktree it named.
+		wt := t.TempDir()
+		writeTaskLogFile(t, "wf-live", startedLine(at.Format(time.RFC3339), wt))
+		claudeDir := t.TempDir()
+		resetC := claudeProjectsDir
+		t.Cleanup(func() { claudeProjectsDir = resetC })
+		claudeProjectsDir = func(string) (string, error) { return claudeDir, nil }
+		resetP := piSessionsDir
+		t.Cleanup(func() { piSessionsDir = resetP })
+		piSessionsDir = func(string) (string, error) { return t.TempDir(), nil }
+		fakeSessionSources(t, noCodexRollout, noOpencodeUpdate)
+		entry := `{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"live reasoning"},{"type":"text","text":"live answer"}]}}`
+		tpath := filepath.Join(claudeDir, "transcript.jsonl")
+		if err := os.WriteFile(tpath, []byte(entry+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(tpath, at, at); err != nil {
+			t.Fatal(err)
+		}
+
+		out := h.get(t, "/runs/wf-live/cot")
+		for _, want := range []string{
+			// The wrapper div carries the poll; outerHTML keeps the arm
+			// self-replacing until a response retires it.
+			`<div ` + pollAttrs("wf-live") + `>`,
+			"=== in-flight round (stage=dev, live, last write " + at.UTC().Format(time.RFC3339),
+			"live reasoning",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the live box lacks %q:\n%s", want, out)
+			}
+		}
+		for _, absent := range []string{"=== round 1:", "finished reasoning"} {
+			if strings.Contains(out, absent) {
+				t.Errorf("a round in flight must win the box over the finished tail (%q present):\n%s", absent, out)
+			}
+		}
+	})
+
+	t.Run("a caught-up idle face is fetch-once", func(t *testing.T) {
+		h := newUIHarness(t)
+		useTaskLogDir(t)
+		dc := converter.GetDefaultDataConverter()
+		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+		h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+			uiRow(t, "wf-idle", "run-idle", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, at, nil),
+		}
+		h.fake.wfHistory["run-idle"] = cotRound(t, dc, 1, at.Add(5*time.Minute), "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			activities.AgentRunResult{Thinking: "caught-up reasoning", Text: "answer"})
+		// One started-and-exited round: the walk's one section answers the
+		// log's one start — nothing lags, so the box must not re-fetch.
+		writeTaskLogFile(t, "wf-idle",
+			startedLine(at.Format(time.RFC3339), "/wt"),
+			exitedLine(at.Add(5*time.Minute).Format(time.RFC3339)))
+
+		out := h.get(t, "/runs/wf-idle/cot")
+		if !strings.Contains(out, "=== round 1: dev (run run-idle) @") || !strings.Contains(out, "caught-up reasoning") {
+			t.Errorf("the idle box lost the tail-1 section:\n%s", out)
+		}
+		if strings.Contains(out, pollAttrs("wf-idle")) {
+			t.Errorf("a caught-up box must stay fetch-once, not carry a poll arm:\n%s", out)
+		}
+	})
+
+	t.Run("a round finished under the walk re-arms the poll", func(t *testing.T) {
+		h := newUIHarness(t)
+		useTaskLogDir(t)
+		dc := converter.GetDefaultDataConverter()
+		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+		h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+			uiRow(t, "wf-lag", "run-lag", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, at, nil),
+		}
+		// The walk answers one finished round while the task log says two
+		// rounds ran — the second's history event had not landed: exactly
+		// one round behind, the transient shape the arm exists for.
+		h.fake.wfHistory["run-lag"] = cotRound(t, dc, 1, at.Add(5*time.Minute), "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			activities.AgentRunResult{Thinking: "walked reasoning", Text: "answer"})
+		writeTaskLogFile(t, "wf-lag",
+			startedLine(at.Format(time.RFC3339), "/wt"),
+			exitedLine(at.Add(5*time.Minute).Format(time.RFC3339)),
+			startedLine(at.Add(10*time.Minute).Format(time.RFC3339), "/wt"),
+			exitedLine(at.Add(15*time.Minute).Format(time.RFC3339)))
+
+		out := h.get(t, "/runs/wf-lag/cot")
+		for _, want := range []string{
+			`<div ` + pollAttrs("wf-lag") + `>`,
+			"=== round 1: dev (run run-lag) @",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the lagging box lacks %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("the empty face carries the arm on its placeholder", func(t *testing.T) {
+		h := newUIHarness(t)
+		useTaskLogDir(t)
+		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+		h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+			uiRow(t, "wf-empty", "run-empty", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, at, nil),
+		}
+		// History holds no jailed round yet — the no-sections face — while
+		// the log's one exited round is the lag shape, so the arm rides the
+		// placeholder and the first finished section re-renders into the box.
+		h.fake.wfHistory["run-empty"] = []*historypb.HistoryEvent{
+			uiStartedEvent(t, workflows.PipelineInput{IssueID: "42", RepoPath: "/repo/alpha"}),
+		}
+		writeTaskLogFile(t, "wf-empty",
+			startedLine(at.Format(time.RFC3339), "/wt"),
+			exitedLine(at.Add(5*time.Minute).Format(time.RFC3339)))
+
+		out := h.get(t, "/runs/wf-empty/cot")
+		want := `<p class="text-sm text-slate-500 mt-2" ` + pollAttrs("wf-empty") + `>No jailed agent rounds in this run's history yet.</p>`
+		if !strings.Contains(out, want) {
+			t.Errorf("the empty face must carry the poll arm on the placeholder; got:\n%s", out)
+		}
+	})
+
+	t.Run("a wider mismatch stays fetch-once", func(t *testing.T) {
+		h := newUIHarness(t)
+		useTaskLogDir(t)
+		dc := converter.GetDefaultDataConverter()
+		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+		h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+			uiRow(t, "wf-wide", "run-wide", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, at, nil),
+		}
+		// One finished section against three logged starts: not the
+		// one-behind transient — arming here would re-walk full history
+		// every tick forever.
+		h.fake.wfHistory["run-wide"] = cotRound(t, dc, 1, at.Add(5*time.Minute), "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			activities.AgentRunResult{Thinking: "wide reasoning", Text: "answer"})
+		writeTaskLogFile(t, "wf-wide",
+			startedLine(at.Format(time.RFC3339), "/wt"), exitedLine(at.Add(5*time.Minute).Format(time.RFC3339)),
+			startedLine(at.Add(10*time.Minute).Format(time.RFC3339), "/wt"), exitedLine(at.Add(15*time.Minute).Format(time.RFC3339)),
+			startedLine(at.Add(20*time.Minute).Format(time.RFC3339), "/wt"), exitedLine(at.Add(25*time.Minute).Format(time.RFC3339)))
+
+		out := h.get(t, "/runs/wf-wide/cot")
+		if !strings.Contains(out, "=== round 1: dev (run run-wide) @") {
+			t.Errorf("the wide-mismatch box lost the tail-1 section:\n%s", out)
+		}
+		if strings.Contains(out, pollAttrs("wf-wide")) {
+			t.Errorf("a permanently-mismatched face must stay fetch-once:\n%s", out)
+		}
+	})
+
+	t.Run("a visibility miss keeps its degraded face fetch-once", func(t *testing.T) {
+		h := newUIHarness(t)
+		useTaskLogDir(t)
+		dc := converter.GetDefaultDataConverter()
+		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+		// Visibility answers nothing: the fallback walks the latest
+		// execution alone while the task log counts rounds across every
+		// execution — the mismatch never closes, so no arm even in the lag
+		// shape. The history rides the workflow-id key (the empty-run-id
+		// read), and its section carries no run attribution.
+		h.fake.wfHistory["wf-fall"] = cotRound(t, dc, 1, at.Add(5*time.Minute), "RunJailedClaudeActivity",
+			activities.AgentRunInput{Role: activities.RoleDev},
+			activities.AgentRunResult{Thinking: "fallback reasoning", Text: "answer"})
+		writeTaskLogFile(t, "wf-fall",
+			startedLine(at.Format(time.RFC3339), "/wt"), exitedLine(at.Add(5*time.Minute).Format(time.RFC3339)),
+			startedLine(at.Add(10*time.Minute).Format(time.RFC3339), "/wt"), exitedLine(at.Add(15*time.Minute).Format(time.RFC3339)))
+
+		out := h.get(t, "/runs/wf-fall/cot")
+		for _, want := range []string{
+			"=== round 1: dev @",
+			"fallback reasoning",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the fallback box lacks %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, pollAttrs("wf-fall")) {
+			t.Errorf("the visibility-miss face must stay fetch-once — its lag never closes:\n%s", out)
+		}
+	})
+}
+
 // TestUIPolledPageFaces pins the polling client's decisions as the page
 // shells ship them: every polled region gates its poll on a visible tab,
 // the runs region re-renders the moment a filter changes, an active
-// selection vetoes the swap that would destroy it, the excerpt's scroll
+// selection vetoes the swap that would destroy it, the CoT box's own poll
+// holds its fetches while its details is closed, the excerpt's scroll
 // offset rides the swap both ways, a failed poll announces itself in the
 // header, and the every-trigger probe is what hides the countdown ring on
 // a page with nothing polling instead of leaving it clamped at zero. The
@@ -1407,6 +1626,21 @@ func TestUIPolledPageFaces(t *testing.T) {
 		} {
 			if !strings.Contains(index, want) {
 				t.Errorf("the page shell lacks the selection veto's %q:\n%s", want, index)
+			}
+		}
+	})
+
+	t.Run("the CoT box's poll holds while its details is closed", func(t *testing.T) {
+		// The box's 5s poll keeps ticking under the collapsed caret; the
+		// beforeRequest veto is what stops it asking for anything until a
+		// reader opens the box again.
+		for _, want := range []string{
+			`if(/\/cot$/.test(ev.detail.requestConfig.path)){`,
+			`var cb=ev.detail.elt.closest('details');`,
+			`if(!cb||!cb.open){ev.preventDefault();return;}`,
+		} {
+			if !strings.Contains(detail, want) {
+				t.Errorf("the page shell lacks the CoT closed-details veto's %q:\n%s", want, detail)
 			}
 		}
 	})

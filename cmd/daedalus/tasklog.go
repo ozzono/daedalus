@@ -965,6 +965,27 @@ func lastRoundState(log string) (name, stage, worktree string, running bool) {
 	return name, stage, worktree, running
 }
 
+// roundStarts counts the task log's started rounds — the same strict
+// header grammar lastRoundState parses, never a raw substring count, so a
+// test command echoing "round started" inside a suite block cannot
+// inflate it. The count is how many rounds the log says ever ran; the CoT
+// walk's finished-section count answers against it.
+func roundStarts(log string) int {
+	n := 0
+	for line := range strings.SplitSeq(log, "\n") {
+		if !strings.HasPrefix(line, "=== ") {
+			continue
+		}
+		header := strings.TrimSuffix(strings.TrimPrefix(line, "=== "), " ===")
+		_, rest, _ := strings.Cut(header, " ") // first field is the timestamp
+		event, _, _ := strings.Cut(rest, " (run ")
+		if strings.HasPrefix(event, "jailed ") && strings.Contains(event, " round started: ") {
+			n++
+		}
+	}
+	return n
+}
+
 // newestTranscript returns the newest transcript written for a worktree,
 // naming the agent that wrote it: claude's project dir, pi's session dir,
 // and codex's rollout tree (the cwd recorded in each rollout file
