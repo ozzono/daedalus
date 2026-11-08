@@ -59,12 +59,17 @@ func TestMain(m *testing.M) {
 	for _, name := range config.AllWorkerEnvVars() {
 		os.Unsetenv(name)
 	}
-	// The egress derivation reads two go/proxy ambients the worker-var
-	// scrub above does not cover (neither is config-derived): left set,
-	// they would move the pinned --allow-host grants per host. Tests that
-	// need one arm it explicitly (t.Setenv).
+	// The egress derivation reads three go/proxy ambients the worker-var
+	// scrub above does not cover (none is config-derived): left set, they
+	// would move the pinned --allow-host/--forward-port grants per host.
+	// HTTPS_PROXY and https_proxy are one knob in the two spellings the
+	// derivation honors (uppercase first, lowercase fallback — an ambient
+	// sandbox export of the lowercase member alone must not grant a
+	// --forward-port into every exact-argv pin either). Tests that need
+	// one arm it explicitly (t.Setenv).
 	os.Unsetenv("GOPROXY")
 	os.Unsetenv("HTTPS_PROXY")
+	os.Unsetenv("https_proxy")
 	os.Exit(m.Run())
 }
 
