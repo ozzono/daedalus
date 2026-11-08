@@ -42,7 +42,7 @@ type AgentRunInput struct {
 	// codex exec resume) instead of starting
 	// cold — the round inherits the prior context and its warm provider
 	// prompt cache. Empty starts a fresh session; agents without an
-	// id-addressable session (amp, aider) ignore it.
+	// id-addressable session (aider) ignores it.
 	SessionID string
 	// Role scopes the recorded-session fallback to one of the run's four
 	// chained conversations (RoleDev, RoleTest, RoleDevReview,
@@ -127,7 +127,7 @@ type ReviewInput struct {
 	// earlier findings with the prior context and warm prompt cache
 	// instead of starting cold. Each reviewer role (code review, test
 	// review) chains its own session; empty starts a fresh one. Agents
-	// without an id-addressable session (amp, aider) ignore it.
+	// without an id-addressable session (aider) ignores it.
 	SessionID string
 	// Role scopes the recorded-session fallback to one of the run's chained
 	// conversations (RoleDev, RoleTest, RoleDevReview, RoleTestReview,
@@ -214,7 +214,7 @@ type ReviewResult struct {
 	// to be fed back to the implementing agent.
 	Comments string
 	// Thinking carries the reviewer's native chain of thought (the same
-	// structured capture the implementing rounds get: claude/amp result
+	// structured capture the implementing rounds get: claude result
 	// JSON, pi's json stream) — weak-model review failures (marker
 	// misses, hallucinated locations) become explicable in
 	// `daedalus log -cot` only if the thinking reaches history, so it is
@@ -263,12 +263,10 @@ type ReviewResult struct {
 }
 
 // RunJailedClaudeActivity runs the jailed agent (Claude Code, opencode,
-// amp, pi, codex, or aider, per config) inside an ai-jail sandbox rooted at the
+// pi, codex, or aider, per config) inside an ai-jail sandbox rooted at the
 // worktree. Claude runs with json output so its visible text comes back
 // structured and lands complete in the activity result (serialized into
-// Temporal history, visible in the UI per round); amp's --stream-json-thinking emits
-// Claude-Code-compatible events including thinking blocks, so the same
-// parser applies; pi's --mode json emits pi's own event schema, read by
+// Temporal history, visible in the UI per round); pi's --mode json emits pi's own event schema, read by
 // its own parser branch (thinking, session id, and usage all captured);
 // opencode's, codex's, and aider's plain output is taken as-is (no thinking,
 // session, or usage). stream-json (which also carries the chain of
@@ -284,12 +282,15 @@ func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRun
 	// stays for the unmounted fallback shape.
 	defer mirrorToHost(ctx, input.WorktreePath,
 		os.Getenv(config.BugDirEnv), os.Getenv(config.BugMirrorEnv))
-	agent, _, agentArgs := jailedAgentCLI(input.Agent)
+	agent, _, agentArgs, err := jailedAgentCLI(input.Agent)
+	if err != nil {
+		return AgentRunResult{}, err
+	}
 	// A session id from a previous round resumes that conversation instead
 	// of starting cold — the round inherits the prior context and the
 	// provider's warm prompt cache for it. claude (--resume), pi
 	// (--session), opencode (-s), and codex (exec resume) support resume;
-	// amp and aider have no id-addressable session and ignore the field.
+	// aider has no id-addressable session and ignores the field.
 	//
 	// With no workflow-provided id — a first round, or the retry after a
 	// round cut off at its ceiling, which never produced a result carrying
@@ -531,12 +532,15 @@ func RunJailedReviewerActivity(ctx context.Context, input ReviewInput) (ReviewRe
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	agent, _, agentArgs := jailedAgentCLI(input.Agent)
+	agent, _, agentArgs, err := jailedAgentCLI(input.Agent)
+	if err != nil {
+		return ReviewResult{}, err
+	}
 	// A session id from a previous round of the same review role resumes
 	// that conversation — the re-review verifies its earlier findings with
 	// the prior context instead of re-deriving them cold. claude
 	// (--resume), pi (--session), opencode (-s), and codex (exec resume)
-	// support resume; amp and aider start fresh. As with the agent rounds,
+	// support resume; aider starts fresh. As with the agent rounds,
 	// a retry with no workflow-provided id resumes the conversation
 	// recorded from a cut-off attempt's transcript — the exact incident
 	// this replaces: a long review killed at its ceiling used to restart

@@ -455,6 +455,7 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 		t.Setenv("OPENAI_API_KEY", "sk-local")
 		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
 		wt := gitRepo(t)
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
@@ -473,9 +474,13 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		staged := stagedOpencodeConfigPath(wt)
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
-				"--network",
 				"--no-save-config",
-				"--mask",
+				"--allow-host",
+				"selfhost.example"},
+			// OPENCODE_CONFIG is staged after composition — the bridge's
+			// own --env below carries it — so it is not a composition rider.
+			roundEnvRiders(calls[0].Env, "OPENCODE_CONFIG"),
+			[]string{"--mask",
 				".claude/settings.json",
 				"--mask",
 				".claude/settings.local.json",
@@ -528,11 +533,12 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		if len(calls) != 1 {
 			t.Fatalf("ai-jail called %d times, want 1", len(calls))
 		}
+		// opencode dials the openai wire; with no openai URL staged the
+		// channel default fires.
 		assertArgs(t, calls[0].Args, slices.Concat(
-			[]string{"--worktree",
-				"--network",
-				"--no-save-config",
-				"--mask",
+			[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask",
 				".claude/settings.json",
 				"--mask",
 				".claude/settings.local.json",
@@ -566,9 +572,13 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		}
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
-				"--network",
 				"--no-save-config",
-				"--mask",
+				"--allow-host",
+				"selfhost.example"},
+			// OPENCODE_CONFIG is staged after composition — the bridge's
+			// own --env below carries it — so it is not a composition rider.
+			roundEnvRiders(calls[0].Env, "OPENCODE_CONFIG"),
+			[]string{"--mask",
 				".claude/settings.json",
 				"--mask",
 				".claude/settings.local.json",

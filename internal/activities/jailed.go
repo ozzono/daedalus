@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,12 +45,17 @@ type jailResult struct {
 // environment here; empty means no override. Every CLI except aider reads
 // the prompt from piped stdin (aider has no stdin mode — runJailedRound
 // bridges it through --message-file); each headless flag set approves every
-// tool call, which is only safe inside the jail.
-func jailedAgentCLI(agent string) (selected string, headless, output []string) {
+// tool call, which is only safe inside the jail. A removed agent
+// (recorded on an in-flight workflow the binary predates) errors — never
+// a silent fallback that would run the round on a different CLI and drop
+// its recorded session.
+func jailedAgentCLI(agent string) (selected string, headless, output []string, err error) {
 	if agent == "" {
 		agent = os.Getenv("DAEDALUS_AGENT")
 	}
 	switch agent {
+	case "amp":
+		return "", nil, nil, fmt.Errorf("agent %q was removed from daedalus (deprecated): restart the run with -cli <agent> naming a shipped CLI — a silent fallback would run the round on a different agent and drop its recorded session", agent)
 	case "opencode":
 		// opencode reads the prompt from piped stdin just like claude -p;
 		// --auto approves everything not explicitly denied. Plain text
@@ -60,16 +67,7 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// note, issue 137) — the flag runs a private server for this
 		// invocation instead (verified present on the host opencode
 		// 2.0.25's run subcommand).
-		return "opencode", []string{"run", "--auto", "--standalone"}, nil
-	case "amp":
-		// -x is amp's execute mode (single-shot, prompt from stdin);
-		// --dangerously-allow-all approves all tool calls. It is absent
-		// from amp's --help (only the settings key amp.dangerouslyAllowAll
-		// is documented), so its disappearance across updates is the first
-		// thing to check if amp rounds start failing on unknown flags.
-		// --stream-json-thinking implies --stream-json and adds thinking
-		// blocks, which parseAgentStream reads like claude's.
-		return "amp", []string{"-x", "--dangerously-allow-all"}, []string{"--stream-json-thinking"}
+		return "opencode", []string{"run", "--auto", "--standalone"}, nil, nil
 	case "pi":
 		// -p is pi's print mode: one prompt (piped stdin is merged into it,
 		// matching the transport below), response printed, exit. pi has no
@@ -79,7 +77,7 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// project trust is granted inside the worktree. --mode json emits
 		// JSON lines in pi's own schema (session header, message_end,
 		// usage on message_update) — a parser branch of its own
-		// (parsePiStream), unlike amp whose events reuse claude's.
+		// (parsePiStream).
 		// Auth rides the provider env vars (ANTHROPIC_API_KEY, ...) the
 		// worker already exports — except the openai section, whose env
 		// vars pi only half-reads (key yes, base URL no): those rounds are
@@ -92,7 +90,7 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// keep auth.json clean or aligned. The same mount is what makes
 		// the session tracking below work: the host sees
 		// ~/.pi/agent/sessions.
-		return "pi", []string{"-p"}, []string{"--mode", "json"}
+		return "pi", []string{"-p"}, []string{"--mode", "json"}, nil
 	case "codex":
 		// codex exec is the headless entry: it reads the prompt from piped
 		// stdin like claude -p (probe-verified banner, codex-cli 0.160.0:
@@ -108,7 +106,7 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// section is bridged per invocation by stageCodexProvider, and the
 		// state dir the jail must bridge for auth and session tracking is
 		// resolved by codexJailMounts.
-		return "codex", []string{"exec", "--dangerously-bypass-approvals-and-sandbox"}, nil
+		return "codex", []string{"exec", "--dangerously-bypass-approvals-and-sandbox"}, nil, nil
 	case "hands":
 		// `hands round` is the headless entry: it reads the prompt from
 		// piped stdin like claude -p (probe-verified 2026-10-25 on the
@@ -122,9 +120,9 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// per round through the jail mount (handsJailMounts +
 		// stageHandsProvider), not through env vars: hands reads its
 		// provider exclusively from $HOME/.config/hands/config.yaml.
-		return "hands", []string{"round", "--format", "json"}, nil
+		return "hands", []string{"round", "--format", "json"}, nil, nil
 	case "aider":
-		// DEPRECATED, amp-parity: it keeps working exactly as it does
+		// DEPRECATED: it keeps working exactly as it does
 		// today, but it is no longer changed or maintained — no new flags,
 		// fixes, or probes. Its known gaps are accepted limitations, not
 		// work items: no id-addressable resume (below), openai-only model
@@ -155,17 +153,17 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string) {
 		// jail masks ./.env to empty (probe-verified) and ~/.env is not
 		// among the bridged home dirs, so the exports stand. The flag
 		// set is verified against the aider installed on this host
-		// (0.86.2) — like amp's --dangerously-allow-all, a rename across
-		// releases is the first thing to check if aider rounds start
-		// failing on unknown flags. Model selection (--model
+		// (0.86.2) — a rename across releases is the first thing to check
+		// if aider rounds start failing on unknown flags. Model selection
+		// (--model
 		// openai/<model>) and the jail mounts for aider's uv install are
 		// wired per-round in runJailedRound — both depend on the round's
 		// provider env and the host install, not on this fixed flag set.
 		return "aider", []string{"--yes-always", "--no-auto-commits", "--no-gitignore",
 			"--chat-history-file", ".daedalus-aider/chat.history.md",
-			"--input-history-file", ".daedalus-aider/input.history"}, nil
+			"--input-history-file", ".daedalus-aider/input.history"}, nil, nil
 	default:
-		return "claude", []string{"-p", "--dangerously-skip-permissions"}, []string{"--output-format", "json"}
+		return "claude", []string{"-p", "--dangerously-skip-permissions"}, []string{"--output-format", "json"}, nil
 	}
 }
 
@@ -311,7 +309,7 @@ func codexJailMounts() ([]string, error) {
 // root), ~/.local/share otherwise; like codexJailMounts the dir is mapped
 // read-write at its host path so the child's own resolution lands on it,
 // which requires the child to see the same XDG_DATA_HOME — the caller
-// passes it through with --env (the amp pattern) when set. The accepted
+// passes it through with --env (the provider-rider pattern) when set. The accepted
 // trade is pi's and codex's: the bridged dir carries opencode's
 // auth.json, so host login state reaches jailed rounds read-write.
 // ponytail: assembled but never probed against a real ai-jail — this
@@ -345,7 +343,7 @@ func opencodeJailMounts() ([]string, error) {
 // (on its run subcommand). codex and hands have no flag — their resumes
 // are subcommands nested under exec/round (`codex exec resume <id>`,
 // `hands resume <id>`), composed whole by agentResumeArgs, and "" marks
-// that. ok is false for agents with no id-addressable resume (amp, aider —
+// that. ok is false for agents with no id-addressable resume (aider —
 // aider's chat history persists to a markdown file, not anything
 // id-addressable), whose rounds ignore a set SessionID and always start
 // fresh.
@@ -380,17 +378,17 @@ func agentResumeArgs(agent, id string, agentArgs []string) []string {
 	flag, _ := agentResumeFlag(agent)
 	switch agent {
 	case "opencode":
-		_, headless, _ := jailedAgentCLI(agent)
+		_, headless, _, _ := jailedAgentCLI(agent)
 		// -s belongs to the run subcommand: it composes right after the
 		// subcommand head, before the rest of the headless set.
 		return append([]string{headless[0], flag, id}, headless[1:]...)
 	case "codex":
-		_, headless, _ := jailedAgentCLI(agent)
+		_, headless, _, _ := jailedAgentCLI(agent)
 		// The resume subcommand nests under exec; the rest of the headless
 		// set trails.
 		return append([]string{headless[0], "resume", id, "-"}, headless[1:]...)
 	case "hands":
-		_, headless, _ := jailedAgentCLI(agent)
+		_, headless, _, _ := jailedAgentCLI(agent)
 		// resume replaces the round subcommand head; the format flags
 		// trail so the resumed stream stays typed like a fresh one.
 		return append([]string{"resume", id}, headless[1:]...)
@@ -700,6 +698,285 @@ func windowPreflight(prompt string, env []string, selected string) error {
 		ErrPromptOverWindow, selected, estimate, window, windowPreflightReserve, budget)
 }
 
+// agentServingChannel names the wire an agent's rounds dial by default:
+// claude is the anthropic wire's only native client; pi, codex, opencode,
+// and aider speak only the openai wire (the same channel split
+// config.AgentWireConflict enforces at the launch gate); hands takes
+// either wire through its staged provider block, so it has no
+// unconditional default — its grants derive from the staged env URLs
+// alone. "" means no serving channel.
+func agentServingChannel(agent string) string {
+	switch agent {
+	case "claude":
+		return "anthropic"
+	case "pi", "codex", "opencode", "aider":
+		return "openai"
+	}
+	return ""
+}
+
+// jailEgressHosts derives the round's filtered-egress grants from the
+// round env (call it after metricsRoundEnv, so relay-staged rounds
+// classify correctly). Each staged base URL — anthropic, openai
+// (OPENAI_API_BASE is the legacy spelling), the round's GOPROXY entries, and
+// its HTTPS_PROXY — classifies three ways by its literal target. A
+// loopback listener the jail can bridge (localhost / 127.0.0.1 — the
+// metrics relay, an operator's local gateway) gets --forward-port <port>:
+// the sandbox's own loopback is not the host's, and ai-jail denies
+// loopback egress even under --allow-private-host; --forward-port exposes
+// only the host's 127.0.0.1:PORT, so a loopback URL on any other address
+// (127.0.0.2, ::1) targets a listener that does not exist — a strict
+// target fails the round (no reachable grant exists), a best-effort one
+// skips. A literal-IP target resolving private/CGNAT (RFC1918, ULA,
+// 100.64/10) gets --allow-private-host — plain --allow-host denies
+// private-resolving hosts, so a LAN relay deployment would silently fail
+// its grant — while a public host gets plain --allow-host; hostnames
+// always stay plain --allow-host (no per-round DNS classification). A
+// literal link-local/metadata target (169.254/16 incl. the cloud
+// metadata endpoint, fe80::/10) has no reachable grant — ai-jail denies
+// it under both flags — so a strict target fails the round and a
+// best-effort one skips. The agent's serving channel gets its public API
+// host (api.anthropic.com for claude, api.openai.com for the openai-wire
+// agents) when that channel stages no base URL — the keyless ambient
+// posture and the default-authed otel path both stage none, and preset
+// reliance would leave the grant absent on ai-jail versions that inject
+// nothing. Duplicate grants collapse (both sections behind one relay
+// stage the same listener). captureEndpoint is the resolved metrics
+// capture URL metricsRoundEnv selected — claude stages it into the env
+// (OTEL_EXPORTER_OTLP_METRICS_ENDPOINT) but codex rides it as argv -c
+// overrides, so the env cannot carry it for every agent and the value
+// passes through explicitly. Strictness follows the serving channel: a
+// staged URL on the channel the agent actually dials (both, for hands,
+// whose staged provider takes either family) fails the round before
+// launch when it carries no usable target — a grant derived from it would
+// be a guess — while the unused channel's malformed URL skips silently.
+// The capture endpoint, GOPROXY, and HTTPS_PROXY are best-effort (cold
+// module fetch, proxied egress, and metrics capture keep working when
+// parseable, silently skipped when not — the capture endpoint is loopback
+// by construction, the others are operator ambients, none a
+// daedalus-staged contract), and a loopback URL without a port is
+// likewise skipped when their scheme names no derivable port (a portless
+// http/https loopback URL forwards its scheme-default port instead).
+func jailEgressHosts(env []string, agent string, captureEndpoint string) (hosts []string, privateHosts []string, ports []int, err error) {
+	var portSeen map[int]bool
+	seen := map[string]bool{}
+	addHost := func(h string) {
+		if !seen[h] {
+			seen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	addPrivateHost := func(h string) {
+		if !seen[h] {
+			seen[h] = true
+			privateHosts = append(privateHosts, h)
+		}
+	}
+	addPort := func(p string) {
+		n, perr := strconv.Atoi(p)
+		if perr != nil || n <= 0 || portSeen[n] {
+			return
+		}
+		if portSeen == nil {
+			portSeen = map[int]bool{}
+		}
+		portSeen[n] = true
+		ports = append(ports, n)
+	}
+	// grant classifies one raw URL into its argv grant; an unusable target
+	// errors for strict URLs (the agent's serving channel) and skips for
+	// best-effort ones.
+	grant := func(raw string, name string, strict bool) error {
+		if raw == "" {
+			return nil
+		}
+		u, perr := url.Parse(raw)
+		host := ""
+		if perr == nil {
+			host = u.Hostname()
+		}
+		if host == "" {
+			if strict {
+				return fmt.Errorf("%s %q carries no host for the jail's filtered egress", name, raw)
+			}
+			return nil
+		}
+		if host == "localhost" || host == "127.0.0.1" {
+			port := u.Port()
+			if port == "" {
+				// A portless URL still names a concrete listener through
+				// its scheme default — resolve it, or a strict round would
+				// silently launch into a doomed dial. Only a scheme-less
+				// or unknown-scheme URL keeps the skip (best-effort) or
+				// fails loud (strict): there is no port to derive.
+				switch u.Scheme {
+				case "http":
+					port = "80"
+				case "https":
+					port = "443"
+				default:
+					if strict {
+						return fmt.Errorf("%s %q points at loopback %q with no derivable port for --forward-port", name, raw, host)
+					}
+					return nil
+				}
+			}
+			addPort(port)
+			return nil
+		}
+		if isLoopbackHost(host) {
+			// A loopback address --forward-port cannot bridge (it exposes
+			// only the host's 127.0.0.1): no reachable grant exists, and
+			// ai-jail denies loopback egress outright.
+			if strict {
+				return fmt.Errorf("%s %q points at loopback address %q, which the jail cannot bridge (--forward-port exposes only the host's 127.0.0.1)", name, raw, host)
+			}
+			return nil
+		}
+		// Literal-IP targets split further: private/CGNAT addresses are
+		// denied by plain --allow-host (only --allow-private-host permits
+		// resolving there), while link-local/metadata addresses are denied
+		// under both flags — no reachable grant exists. Hostnames stay
+		// plain --allow-host: no per-round DNS classification.
+		if addr, aerr := netip.ParseAddr(host); aerr == nil {
+			if addr.IsPrivate() || cgnatRange.Contains(addr) {
+				addPrivateHost(host)
+				return nil
+			}
+			if addr.IsLinkLocalUnicast() {
+				if strict {
+					return fmt.Errorf("%s %q points at link-local address %q, which ai-jail denies under both --allow-host and --allow-private-host", name, raw, host)
+				}
+				return nil
+			}
+		}
+		addHost(host)
+		return nil
+	}
+	channel := agentServingChannel(agent)
+	anthropicStrict := channel == "anthropic" || agent == "hands"
+	openaiStrict := channel == "openai" || agent == "hands"
+	anthropicRaw := envLookup(env, "ANTHROPIC_BASE_URL")
+	if err := grant(anthropicRaw, "ANTHROPIC_BASE_URL", anthropicStrict); err != nil {
+		return nil, nil, nil, err
+	}
+	openaiRaw := envLookup(env, "OPENAI_BASE_URL")
+	if openaiRaw == "" {
+		openaiRaw = envLookup(env, "OPENAI_API_BASE")
+	}
+	if err := grant(openaiRaw, "OPENAI base URL", openaiStrict); err != nil {
+		return nil, nil, nil, err
+	}
+	// The serving channel's public API host rides when and only when that
+	// channel carries no staged base URL: the keyless ambient posture
+	// stages none, and neither does a default-authed otel round (the otel
+	// path skips the relay rewrite entirely, so it gets the channel
+	// default beside its capture forward-port). A staged URL — custom or
+	// relay-rewritten — suppresses the default: a custom round grants its
+	// own host only, a relay-staged round gets the forward-port only, no
+	// provider escape hatch beside the relay. Trigger is per-channel URL
+	// absence, never whole-env emptiness or credential presence.
+	switch channel {
+	case "anthropic":
+		if anthropicRaw == "" {
+			addHost("api.anthropic.com")
+		}
+	case "openai":
+		if openaiRaw == "" {
+			addHost("api.openai.com")
+		}
+		// The documented pi posture: a bare anthropic key reaches pi
+		// through the exported env — the public base with that key — even
+		// though pi never reads an anthropic base URL. When that
+		// credential is staged without an anthropic URL, the round dials
+		// api.anthropic.com, so the anthropic default rides beside the
+		// openai one.
+		if anthropicRaw == "" && anthropicCredentialStaged(env) {
+			addHost("api.anthropic.com")
+		}
+	case "":
+		// hands takes either wire through its staged provider block, whose
+		// url is optional — absent means the channel's own public default,
+		// the same key-alone posture as claude. Whichever channel stages a
+		// credential without a URL grants that channel's public host.
+		if agent == "hands" {
+			if anthropicRaw == "" && anthropicCredentialStaged(env) {
+				addHost("api.anthropic.com")
+			}
+			if openaiRaw == "" && openaiCredentialStaged(env) {
+				addHost("api.openai.com")
+			}
+		}
+	}
+	// The capture endpoint classifies the same way, from the resolved
+	// value metricsRoundEnv surfaced: the agent-native metrics path dials
+	// it from inside the sandbox, it is the relay's loopback listener by
+	// construction, and for codex it rides argv overrides the env never
+	// carries — so the explicit value, not an env lookup, is the source.
+	_ = grant(captureEndpoint, "metrics capture endpoint", false)
+	// Best-effort: the go module proxy's every CSV entry that parses to a
+	// usable URL (a mid-round fallthrough from the head to a later mirror
+	// must not die on egress; direct/off and other non-URL segments skip)
+	// and the https proxy (uppercase first, net/http's precedence — a
+	// lowercase-spelled worker must not route provider dials through an
+	// ungranted host). Scheme-less proxy values ("127.0.0.1:8080") parse
+	// without a host and skip — an operator proxy for jailed egress must
+	// carry its scheme. GOTOOLCHAIN gets nothing: a cold toolchain
+	// download is rare and fails loud.
+	if roundEnvCarries(env, "GOPROXY") {
+		for _, seg := range strings.Split(envLookup(env, "GOPROXY"), ",") {
+			_ = grant(strings.TrimSpace(seg), "GOPROXY", false)
+		}
+	}
+	proxy := envLookup(env, "HTTPS_PROXY")
+	if proxy == "" {
+		proxy = envLookup(env, "https_proxy")
+	}
+	if proxy != "" {
+		_ = grant(proxy, "HTTPS_PROXY", false)
+	}
+	return hosts, privateHosts, ports, nil
+}
+
+// anthropicCredentialStaged reports whether the round env carries an
+// anthropic credential or model var — the staged shapes that dial the
+// anthropic public base when no custom URL rides with them.
+func anthropicCredentialStaged(env []string) bool {
+	return roundEnvCarries(env, "ANTHROPIC_API_KEY") || roundEnvCarries(env, "ANTHROPIC_MODEL") || roundEnvCarries(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL")
+}
+
+// openaiCredentialStaged is the openai-wire counterpart.
+func openaiCredentialStaged(env []string) bool {
+	return roundEnvCarries(env, "OPENAI_API_KEY") || roundEnvCarries(env, "OPENAI_MODEL")
+}
+
+// cgnatRange is the CGNAT block (100.64.0.0/10): netip's IsPrivate does
+// not cover it, and ai-jail's --allow-host denies it alongside the
+// RFC1918/ULA private ranges --allow-private-host permits.
+var cgnatRange = netip.MustParsePrefix("100.64.0.0/10")
+
+// isLoopbackHost reports whether h is a loopback address: the whole 127/8
+// range and ::1 included, which a bare string comparison would miss.
+// Loopback alone is not forwardable — --forward-port exposes only the
+// host's 127.0.0.1 — so the caller splits the two cases.
+func isLoopbackHost(h string) bool {
+	if ip, err := netip.ParseAddr(h); err == nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// roundEnvAllowNames caches the sandbox spawn-gate allowlist: RoundEnvVars
+// rebuilds its slice per call, and the carries/host checks below run per
+// rider and per provider trigger on every round.
+var roundEnvAllowNames = sync.OnceValue(config.RoundEnvVars)
+
+// roundEnvCarries reports whether name both survives the sandbox spawn
+// gate (config.RoundEnvVars) and is present with a value in the round env.
+func roundEnvCarries(env []string, name string) bool {
+	return envLookup(env, name) != "" && slices.Contains(roundEnvAllowNames(), name)
+}
+
 // runJailedRound is runJailedKind's single invocation against one provider's
 // environment. A tracked round (non-empty role) also snapshots the CLI's
 // transcript dir before spawn and records any transcript the round's
@@ -728,14 +1005,17 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// selector dispatches on the resolved binary (claude/codex stage the
 	// agent-native OTLP path when metrics is on and the binary is new
 	// enough — see metricsRoundEnv).
-	selected, headless, _ := jailedAgentCLI(agent)
+	selected, headless, _, cliErr := jailedAgentCLI(agent)
+	if cliErr != nil {
+		return jailResult{}, cliErr
+	}
 	// Metrics staging: select the round's capture path and stage it — the
 	// agent-native OTLP path (otelArgs carries codex's -c overrides for
 	// the argv build below) or the metrics daemon's relay (staged path
 	// prefix, synthetic attribution key on keyed rounds). A no-op when the
 	// relay vars are absent — metrics disabled, or an endpoint override
-	// removed them upstream (see metricsRoundEnv).
-	env, otelArgs := metricsRoundEnv(ctx, env, role, selected)
+	// removed them upstream (see metricsRoundEnv). The staging runs above
+	// the slot wait (see the derivation block there).
 	// opencode, codex, and hands resumed rounds arrive with the whole
 	// post-`--` argv precomposed (agentResumeArgs — their resume tokens
 	// follow the subcommand, which replaces or nests under the fresh
@@ -766,6 +1046,17 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	if err := windowPreflight(prompt, env, selected); err != nil {
 		return jailResult{}, err
 	}
+	// Metrics staging and the egress derivation hoist above the slot wait
+	// alongside the window preflight: both read only the round env (and
+	// the resolved CLI), and a round doomed by a broken egress target must
+	// fail before queueing for a concurrency slot it can never use — the
+	// same rationale windowPreflight's comment carries. otelArgs carries
+	// codex's -c overrides for the argv build below.
+	env, otelArgs, captureEndpoint := metricsRoundEnv(ctx, env, role, selected)
+	hosts, privateHosts, ports, egressErr := jailEgressHosts(env, selected, captureEndpoint)
+	if egressErr != nil {
+		return jailResult{}, egressErr
+	}
 	lim := agentLimiter()
 	hbDone := make(chan struct{})
 	defer close(hbDone)
@@ -790,7 +1081,41 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// duplicate-regrowth class and the round4-era in-diff .ai-jail hunks
 	// (probe-verified 2026-10-09 on 2.8.1: with the flag, no .ai-jail is
 	// written at all).
-	args := []string{"--worktree", "--network", "--no-save-config"}
+	args := []string{"--worktree", "--no-save-config"}
+	// Filtered egress replaces the old hardcoded --network: ai-jail 3.x
+	// makes --network unrestricted and mutually exclusive with
+	// --allow-host, and its harness presets inject --allow-host
+	// api.anthropic.com on their own — an argv conflict that killed every
+	// jailed round at execve. The grants derive above the slot wait (see
+	// jailEgressHosts there) from the round env — the per-attempt product
+	// of provider failover and metrics staging — so a failover swap of
+	// ANTHROPIC_BASE_URL re-derives the grant.
+	for _, h := range hosts {
+		args = append(args, "--allow-host", h)
+	}
+	// Literal private/CGNAT targets (a LAN relay deployment) need the
+	// private-resolving variant: plain --allow-host denies them.
+	for _, h := range privateHosts {
+		args = append(args, "--allow-private-host", h)
+	}
+	for _, p := range ports {
+		args = append(args, "--forward-port", strconv.Itoa(p))
+	}
+	// Env riders (--env NAME copies the value from this invocation env):
+	// ai-jail's default passthrough strips every variable without an
+	// explicit rider — provider keys and base URLs, the otel capture set,
+	// claude's token knobs, the proxy and go-fetch ambients — so every
+	// member of the spawn gate's vouch list present in the round env
+	// rides. RoundEnvVars is complete by construction: a var that reaches
+	// the invocation env is one the gate already vouched for, and one an
+	// ambient worker-env stray outside the list can never enter (the
+	// gate-cached lookup below never names it). Gated on presence, so the
+	// argv stays byte-identical when a var is unstaged.
+	for _, name := range roundEnvAllowNames() {
+		if envLookup(env, name) != "" {
+			args = append(args, "--env", name)
+		}
+	}
 	// Mask the worktree's .claude/settings*.json: Claude Code applies a
 	// repo-committed settings file's env block over process env — a stale
 	// ANTHROPIC_AUTH_TOKEN there authenticated every jailed round as the
@@ -832,14 +1157,6 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	args = append(args, "--mask", ".claude/settings.json",
 		"--mask", ".claude/settings.local.json",
 		"--mask", filepath.Join(home, ".claude", "settings.json"))
-	// amp's host login state (~/.config/amp) is not among ai-jail's
-	// agent-state dirs and AMP_API_KEY is not in its default env allowlist,
-	// so neither documented auth route reaches the jailed child on a stock
-	// jail. --env copies the value from this process's environment (set
-	// below), making the key route work without operator jail config.
-	if selected == "amp" && os.Getenv("AMP_API_KEY") != "" {
-		args = append(args, "--env", "AMP_API_KEY")
-	}
 	// ai-jail has no aider preset: its generic passthrough blank-slates
 	// /home/hugo, where aider's entire uv-tools install lives, so the round
 	// would die at execve before aider's own code runs (wa-termo
@@ -855,34 +1172,28 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// ai-jail has no codex preset: its agent-state dirs bridge ~/.claude
 	// and ~/.pi, not ~/.codex — map the state dir in read-write before
 	// launch (codexJailMounts), or the round can neither authenticate nor
-	// record the session a retry would resume. CODEX_HOME rides the amp
-	// pattern (--env copies the value from this process's environment)
-	// when the operator set it: the mount follows the var host-side, so
-	// the jailed codex must resolve the same dir — without it the child
-	// falls back to $HOME/.codex and misses the mounted state entirely.
+	// record the session a retry would resume. CODEX_HOME rides the generic
+	// vouched-env rider loop (the mount follows the var host-side, so the
+	// jailed codex must resolve the same dir — without it the child falls
+	// back to $HOME/.codex and misses the mounted state entirely).
 	if selected == "codex" {
 		mounts, err := codexJailMounts()
 		if err != nil {
 			return jailResult{}, err
 		}
 		args = append(args, mounts...)
-		if os.Getenv("CODEX_HOME") != "" {
-			args = append(args, "--env", "CODEX_HOME")
-		}
 	}
 	// Same for opencode: its session database (and auth.json) lives under
 	// the data home (opencodeJailMounts), and an operator-set
-	// XDG_DATA_HOME must reach the child or it resolves a different root
-	// than the one mounted.
+	// XDG_DATA_HOME reaches the child through the generic vouched-env
+	// rider loop — or it would resolve a different root than the one
+	// mounted.
 	if selected == "opencode" {
 		mounts, err := opencodeJailMounts()
 		if err != nil {
 			return jailResult{}, err
 		}
 		args = append(args, mounts...)
-		if os.Getenv("XDG_DATA_HOME") != "" {
-			args = append(args, "--env", "XDG_DATA_HOME")
-		}
 	}
 	// Same for hands: ai-jail's agent-state dirs bridge ~/.claude and ~/.pi,
 	// not ~/.config/hands — and the provider config the child reads must be
@@ -890,8 +1201,10 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// dir (stageHandsProvider writes into it below) mounts read-write onto
 	// the real path, so the child reads the staged provider and its session
 	// store lands back in the scratch — per-worktree resume state that
-	// survives a worker restart and stays out of git (see handsJailMounts;
-	// no env var hands reads exists, so no --env rides).
+	// survives a worker restart and stays out of git (see handsJailMounts).
+	// hands carries the generic vouched-env riders like every agent; unlike
+	// every other agent no builder --env beyond them exists — its whole
+	// provider bridge is the staged file.
 	if selected == "hands" {
 		mounts, err := handsJailMounts(worktreePath)
 		if err != nil {
@@ -1150,8 +1463,8 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// gains `--thinking-tokens 0` (argv, like --model — its --help
 	// documents that 0 disables); claude's round env gains
 	// MAX_THINKING_TOKENS=0 (verified in binary 2.1.283's own code: 0
-	// selects {type:"disabled"}). opencode and amp have no verified off
-	// lever and ignore the setting. The flags are appended here rather
+	// selects {type:"disabled"}). opencode has no verified off lever and
+	// ignores the setting. The flags are appended here rather
 	// than in jailedAgentCLI so discovery and every other caller of that
 	// function stay flag-blind.
 	if os.Getenv("DAEDALUS_THINKING") == "off" {
@@ -1221,8 +1534,8 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// the new one (claude: its transcript dir; pi: its per-worktree session
 	// dir; codex: its rollout tree, arbitrated per worktree by the
 	// recorded cwd; opencode: its session database, listed by shelling out
-	// — amp and aider create nothing the watcher would find, so the claude
-	// snapshot stays harmless for them). If the source cannot be read,
+	// — aider creates nothing the watcher would find, so the claude
+	// snapshot stays harmless for it). If the source cannot be read,
 	// tracking stays off for the round (known stays nil) rather than risk
 	// recording an old session. The capture itself is the session state on
 	// disk — not anything the round printed: pi's json output carries
@@ -1316,7 +1629,7 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	appendTaskLog(ctx, fmt.Sprintf("jailed %s round exited after %s",
 		selected, time.Since(start).Round(time.Second)), body)
 	// Structured api_error classification: the CLI's own machine-readable
-	// report (claude/amp result JSON, pi json stream) of a round that died
+	// report (claude result JSON, pi json stream) of a round that died
 	// on a provider error. It routes into ErrAPIExhausted — whose path is
 	// the rescue: immediate failover to the other provider here, then the
 	// workflow's hourly heartbeat and, past its ceiling, a park to the
@@ -1672,7 +1985,7 @@ var apiExhaustionMarkers = []string{
 // exhaustion match on a failed round's output and are the only
 // classification a clean-exiting plain-text round can get (see the
 // success-path check in runJailedRoundFolders). The structured faces
-// (claude/amp result JSON, pi json stream) never depend on these — text an
+// (claude result JSON, pi json stream) never depend on these — text an
 // agent printed cannot decide their rounds.
 var apiErrorTextMarkers = []string{
 	"litellm.internalservererror",

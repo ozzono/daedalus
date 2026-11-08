@@ -89,7 +89,6 @@ echo "ENV:ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" >> "$STUB_LOG"
 echo "ENV:ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL" >> "$STUB_LOG"
 echo "ENV:ANTHROPIC_MODEL=$ANTHROPIC_MODEL" >> "$STUB_LOG"
 echo "ENV:ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_DEFAULT_HAIKU_MODEL" >> "$STUB_LOG"
-echo "ENV:AMP_API_KEY=$AMP_API_KEY" >> "$STUB_LOG"
 echo "ENV:OPENAI_BASE_URL=$OPENAI_BASE_URL" >> "$STUB_LOG"
 echo "ENV:OPENAI_API_BASE=$OPENAI_API_BASE" >> "$STUB_LOG"
 echo "ENV:OPENAI_API_KEY=$OPENAI_API_KEY" >> "$STUB_LOG"
@@ -98,6 +97,7 @@ echo "ENV:OPENCODE_CONFIG=$OPENCODE_CONFIG" >> "$STUB_LOG"
 echo "ENV:AIDER_MODEL=$AIDER_MODEL" >> "$STUB_LOG"
 echo "ENV:AIDER_WEAK_MODEL=$AIDER_WEAK_MODEL" >> "$STUB_LOG"
 echo "ENV:AIDER_EDITOR_MODEL=$AIDER_EDITOR_MODEL" >> "$STUB_LOG"
+env | sed 's/^/ENV:/' >> "$STUB_LOG"
 ` + body + "\n"
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -266,6 +266,29 @@ func assertArgs(t *testing.T, got, want []string, context string) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("%s args = %v, want %v", context, got, want)
 	}
+}
+
+// roundEnvRiders computes the --env rider segment the jail composition
+// emits for a recorded call: every config.RoundEnvVars member present in
+// the call's environment rides, in RoundEnvVars order — production
+// iterates the same allowlist over the same post-allowlist env, so this
+// is exactly the emitted segment. Hermeticity choice for the exact-argv
+// pins: the rider collapse vouches the whole ambient base (PATH, HOME,
+// USER, …), which varies per host — computing the segment from the
+// recorded env keeps the pins host-stable while still pinning the
+// contract ("RoundEnvVars ∩ round env rides, in vouch order") instead of
+// enumerating one host's ambient set. Names in except are skipped — for a
+// var staged onto the env only after argv composition (the opencode
+// bridge's OPENCODE_CONFIG, which rides the bridge's own --env), where
+// the recorded env carries it but the composed rider set does not.
+func roundEnvRiders(env map[string]string, except ...string) []string {
+	var riders []string
+	for _, name := range config.RoundEnvVars() {
+		if env[name] != "" && !slices.Contains(except, name) {
+			riders = append(riders, "--env", name)
+		}
+	}
+	return riders
 }
 
 // contains reports whether any argument in args contains substr.
@@ -961,7 +984,7 @@ func TestRunJailedGenuineFailureNotRescued(t *testing.T) {
 // TestAgentAPIErrorClassify pins agentAPIError's classification table:
 // only a structured report decides — pi's last message_end (an error still
 // standing at stream end, its errorMessage or a shape fallback), the
-// claude/amp result event, hands's last retriable failed event — and chat
+// claude result event, hands's last retriable failed event — and chat
 // text or unstructured agents never do.
 func TestAgentAPIErrorClassify(t *testing.T) {
 	cases := []struct {
@@ -977,9 +1000,6 @@ func TestAgentAPIErrorClassify(t *testing.T) {
 			`{"type":"result","result":"done"}`, ""},
 		{"claude non-result events ignored", "claude",
 			"not json\n" + `{"type":"system","subtype":"init"}`, ""},
-		{"amp rides the claude face", "amp",
-			`{"type":"result","terminal_reason":"api_error"}`,
-			"terminal_reason api_error"},
 		{"pi error standing", "pi",
 			`{"type":"message_end","message":{"stopReason":"error","errorMessage":"p500"}}`, "p500"},
 		{"pi error standing without a message", "pi",
@@ -1336,24 +1356,32 @@ func TestRunJailedClaudeActivity(t *testing.T) {
 	}
 	// The prompt must travel via stdin, not argv; the agent runs with json
 	// output so its text comes back structured (stream-json needs
-	// --verbose, which ai-jail's flag guard rejects).
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"claude",
-		"--output-format",
-		"json",
-		"-p",
-		"--dangerously-skip-permissions",
-	}, "ai-jail")
+	// --verbose, which ai-jail's flag guard rejects). The rider segment is
+	// computed from the recorded env (see roundEnvRiders): with the staged
+	// key it is the ambient base plus ANTHROPIC_API_KEY, in vouch order.
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{
+			"--worktree",
+			"--no-save-config",
+			"--allow-host",
+			"api.anthropic.com",
+		},
+		roundEnvRiders(calls[0].Env),
+		[]string{
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t),
+			"--",
+			"claude",
+			"--output-format",
+			"json",
+			"-p",
+			"--dangerously-skip-permissions",
+		},
+	), "ai-jail")
 	if calls[0].Stdin != "fix the bug" {
 		t.Errorf("ai-jail stdin = %q, want the prompt", calls[0].Stdin)
 	}
@@ -1399,25 +1427,28 @@ func TestRunJailedClaudeActivityResume(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"claude",
-		"--resume",
-		"sess-7",
-		"--output-format",
-		"json",
-		"-p",
-		"--dangerously-skip-permissions",
-	}, "ai-jail")
+	// Nothing is staged, and the anthropic channel default still fires —
+	// the trigger is the channel's URL absence, not credential presence.
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.anthropic.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t),
+			"--",
+			"claude",
+			"--resume",
+			"sess-7",
+			"--output-format",
+			"json",
+			"-p",
+			"--dangerously-skip-permissions",
+		},
+	), "ai-jail")
 }
 
 // TestRunJailedClaudeActivityMasksHomeSettings pins that the operator-level
@@ -1450,17 +1481,18 @@ func TestRunJailedClaudeActivityMasksHomeSettings(t *testing.T) {
 	if cutoff < 0 {
 		t.Fatalf("ai-jail args have no -- separator: %q", args)
 	}
-	assertArgs(t, args[:cutoff], []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		filepath.Join(home, ".claude", "settings.json"),
-	}, "ai-jail pre-agent flags")
+	assertArgs(t, args[:cutoff], slices.Concat(
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.anthropic.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			filepath.Join(home, ".claude", "settings.json"),
+		},
+	), "ai-jail pre-agent flags")
 }
 
 // TestRunJailedClaudeActivityHomeUnresolved pins the fail-fast path: an
@@ -1488,8 +1520,7 @@ func TestRunJailedClaudeActivityHomeUnresolved(t *testing.T) {
 // compose: opencode and codex take their resume tokens after the run/exec
 // subcommand, so the activity hands over the whole post-`--` argv
 // (agentResumeArgs — subcommand and headless flags embedded, and codex's
-// provider staging still trails the headless set); amp has no
-// id-addressable resume and starts fresh rather than pass an unknown flag.
+// provider staging still trails the headless set).
 func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
 	t.Run("opencode resumes via run -s", func(t *testing.T) {
 		scrubBugFilingEnv(t)
@@ -1513,13 +1544,14 @@ func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
 		if len(calls) != 1 {
 			t.Fatalf("ai-jail called %d times, want 1", len(calls))
 		}
-		assertArgs(t, calls[0].Args, append(slices.Concat(
-			[]string{"--worktree", "--network", "--no-save-config",
-				"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
+		assertArgs(t, calls[0].Args, slices.Concat(
+			[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
 				"--mask", homeClaudeMask(t)},
 			ocMount,
-			[]string{"--", "opencode"},
-		), "run", "-s", "sess-7", "--auto", "--standalone"), "ai-jail")
+			[]string{"--", "opencode", "run", "-s", "sess-7", "--auto", "--standalone"},
+		), "ai-jail")
 	})
 
 	t.Run("codex resumes via exec resume, staging trails", func(t *testing.T) {
@@ -1531,6 +1563,7 @@ func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
 		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 		t.Setenv("OPENAI_API_KEY", "sk-local")
 		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
 
 		res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
@@ -1548,36 +1581,15 @@ func TestRunJailedClaudeActivityResumeOtherAgents(t *testing.T) {
 			t.Fatalf("ai-jail called %d times, want 1", len(calls))
 		}
 		assertArgs(t, calls[0].Args, append(slices.Concat(
-			[]string{"--worktree", "--network", "--no-save-config",
-				"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
+			[]string{"--worktree", "--no-save-config",
+				"--allow-host", "selfhost.example"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask", ".claude/settings.json", "--mask", ".claude/settings.local.json",
 				"--mask", homeClaudeMask(t)},
 			cxMount,
 			[]string{"--", "codex", "exec", "resume", "sess-7", "-",
 				"--dangerously-bypass-approvals-and-sandbox"},
 		), stagedCodexArgs("https://selfhost.example/v1", true, "glm-selfhost")...), "ai-jail")
-	})
-
-	t.Run("amp ignores the session", func(t *testing.T) {
-		log := newStubLog(t)
-		stubBin(t, "ai-jail", "echo OUTPUT; exit 0")
-		t.Setenv("DAEDALUS_AGENT", "amp")
-		t.Setenv("AMP_API_KEY", "")
-
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
-			WorktreePath: t.TempDir(),
-			Prompt:       "fix the bug",
-			SessionID:    "sess-7",
-		})
-		if err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
-		}
-		calls := readCalls(t, log)
-		if len(calls) != 1 {
-			t.Fatalf("ai-jail called %d times, want 1", len(calls))
-		}
-		if contains(calls[0].Args, "--resume") || contains(calls[0].Args, "sess-7") {
-			t.Errorf("amp round passed resume state: %v", calls[0].Args)
-		}
 	})
 }
 
@@ -1689,11 +1701,12 @@ func TestRunJailedClaudeActivityOpenCode(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
+	// opencode dials the openai wire; with no openai URL staged the
+	// channel default fires.
 	assertArgs(t, calls[0].Args, slices.Concat(
-		[]string{"--worktree",
-			"--network",
-			"--no-save-config",
-			"--mask",
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{"--mask",
 			".claude/settings.json",
 			"--mask",
 			".claude/settings.local.json",
@@ -1736,10 +1749,9 @@ func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
 	assertArgs(t, calls[0].Args, slices.Concat(
-		[]string{"--worktree",
-			"--network",
-			"--no-save-config",
-			"--mask",
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{"--mask",
 			".claude/settings.json",
 			"--mask",
 			".claude/settings.local.json",
@@ -1752,95 +1764,6 @@ func TestRunJailedClaudeActivityAgentOverride(t *testing.T) {
 			"--auto",
 			"--standalone"},
 	), "ai-jail")
-}
-
-// TestRunJailedClaudeActivityAmp pins the amp path: DAEDALUS_AGENT switches
-// to amp's headless flags and --stream-json-thinking output mode (whose
-// events parse like claude's), and a set AMP_API_KEY reaches the jail via
-// --env, by name only — never in argv. Without a key no --env is passed.
-func TestRunJailedClaudeActivityAmp(t *testing.T) {
-	scrubBugFilingEnv(t)
-	log := newStubLog(t)
-	script := `printf '%s\n' ` +
-		`'{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"plan via amp"}]}}' ` +
-		`'{"type":"assistant","message":{"content":[{"type":"text","text":"did it via amp"}]}}'; exit 0`
-	stubBin(t, "ai-jail", script)
-	t.Setenv("DAEDALUS_AGENT", "amp")
-
-	// No key: the agent still runs, just without the forwarded credential.
-	t.Setenv("AMP_API_KEY", "")
-	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
-		WorktreePath: t.TempDir(),
-		Prompt:       "fix the bug",
-	}); err != nil {
-		t.Fatalf("RunJailedClaudeActivity without a key: %v", err)
-	}
-
-	// Key set: it travels by name for ai-jail to copy from the environment.
-	t.Setenv("AMP_API_KEY", "amp-test-key")
-	result, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
-		WorktreePath: t.TempDir(),
-		Prompt:       "fix the bug",
-	})
-	if err != nil {
-		t.Fatalf("RunJailedClaudeActivity: %v", err)
-	}
-	if result.Thinking != "plan via amp" {
-		t.Errorf("result.Thinking = %q, want the stream's thinking block", result.Thinking)
-	}
-	if result.Text != "did it via amp" {
-		t.Errorf("result.Text = %q, want the stream's text block", result.Text)
-	}
-
-	calls := readCalls(t, log)
-	if len(calls) != 2 {
-		t.Fatalf("ai-jail called %d times, want 2", len(calls))
-	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"amp",
-		"--stream-json-thinking",
-		"-x",
-		"--dangerously-allow-all",
-	}, "ai-jail without a key")
-	assertArgs(t, calls[1].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--env",
-		"AMP_API_KEY",
-		"--",
-		"amp",
-		"--stream-json-thinking",
-		"-x",
-		"--dangerously-allow-all",
-	}, "ai-jail with a key")
-	if calls[1].Env["AMP_API_KEY"] != "amp-test-key" {
-		t.Errorf("ai-jail AMP_API_KEY = %q, want carried via the environment", calls[1].Env["AMP_API_KEY"])
-	}
-	for _, call := range calls {
-		if contains(call.Args, "amp-test-key") {
-			t.Errorf("API key leaked into argv: %v", call.Args)
-		}
-		if call.Stdin != "fix the bug" {
-			t.Errorf("ai-jail stdin = %q, want the prompt", call.Stdin)
-		}
-	}
 }
 
 // TestRunJailedClaudeActivityWithoutKey pins the no-key behavior: an unset
@@ -2100,10 +2023,9 @@ exit 0`)
 		t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 	}
 	assertArgs(t, calls[6].Args, slices.Concat(
-		[]string{"--worktree",
-			"--network",
-			"--no-save-config",
-			"--mask",
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+		roundEnvRiders(calls[6].Env),
+		[]string{"--mask",
 			".claude/settings.json",
 			"--mask",
 			".claude/settings.local.json",
@@ -2235,25 +2157,26 @@ exit 0`)
 	if len(calls) != 7 {
 		t.Fatalf("%d subprocess calls, want 7 (diff digest's add/diff HEAD/reset, then the prompt diff's add/diff HEAD/reset, then ai-jail)", len(calls))
 	}
-	assertArgs(t, calls[6].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"claude",
-		"--resume",
-		"rev-9",
-		"--output-format",
-		"json",
-		"-p",
-		"--dangerously-skip-permissions",
-	}, "ai-jail")
+	assertArgs(t, calls[6].Args, slices.Concat(
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.anthropic.com"},
+		roundEnvRiders(calls[6].Env),
+		[]string{
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t),
+			"--",
+			"claude",
+			"--resume",
+			"rev-9",
+			"--output-format",
+			"json",
+			"-p",
+			"--dangerously-skip-permissions",
+		},
+	), "ai-jail")
 }
 
 func TestFinalizeWorktreeActivity(t *testing.T) {
@@ -3039,10 +2962,9 @@ func TestNativeTestsAIDiscoveryAgentOverride(t *testing.T) {
 		t.Fatalf("called %d times, want 2 (discovery + test run)", len(calls))
 	}
 	assertArgs(t, calls[0].Args, slices.Concat(
-		[]string{"--worktree",
-			"--network",
-			"--no-save-config",
-			"--mask",
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{"--mask",
 			".claude/settings.json",
 			"--mask",
 			".claude/settings.local.json",
@@ -4457,22 +4379,23 @@ func TestRunJailedClaudeActivityPi(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("ai-jail called %d times, want 1", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"pi",
-		"--mode",
-		"json",
-		"-p",
-	}, "ai-jail")
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t),
+			"--",
+			"pi",
+			"--mode",
+			"json",
+			"-p",
+		},
+	), "ai-jail")
 	// pi implementing rounds carry the edit-discipline guardrail, appended
 	// to the round's prompt (reviewers and every other agent get the bare
 	// prompt).
@@ -4804,7 +4727,7 @@ func TestParsePiUsage(t *testing.T) {
 }
 
 // TestParseRoundOutput pins the per-CLI dispatch: pi reads its own event
-// schema, claude and amp share the claude schema, hands reads its own
+// schema, claude's stream-json is its own parse, hands reads its own
 // typed event protocol, and the plain-text CLIs (opencode, codex, aider)
 // yield nothing — the caller's cue to take the raw stdout.
 func TestParseRoundOutput(t *testing.T) {
@@ -4871,20 +4794,21 @@ func TestNativeTestsAIDiscoveryPi(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("called %d times, want 2 (discovery + test run)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"pi",
-		"-p",
-	}, "discovery jail")
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t),
+			"--",
+			"pi",
+			"-p",
+		},
+	), "discovery jail")
 }
 
 // TestNativeTestsAIDiscoveryPlainText pins the plain-text fallback: a CLI

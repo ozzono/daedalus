@@ -332,8 +332,8 @@ func parseHandsUsage(stdout string) (usage Usage) {
 
 // parseRoundOutput extracts a jailed round's chain of thought, visible
 // text, conversation session id, and raw usage metrics from its stdout,
-// dispatching on the CLI: claude and amp share the claude event schema
-// (parseAgentStream); pi emits its own JSON-lines schema (parsePiStream);
+// dispatching on the CLI: claude's event schema is parseAgentStream; pi
+// emits its own JSON-lines schema (parsePiStream);
 // hands emits its own typed event protocol (parseHandsStream); opencode,
 // codex, and aider print plain text and yield empty fields — the
 // caller's cue to take the raw stdout as the text.
@@ -361,10 +361,7 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // live). The classification is the CLI's own machine-readable report, not
 // chat text, so the caller can route it into the ErrAPIExhausted rescue
 // (immediate provider failover, then the workflow's hourly heartbeat)
-// wherever the CLI chose to put the report. amp rides the claude branch
-// on the assumption its reused schema carries the same field — unverifiable
-// here (no binary) and the diff declares amp unmaintained, so it stays an
-// assumption: if the shape differs, amp's face degrades to "" (inert).
+// wherever the CLI chose to put the report.
 // Agents without a structured stream (opencode, codex, aider) report ""
 // here; their plain-text face is matched separately (apiErrorTextMarkers).
 // hands reports through its terminal failed event, and only the class
@@ -426,7 +423,7 @@ func agentAPIError(agent, stdout string) string {
 			}
 		}
 		return errMsg
-	case "claude", "amp":
+	case "claude":
 		for line := range strings.SplitSeq(stdout, "\n") {
 			var m streamMessage
 			if json.Unmarshal([]byte(line), &m) != nil {

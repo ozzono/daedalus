@@ -49,7 +49,6 @@ GLOBAL FLAGS
 
 EXAMPLES
   $ daedalus run ./my-repo 42 "Add /health endpoint"
-  $ daedalus run -cli amp -f prompt.md ./my-repo 101
   $ daedalus guide daedalus-42 "Focus on the database migration first"
   $ daedalus worker restart all
   $ daedalus log daedalus-42
@@ -178,8 +177,8 @@ FLAGS
                           <prefix>/issue-<id>-<timestamp>, overriding the config's
                           branch_prefix (the issue part of the name stays as given).
                           Fresh runs only — rejected in append mode.
-  -cli, --cli <agent>     Jailed agent for this run: claude, opencode, amp,
-                          pi, aider (deprecated), or codex. Overrides the
+  -cli, --cli <agent>     Jailed agent for this run: claude, opencode, pi,
+                          aider (deprecated), or codex. Overrides the
                           config's agent; travels with the run's workflow
                           input, so it applies on whichever worker serves
                           the queue. Fresh runs only — rejected in append
@@ -263,7 +262,6 @@ touches the repo.
 EXAMPLES
   $ daedalus run ./my-repo 42 "Add /health endpoint"
   $ daedalus run -d ./my-repo 43 "Refactor the config loader"
-  $ daedalus run -cli amp -f prompt.md ./my-repo 101
   $ daedalus run -a daedalus-42 "Also cover the migration in tests"
 
 The printed workflow id (<task-queue>-<issue-id>, flow-scoped as
@@ -373,8 +371,8 @@ file attributes it to this worktree), newest wins — a previous run's
 stale transcripts on one side never shadow the other agent's live
 session. opencode keeps no files: its freshness comes from one "opencode
 session list" call against its session database, printed as the newest
-updated stamp with no digest — the messages stay in the database. Amp and
-aider keep no addressable session state and show "no transcripts yet"
+updated stamp with no digest — the messages stay in the database. Aider keeps
+no addressable session state and shows "no transcripts yet"
 even while running; the task log itself is complete for every agent.
 
 With -cot, prints the run's chain-of-thought logs instead of the task
@@ -384,7 +382,7 @@ read from Temporal history, never truncated. Every section opens with a
 the round's Temporal completion time ("=== round 2: dev-review (claude) @
 2026-10-05 14:32:11 UTC ==="), so consecutive rounds read as separate
 blocks instead of one unbroken blob. Rounds with a native
-thinking channel (claude, amp, pi) show their captured thinking;
+thinking channel (claude, pi) show their captured thinking;
 openai-wire rounds whose reasoning arrived inline in the answer show the
 <think>-fenced part when the model fenced it (tagless inline CoT cannot
 be told apart from the answer, so it is not guessed at); rounds with no
@@ -421,7 +419,7 @@ While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
 host-side transcript as the agent writes it — claude's and pi's, newest
 file wins. Agents whose host transcripts the
-live view does not follow (aider, opencode, codex, amp) get one line
+live view does not follow (aider, opencode, codex) get one line
 saying their CoT appears when the round completes — codex does keep a
 rollout transcript, the live view just does not read it yet. Between
 rounds there is no live section — the newest
@@ -603,7 +601,7 @@ fresh "daedalus run <repo-path>" additionally prefers the target repo's
 still wins over it; see "daedalus run --help".
 
 CONFIGURATION REFERENCE
-  agent                 Jailed agent CLI: claude, opencode, amp, pi, aider
+  agent                 Jailed agent CLI: claude, opencode, pi, aider
                         (deprecated), or codex (default claude; run
                         -cli/--cli overrides per run). Launch gate: a run
                         whose agent cannot take the config's only serving
@@ -611,8 +609,7 @@ CONFIGURATION REFERENCE
                         claude needs an anthropic channel (url, or key
                         alone on the public base); codex/opencode/aider are
                         openai-only; pi is staged on the openai channel
-                        only; amp exempt; an all-unset config never trips
-                        it
+                        only; an all-unset config never trips it
   thinking              Thinking toggle: an explicit false sends each
                         agent its own off lever (pi --thinking off, aider
                         --thinking-tokens 0, claude MAX_THINKING_TOKENS=0);
@@ -737,12 +734,12 @@ CONFIGURATION REFERENCE
                         Jailed agent context window in tokens: exported as
                         CLAUDE_CODE_MAX_CONTEXT_TOKENS for claude, and the
                         input side of aider's staged model metadata;
-                        ignored by opencode/pi/amp/codex (0 = agent default)
+                        ignored by opencode/pi/codex (0 = agent default)
   anthropic.max_output_tokens
                         Jailed agent completion cap in tokens: re-exported
                         as CLAUDE_CODE_MAX_OUTPUT_TOKENS for claude, and
                         both sides of the 8192 constant in aider's staged
-                        model metadata; ignored by opencode/pi/amp/codex (0 =
+                        model metadata; ignored by opencode/pi/codex (0 =
                         aider constant / agent API default)
   openai.top_p/presence_penalty/top_k/min_p/repetition_penalty
                         Sampler knobs for rounds served by the openai
@@ -1092,7 +1089,7 @@ invoking config's worker — its task queue — alone; there is no -q/--all.
 CLIs without a structured result (opencode, codex, aider) report only the
 worker's measured wall time: their rounds count toward ROUNDS and TIME with
 zero cost and tokens. pi's --mode json events carry usage, so its rounds
-report cost and tokens like claude's and amp's. Rounds that ran before
+report cost and tokens like claude's. Rounds that ran before
 usage capture carry no Usage at all in history and are absent from the
 slices entirely, not zeroed.
 

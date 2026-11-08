@@ -704,6 +704,7 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 		t.Setenv("OPENAI_API_KEY", "sk-local")
 		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
 		wt := gitRepo(t)
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
@@ -723,9 +724,11 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 		dst := filepath.Join(home, ".config", "hands")
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
-				"--network",
 				"--no-save-config",
-				"--mask",
+				"--allow-host",
+				"selfhost.example"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask",
 				".claude/settings.json",
 				"--mask",
 				".claude/settings.local.json",
@@ -740,10 +743,18 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 				"json",
 			},
 		), "ai-jail")
-		// No --env rides: hands reads no provider env var — the staged
-		// file is the whole bridge.
-		if contains(calls[0].Args, "--env") {
-			t.Errorf("ai-jail args %v carry an --env passthrough, want none for hands", calls[0].Args)
+		// The rider invariant, in its true form under the collapse: hands'
+		// --env segment equals the generic vouched riders exactly — the
+		// staged-config bridge adds no builder --env of its own (hands
+		// reads no agent-state var; the staged file is the whole bridge).
+		var argvRiders []string
+		for i := 0; i+1 < len(calls[0].Args); i++ {
+			if calls[0].Args[i] == "--env" {
+				argvRiders = append(argvRiders, "--env", calls[0].Args[i+1])
+			}
+		}
+		if !slices.Equal(argvRiders, roundEnvRiders(calls[0].Env)) {
+			t.Errorf("hands rider segment %v, want the generic vouched riders %v exactly", argvRiders, roundEnvRiders(calls[0].Env))
 		}
 		// The bytes the jailed hands would read carry the bridge, with
 		// the /v1 tail stripped.
@@ -780,9 +791,11 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 		dst := filepath.Join(home, ".config", "hands")
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
-				"--network",
 				"--no-save-config",
-				"--mask",
+				"--allow-host",
+				"selfhost.example"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask",
 				".claude/settings.json",
 				"--mask",
 				".claude/settings.local.json",
@@ -866,6 +879,7 @@ func TestHandsRoundRecordsKilledSessionAndResumes(t *testing.T) {
 	t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 	t.Setenv("OPENAI_API_KEY", "sk-local")
 	t.Setenv("OPENAI_MODEL", "glm-selfhost")
+	t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
 	wt := gitRepo(t)
 	scratch := filepath.Join(wt, handsScratchDir)
 
@@ -927,16 +941,20 @@ func TestHandsRoundRecordsKilledSessionAndResumes(t *testing.T) {
 		t.Fatalf("ai-jail called %d times, want 2 (killed round, retry)", len(calls))
 	}
 	assertArgs(t, calls[0].Args, slices.Concat(
-		[]string{"--worktree", "--network", "--no-save-config",
-			"--mask", ".claude/settings.json",
+		[]string{"--worktree", "--no-save-config",
+			"--allow-host", "selfhost.example"},
+		roundEnvRiders(calls[0].Env),
+		[]string{"--mask", ".claude/settings.json",
 			"--mask", ".claude/settings.local.json",
 			"--mask", homeClaudeMask(t),
 			"--rw-map", src + ":" + dst,
 			"--", "hands", "round", "--format", "json"},
 	), "killed round")
 	assertArgs(t, calls[1].Args, slices.Concat(
-		[]string{"--worktree", "--network", "--no-save-config",
-			"--mask", ".claude/settings.json",
+		[]string{"--worktree", "--no-save-config",
+			"--allow-host", "selfhost.example"},
+		roundEnvRiders(calls[1].Env),
+		[]string{"--mask", ".claude/settings.json",
 			"--mask", ".claude/settings.local.json",
 			"--mask", homeClaudeMask(t),
 			"--rw-map", src + ":" + dst,

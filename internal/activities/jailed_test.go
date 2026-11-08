@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1251,16 +1252,19 @@ func opencodeTestEnv(t *testing.T) []string {
 	dataHome := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", dataHome)
 	dir := filepath.Join(dataHome, "opencode")
-	return []string{"--rw-map", dir + ":" + dir, "--env", "XDG_DATA_HOME"}
+	// Only the mount segment: the XDG_DATA_HOME rider rides the generic
+	// env-rider loop (roundEnvRiders covers it), not the mount.
+	return []string{"--rw-map", dir + ":" + dir}
 }
 
 // codexTestEnv points CODEX_HOME at a fresh temp dir and returns the jail
-// args the codex bridge composes from it — same shape as opencodeTestEnv.
+// args the codex bridge composes from it — same shape as opencodeTestEnv;
+// the CODEX_HOME rider likewise rides the generic env-rider loop.
 func codexTestEnv(t *testing.T) []string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)
-	return []string{"--rw-map", home + ":" + home, "--env", "CODEX_HOME"}
+	return []string{"--rw-map", home + ":" + home}
 }
 
 // TestCodexJailMounts pins the state-dir resolution behind the codex jail
@@ -1376,7 +1380,7 @@ func TestOpencodeJailMounts(t *testing.T) {
 // TestAgentResumeFlag pins the resume-capability table: claude, pi,
 // opencode, codex, and hands take an id-addressable resume (codex and
 // hands via a subcommand, so their flag is empty — agentResumeArgs
-// composes that shape), while amp and aider have none and their rounds
+// composes that shape), while aider has none and its rounds
 // ignore a set SessionID.
 func TestAgentResumeFlag(t *testing.T) {
 	for _, c := range []struct {
@@ -1389,13 +1393,26 @@ func TestAgentResumeFlag(t *testing.T) {
 		{"opencode", "-s", true},
 		{"codex", "", true},
 		{"hands", "", true},
-		{"amp", "", false},
 		{"aider", "", false},
 	} {
 		flag, ok := agentResumeFlag(c.agent)
 		if flag != c.flag || ok != c.ok {
 			t.Errorf("agentResumeFlag(%s) = %q, %v; want %q, %v", c.agent, flag, ok, c.flag, c.ok)
 		}
+	}
+}
+
+// TestJailedAgentCLIRemovedAgentRejectsLoudly pins the amp removal's
+// in-flight face: a recorded Agent="amp" resolves to an error naming the
+// removal and the -cli restart path — never a silent fallback that would
+// run the round on a different CLI and drop its recorded session.
+func TestJailedAgentCLIRemovedAgentRejectsLoudly(t *testing.T) {
+	selected, _, _, err := jailedAgentCLI("amp")
+	if err == nil {
+		t.Fatalf("jailedAgentCLI(amp) = %q, nil error; want the loud removal rejection", selected)
+	}
+	if !strings.Contains(err.Error(), "removed") || !strings.Contains(err.Error(), "-cli") {
+		t.Errorf("jailedAgentCLI(amp) error = %q, want the removal notice naming the -cli restart path", err)
 	}
 }
 
@@ -1446,6 +1463,7 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 		t.Setenv("OPENAI_API_KEY", "sk-local")
 		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "echo CODEX-OUTPUT; exit 0")
 
@@ -1466,9 +1484,11 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		}
 		want := slices.Concat(
 			[]string{"--worktree",
-				"--network",
 				"--no-save-config",
-				"--mask",
+				"--allow-host",
+				"selfhost.example"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask",
 				".claude/settings.json",
 				"--mask",
 				".claude/settings.local.json",
@@ -1504,9 +1524,11 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		}
 		assertArgs(t, calls[0].Args, slices.Concat(
 			[]string{"--worktree",
-				"--network",
 				"--no-save-config",
-				"--mask",
+				"--allow-host",
+				"api.openai.com"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask",
 				".claude/settings.json",
 				"--mask",
 				".claude/settings.local.json",
@@ -1586,6 +1608,512 @@ func TestCodexRoundAPIErrorText(t *testing.T) {
 	if !strings.Contains(err.Error(), "codex round reported an api error and exited clean") {
 		t.Errorf("error = %q, want the exit-0 marker classification", err)
 	}
+}
+
+// argvCarriesPair reports whether args holds flag immediately followed by
+// value — the shape every ai-jail egress grant and env rider takes.
+func argvCarriesPair(args []string, flag, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+// TestJailEgressHosts pins the filtered-egress derivation table: the host
+// of a staged base URL is the grant (hostname only — path and port never
+// ride), the agent's serving channel gets its public API host when and
+// only when that channel stages no base URL (trigger is URL absence, the
+// keyless ambient posture and the default-authed otel path included —
+// never credential presence), hands takes either wire through its staged
+// provider and has no unconditional default, OPENAI_API_BASE is the
+// legacy spelling of the openai URL, a failover swap of the base URL
+// moves the grant, both channels behind one host collapse into one entry,
+// 127.0.0.1/localhost forward their port while unbridgeable loopback
+// addresses fail loud on a strict channel and skip best-effort, the
+// capture endpoint and the go/proxy ambients are best-effort, strictness
+// follows the serving channel, and a staged strict URL without a usable
+// target fails rather than grant a guess.
+func TestJailEgressHosts(t *testing.T) {
+	t.Run("derivation table", func(t *testing.T) {
+		cases := []struct {
+			name        string
+			agent       string
+			env         []string
+			wantHosts   []string
+			wantPrivate []string
+			wantPorts   []int
+		}{
+			{"custom anthropic url grants its host", "claude", []string{"ANTHROPIC_BASE_URL=https://relay.example/v1", "ANTHROPIC_API_KEY=sk"}, []string{"relay.example"}, nil, nil},
+			{"claude key without url grants the channel default", "claude", []string{"ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"claude model without url grants the channel default", "claude", []string{"ANTHROPIC_MODEL=glm"}, []string{"api.anthropic.com"}, nil, nil},
+			{"claude nothing staged still grants the channel default", "claude", nil, []string{"api.anthropic.com"}, nil, nil},
+			{"claude auth token alone grants the channel default, trigger is url absence", "claude", []string{"ANTHROPIC_AUTH_TOKEN=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"custom openai url grants its host, port stripped", "codex", []string{"OPENAI_BASE_URL=https://selfhost.example:8443/v1", "OPENAI_API_KEY=sk"}, []string{"selfhost.example"}, nil, nil},
+			{"legacy openai api-base grants its host", "codex", []string{"OPENAI_API_BASE=https://legacy.example/v1", "OPENAI_API_KEY=sk"}, []string{"legacy.example"}, nil, nil},
+			{"openai base url wins over the legacy spelling", "codex", []string{"OPENAI_BASE_URL=https://new.example/v1", "OPENAI_API_BASE=https://legacy.example/v1", "OPENAI_API_KEY=sk"}, []string{"new.example"}, nil, nil},
+			{"codex key without url grants the channel default", "codex", []string{"OPENAI_API_KEY=sk"}, []string{"api.openai.com"}, nil, nil},
+			{"codex model without url grants the channel default", "codex", []string{"OPENAI_MODEL=glm"}, []string{"api.openai.com"}, nil, nil},
+			{"codex nothing staged still grants the channel default", "codex", nil, []string{"api.openai.com"}, nil, nil},
+			{"openai-wire agent with a bare anthropic credential grants both defaults", "pi", []string{"ANTHROPIC_API_KEY=sk"}, []string{"api.openai.com", "api.anthropic.com"}, nil, nil},
+			{"claude staging only openai tooling vars skips the openai default", "claude", []string{"OPENAI_MODEL=glm"}, []string{"api.anthropic.com"}, nil, nil},
+			{"unused-channel openai url still grants its host beside the anthropic default", "claude", []string{"OPENAI_BASE_URL=https://selfhost.example/v1", "OPENAI_API_KEY=sk"}, []string{"selfhost.example", "api.anthropic.com"}, nil, nil},
+			{"hands stages no unconditional default", "hands", nil, nil, nil, nil},
+			{"hands anthropic credential without url grants the anthropic default", "hands", []string{"ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"hands openai credential without url grants the openai default", "hands", []string{"OPENAI_API_KEY=sk"}, []string{"api.openai.com"}, nil, nil},
+			{"hands custom openai url grants its host", "hands", []string{"OPENAI_BASE_URL=https://selfhost.example/v1", "OPENAI_API_KEY=sk"}, []string{"selfhost.example"}, nil, nil},
+			{"hands custom anthropic url grants its host", "hands", []string{"ANTHROPIC_BASE_URL=https://relay.example/v1", "ANTHROPIC_API_KEY=sk"}, []string{"relay.example"}, nil, nil},
+			{"both channels behind one host collapse", "claude", []string{"ANTHROPIC_BASE_URL=https://relay.example/v1", "ANTHROPIC_API_KEY=sk", "OPENAI_BASE_URL=https://relay.example:8443/v1", "OPENAI_API_KEY=sk"}, []string{"relay.example"}, nil, nil},
+			{"failover-swapped url grants the swapped host", "claude", []string{"ANTHROPIC_BASE_URL=https://backup.example", "ANTHROPIC_API_KEY=sk-backup"}, []string{"backup.example"}, nil, nil},
+			{"relay-staged anthropic base url forwards its port, default suppressed", "claude", []string{"ANTHROPIC_BASE_URL=http://127.0.0.1:7778/relay/w/anthropic", "ANTHROPIC_API_KEY=sk"}, nil, nil, []int{7778}},
+			{"localhost gateway forwards its port", "codex", []string{"OPENAI_BASE_URL=http://localhost:1234/v1", "OPENAI_API_KEY=sk"}, nil, nil, []int{1234}},
+			{"hostname stays a plain allow-host", "claude", []string{"ANTHROPIC_BASE_URL=https://selfhost.example/v1", "ANTHROPIC_API_KEY=sk"}, []string{"selfhost.example"}, nil, nil},
+			{"private ip gets the private-host grant", "claude", []string{"ANTHROPIC_BASE_URL=http://192.168.1.10:8000", "ANTHROPIC_API_KEY=sk"}, nil, []string{"192.168.1.10"}, nil},
+			{"cgnat address gets the private-host grant", "claude", []string{"ANTHROPIC_BASE_URL=http://100.64.1.1:8000", "ANTHROPIC_API_KEY=sk"}, nil, []string{"100.64.1.1"}, nil},
+			{"relay and gateway ports collapse", "claude", []string{"ANTHROPIC_BASE_URL=http://127.0.0.1:7778/a", "OPENAI_BASE_URL=http://localhost:7778/b", "ANTHROPIC_API_KEY=sk", "OPENAI_API_KEY=sk"}, nil, nil, []int{7778}},
+		}
+		for _, tc := range cases {
+			gotHosts, gotPrivate, gotPorts, err := jailEgressHosts(tc.env, tc.agent, "")
+			if err != nil {
+				t.Errorf("%s: jailEgressHosts error = %v, want none", tc.name, err)
+				continue
+			}
+			if !slices.Equal(gotHosts, tc.wantHosts) || !slices.Equal(gotPrivate, tc.wantPrivate) || !slices.Equal(gotPorts, tc.wantPorts) {
+				t.Errorf("%s: jailEgressHosts = (%v, %v, %v), want (%v, %v, %v)", tc.name, gotHosts, gotPrivate, gotPorts, tc.wantHosts, tc.wantPrivate, tc.wantPorts)
+			}
+		}
+	})
+
+	// Strictness follows the serving channel: a malformed or unbridgeable
+	// URL on the channel the agent actually dials fails the round before
+	// launch — a grant derived from it would be a guess, and no reachable
+	// grant exists for a loopback --forward-port cannot bridge — while the
+	// unused channel's junk skips silently. Hands is strict on both.
+	t.Run("strict on the serving channel, silent on the unused one", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			agent string
+			env   []string
+			want  string
+		}{
+			{"claude hostless anthropic url fails", "claude", []string{"ANTHROPIC_BASE_URL=not-a-url", "ANTHROPIC_API_KEY=sk"}, "carries no host"},
+			{"codex hostless openai url fails", "codex", []string{"OPENAI_BASE_URL=not-a-url", "OPENAI_API_KEY=sk"}, "carries no host"},
+			{"hands hostless openai api-base fails", "hands", []string{"OPENAI_API_BASE=not-a-url", "OPENAI_API_KEY=sk"}, "carries no host"},
+			{"codex hostless anthropic url skips silently", "codex", []string{"ANTHROPIC_BASE_URL=not-a-url", "OPENAI_API_KEY=sk"}, ""},
+			{"claude hostless openai url skips silently", "claude", []string{"ANTHROPIC_API_KEY=sk", "OPENAI_BASE_URL=not-a-url"}, ""},
+			{"claude unbridgeable loopback url fails loud", "claude", []string{"ANTHROPIC_BASE_URL=http://127.0.0.2:9000"}, "cannot bridge"},
+			{"codex ipv6 loopback url fails loud", "codex", []string{"OPENAI_BASE_URL=http://[::1]:8123"}, "cannot bridge"},
+			{"hands unbridgeable loopback url fails on either channel", "hands", []string{"ANTHROPIC_BASE_URL=http://127.0.0.2:9000"}, "cannot bridge"},
+			{"codex unbridgeable anthropic loopback skips silently", "codex", []string{"ANTHROPIC_BASE_URL=http://127.0.0.2:9000", "OPENAI_API_KEY=sk"}, ""},
+			{"claude link-local url fails loud", "claude", []string{"ANTHROPIC_BASE_URL=http://169.254.1.1:8000"}, "link-local"},
+			{"codex metadata address fails loud", "codex", []string{"OPENAI_BASE_URL=http://169.254.169.254"}, "link-local"},
+			{"hands link-local url fails on either channel", "hands", []string{"OPENAI_API_BASE=http://169.254.1.1:8000", "OPENAI_API_KEY=sk"}, "link-local"},
+			{"codex link-local anthropic url skips silently", "codex", []string{"ANTHROPIC_BASE_URL=http://169.254.1.1:8000", "OPENAI_API_KEY=sk"}, ""},
+		}
+		for _, tc := range cases {
+			hosts, private, ports, err := jailEgressHosts(tc.env, tc.agent, "")
+			if tc.want == "" {
+				if err != nil {
+					t.Errorf("%s: jailEgressHosts error = %v, want a silent skip", tc.name, err)
+					continue
+				}
+				if len(hosts) == 0 && len(private) == 0 && len(ports) == 0 {
+					t.Errorf("%s: jailEgressHosts granted nothing, want the serving channel's default", tc.name)
+				}
+				continue
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("%s: jailEgressHosts = (%v, %v, %v, %v), want the %q failure", tc.name, hosts, private, ports, err, tc.want)
+			}
+		}
+	})
+
+	// A portless loopback URL still names a concrete listener through its
+	// scheme default — http forwards 80, https 443 — while an unknown
+	// scheme has no derivable port: strict fails loud, best-effort skips.
+	t.Run("portless loopback urls derive their scheme default port", func(t *testing.T) {
+		hosts, private, ports, err := jailEgressHosts([]string{"ANTHROPIC_BASE_URL=http://127.0.0.1/v1", "ANTHROPIC_API_KEY=sk"}, "claude", "")
+		if err != nil || len(hosts) != 0 || len(private) != 0 || !slices.Equal(ports, []int{80}) {
+			t.Errorf("portless http loopback = (%v, %v, %v, %v), want (nil, nil, 80, nil)", hosts, private, ports, err)
+		}
+		_, _, ports, err = jailEgressHosts([]string{"ANTHROPIC_BASE_URL=https://127.0.0.1"}, "claude", "")
+		if err != nil || !slices.Equal(ports, []int{443}) {
+			t.Errorf("portless https loopback = (%v, %v), want (443, nil)", ports, err)
+		}
+		if _, _, _, err = jailEgressHosts([]string{"ANTHROPIC_BASE_URL=ftp://127.0.0.1"}, "claude", ""); err == nil || !strings.Contains(err.Error(), "no derivable port") {
+			t.Errorf("unknown-scheme portless loopback error = %v, want the no-derivable-port failure", err)
+		}
+	})
+
+	// The capture endpoint is loopback by construction and rides the same
+	// listener as the relay: it forwards its port beside the channel
+	// default (otel staging never suppresses the default — the
+	// default-authed path stages no URL). It is best-effort — a value
+	// without a usable target skips silently, and so does an unbridgeable
+	// loopback one, unlike the strict provider URLs.
+	t.Run("capture endpoint forwards its port and skips best-effort garbage", func(t *testing.T) {
+		env := []string{"ANTHROPIC_API_KEY=sk"}
+		hosts, _, ports, err := jailEgressHosts(env, "claude", "http://127.0.0.1:7778/v1/metrics")
+		if err != nil || !slices.Equal(hosts, []string{"api.anthropic.com"}) || !slices.Equal(ports, []int{7778}) {
+			t.Errorf("jailEgressHosts with capture endpoint = (%v, %v, %v), want (api.anthropic.com, 7778, nil)", hosts, ports, err)
+		}
+		_, _, ports, _ = jailEgressHosts(env, "claude", "")
+		if len(ports) != 0 {
+			t.Errorf("jailEgressHosts without a capture endpoint forwarded %v, want none", ports)
+		}
+		hosts, _, ports, err = jailEgressHosts(env, "claude", "not-a-url")
+		if err != nil || !slices.Equal(hosts, []string{"api.anthropic.com"}) || len(ports) != 0 {
+			t.Errorf("jailEgressHosts with a hostless capture endpoint = (%v, %v, %v), want the channel default only and the endpoint skipped silently", hosts, ports, err)
+		}
+		_, _, ports, err = jailEgressHosts(env, "claude", "http://127.0.0.2:9000/x")
+		if err != nil || len(ports) != 0 {
+			t.Errorf("jailEgressHosts with an unbridgeable capture endpoint = (%v, %v), want it skipped silently", ports, err)
+		}
+	})
+
+	// GOPROXY (every CSV entry that parses to a usable URL — a mid-round
+	// fallthrough to a later mirror must not die on egress; direct/off and
+	// scheme-less segments skip) and HTTPS_PROXY (uppercase first,
+	// net/http's precedence) are operator ambients a cold jailed go test
+	// may need: granted when parseable, skipped silently when not — a
+	// proxy must carry its scheme — and never failing the round.
+	t.Run("go proxy and https proxy grant best-effort", func(t *testing.T) {
+		cases := []struct {
+			name        string
+			env         []string
+			wantHosts   []string
+			wantPrivate []string
+			wantPorts   []int
+		}{
+			{"goproxy csv head grants its host", []string{"GOPROXY=https://proxy.example/v1,direct", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com", "proxy.example"}, nil, nil},
+			{"direct head grants nothing", []string{"GOPROXY=direct", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"usable entry behind off still grants", []string{"GOPROXY=off,https://proxy.example", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com", "proxy.example"}, nil, nil},
+			{"multi-entry chain grants every usable url, skips direct and off", []string{"GOPROXY=https://p1.example,direct,https://p2.example,off", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com", "p1.example", "p2.example"}, nil, nil},
+			{"scheme-less goproxy skips", []string{"GOPROXY=127.0.0.1:8080,direct", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"loopback goproxy forwards its port", []string{"GOPROXY=http://127.0.0.1:8080,direct", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, []int{8080}},
+			{"unknown-scheme portless loopback goproxy skips", []string{"GOPROXY=ftp://127.0.0.1", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"unbridgeable loopback goproxy skips", []string{"GOPROXY=http://127.0.0.2:8080,direct", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"link-local goproxy head skips", []string{"GOPROXY=http://169.254.1.1:8000,direct", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"https proxy grants its host", []string{"HTTPS_PROXY=https://proxy.example:3128", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com", "proxy.example"}, nil, nil},
+			{"lowercase https proxy grants when uppercase is absent", []string{"https_proxy=https://proxy.example:3128", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com", "proxy.example"}, nil, nil},
+			{"uppercase https proxy wins when both are spelled", []string{"HTTPS_PROXY=https://upper.example:3128", "https_proxy=https://lower.example:3128", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com", "upper.example"}, nil, nil},
+			{"scheme-less https proxy skips", []string{"HTTPS_PROXY=127.0.0.1:3128", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+			{"hostless best-effort urls skip where a provider url fails", []string{"GOPROXY=not-a-url", "HTTPS_PROXY=also-junk", "ANTHROPIC_API_KEY=sk"}, []string{"api.anthropic.com"}, nil, nil},
+		}
+		for _, tc := range cases {
+			gotHosts, gotPrivate, gotPorts, err := jailEgressHosts(tc.env, "claude", "")
+			if err != nil {
+				t.Errorf("%s: jailEgressHosts error = %v, want none", tc.name, err)
+				continue
+			}
+			if !slices.Equal(gotHosts, tc.wantHosts) || !slices.Equal(gotPrivate, tc.wantPrivate) || !slices.Equal(gotPorts, tc.wantPorts) {
+				t.Errorf("%s: jailEgressHosts = (%v, %v, %v), want (%v, %v, %v)", tc.name, gotHosts, gotPrivate, gotPorts, tc.wantHosts, tc.wantPrivate, tc.wantPorts)
+			}
+		}
+	})
+}
+
+// TestJailArgvEgressPosture pins the composed argv's egress and rider
+// posture end to end — the ai-jail 3.x break class: --network must never
+// return to the argv (3.x made it unrestricted and mutually exclusive
+// with --allow-host, killing every round at execve), an ambient provider
+// stray outside the round-env allowlist must not open a rider, relay and
+// otel staging turn the loopback listener into --forward-port instead of
+// a dead allow-host, and a staged hostless provider URL fails the round
+// before ai-jail is ever invoked.
+func TestJailArgvEgressPosture(t *testing.T) {
+	t.Run("no network flag on claude and codex rounds", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("ANTHROPIC_API_KEY", "sk-local")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if contains(calls[0].Args, "--network") {
+			t.Errorf("claude argv %v carries --network, want filtered --allow-host egress only", calls[0].Args)
+		}
+		if contains(calls[0].Args, "--forward-port") {
+			t.Errorf("metrics-off argv %v carries a --forward-port, want none", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--allow-host", "api.anthropic.com") {
+			t.Errorf("claude argv %v carries no --allow-host api.anthropic.com grant", calls[0].Args)
+		}
+	})
+
+	t.Run("codex round keeps the same posture on the openai side", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		codexTestEnv(t)
+		t.Setenv("DAEDALUS_AGENT", "codex")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if contains(calls[0].Args, "--network") {
+			t.Errorf("codex argv %v carries --network, want filtered --allow-host egress only", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--allow-host", "selfhost.example") {
+			t.Errorf("codex argv %v carries no --allow-host selfhost.example grant", calls[0].Args)
+		}
+		// AgentEnv exports OPENAI_API_BASE alongside OPENAI_BASE_URL, so a
+		// real openai-served round carries four openai riders — the legacy
+		// spelling's rider drops only if the staging loses the var.
+		if !argvCarriesPair(calls[0].Args, "--env", "OPENAI_API_BASE") {
+			t.Errorf("codex argv %v carries no rider for the legacy OPENAI_API_BASE spelling", calls[0].Args)
+		}
+	})
+
+	t.Run("relay-staged round forwards the relay port instead of a dead loopback allow-host", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("ANTHROPIC_BASE_URL", "https://primary.example")
+		t.Setenv("ANTHROPIC_API_KEY", "sk-primary")
+		t.Setenv("DAEDALUS_WORKER_NAME", "w-jail")
+		t.Setenv(config.MetricsRelayAnthropicEnv, "http://127.0.0.1:7778")
+		t.Setenv(config.MetricsRelayTokenEnv, "regtok")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if argvCarriesPair(calls[0].Args, "--allow-host", "127.0.0.1") {
+			t.Errorf("relay-staged argv %v grants a dead loopback allow-host", calls[0].Args)
+		}
+		if argvCarriesPair(calls[0].Args, "--allow-host", "primary.example") {
+			t.Errorf("relay-staged argv %v still grants the rewritten provider host", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--forward-port", "7778") {
+			t.Errorf("relay-staged argv %v carries no --forward-port for the relay listener", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--env", "ANTHROPIC_API_KEY") {
+			t.Errorf("relay-staged argv %v carries no key rider", calls[0].Args)
+		}
+	})
+
+	t.Run("claude otel round grants the provider host plus the capture forward-port", func(t *testing.T) {
+		writeVersionBin(t, "claude", "2.1.304 (Claude Code)\n")
+		otelProbeOnce = sync.Once{}
+		otelCapable = nil
+		t.Cleanup(func() { otelProbeOnce = sync.Once{}; otelCapable = nil })
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("ANTHROPIC_API_KEY", "sk-local")
+		t.Setenv(config.MetricsOtelEndpointEnv, "http://127.0.0.1:7778/v1/metrics")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if !argvCarriesPair(calls[0].Args, "--allow-host", "api.anthropic.com") {
+			t.Errorf("otel argv %v carries no provider host grant", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--forward-port", "7778") {
+			t.Errorf("otel argv %v carries no capture-endpoint forward-port", calls[0].Args)
+		}
+	})
+
+	t.Run("codex otel round grants the same pair with the endpoint riding argv", func(t *testing.T) {
+		writeVersionBin(t, "codex", "codex-cli 0.160.0\n")
+		otelProbeOnce = sync.Once{}
+		otelCapable = nil
+		t.Cleanup(func() { otelProbeOnce = sync.Once{}; otelCapable = nil })
+		scrubBugFilingEnv(t)
+		codexTestEnv(t)
+		t.Setenv("DAEDALUS_AGENT", "codex")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
+		t.Setenv(config.MetricsOtelEndpointEnv, "http://127.0.0.1:7778/v1/metrics")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if !argvCarriesPair(calls[0].Args, "--allow-host", "selfhost.example") {
+			t.Errorf("otel argv %v carries no provider host grant", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--forward-port", "7778") {
+			t.Errorf("otel argv %v carries no capture-endpoint forward-port", calls[0].Args)
+		}
+		// The codex round's endpoint never stages into the env (it rides
+		// argv overrides) — the grant arrives via the captureEndpoint
+		// parameter, proven by the argv overrides riding alongside.
+		if !slices.Contains(calls[0].Args, `otel.environment="daedalus"`) {
+			t.Errorf("otel argv %v carries no codex -c otel overrides", calls[0].Args)
+		}
+	})
+
+	t.Run("ambient provider stray outside the round-env allowlist rides no rider", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("ANTHROPIC_API_KEY", "sk-local")
+		// An operator's ambient export: ANTHROPIC_AUTH_TOKEN is not in
+		// config.RoundEnvVars — so composition must not open a rider
+		// for it even though the invocation env carries it.
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-ambient-stray")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if argvCarriesPair(calls[0].Args, "--env", "ANTHROPIC_AUTH_TOKEN") {
+			t.Errorf("ambient ANTHROPIC_AUTH_TOKEN leaked a rider into %v", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--env", "ANTHROPIC_API_KEY") {
+			t.Errorf("staged key lost its rider in %v", calls[0].Args)
+		}
+	})
+
+	t.Run("openai model-only staging rides its rider but no openai default on the anthropic channel", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("ANTHROPIC_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-tooling")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedClaudeActivity: %v", err)
+		}
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		// The channel default is per serving channel: claude dials the
+		// anthropic wire, so its URL absence — not the openai side's
+		// staging — decides, and the openai default never fires here.
+		if !argvCarriesPair(calls[0].Args, "--allow-host", "api.anthropic.com") {
+			t.Errorf("argv %v carries no anthropic channel default", calls[0].Args)
+		}
+		if argvCarriesPair(calls[0].Args, "--allow-host", "api.openai.com") {
+			t.Errorf("argv %v carries an openai default beside the anthropic serving channel", calls[0].Args)
+		}
+		if !argvCarriesPair(calls[0].Args, "--env", "OPENAI_MODEL") {
+			t.Errorf("staged OPENAI_MODEL lost its rider in %v", calls[0].Args)
+		}
+		if argvCarriesPair(calls[0].Args, "--env", "OPENAI_API_KEY") {
+			t.Errorf("unstaged OPENAI_API_KEY gained a rider in %v", calls[0].Args)
+		}
+	})
+
+	t.Run("unbridgeable loopback url fails the round loud before launch", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("ANTHROPIC_API_KEY", "sk-local")
+		t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.2:9000")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		})
+		if err == nil {
+			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-loopback failure")
+		}
+		if !strings.Contains(err.Error(), "cannot bridge") {
+			t.Errorf("error = %q, want the loopback bridge failure", err)
+		}
+		if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+			calls := readCalls(t, log)
+			t.Errorf("ai-jail called %d times, want the round failed before launch (%v)", len(calls), calls)
+		}
+	})
+
+	// The egress derivation hoists above the concurrency-slot wait: with
+	// the slot held, a doomed egress target still fails fast with the
+	// egress error — never queued for five minutes to die at the same
+	// diagnosis.
+	t.Run("egress failure preempts the slot wait", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("ANTHROPIC_API_KEY", "sk-local")
+		t.Setenv("ANTHROPIC_BASE_URL", "not-a-url")
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		lim := agentLimiter()
+		lim <- struct{}{}
+		defer func() { <-lim }()
+		prevWait := slotWaitTimeout
+		slotWaitTimeout = 50 * time.Millisecond
+		t.Cleanup(func() { slotWaitTimeout = prevWait })
+
+		start := time.Now()
+		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			WorktreePath: t.TempDir(),
+			Prompt:       "fix the bug",
+		})
+		if err == nil {
+			t.Fatal("RunJailedClaudeActivity = nil error, want the hostless-URL failure")
+		}
+		if !strings.Contains(err.Error(), "carries no host") {
+			t.Errorf("error = %q, want the egress derivation to preempt the slot wait (ErrAgentSlotsBusy after %v would mean it queued first)", err, time.Since(start))
+		}
+		if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+			calls := readCalls(t, log)
+			t.Errorf("ai-jail called %d times, want the round failed before launch (%v)", len(calls), calls)
+		}
+	})
 }
 
 // TestWindowPreflight pins the round-start gate's arithmetic and its

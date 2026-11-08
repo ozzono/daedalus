@@ -91,7 +91,7 @@ func plainTailState(log string) string {
 // separate blocks. cotN tails the finished sections (completed or dead)
 // to the last N rounds (-1 means every round); a live in-flight section,
 // when one exists, always follows — it is the newest material there is.
-// Rounds with a native thinking channel (claude, amp, pi)
+// Rounds with a native thinking channel (claude, pi)
 // show their captured Thinking — implementing and reviewer rounds alike;
 // openai-wire rounds whose reasoning arrived inline show the
 // <think>-fenced part; rounds with no CoT at all say so rather than
@@ -744,7 +744,7 @@ func liveCotSectionWith(workflowID string, c client.Client) string {
 		return b.String() + "\n"
 	}
 	if name != "claude" && name != "pi" {
-		// aider, opencode, and amp keep no host transcript the live view
+		// aider and opencode keep no host transcript the live view
 		// follows — opencode's session database exists, the live view just
 		// does not read it; never silence, never a guess.
 		b.WriteString(bare)

@@ -3,10 +3,7 @@
 # jailed agent then inherits whatever the worker's environment provides.
 
 # Which jailed agent CLI runs the implementing and reviewer agents:
-# claude (Claude Code, the default), opencode, amp (Sourcegraph Amp —
-# authenticates via AMP_API_KEY in the worker's environment, passed into
-# the jail when set; amp's own host login does not reach the jail, and the
-# anthropic/openai sections below do not apply to it), pi (Earendil's pi —
+# claude (Claude Code, the default), opencode, pi (Earendil's pi —
 # authenticates via the provider env vars below, except the openai
 # section which pi only half-reads over env (key yes, base URL no) and
 # which is therefore staged into ~/.pi/agent/models.json per round — see
@@ -52,8 +49,8 @@ agent: claude
 # express "off only for daedalus's headless rounds", where a small
 # non-reasoning model would burn output budget on thinking blocks), aider
 # gains "--thinking-tokens 0", and claude's round env gains
-# MAX_THINKING_TOKENS=0. opencode and amp have no verified off lever and
-# ignore this setting.
+# MAX_THINKING_TOKENS=0. opencode has no verified off lever and
+# ignores this setting.
 thinking: true
 
 # Streaming toggle for the jailed agents, the same tri-state shape as
@@ -275,14 +272,14 @@ temporal:
 # wired lever, so the agent proceeds silently on its default (never an
 # error):
 #
-#   knob               claude    aider          opencode    pi            amp         codex
-#   -----------------  --------  -------------  ----------  ------------  ----------  ---------
-#   context_tokens     env       staged file    ignored     staged file*  ignored     ignored
-#   max_output_tokens  env       staged file    ignored     staged file*  ignored     ignored
-#   thinking: false    env       argv           ignored     argv          ignored     ignored
-#   stream on/off      —         argv           ignored     ignored       ignored     ignored
-#   samplers (openai)  (n/a)     staged file    ignored     staged file*  (n/a)       ignored
-#   timeout_ms         env       (unprobed)     (unprobed)  staged file*  (unprobed)  (unprobed)
+#   knob               claude    aider          opencode    pi            codex
+#   -----------------  --------  -------------  ----------  ------------  ---------
+#   context_tokens     env       staged file    ignored     staged file*  ignored
+#   max_output_tokens  env       staged file    ignored     staged file*  ignored
+#   thinking: false    env       argv           ignored     argv          ignored
+#   stream on/off      —         argv           ignored     ignored       ignored
+#   samplers (openai)  (n/a)     staged file    ignored     staged file*  ignored
+#   timeout_ms         env       (unprobed)     (unprobed)  staged file*  (unprobed)
 #
 # Lever detail: claude env = CLAUDE_CODE_MAX_CONTEXT_TOKENS (window) and
 # MAX_THINKING_TOKENS=0 (thinking) and CLAUDE_CODE_MAX_OUTPUT_TOKENS
@@ -304,7 +301,7 @@ temporal:
 # samplingParams as top-level OpenAI-completions request params with no
 # litellm layer in between, so top_k/min_p reach only backends that accept
 # non-standard OpenAI params.
-# amp is unprobed: no lever assumed until someone probes one. codex is
+# codex is
 # likewise unprobed for every knob row — no lever assumed — but note the
 # codex column says nothing about provider serving: the openai section's
 # url/key/model reach codex rounds regardless, bridged through codex's own
@@ -346,8 +343,8 @@ anthropic:
   # the model entry staged for openai-served pi rounds, and lands as
   # limit.context on the entry staged for openai-served opencode rounds
   # (that staged file rides OPENCODE_CONFIG, whose precedence against a
-  # repo-committed opencode.json was never probed); amp and codex
-  # ignore it. Zero/unset means each agent's own default.
+  # repo-committed opencode.json was never probed); codex
+  # ignores it. Zero/unset means each agent's own default.
   context_tokens: 0
   # Completion cap for the jailed agent's rounds, in tokens. When set, it
   # replaces both sides of the 8k constant in the model metadata staged
@@ -357,7 +354,7 @@ anthropic:
   # names for its request-level max_tokens override), lands as
   # maxTokens on the model entry staged for openai-served pi rounds, and
   # lands as limit.output on the entry staged for openai-served opencode
-  # rounds. amp and codex have
+  # rounds. codex has
   # no wired route. Zero/unset keeps aider's 8192 constant and every other
   # agent's API default.
   max_output_tokens: 0
@@ -435,7 +432,7 @@ openai:
   # params, top_k and min_p under extra_body — litellm's syntax for params
   # it does not map natively) and by pi's staged models.json entry (all
   # six as top-level OpenAI-completions request params, sent straight to
-  # url). claude and amp are out of scope. Zero/unset means the
+  # url). claude is out of scope. Zero/unset means the
   # field is omitted from the request entirely — never sent as a default,
   # so the backend's own sampler values stand (an explicit 0 above is
   # therefore the same as unset).
@@ -643,8 +640,7 @@ dev:
 # needed. The values travel worker env only (never workflow history,
 # activity inputs, or argv). pi's staging bridge reads the overridden
 # OPENAI_* values, so pi reviewer rounds stage the reviewer endpoint and
-# model; amp authenticates through AMP_API_KEY alone and ignores the
-# section (disable_thinking included — it has no wire staging).
+# model.
 reviewer:
   url: ""
   key: ""
@@ -658,7 +654,7 @@ reviewer:
   # requests — chat_template_kwargs {"enable_thinking": false}, the
   # Qwen3-template convention, so a hybrid-thinking reviewer brain (a
   # Qwen3-template model) runs its review rounds non-thinking. Consumed by
-  # the pi and aider stagings; agents without a wire staging (claude, amp,
+  # the pi and aider stagings; agents without a wire staging (claude,
   # codex, opencode) ignore it. false/unset sends no signal — the
   # backend's own thinking default stands. This keys on the reviewer
   # section alone: openai's disable_thinking below never reaches reviewer
