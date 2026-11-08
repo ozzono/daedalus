@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -122,7 +123,7 @@ func recaptureStuckTasks() error {
 				q, cfg.Temporal.Host, err)
 			continue
 		}
-		stuck, err := detectStuckAttempts(context.Background(), c, q)
+		stuck, err := detectStuckAttempts(context.Background(), c, q, liveRecordedPidSet(), livePidSet(recs))
 		if err != nil {
 			alertRecapture(recs[0].name, "queue %s not checked for stuck tasks: %v", q, err)
 			c.Close()
@@ -151,7 +152,53 @@ func recaptureStuckTasks() error {
 // undecidable and skipped, never judged against the workflow's queue —
 // guessing could flag a live suite on another daemon's test worker, and a
 // skipped recovery only waits one more status call.
-func detectStuckAttempts(ctx context.Context, c client.Client, queue string) ([]stuckAttempt, error) {
+// livePidSet maps the pids of recs' workers whose pid file names a live
+// process — the roster's own liveness record.
+func livePidSet(recs []statusRecord) map[string]bool {
+	set := make(map[string]bool, len(recs))
+	for _, r := range recs {
+		pidFile, _, _ := daemonPaths(r.name)
+		if pid, ok := readLivePid(pidFile); ok {
+			set[strconv.Itoa(pid)] = true
+		}
+	}
+	return set
+}
+
+// liveRecordedPidSet maps the pids of every recorded worker with a live
+// pid file.
+func liveRecordedPidSet() map[string]bool {
+	names, err := recordedWorkers()
+	if err != nil {
+		return nil
+	}
+	recs := make([]statusRecord, 0, len(names))
+	for _, name := range names {
+		recs = append(recs, statusRecord{name: name})
+	}
+	return livePidSet(recs)
+}
+
+// detectStuckAttempts returns the outstanding activity attempts of queue's
+// running workflows that no live poller will ever serve: an attempt whose
+// last worker identity has no poller on its own task queue (the ghost a
+// dead worker leaves mid-round), or one never dispatched while nothing
+// polls that queue at all (a daemon that died or was never started). Each
+// attempt is judged against ITS activity options' task queue — suites run
+// on a suite queue (shared "test" or the derived "<queue>-test"), so the
+// workflow's queue is the wrong reference
+// in any multi-daemon deployment. The server must populate
+// activity_options.task_queue: an attempt whose queue cannot be read is
+// undecidable and skipped, never judged against the workflow's queue —
+// guessing could flag a live suite on another daemon's test worker, and a
+// skipped recovery only waits one more status call.
+// liveHolderPids is the recorded roster's live-pid set: a holder whose pid
+// is alive there is being served even while absent from the poller list,
+// because poller visibility lags a boot — judge it dead and the recapture
+// kills the worker's in-flight round inside that window. liveQueuePids is
+// the same liveness record scoped to the records serving queue, guarding
+// the never-dispatched arm against the same lag.
+func detectStuckAttempts(ctx context.Context, c client.Client, queue string, liveHolderPids, liveQueuePids map[string]bool) ([]stuckAttempt, error) {
 	// Per-queue live poller identities, described on first use and cached:
 	// a workflow's pending activities usually share one queue.
 	live := map[string]map[string]bool{}
@@ -200,9 +247,18 @@ func detectStuckAttempts(ctx context.Context, c client.Client, queue string) ([]
 			identity := pa.GetLastWorkerIdentity()
 			var unserved bool
 			if identity != "" {
+				if pid, _, _ := strings.Cut(identity, "@"); liveHolderPids[pid] {
+					// The holder's pid file names a live process: the
+					// attempt is being served, whatever the poller list
+					// claims — poller visibility lags a worker's boot,
+					// and judging a live worker dead inside that window
+					// kills its in-flight round. Skip; recovery waits
+					// one more status call.
+					continue
+				}
 				unserved = !pollers[identity]
 			} else {
-				unserved = len(pollers) == 0
+				unserved = len(pollers) == 0 && len(liveQueuePids) == 0
 			}
 			if unserved {
 				stuck = append(stuck, stuckAttempt{
