@@ -652,27 +652,27 @@ func TestFeatureDevWorkflowAgentTravelsToEveryRound(t *testing.T) {
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
 
 	in := baseInput()
-	in.Agent = "amp"
+	in.Agent = "claude"
 	env.ExecuteWorkflow(FeatureDevWorkflow, in)
 
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("workflow error: %v", err)
 	}
 	for i, input := range rec.inputs {
-		if input.Agent != "amp" {
-			t.Errorf("agent round %d Agent = %q, want amp", i, input.Agent)
+		if input.Agent != "claude" {
+			t.Errorf("agent round %d Agent = %q, want claude", i, input.Agent)
 		}
 	}
 	if len(rec.inputs) != 2 {
 		t.Fatalf("agent ran %d times, want 2 (implement + tests)", len(rec.inputs))
 	}
 	for i, input := range rev.inputs {
-		if input.Agent != "amp" {
-			t.Errorf("review round %d Agent = %q, want amp", i, input.Agent)
+		if input.Agent != "claude" {
+			t.Errorf("review round %d Agent = %q, want claude", i, input.Agent)
 		}
 	}
-	if len(disc.agents) != 2 || disc.agents[0] != "amp" || disc.agents[1] != "amp" {
-		t.Errorf("discovery agent args = %v, want amp twice (preflight discovery, phase-2 discovery)", disc.agents)
+	if len(disc.agents) != 2 || disc.agents[0] != "claude" || disc.agents[1] != "claude" {
+		t.Errorf("discovery agent args = %v, want claude twice (preflight discovery, phase-2 discovery)", disc.agents)
 	}
 	if len(suiteRec.runs) != 2 || suiteRec.runs[0].Command != "go test ./..." {
 		t.Errorf("suite runs = %+v, want the preflight baseline plus phase 2 executing the resolved command", suiteRec.runs)

@@ -254,8 +254,8 @@ func recordedPiSession(ctx context.Context, worktree string, role SessionRole) (
 // recordedAgentSession dispatches recordedSession per agent: claude and pi
 // get their dedicated wrappers; opencode and codex share the body with
 // their own staleness check; hands shares it too, its staleness checked
-// against the session store in the worktree's scratch dir; amp and aider
-// have no session state the tracking can address. Every caller is gated on
+// against the session store in the worktree's scratch dir; aider
+// has no session state the tracking can address. Every caller is gated on
 // agentResumeFlag, so anything else never reaches here.
 func recordedAgentSession(ctx context.Context, agent, worktree string, role SessionRole) (string, bool) {
 	switch agent {

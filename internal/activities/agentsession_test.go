@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1025,22 +1026,23 @@ exit 0`)
 	if len(calls) != 2 {
 		t.Fatalf("ai-jail called %d times, want 2 (killed round, retry)", len(calls))
 	}
-	assertArgs(t, calls[0].Args, []string{
-		"--worktree",
-		"--network",
-		"--no-save-config",
-		"--mask",
-		".claude/settings.json",
-		"--mask",
-		".claude/settings.local.json",
-		"--mask",
-		homeClaudeMask(t),
-		"--",
-		"pi",
-		"--mode",
-		"json",
-		"-p",
-	}, "killed pi round")
+	assertArgs(t, calls[0].Args, slices.Concat(
+		[]string{"--worktree", "--no-save-config", "--allow-host", "api.openai.com"},
+		roundEnvRiders(calls[0].Env),
+		[]string{
+			"--mask",
+			".claude/settings.json",
+			"--mask",
+			".claude/settings.local.json",
+			"--mask",
+			homeClaudeMask(t),
+			"--",
+			"pi",
+			"--mode",
+			"json",
+			"-p",
+		},
+	), "killed pi round")
 	if !contains(calls[1].Args, "--session") || !contains(calls[1].Args, "sess-pi-1") {
 		t.Errorf("retry args %v should resume the recorded session sess-pi-1 via --session", calls[1].Args)
 	}

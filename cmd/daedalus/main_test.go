@@ -134,9 +134,9 @@ func TestParseFlagsCLI(t *testing.T) {
 		want     string
 		wantRest []string
 	}{
-		{[]string{"run", "-cli", "amp", "/repo", "42", "do it"}, "amp", []string{"run", "/repo", "42", "do it"}},
+		{[]string{"run", "-cli", "pi", "/repo", "42", "do it"}, "pi", []string{"run", "/repo", "42", "do it"}},
 		{[]string{"run", "--cli", "opencode", "/repo", "42", "do it"}, "opencode", []string{"run", "/repo", "42", "do it"}},
-		{[]string{"--cli=amp", "run", "/repo", "42", "do it"}, "amp", []string{"run", "/repo", "42", "do it"}},
+		{[]string{"--cli=pi", "run", "/repo", "42", "do it"}, "pi", []string{"run", "/repo", "42", "do it"}},
 	} {
 		f, rest, err := parseFlags(c.args)
 		if err != nil {
@@ -160,12 +160,12 @@ func TestParseFlagsCLI(t *testing.T) {
 		t.Errorf("parseFlags(-cli cursor) err = %v, want an unknown-agent rejection", err)
 	}
 	// -cli names a run option; the worker would silently ignore it.
-	if _, _, err := parseFlags([]string{"worker", "start", "-cli", "amp"}); err == nil ||
+	if _, _, err := parseFlags([]string{"worker", "start", "-cli", "pi"}); err == nil ||
 		!strings.Contains(err.Error(), "only applies to run") {
 		t.Errorf("parseFlags(worker -cli) err = %v, want a -cli-outside-run rejection", err)
 	}
 	// Append mode targets a pipeline whose agent is already fixed.
-	if _, _, err := parseFlags([]string{"run", "-a", "wf-1", "-cli", "amp", "steer it"}); err == nil ||
+	if _, _, err := parseFlags([]string{"run", "-a", "wf-1", "-cli", "pi", "steer it"}); err == nil ||
 		!strings.Contains(err.Error(), "only applies to run") {
 		t.Errorf("parseFlags(run -a -cli) err = %v, want a -cli-in-append-mode rejection", err)
 	}

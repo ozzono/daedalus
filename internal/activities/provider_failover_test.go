@@ -59,6 +59,12 @@ func TestMain(m *testing.M) {
 	for _, name := range config.AllWorkerEnvVars() {
 		os.Unsetenv(name)
 	}
+	// The egress derivation reads two go/proxy ambients the worker-var
+	// scrub above does not cover (neither is config-derived): left set,
+	// they would move the pinned --allow-host grants per host. Tests that
+	// need one arm it explicitly (t.Setenv).
+	os.Unsetenv("GOPROXY")
+	os.Unsetenv("HTTPS_PROXY")
 	os.Exit(m.Run())
 }
 
@@ -125,6 +131,34 @@ func TestRunJailedFailsOverOnExhaustion(t *testing.T) {
 	}
 	if got := calls[1].Env["ANTHROPIC_DEFAULT_HAIKU_MODEL"]; got != "glm-backup-air" {
 		t.Errorf("retry round heartbeat model = %q, want the fallback's", got)
+	}
+	// The egress grant and env riders re-derive per attempt from that
+	// attempt's env: the primary round (key only) grants the explicit
+	// anthropic default host, and the fallback's swapped base URL moves
+	// the grant — a stale primary grant on the retry would dial the
+	// benched provider.
+	if contains(calls[0].Args, "--network") || contains(calls[1].Args, "--network") {
+		t.Errorf("failover argvs carry --network (%v / %v), want filtered --allow-host egress", calls[0].Args, calls[1].Args)
+	}
+	if !argvCarriesPair(calls[0].Args, "--allow-host", "api.anthropic.com") {
+		t.Errorf("primary argv %v carries no anthropic default-host grant", calls[0].Args)
+	}
+	if !argvCarriesPair(calls[0].Args, "--env", "ANTHROPIC_API_KEY") {
+		t.Errorf("primary argv %v carries no key rider", calls[0].Args)
+	}
+	if !argvCarriesPair(calls[1].Args, "--allow-host", "backup.example") {
+		t.Errorf("retry argv %v carries no grant for the fallback's swapped base URL", calls[1].Args)
+	}
+	if argvCarriesPair(calls[1].Args, "--allow-host", "api.anthropic.com") {
+		t.Errorf("retry argv %v still grants the primary's host", calls[1].Args)
+	}
+	for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"} {
+		if !argvCarriesPair(calls[1].Args, "--env", name) {
+			t.Errorf("retry argv %v carries no rider for the fallback's %s", calls[1].Args, name)
+		}
+	}
+	if argvCarriesPair(calls[1].Args, "--env", "OPENAI_API_KEY") {
+		t.Errorf("retry argv %v carries an openai rider with no openai staging", calls[1].Args)
 	}
 	providerState.Lock()
 	defer providerState.Unlock()

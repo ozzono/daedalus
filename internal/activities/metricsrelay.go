@@ -52,28 +52,33 @@ import (
 // probes at or above its version floor — one capture path per round, so
 // the staged round skips the relay rewrite entirely (claude's staging
 // rides the env; codex's comes back as -c overrides for the argv build).
+// The third return surfaces the resolved capture endpoint for the jail's
+// egress derivation: the sandbox must reach it, and the env cannot carry
+// it for codex (argv-only), so the value passes through explicitly. The
+// relay path needs no surfacing — its loopback listener rides the staged
+// base URLs the env already carries.
 // Everything else stages the relay exactly as before. The one dark
 // corner is the keyed-only fallback's pinned consequence: metrics on,
 // an otel agent below its floor, and an unkeyed round (no activity
 // identity — the synthetic attribution's contract) stages nothing and
 // the round is invisible to the ledger, exactly as the design accepted.
-func metricsRoundEnv(ctx context.Context, env []string, role SessionRole, agent string) ([]string, []string) {
+func metricsRoundEnv(ctx context.Context, env []string, role SessionRole, agent string) (out []string, otelArgs []string, captureEndpoint string) {
 	endpoint := envLookup(env, config.MetricsOtelEndpointEnv)
 	if endpoint == "" || (agent != "claude" && agent != "codex") {
-		return metricsRelayEnv(ctx, env, role), nil
+		return metricsRelayEnv(ctx, env, role), nil, ""
 	}
 	if agentOTelCapable(agent) {
 		if agent == "claude" {
 			worker := envLookup(env, "DAEDALUS_WORKER_NAME")
 			task, roleName, round := metricsAttributionParts(ctx, role)
-			return claudeOtelEnv(env, endpoint, worker, task, roleName, round), nil
+			return claudeOtelEnv(env, endpoint, worker, task, roleName, round), nil, endpoint
 		}
-		return env, codexOtelArgs(endpoint)
+		return env, codexOtelArgs(endpoint), endpoint
 	}
 	if metricsAttributionKey(ctx, role) == "" {
-		return env, nil
+		return env, nil, ""
 	}
-	return metricsRelayEnv(ctx, env, role), nil
+	return metricsRelayEnv(ctx, env, role), nil, ""
 }
 
 // claudeOtelEnv stages the eight documented env names a metrics-on

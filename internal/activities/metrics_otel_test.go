@@ -176,7 +176,7 @@ func TestMetricsRoundEnvClaudeStagesTheWorker(t *testing.T) {
 	env := append(metricsRoundBaseEnv(), config.MetricsOtelEndpointEnv+"=http://127.0.0.1:7778/v1/metrics")
 	keyedRoundEnv(t, func(ctx context.Context) []string {
 		task, roleName, round := metricsAttributionParts(ctx, RoleDev)
-		got, args := metricsRoundEnv(ctx, slices.Clone(env), RoleDev, "claude")
+		got, args, _ := metricsRoundEnv(ctx, slices.Clone(env), RoleDev, "claude")
 		if args != nil {
 			t.Errorf("otel args = %v, want none (claude stages env, not argv)", args)
 		}
@@ -261,7 +261,7 @@ func TestMetricsAttributionParts(t *testing.T) {
 func TestMetricsRoundEnvWithoutTheEndpoint(t *testing.T) {
 	t.Run("no endpoint stages the relay even for claude", func(t *testing.T) {
 		env := metricsRoundBaseEnv()
-		got, args := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, "claude")
+		got, args, _ := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, "claude")
 		if args != nil {
 			t.Errorf("otel args = %v, want none with no endpoint staged", args)
 		}
@@ -273,7 +273,7 @@ func TestMetricsRoundEnvWithoutTheEndpoint(t *testing.T) {
 
 	t.Run("an empty endpoint value counts as off", func(t *testing.T) {
 		env := append(metricsRoundBaseEnv(), config.MetricsOtelEndpointEnv+"=")
-		got, args := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, "claude")
+		got, args, _ := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, "claude")
 		if args != nil {
 			t.Errorf("otel args = %v, want none with the endpoint empty", args)
 		}
@@ -285,8 +285,8 @@ func TestMetricsRoundEnvWithoutTheEndpoint(t *testing.T) {
 
 	t.Run("a non-otel agent keeps the relay with the endpoint staged", func(t *testing.T) {
 		env := append(metricsRoundBaseEnv(), config.MetricsOtelEndpointEnv+"=http://127.0.0.1:7778/v1/metrics")
-		for _, agent := range []string{"aider", "opencode", "amp", "hands"} {
-			got, args := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, agent)
+		for _, agent := range []string{"aider", "opencode", "hands"} {
+			got, args, _ := metricsRoundEnv(context.Background(), slices.Clone(env), RoleDev, agent)
 			if args != nil {
 				t.Errorf("%s: otel args = %v, want none (the agent has no otel surface)", agent, args)
 			}

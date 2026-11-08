@@ -85,7 +85,7 @@ func TestLoadDefaults(t *testing.T) {
 // TestLoadAgent pins the accepted agent values: every shipped agent loads,
 // anything else is rejected with the available choices named.
 func TestLoadAgent(t *testing.T) {
-	for _, agent := range []string{"claude", "opencode", "amp", "pi", "aider", "codex"} {
+	for _, agent := range []string{"claude", "opencode", "pi", "aider", "codex"} {
 		cfg, err := Load(writeConfig(t, "agent: "+agent+"\n"))
 		if err != nil {
 			t.Fatalf("Load(agent: %s): %v", agent, err)
@@ -805,7 +805,7 @@ func TestRoundEnvVarsCoversServedAndStagedVars(t *testing.T) {
 		"OTEL_TRACES_EXPORTER",
 		"OTEL_RESOURCE_ATTRIBUTES",
 		"AIDER_MODEL", "AIDER_WEAK_MODEL", "AIDER_EDITOR_MODEL", // slim pins + operator exports
-		"AMP_API_KEY", "CODEX_HOME", "XDG_DATA_HOME", // named agents' in-jail exports
+		"CODEX_HOME", "XDG_DATA_HOME", // named agents' in-jail exports
 		"PATH", "HOME", "TMPDIR", // exec, identity, scratch
 		"HTTPS_PROXY", "SSL_CERT_FILE", // egress trust shape
 		"GOPROXY", // a jailed `go test`'s module fetch
@@ -3672,9 +3672,8 @@ func TestLoadMid(t *testing.T) {
 // wire names: claude dials ANTHROPIC_* and is served by an anthropic url or
 // a key alone (the public base with that key); codex, opencode, and aider
 // have no anthropic channel at all; pi is staged on the openai channel only,
-// though a bare anthropic key still reaches it through the exported env; amp
-// authenticates through AMP_API_KEY alone and is exempt; hands takes either
-// wire through its own staged provider block and is exempt like amp. A
+// though a bare anthropic key still reaches it through the exported env; hands
+// takes either wire through its own staged provider block and is exempt. A
 // conflict fires only when a serving endpoint exists and no channel serves
 // the agent — an all-unset config is the ambient posture and never trips it.
 func TestAgentWireConflict(t *testing.T) {
@@ -3698,7 +3697,7 @@ func TestAgentWireConflict(t *testing.T) {
 		{"an openai url beside an anthropic key serves both wires", Config{Anthropic: anthKey, OpenAI: openURL}, nil},
 		{"an anthropic url beside an openai key still leaves the openai-wire agents unserved", Config{Anthropic: anthURL, OpenAI: openKey}, []string{"pi", "codex", "opencode", "aider"}},
 	}
-	agents := []string{"claude", "pi", "codex", "opencode", "aider", "amp", "hands"}
+	agents := []string{"claude", "pi", "codex", "opencode", "aider", "hands"}
 	for _, p := range postures {
 		t.Run(p.name, func(t *testing.T) {
 			for _, agent := range agents {

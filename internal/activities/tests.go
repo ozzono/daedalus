@@ -668,7 +668,12 @@ func discoverTestCommand(ctx context.Context, worktreePath, agent string) ([]str
 		// resolved CLI, not the raw override (empty means the default, and a
 		// pi-default worker would otherwise be parsed as claude and feed a
 		// JSON session header to firstCommandLine as the "test command").
-		selected, _, _ := jailedAgentCLI(agent)
+		selected, _, _, cliErr := jailedAgentCLI(agent)
+		if cliErr != nil {
+			// A removed agent has no structured face: parse as plain text
+			// and let the round's own output carry the failure.
+			selected = ""
+		}
 		_, text, _, _ := parseRoundOutput(selected, res.Stdout)
 		if text == "" && selected == "aider" {
 			// Aider's raw stdout is all banner chrome, and its command-shaped

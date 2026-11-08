@@ -346,8 +346,8 @@ type AnthropicConfig struct {
 	// the model metadata staged for aider rounds (aider's completion cap is
 	// unchanged — see MaxOutputTokens for that). openai-served opencode
 	// rounds stage it as limit.context on the staged provider's model entry
-	// (stageOpencodeProvider, selected with -m); amp and codex have
-	// no wired lever and simply ignore it. The staged entry rides
+	// (stageOpencodeProvider, selected with -m); codex has
+	// no wired lever and simply ignores it. The staged entry rides
 	// OPENCODE_CONFIG, whose precedence against a repo-committed
 	// opencode.json (project config, which upstream merge order puts
 	// above it) was never probed — see the stageOpencodeProvider ponytail
@@ -362,7 +362,7 @@ type AnthropicConfig struct {
 	// aider staging replaces both sides of the 8192 constant (the staged
 	// metadata's max_output_tokens and extra_params.max_tokens).
 	// Openai-served opencode rounds stage it as limit.output on the staged
-	// provider's model entry; amp and codex have no wired route. Zero
+	// provider's model entry; codex has no wired route. Zero
 	// (unset) keeps the aider constant and every other agent's API default.
 	MaxOutputTokens int `yaml:"max_output_tokens"`
 }
@@ -517,7 +517,7 @@ type OpenAIConfig struct {
 	// extra_params top level (litellm maps them natively), while top_k and
 	// min_p ride extra_body — litellm's syntax for params it does not map.
 	// pi's staging bridge sends them as top-level OpenAI-completions
-	// request params; claude and amp are out of scope by decision;
+	// request params; claude is out of scope by decision;
 	// opencode's provider.<id>.options may carry them but was never
 	// probed. Zero
 	// (unset) means the field is omitted from the request entirely —
@@ -1065,7 +1065,7 @@ func (m *MetricsConfig) UnmarshalYAML(value *yaml.Node) error {
 // from a YAML file (see config-example.yaml).
 type Config struct {
 	// Agent selects which jailed CLI runs the implementing and reviewer
-	// agents: "claude" (Claude Code), "opencode", "amp", "pi", "aider"
+	// agents: "claude" (Claude Code), "opencode", "pi", "aider"
 	// (deprecated), "codex", or "hands" (see agents for the accepted
 	// values).
 	Agent string `yaml:"agent"`
@@ -1171,7 +1171,7 @@ type Config struct {
 	// translate the off signal to each agent's own lever — pi argv gains
 	// `--thinking off`, aider gains `--thinking-tokens 0`, claude's round
 	// env gains MAX_THINKING_TOKENS=0 (0-disables verified in claude
-	// 2.1.283's own code). opencode and amp have no verified off lever and
+	// 2.1.283's own code). opencode has no verified off lever and
 	// silently ignore the setting, per the agnostic-config rule. A pointer
 	// because an absent key and an explicit false are otherwise the same
 	// Go zero value.
@@ -1474,10 +1474,7 @@ func (c Config) RenderYAML() (string, error) {
 	return string(out), err
 }
 
-// agents lists the accepted config Agent values. amp authenticates through
-// AMP_API_KEY in the worker's environment (runJailed passes it into the jail
-// when set; amp's host login does not reach the jail) — the anthropic/openai
-// config sections do not apply to it. pi and aider authenticate through the
+// agents lists the accepted config Agent values. pi and aider authenticate through the
 // provider env vars the worker already exports (ANTHROPIC_API_KEY,
 // OPENAI_API_KEY, ...) with three caveats: pi also reads ~/.pi/agent/auth.json,
 // which the jail's pi preset bridges in read-write (probe-verified — see
@@ -1494,13 +1491,13 @@ func (c Config) RenderYAML() (string, error) {
 // OpenAI wire formats, so an openai-served codex round is bridged through
 // per-invocation `-c` config overrides instead (stageCodexProvider — the
 // same missing-url/missing-model failure posture as pi's staging), and an
-// anthropic-section round has no codex channel at all. aider is DEPRECATED
-// (amp-parity): it keeps working as-is, accepts no new flags or fixes, and
+// anthropic-section round has no codex channel at all. aider is DEPRECATED:
+// it keeps working as-is, accepts no new flags or fixes, and
 // its gaps are accepted limitations — no id-addressable resume, openai-only
 // model wiring (the anthropic half awaits a litellm probe), uv-tools-only
 // install layout. Which wire a round dials is chosen by the agent's selected
 // model, not by daedalus — see FallbackTypeOpenAI.
-var agents = []string{"claude", "opencode", "amp", "pi", "aider", "codex", "hands"}
+var agents = []string{"claude", "opencode", "pi", "aider", "codex", "hands"}
 
 // Agents lists the agent names ValidateAgent accepts — the single source
 // the dashboard's New-Task dropdown renders from, so its options can never
@@ -1667,8 +1664,7 @@ func (c Config) ProviderChannels() (AnthropicConfig, OpenAIConfig) {
 // pi is staged on the openai channel, and — reading no ANTHROPIC_BASE_URL
 // and getting no anthropic-side staging — an anthropic channel's custom URL
 // never reaches it, though a key with no url still does (the public base
-// with the exported key); amp authenticates through AMP_API_KEY alone and
-// is exempt. A conflict fires only when a serving endpoint EXISTS and no
+// with the exported key). A conflict fires only when a serving endpoint EXISTS and no
 // channel serves the agent; an all-unset config is the ambient posture and
 // never fires. Deliberately not a validate() rule: an openai-url-only
 // section under the default agent is a pinned-legal load — the env channel
@@ -1678,8 +1674,6 @@ func (c Config) ProviderChannels() (AnthropicConfig, OpenAIConfig) {
 func (c Config) AgentWireConflict(agent string) error {
 	anth, open := c.ProviderChannels()
 	switch agent {
-	case "amp":
-		return nil
 	case "hands":
 		// hands takes either wire through its own staged provider block
 		// (provider.type anthropic|openai — the staging writes whichever
@@ -1990,7 +1984,7 @@ var roundEnvWorkerSideVars = map[string]bool{
 // round builder itself stages (OPENCODE_CONFIG; claude's
 // MAX_THINKING_TOKENS and CLAUDE_CODE_MAX_OUTPUT_TOKENS; the slim aider
 // pins), the operator exports named agents consume in-jail (AIDER_MODEL,
-// and AMP_API_KEY / CODEX_HOME / XDG_DATA_HOME, which the builder's
+// and CODEX_HOME / XDG_DATA_HOME, which the builder's
 // --env passthrough copies from this same round env), and the ambient
 // base every round needs: shell identity and locale, the proxy and TLS
 // trust shape, and the go module-fetch knobs a jailed `go test` inherits.
@@ -2024,7 +2018,6 @@ func RoundEnvVars() []string {
 		"AIDER_MODEL",
 		"AIDER_WEAK_MODEL",
 		"AIDER_EDITOR_MODEL",
-		"AMP_API_KEY",
 		"CODEX_HOME",
 		"XDG_DATA_HOME",
 		"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
