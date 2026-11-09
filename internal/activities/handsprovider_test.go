@@ -981,15 +981,17 @@ func handsNoDeliveryRoundEnv(t *testing.T) {
 // ErrAPIExhausted, though its session id embeds "402" (the live
 // misclassification the all-digit boundary rule exists for) — and carries
 // the stranded prose as the salvage envelope NoDeliveryCapturedText
-// extracts. The wrap degrades to unsalvageable, never a mis-sliced plan: a
-// capture already carrying an envelope marker ships bare. A signal death
-// outranks the stream report exactly as it outranks the stuck report, and
-// the event shape is deaf on a non-hands agent — only hands's typed stream
-// can mint the face.
+// extracts. The text events use the probe-settled live shape — the prose
+// flat on the payload, the level failed carries class and reason at — the
+// shape whose mis-decode degraded the salvage to a park. The wrap degrades
+// to unsalvageable, never a mis-sliced plan: a capture already carrying an
+// envelope marker ships bare. A signal death outranks the stream report
+// exactly as it outranks the stuck report, and the event shape is deaf on
+// a non-hands agent — only hands's typed stream can mint the face.
 func TestHandsRoundNoDeliveryKillClassifies(t *testing.T) {
 	noDeliveryStream := `printf '%s\n' \
   '{"round_id":"r-1","seq":0,"kind":"started","payload":{"session":"conv-2a8464029e36"}}' \
-  '{"round_id":"r-1","seq":1,"kind":"text","payload":{"payload":{"text":"Sub-task 1 (implement, adder.go): add the adder."}}}' \
+  '{"round_id":"r-1","seq":1,"kind":"text","payload":{"text":"Sub-task 1 (implement, adder.go): add the adder."}}' \
   '{"round_id":"r-1","seq":2,"kind":"failed","payload":{"class":"no-delivery","reason":"2 turns with no delivery tool call"}}'
 exit 1`
 
@@ -1029,7 +1031,7 @@ exit 1`
 		wt := gitRepo(t)
 		newStubLog(t)
 		stubBin(t, "ai-jail", `printf '%s\n' \
-  '{"round_id":"r-1","seq":0,"kind":"text","payload":{"payload":{"text":"planning... `+noDeliveryCaptureBegin+`"}}}' \
+  '{"round_id":"r-1","seq":0,"kind":"text","payload":{"text":"planning... `+noDeliveryCaptureBegin+`"}}' \
   '{"round_id":"r-1","seq":1,"kind":"failed","payload":{"class":"no-delivery","reason":"2 turns with no delivery tool call"}}'
 exit 1`)
 

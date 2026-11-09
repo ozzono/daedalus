@@ -137,10 +137,11 @@ type pipelineRun struct {
 	// past its replayed-history boundary and the SDK's replay branch
 	// answers DefaultVersion for a version the same history holds,
 	// scheduling the legacy name over the new one. Pre-await, the call
-	// replays inside the first workflow task like the gates above: a
-	// marker the history holds in that task yields the new name; a marker
-	// it holds later, or lacks, yields the legacy name the recorded
-	// schedules carry.
+	// replays inside the first workflow task like the gates above, and
+	// the mapping is one spelling per era (jailedAgentActivity): marker 2
+	// yields the new name; no marker or marker 1 — the rename-era marker,
+	// recorded under the wire-rewriting registration whose schedules hold
+	// the legacy name — yields the legacy spelling.
 	jailedActivity string
 
 	// slimScopeGate records whether this execution recorded the slim
@@ -595,14 +596,16 @@ func (r *pipelineRun) heartbeat(err error, stage string) error {
 // jailedAgentActivityChangeID gates the agent-activity rename behind
 // workflow.GetVersion: the activity type name is a wire string whose
 // replay consumer is immutable — the SDK matches replay commands against
-// recorded history events by name, so a worker upgraded mid-run would
-// wedge every in-flight workflow with a nondeterminism failure if the new
-// code scheduled the renamed activity unconditionally (a
-// scheduled-but-unstarted pre-rename task included). Pre-marker replays —
-// every history recorded before the rename — schedule the legacy
-// spelling, which the worker keeps registered as an alias onto the same
-// function (worker_run.go); marker replays and fresh executions schedule
-// the new name.
+// recorded history events by name, so the scheduled spelling must be
+// decided per history, never unconditionally (a scheduled-but-unstarted
+// task included). Three histories exist: pre-rename (no marker),
+// rename-era (marker 1, recorded while the worker's legacy registration
+// rewrote every dispatch to the legacy spelling, so its recorded
+// schedules hold the legacy name), and post-fix (marker 2, recorded once
+// the gate's decision reached the wire). The gate maps each to the
+// spelling its own history holds (jailedAgentActivity); the legacy name
+// stays registered on the worker (worker_run.go) onto a wrapper of the
+// same function for the first two.
 const jailedAgentActivityChangeID = "jailed-agent-activity-rename"
 
 // jailedAgentActivity returns the activity type name to schedule for an
@@ -610,9 +613,16 @@ const jailedAgentActivityChangeID = "jailed-agent-activity-rename"
 // the early gates (pipelineRun.jailedActivity): GetVersion is memoized
 // per execution, and evaluating at the schedule site — deep in the flow,
 // past a continuation task's replayed-history boundary — reads the SDK's
-// replay branch and schedules the legacy name over the new one.
+// replay branch and schedules the wrong spelling for the history being
+// replayed. The mapping is three-way, one spelling per era: pre-rename
+// histories (DefaultVersion — no marker) and rename-era histories
+// (marker 1, recorded while the worker rewrote every dispatch to the
+// legacy spelling, so their recorded schedules hold the legacy name)
+// schedule the legacy spelling; marker 2 — recorded by fresh executions
+// whose decision reaches the wire — is the only version scheduling the
+// new name.
 func jailedAgentActivity(ctx workflow.Context) string {
-	if workflow.GetVersion(ctx, jailedAgentActivityChangeID, workflow.DefaultVersion, 1) == 1 {
+	if workflow.GetVersion(ctx, jailedAgentActivityChangeID, workflow.DefaultVersion, 2) == 2 {
 		return "RunJailedAgentActivity"
 	}
 	return "RunJailedClaudeActivity"

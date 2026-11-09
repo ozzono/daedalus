@@ -547,15 +547,25 @@ func runWorker(cfg config.Config, workerType string) error {
 		}
 		w.RegisterActivity(activities.CreateWorktreeActivity)
 		w.RegisterActivity(activities.RunJailedAgentActivity)
-		// Legacy alias for the rename: replay matches a scheduled activity
-		// task to its recorded history event by type name, and histories
-		// recorded before the rename permanently hold the old spelling —
-		// a run that sleeps across the worker upgrade would otherwise
-		// wedge on its next round with a nondeterminism failure. The same
-		// function serves both names; only the schedule side picks
+		// Legacy spelling for the rename: replay matches a scheduled
+		// activity task to its recorded history event by type name, and
+		// two history classes permanently hold the old spelling — the
+		// histories recorded before the rename, and the rename-era
+		// histories whose marker rides a schedule the era's registration
+		// rewired to the legacy name (jailedAgentActivity maps marker 1
+		// back to it). A run that sleeps across the worker upgrade would
+		// otherwise wedge on its next round with a nondeterminism failure.
+		// The legacy name carries its own wrapper function
+		// (RunJailedClaudeActivity), never an alias registration of the
+		// renamed function: the SDK rewrites dispatch names through a map
+		// keyed on the registered function's own name — by-name schedules
+		// included — so aliasing the renamed function would put the legacy
+		// spelling on the wire whatever the schedule side picks
 		// (jailedAgentActivity's version gate in the workflows package).
-		w.RegisterActivityWithOptions(activities.RunJailedAgentActivity,
-			activity.RegisterOptions{Name: "RunJailedClaudeActivity"})
+		// The wrapper keys that rewrite on the legacy name, the gate's
+		// decision reaches the wire verbatim, and both legacy-holding
+		// eras still resolve to the same implementation.
+		w.RegisterActivity(activities.RunJailedClaudeActivity)
 		w.RegisterActivity(activities.RunJailedReviewerActivity)
 		w.RegisterActivity(activities.DiffDigestActivity)
 		w.RegisterActivity(activities.RunNativeTestsActivity)

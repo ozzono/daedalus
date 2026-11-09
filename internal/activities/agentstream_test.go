@@ -243,19 +243,33 @@ func TestHandsNoDeliveryClassify(t *testing.T) {
 
 // TestHandsTextEvents pins the salvage capture: the text of a hands round's
 // last non-empty text event — the prose a deliver-contract kill strands in
-// the stream. The payload decodes through both observed shapes (the
-// {"text": ...} object, then a bare JSON string), a shape drift degrades to
-// "" rather than a wrong plan, non-text events and malformed lines are
-// ignored, and last-non-empty-wins is never a concatenation — the watchdog
-// strikes regenerate byte-identical prose, so joining them would hand the
-// consumer a duplicated plan.
+// the stream. The payload decodes through the probe-settled live shape
+// (the prose flat on the payload) and the deeper drift fallbacks (the body
+// under a nested payload key, then a bare JSON string); a total shape
+// drift degrades to "" rather than a wrong plan, non-text events and
+// malformed lines are ignored, and last-non-empty-wins is never a
+// concatenation — the watchdog strikes regenerate byte-identical prose, so
+// joining them would hand the consumer a duplicated plan.
 func TestHandsTextEvents(t *testing.T) {
 	cases := []struct {
 		name   string
 		stdout string
 		want   string
 	}{
-		{"object payload shape", `{"kind":"text","payload":{"payload":{"text":"the plan"}}}`, "the plan"},
+		{"live shape: prose flat on the payload", `{"kind":"text","payload":{"text":"the plan"}}`, "the plan"},
+		{"live shape last-wins across identical strikes", `{"kind":"text","payload":{"text":"first strike"}}` + "\n" +
+			`{"kind":"text","payload":{"text":"first strike"}}`,
+			"first strike"},
+		{"live shape last non-empty wins over an earlier one", `{"kind":"text","payload":{"text":"old"}}` + "\n" +
+			`{"kind":"text","payload":{"text":"new"}}`,
+			"new"},
+		{"live shape empty text skipped, earlier non-empty wins", `{"kind":"text","payload":{"text":"the plan"}}` + "\n" +
+			`{"kind":"text","payload":{"text":""}}`,
+			"the plan"},
+		{"shapes mixed, last non-empty wins", `{"kind":"text","payload":{"payload":{"text":"old"}}}` + "\n" +
+			`{"kind":"text","payload":{"text":"new"}}`,
+			"new"},
+		{"nested object payload shape", `{"kind":"text","payload":{"payload":{"text":"the plan"}}}`, "the plan"},
 		{"bare string payload shape", `{"kind":"text","payload":{"payload":"the plan"}}`, "the plan"},
 		{"last text wins, never concatenated", `{"kind":"text","payload":{"payload":{"text":"first strike"}}}` + "\n" +
 			`{"kind":"text","payload":{"payload":{"text":"first strike"}}}`,
@@ -268,13 +282,13 @@ func TestHandsTextEvents(t *testing.T) {
 			"new"},
 		{"non-text kinds ignored", `{"kind":"started","payload":{"session":"s"}}` + "\n" +
 			`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}` + "\n" +
-			`{"kind":"text","payload":{"payload":{"text":"the plan"}}}`,
+			`{"kind":"text","payload":{"text":"the plan"}}`,
 			"the plan"},
 		{"failed events ignored", `{"kind":"failed","payload":{"class":"no-delivery","reason":"killed"}}` + "\n" +
-			`{"kind":"text","payload":{"payload":{"text":"the plan"}}}`,
+			`{"kind":"text","payload":{"text":"the plan"}}`,
 			"the plan"},
 		{"malformed lines ignored", "not json" + "\n" +
-			`{"kind":"text","payload":{"payload":{"text":"the plan"}}}`,
+			`{"kind":"text","payload":{"text":"the plan"}}`,
 			"the plan"},
 		{"payload shape drift degrades to empty", `{"kind":"text","payload":{"payload":{"nope":1}}}`, ""},
 		{"no text events at all", `{"kind":"started","payload":{"session":"s"}}`, ""},
