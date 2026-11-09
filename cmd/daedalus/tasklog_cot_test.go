@@ -939,3 +939,31 @@ func TestLastCoTAge(t *testing.T) {
 		t.Errorf("lastCoTAge(no log) = %q, want the dash", got)
 	}
 }
+
+// TestTaskLogCotRendersRenamedAgentRounds pins the rename's forward face on
+// the -cot walk: a round recorded after the agent activity's rename carries
+// "RunJailedAgentActivity" as its history type, and its section decodes
+// exactly like the legacy spelling its older histories hold (the legacy
+// face is already on trial in the seeded fixtures above).
+func TestTaskLogCotRendersRenamedAgentRounds(t *testing.T) {
+	dc := converter.GetDefaultDataConverter()
+	when := time.Date(2026, 10, 14, 10, 0, 0, 0, time.UTC)
+	fake := &fakeCotServer{
+		rows: []*workflowpb.WorkflowExecutionInfo{
+			{Execution: &commonpb.WorkflowExecution{WorkflowId: "wf-renamed", RunId: "run-renamed"}, StartTime: timestamppb.New(when)},
+		},
+		history: map[string][]*historypb.HistoryEvent{
+			"run-renamed": cotRound(t, dc, 1, when, "RunJailedAgentActivity",
+				activities.AgentRunInput{Role: activities.RoleDev},
+				activities.AgentRunResult{Thinking: "renamed-round reasoning", Text: "renamed answer"}),
+		},
+		status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+	}
+	startCotServer(t, fake)
+
+	out := captureStdout(t, func() { runTaskLogCot("wf-renamed", -1) })
+
+	if !strings.Contains(out, "=== round 1: dev (run run-rena") || !strings.Contains(out, "renamed-round reasoning") {
+		t.Errorf("-cot output should render the renamed activity's round; got:\n%s", out)
+	}
+}

@@ -880,7 +880,7 @@ func TestSlimPrompts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SlimPlan: %v", err)
 	}
-	for _, want := range []string{"ship the widget", "prose only", "Do not emit JSON, arrays, or code fences"} {
+	for _, want := range []string{"ship the widget", "Do not call any tool to hand off or deliver the plan", "Do not emit JSON, arrays, or code fences"} {
 		if !strings.Contains(plan, want) {
 			t.Errorf("SlimPlan = %q, want it to contain %q", plan, want)
 		}

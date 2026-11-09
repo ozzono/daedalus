@@ -202,7 +202,7 @@ func TestQuotaHeartbeatStampsStarved(t *testing.T) {
 	stubWorktree(t, env)
 
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
 			calls++
 			if calls == 1 {

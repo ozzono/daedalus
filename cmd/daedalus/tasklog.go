@@ -230,8 +230,11 @@ func cotSectionsWith(c client.Client, workflowID string, runs []string, src stri
 				sr := scheduledRound{typ: typ, activityID: s.GetActivityId()}
 				if ps := s.GetInput().GetPayloads(); len(ps) > 0 {
 					// Same shape-vs-type dispatch as the result decode below:
-					// each activity type carries its own input struct.
-					if typ == "RunJailedClaudeActivity" {
+					// each activity type carries its own input struct. The
+					// legacy spelling joins the agent arm for histories
+					// recorded before the activity's rename
+					// (agentActivityTypes note).
+					if typ == "RunJailedAgentActivity" || typ == "RunJailedClaudeActivity" {
 						var in activities.AgentRunInput
 						if dc.FromPayload(ps[0], &in) == nil {
 							sr.role, sr.agent, sr.worktree = in.Role, in.Agent, in.WorktreePath
@@ -296,7 +299,7 @@ func cotSectionsWith(c client.Client, workflowID string, runs []string, src stri
 			}
 			var cot string
 			switch sr.typ {
-			case "RunJailedClaudeActivity":
+			case "RunJailedAgentActivity", "RunJailedClaudeActivity":
 				var r activities.AgentRunResult
 				if dc.FromPayload(ps[0], &r) != nil {
 					continue

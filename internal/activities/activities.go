@@ -262,18 +262,19 @@ type ReviewResult struct {
 	Usage Usage
 }
 
-// RunJailedClaudeActivity runs the jailed agent (Claude Code, opencode,
-// pi, codex, or aider, per config) inside an ai-jail sandbox rooted at the
-// worktree. Claude runs with json output so its visible text comes back
-// structured and lands complete in the activity result (serialized into
-// Temporal history, visible in the UI per round); pi's --mode json emits pi's own event schema, read by
+// RunJailedAgentActivity runs the jailed agent (claude, opencode, pi,
+// codex, hands, or aider, per config) inside an ai-jail sandbox rooted at
+// the worktree. claude runs with json output so its visible text comes
+// back structured and lands complete in the activity result (serialized
+// into Temporal history, visible in the UI per round); pi's --mode json emits pi's own event schema, read by
 // its own parser branch (thinking, session id, and usage all captured);
-// opencode's, codex's, and aider's plain output is taken as-is (no thinking,
-// session, or usage). stream-json (which also carries the chain of
-// thought via --verbose) is blocked for claude for now: ai-jail's flag
-// guard rejects --verbose after the command by prefix match, even
-// behind --.
-func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
+// hands's --format json emits hands's own typed event protocol (same
+// parser family); opencode's, codex's, and aider's plain output is taken
+// as-is (no thinking, session, or usage). stream-json (which also carries
+// the chain of thought via --verbose) is blocked for claude for now:
+// ai-jail's flag guard rejects --verbose after the command by prefix
+// match, even behind --.
+func RunJailedAgentActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
 	// Post-round bug mirror (bug_filing.mirror): on every exit path — a
 	// round cut off at its ceiling may already have filed files, and its
 	// worktree dies with the run's cleanup all the same. With the mirror

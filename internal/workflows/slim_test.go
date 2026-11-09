@@ -715,7 +715,7 @@ func TestSlimWorkflowNoSuiteParks(t *testing.T) {
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var agentCalls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { agentCalls++ }).
 		Return(activities.AgentRunResult{}, nil).Maybe()
 	env.OnActivity(activities.ResolveTestCommandActivity, mock.Anything, mock.Anything, mock.Anything).
@@ -1074,4 +1074,89 @@ func runSlimErr(t *testing.T, env *testsuite.TestWorkflowEnvironment) error {
 	in.Flow = "slim"
 	env.ExecuteWorkflow(SlimWorkflow, in)
 	return env.GetWorkflowError()
+}
+
+// slimSalvageQueue is the parse round's reply transcribing the salvaged
+// prose plan: one sub-task, so the loop converges after its first green
+// round.
+const slimSalvageQueue = `[{"id":1,"type":"implement","target_files":["adder.go"],"description":"add the adder","acceptance_criteria":["adder.go defines Add","Add(2,2) returns 4"]}]`
+
+// TestSlimWorkflowNoDeliverySalvage pins the salvage seat: the planner round
+// is the one stage armed with the salvage pointer, so a deliver-contract
+// kill whose envelope carries the stranded plan feeds the prose to the parse
+// round instead of parking — a plan round's deliverable IS the prose, and
+// the kill did not damage it. The kill is never re-run, the salvage is
+// stamped on the run memo (run-visible, where a maintainer answers "why did
+// the parse round read salvaged prose?"), and the implementation rounds
+// open the dev conversation cold — the killed round never returned a
+// session to chain. A kill without a capture parks even under the seat:
+// salvaging "" would only move the park one call frame.
+func TestSlimWorkflowNoDeliverySalvage(t *testing.T) {
+	t.Run("a captured kill feeds the parse round", func(t *testing.T) {
+		env, agents, reviews, suites, _ := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"PlanProseSalvaged": true}).Return(nil).Once()
+		agents.script = []agentStep{
+			{err: errNoDeliveryStub},
+			{result: activities.AgentRunResult{Text: slimSalvageQueue, SessionID: "dev-2"}},
+			{result: activities.AgentRunResult{Text: "step one done", SessionID: "dev-3"}},
+		}
+		reviews.stub = []activities.ReviewResult{{Approved: true}}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+
+		branch, err := runSlim(t, env)
+		if err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if branch != "daedalus/issue-42-1" {
+			t.Errorf("branch = %q, want the finalize deliverable", branch)
+		}
+		if len(agents.inputs) != 3 {
+			t.Fatalf("agent ran %d times, want 3 (killed plan, parse, step — the kill is never re-run)", len(agents.inputs))
+		}
+		parse := agents.inputs[1]
+		if got := parse.SessionID; got != "" {
+			t.Errorf("parse SessionID = %q, want empty (the parse round always opens fresh)", got)
+		}
+		if p := parse.Prompt; !strings.Contains(p, slimSalvagePlanText) || strings.Contains(p, "PLANNER") {
+			t.Errorf("parse prompt should carry the salvaged prose under the parse template, never a planner re-run, got:\n%s", p)
+		}
+		if got := agents.inputs[2].SessionID; got != "" {
+			t.Errorf("step SessionID = %q, want empty — the killed round never returned a session, so the dev conversation opens cold", got)
+		}
+		if len(suites.runs) != 2 {
+			t.Errorf("suite ran %d times, want 2 (preflight + the accepted round)", len(suites.runs))
+		}
+		// The memo assertion rides AssertExpectations: exactly one stamp,
+		// exactly the PlanProseSalvaged map.
+		env.AssertExpectations(t)
+	})
+
+	t.Run("a kill without a capture parks", func(t *testing.T) {
+		env, agents, reviews, _, _ := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"PlanProseSalvaged": true}).Never()
+		agents.script = []agentStep{
+			{err: errNoDeliveryBareStub},
+		}
+
+		err := runSlimErr(t, env)
+		for _, want := range []string{
+			ErrAwaitingMaintainer.Error(),
+			"planner round:",
+			errNoDeliveryBareStub.Error(),
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if len(agents.inputs) != 1 {
+			t.Errorf("agent ran %d times, want 1 — the kill parks without spending a parse round on an empty salvage", len(agents.inputs))
+		}
+		if len(reviews.inputs) != 0 {
+			t.Errorf("reviewer ran %d times, want 0 (nothing to review without a queue)", len(reviews.inputs))
+		}
+		// No AssertExpectations: the reviewer recorder's minimum-call
+		// expectation can never be met on a park path that runs no review
+		// (the slim parse-retry park tests omit it for the same reason).
+	})
 }

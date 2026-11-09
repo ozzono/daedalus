@@ -188,3 +188,104 @@ func TestHandsStuckClassify(t *testing.T) {
 		})
 	}
 }
+
+// TestHandsNoDeliveryClassify pins handsNoDelivery's classification table:
+// only the failed event's class field decides — "no-delivery" (the deliver
+// contract's watchdog kill) lands with its reason in the composite, which is
+// never empty on a match, every other class stays untracked (stuck belongs
+// to handsStuck, retriable to agentAPIError, the rest to the generic path),
+// and last-wins is total past any later event. The faces are mutually
+// exclusive in a real stream (one terminal failed event, one class per
+// event), so the sibling parsers must stay deaf to each other's class —
+// pinned from both directions on the same streams.
+func TestHandsNoDeliveryClassify(t *testing.T) {
+	stuckStream := `{"kind":"failed","payload":{"class":"stuck","reason":"no wire events for 14m0s"}}`
+	noDeliveryStream := `{"kind":"failed","payload":{"class":"no-delivery","reason":"2 strikes with no delivery tool call"}}`
+	cases := []struct {
+		name   string
+		stdout string
+		want   string
+	}{
+		{"no-delivery kill with reason", noDeliveryStream,
+			"class no-delivery: 2 strikes with no delivery tool call"},
+		{"no-delivery without a reason is never empty", `{"kind":"failed","payload":{"class":"no-delivery"}}`,
+			"class no-delivery: "},
+		{"last no-delivery wins", `{"kind":"failed","payload":{"class":"no-delivery","reason":"first"}}` + "\n" +
+			`{"kind":"failed","payload":{"class":"no-delivery","reason":"second"}}`,
+			"class no-delivery: second"},
+		{"last-wins is total past any later event", `{"kind":"failed","payload":{"class":"no-delivery","reason":"first"}}` + "\n" +
+			`{"kind":"started","payload":{"session":"s-9"}}` + "\n" +
+			`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}`,
+			"class no-delivery: first"},
+		{"stuck belongs to the stuck face", stuckStream, ""},
+		{"retriable belongs to the api-error face", `{"kind":"failed","payload":{"class":"retriable","reason":"connection refused"}}`, ""},
+		{"other classes stay generic", `{"kind":"failed","payload":{"class":"terminal","reason":"unusable response"}}`, ""},
+		{"clean stream", `{"kind":"started","payload":{"session":"s"}}` + "\n" +
+			`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}`, ""},
+		{"non-json lines ignored", "not json", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := handsNoDelivery(c.stdout); got != c.want {
+				t.Errorf("handsNoDelivery(%q) = %q, want %q", c.stdout, got, c.want)
+			}
+		})
+	}
+	// Mutual exclusivity, both directions: a stuck class never mints the
+	// no-delivery face and a no-delivery class never mints the stuck face.
+	if got := handsStuck(noDeliveryStream); got != "" {
+		t.Errorf("handsStuck(no-delivery stream) = %q, want empty", got)
+	}
+	if got := handsNoDelivery(stuckStream); got != "" {
+		t.Errorf("handsNoDelivery(stuck stream) = %q, want empty", got)
+	}
+}
+
+// TestHandsTextEvents pins the salvage capture: the text of a hands round's
+// last non-empty text event — the prose a deliver-contract kill strands in
+// the stream. The payload decodes through both observed shapes (the
+// {"text": ...} object, then a bare JSON string), a shape drift degrades to
+// "" rather than a wrong plan, non-text events and malformed lines are
+// ignored, and last-non-empty-wins is never a concatenation — the watchdog
+// strikes regenerate byte-identical prose, so joining them would hand the
+// consumer a duplicated plan.
+func TestHandsTextEvents(t *testing.T) {
+	cases := []struct {
+		name   string
+		stdout string
+		want   string
+	}{
+		{"object payload shape", `{"kind":"text","payload":{"payload":{"text":"the plan"}}}`, "the plan"},
+		{"bare string payload shape", `{"kind":"text","payload":{"payload":"the plan"}}`, "the plan"},
+		{"last text wins, never concatenated", `{"kind":"text","payload":{"payload":{"text":"first strike"}}}` + "\n" +
+			`{"kind":"text","payload":{"payload":{"text":"first strike"}}}`,
+			"first strike"},
+		{"empty text events skipped, earlier non-empty wins", `{"kind":"text","payload":{"payload":{"text":"the plan"}}}` + "\n" +
+			`{"kind":"text","payload":{"payload":{"text":""}}}`,
+			"the plan"},
+		{"last non-empty wins over an earlier one", `{"kind":"text","payload":{"payload":{"text":"old"}}}` + "\n" +
+			`{"kind":"text","payload":{"payload":{"text":"new"}}}`,
+			"new"},
+		{"non-text kinds ignored", `{"kind":"started","payload":{"session":"s"}}` + "\n" +
+			`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}` + "\n" +
+			`{"kind":"text","payload":{"payload":{"text":"the plan"}}}`,
+			"the plan"},
+		{"failed events ignored", `{"kind":"failed","payload":{"class":"no-delivery","reason":"killed"}}` + "\n" +
+			`{"kind":"text","payload":{"payload":{"text":"the plan"}}}`,
+			"the plan"},
+		{"malformed lines ignored", "not json" + "\n" +
+			`{"kind":"text","payload":{"payload":{"text":"the plan"}}}`,
+			"the plan"},
+		{"payload shape drift degrades to empty", `{"kind":"text","payload":{"payload":{"nope":1}}}`, ""},
+		{"no text events at all", `{"kind":"started","payload":{"session":"s"}}`, ""},
+		{"plain text lines ignored", "hands said something", ""},
+		{"empty stream", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := handsTextEvents(c.stdout); got != c.want {
+				t.Errorf("handsTextEvents(%q) = %q, want %q", c.stdout, got, c.want)
+			}
+		})
+	}
+}

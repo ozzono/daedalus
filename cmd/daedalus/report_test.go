@@ -694,3 +694,32 @@ func TestPrintReportTable(t *testing.T) {
 		}
 	}
 }
+
+// TestAggregateSessionUsageReadsRenamedAgentRounds pins the rename's
+// forward face on the usage walk: a run recorded after the agent activity's
+// rename carries "RunJailedAgentActivity" as its history type, and the walk
+// reads its usage exactly like the legacy spelling its older histories hold
+// (every other usage test here records the legacy name — that face is
+// already on trial).
+func TestAggregateSessionUsageReadsRenamedAgentRounds(t *testing.T) {
+	at := time.Date(2026, 11, 9, 8, 0, 0, 0, time.UTC)
+	c := &fakeHistoryClient{
+		runHistories: map[string][]*historypb.HistoryEvent{
+			"run-new": {
+				scheduledEvent(1, at, "RunJailedAgentActivity"),
+				completedEvent(t, 1, at, activities.AgentRunResult{Usage: activities.Usage{Worker: "w1", CostUSD: 0.4, InputTokens: 200}}),
+			},
+		},
+		runs: map[string][]*workflowpb.WorkflowExecutionInfo{
+			"wf-renamed": {listRow{workflowID: "wf-renamed", runID: "run-new", start: at, status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING}.info(t)},
+		},
+	}
+
+	rep := newUsageReport()
+	if err := aggregateSessionUsage(c, "wf-renamed", rep); err != nil {
+		t.Fatalf("aggregateSessionUsage: %v", err)
+	}
+	if rep.Total.Rounds != 1 || rep.Total.CostUSD != 0.4 {
+		t.Errorf("total = %+v, want the renamed activity's round, cost 0.4", rep.Total)
+	}
+}

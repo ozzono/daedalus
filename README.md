@@ -34,7 +34,7 @@ flowchart TD
     CREATE --> P1_IMPL
 
     %% Phase 1 Nodes
-    P1_IMPL["<b> PHASE 1: IMPLEMENTATION </b><hr/>RunJailedClaude<br/><i>(implements, no tests yet)</i>"]
+    P1_IMPL["<b> PHASE 1: IMPLEMENTATION </b><hr/>RunJailedAgent<br/><i>(implements, no tests yet)</i>"]
     P1_REV["<b> PHASE 1: REVIEW </b><hr/>RunJailedReviewer<br/><i>(code)</i>"]
 
     P1_IMPL --> P1_REV
@@ -43,7 +43,7 @@ flowchart TD
     P1_REV -- "APPROVED" --> P2_IMPL
 
     %% Phase 2 Nodes
-    P2_IMPL["<b> PHASE 2: TESTS </b><hr/>RunJailedClaude<br/><i>(writes/fixes/improves tests)</i>"]
+    P2_IMPL["<b> PHASE 2: TESTS </b><hr/>RunJailedAgent<br/><i>(writes/fixes/improves tests)</i>"]
     P2_TEST["<b> PHASE 2: SUITE </b><hr/>RunNativeTests"]
     P2_REV["<b> PHASE 2: REVIEW </b><hr/>RunJailedReviewer<br/><i>(tests)</i>"]
 

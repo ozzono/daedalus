@@ -709,11 +709,11 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -825,12 +825,12 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the half-specified failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the half-specified failure")
 		}
 		if !strings.Contains(err.Error(), "half-specified") {
 			t.Errorf("error = %q, want the hands half-specified guard message", err)
@@ -848,12 +848,12 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the no-provider failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the no-provider failure")
 		}
 		if !strings.Contains(err.Error(), "no provider section exported") {
 			t.Errorf("error = %q, want the hands no-provider guard message", err)
@@ -893,7 +893,7 @@ func TestHandsRoundRecordsKilledSessionAndResumes(t *testing.T) {
 	stubBin(t, "ai-jail",
 		`printf '%s\n' '{"round_id":"r-1","seq":0,"kind":"started","payload":{"session":"sess-hands-1"}}' '{"round_id":"r-1","seq":1,"kind":"usage","payload":{"input_tokens":10,"output_tokens":2,"cost_dollars":0.01}}'`+"\nkill -9 $$")
 
-	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "implement",
 		Role:         RoleDev,
@@ -916,7 +916,7 @@ func TestHandsRoundRecordsKilledSessionAndResumes(t *testing.T) {
 	// Round two: the retry, with no workflow-provided id.
 	stubBin(t, "ai-jail",
 		`printf '%s\n' '{"round_id":"r-2","seq":0,"kind":"started","payload":{"session":"sess-hands-2"}}' '{"round_id":"r-2","seq":1,"kind":"delivered","payload":{"payload":{"summary":"resumed and delivered","files_changed":["a.go"]}}}' '{"round_id":"r-2","seq":2,"kind":"usage","payload":{"input_tokens":100,"output_tokens":20,"cost_dollars":0.42}}'; exit 0`)
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "continue the work",
 		Role:         RoleDev,
@@ -960,4 +960,137 @@ func TestHandsRoundRecordsKilledSessionAndResumes(t *testing.T) {
 			"--rw-map", src + ":" + dst,
 			"--", "hands", "resume", "sess-hands-1", "--format", "json"},
 	), "retry round")
+}
+
+// handsNoDeliveryRoundEnv stages the serving provider env a jailed hands
+// round launches under, scrubbed of the ambient bug-filing mirror and HOME.
+func handsNoDeliveryRoundEnv(t *testing.T) {
+	t.Helper()
+	scrubBugFilingEnv(t)
+	fakeHome(t)
+	t.Setenv("DAEDALUS_AGENT", "hands")
+	t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+	t.Setenv("OPENAI_API_KEY", "sk-local")
+	t.Setenv("OPENAI_MODEL", "glm-selfhost")
+}
+
+// TestHandsRoundNoDeliveryKillClassifies pins the deliver-contract kill's
+// classification at the round boundary: a hands round whose stream carries
+// its prose turns as text events and dies on a terminal failed event of
+// class "no-delivery" (non-zero exit) wraps ErrAgentNoDelivery — never
+// ErrAPIExhausted, though its session id embeds "402" (the live
+// misclassification the all-digit boundary rule exists for) — and carries
+// the stranded prose as the salvage envelope NoDeliveryCapturedText
+// extracts. The wrap degrades to unsalvageable, never a mis-sliced plan: a
+// capture already carrying an envelope marker ships bare. A signal death
+// outranks the stream report exactly as it outranks the stuck report, and
+// the event shape is deaf on a non-hands agent — only hands's typed stream
+// can mint the face.
+func TestHandsRoundNoDeliveryKillClassifies(t *testing.T) {
+	noDeliveryStream := `printf '%s\n' \
+  '{"round_id":"r-1","seq":0,"kind":"started","payload":{"session":"conv-2a8464029e36"}}' \
+  '{"round_id":"r-1","seq":1,"kind":"text","payload":{"payload":{"text":"Sub-task 1 (implement, adder.go): add the adder."}}}' \
+  '{"round_id":"r-1","seq":2,"kind":"failed","payload":{"class":"no-delivery","reason":"2 turns with no delivery tool call"}}'
+exit 1`
+
+	t.Run("kill classifies with the salvage envelope", func(t *testing.T) {
+		handsNoDeliveryRoundEnv(t)
+		wt := gitRepo(t)
+		newStubLog(t)
+		stubBin(t, "ai-jail", noDeliveryStream)
+
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "plan the work",
+		})
+		if !errors.Is(err, ErrAgentNoDelivery) {
+			t.Fatalf("error = %v, want ErrAgentNoDelivery", err)
+		}
+		if errors.Is(err, ErrAPIExhausted) {
+			t.Errorf("error %v rides the exhaustion family, want the no-delivery face — the provider was healthy (every turn completed); the uuid's embedded 402 must not misclassify the round", err)
+		}
+		for _, want := range []string{
+			"hands round died on a no-delivery kill",
+			"class no-delivery: 2 turns with no delivery tool call",
+			noDeliveryCaptureBegin,
+			noDeliveryCaptureEnd,
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should contain %q", err, want)
+			}
+		}
+		if got := NoDeliveryCapturedText(err); got != "Sub-task 1 (implement, adder.go): add the adder." {
+			t.Errorf("NoDeliveryCapturedText = %q, want the stranded plan prose", got)
+		}
+	})
+
+	t.Run("marker-colliding capture ships bare", func(t *testing.T) {
+		handsNoDeliveryRoundEnv(t)
+		wt := gitRepo(t)
+		newStubLog(t)
+		stubBin(t, "ai-jail", `printf '%s\n' \
+  '{"round_id":"r-1","seq":0,"kind":"text","payload":{"payload":{"text":"planning... `+noDeliveryCaptureBegin+`"}}}' \
+  '{"round_id":"r-1","seq":1,"kind":"failed","payload":{"class":"no-delivery","reason":"2 turns with no delivery tool call"}}'
+exit 1`)
+
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "plan the work",
+		})
+		if !errors.Is(err, ErrAgentNoDelivery) {
+			t.Fatalf("error = %v, want ErrAgentNoDelivery", err)
+		}
+		if got := NoDeliveryCapturedText(err); got != "" {
+			t.Errorf("NoDeliveryCapturedText = %q, want empty — a capture that could collide with the envelope degrades to unsalvageable, never a mis-sliced plan", got)
+		}
+	})
+
+	t.Run("empty capture ships bare", func(t *testing.T) {
+		handsNoDeliveryRoundEnv(t)
+		wt := gitRepo(t)
+		newStubLog(t)
+		stubBin(t, "ai-jail", `printf '%s\n' \
+  '{"round_id":"r-1","seq":0,"kind":"started","payload":{"session":"conv-1"}}' \
+  '{"round_id":"r-1","seq":1,"kind":"failed","payload":{"class":"no-delivery","reason":"killed before any turn"}}'
+exit 1`)
+
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "plan the work",
+		})
+		if !errors.Is(err, ErrAgentNoDelivery) {
+			t.Fatalf("error = %v, want ErrAgentNoDelivery", err)
+		}
+		if got := NoDeliveryCapturedText(err); got != "" {
+			t.Errorf("NoDeliveryCapturedText = %q, want empty (no text events to salvage)", got)
+		}
+	})
+
+	t.Run("signal death outranks the stream report", func(t *testing.T) {
+		handsNoDeliveryRoundEnv(t)
+		wt := gitRepo(t)
+		newStubLog(t)
+		stubBin(t, "ai-jail", strings.TrimSuffix(noDeliveryStream, "exit 1")+"\nkill -9 $$")
+
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "plan the work",
+		})
+		if !errors.Is(err, ErrAgentKilled) {
+			t.Fatalf("error = %v, want ErrAgentKilled — the wait-status-derived death outranks the stream report", err)
+		}
+		if errors.Is(err, ErrAgentNoDelivery) {
+			t.Errorf("error %v also carries the no-delivery face, want the kill alone", err)
+		}
+	})
+
+	t.Run("the event shape is deaf on a non-hands agent", func(t *testing.T) {
+		newStubLog(t)
+		stubBin(t, "ai-jail", noDeliveryStream)
+
+		_, err := runJailedRound(context.Background(), jailedPiRoundEnv(), "", "claude", gitRepo(t), "plan the work")
+		if err == nil || errors.Is(err, ErrAgentNoDelivery) || errors.Is(err, ErrAPIExhausted) {
+			t.Fatalf("error = %v, want the generic failure — the class field is hands's alone, and the uuid's embedded 402 is not an exhaustion marker", err)
+		}
+	})
 }

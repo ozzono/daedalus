@@ -213,6 +213,17 @@ type pipelineRun struct {
 	// testerReply themselves, including the rebuild re-point.
 	devReply string
 
+	// noDeliverySalvage, when non-nil, opts the next agent round's
+	// no-delivery kill into salvage: instead of the park, runAgent stores
+	// the killed round's stranded prose (activities.NoDeliveryCapturedText)
+	// through the pointer and returns the sentinel error for the caller to
+	// route. Set around exactly one round — the slim planner seat, whose
+	// deliverable IS the prose a no-delivery kill strands (see
+	// SlimWorkflow); every other stage leaves it nil and takes the park.
+	// A kill with no capture in its error parks even under the seat:
+	// salvaging "" would only move the park one call frame.
+	noDeliverySalvage *string
+
 	// skillDevReviewSessions and skillTestReviewSessions chain each entry
 	// of the run's review_skill_list to its own reviewer conversation —
 	// one ping-pong per skill per phase, each resuming its own session
@@ -565,6 +576,29 @@ func (r *pipelineRun) heartbeat(err error, stage string) error {
 	return nil
 }
 
+// jailedAgentActivityChangeID gates the agent-activity rename behind
+// workflow.GetVersion: the activity type name is a wire string whose
+// replay consumer is immutable — the SDK matches replay commands against
+// recorded history events by name, so a worker upgraded mid-run would
+// wedge every in-flight workflow with a nondeterminism failure if the new
+// code scheduled the renamed activity unconditionally (a
+// scheduled-but-unstarted pre-rename task included). Pre-marker replays —
+// every history recorded before the rename — schedule the legacy
+// spelling, which the worker keeps registered as an alias onto the same
+// function (worker_run.go); marker replays and fresh executions schedule
+// the new name.
+const jailedAgentActivityChangeID = "jailed-agent-activity-rename"
+
+// jailedAgentActivity returns the activity type name to schedule for an
+// agent round. GetVersion is memoized per execution, so the per-round
+// calls record the marker once.
+func jailedAgentActivity(ctx workflow.Context) string {
+	if workflow.GetVersion(ctx, jailedAgentActivityChangeID, workflow.DefaultVersion, 1) == 1 {
+		return "RunJailedAgentActivity"
+	}
+	return "RunJailedClaudeActivity"
+}
+
 // runAgent executes one autonomous agent round in the given role's session,
 // resuming it when set, and returns the round's result — its reply text is
 // what a test phase relays to its reviewer, and a dev-role round's reply is
@@ -587,7 +621,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 	freshRetry := false
 	for {
 		var result activities.AgentRunResult
-		err := workflow.ExecuteActivity(r.agentCtx, activities.RunJailedClaudeActivity, activities.AgentRunInput{
+		err := workflow.ExecuteActivity(r.agentCtx, jailedAgentActivity(r.ctx), activities.AgentRunInput{
 			WorktreePath: r.worktree.WorktreePath,
 			Prompt:       prompt,
 			Agent:        r.input.Agent,
@@ -628,6 +662,27 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			// over the output-text classifications and the fresh-start
 			// fallback below.
 			return activities.AgentRunResult{}, r.park(fmt.Sprintf("agent round stuck (stage %q): %v", stage, err))
+		}
+		if !killed && isAgentNoDelivery(err) {
+			// Same precedence slot as the stuck park it mirrors: a
+			// no-delivery kill is a terminal contract enforcement, not a
+			// provider failure — the turns completed cleanly, so the
+			// exhaustion rescue (failover, quota heartbeat) would only
+			// re-run a round whose byte-identical regeneration is the
+			// live-proven failure mode. The routing ruling parks, with one
+			// exception: a caller that armed the salvage seat and whose
+			// kill carries the stranded prose gets the raw sentinel
+			// instead — the slim planner seat consumes it (see
+			// SlimWorkflow) rather than parking on its own deliverable.
+			// A salvage-armed kill without a capture parks anyway:
+			// salvaging "" would only move the park one call frame.
+			if r.noDeliverySalvage != nil {
+				if text := activities.NoDeliveryCapturedText(err); text != "" {
+					*r.noDeliverySalvage = text
+					return activities.AgentRunResult{}, err
+				}
+			}
+			return activities.AgentRunResult{}, r.park(fmt.Sprintf("agent round killed on a no-delivery watchdog (stage %q): %v", stage, err))
 		}
 		if !killed && isAPIExhaustion(err) {
 			if herr := r.heartbeat(err, stage); herr != nil {
@@ -922,6 +977,14 @@ func (r *pipelineRun) review(opts reviewOpts) (activities.ReviewResult, error) {
 			// over, never parked in the quota heartbeat.
 			return result, r.park(fmt.Sprintf("reviewer round stuck (focus %q): %v", focus, err))
 		}
+		if !killed && isAgentNoDelivery(err) {
+			// Same park, same reasoning: a reviewer round killed on the
+			// deliver contract is terminal contract enforcement — no
+			// salvage seat exists on this path, so the park preserves the
+			// round for the operator instead of re-running it into the
+			// same kill.
+			return result, r.park(fmt.Sprintf("reviewer round killed on a no-delivery watchdog (focus %q): %v", focus, err))
+		}
 		if !killed && isPromptOverflow(err) {
 			// A prompt that cannot fit the serving model's context is a
 			// static failure: the same prompt is re-sent by every retry,
@@ -1033,6 +1096,11 @@ func (r *pipelineRun) resolveTestCommand() (string, error) {
 			// Test-command discovery runs a jailed agent round, so the
 			// stuck park covers it too.
 			return "", fmt.Errorf("resolve test command: %w", r.park(fmt.Sprintf("test-command discovery round stuck: %v", err)))
+		}
+		if isAgentNoDelivery(err) {
+			// Same park for the deliver contract's kill: discovery rounds
+			// carry no salvage seat, so the kill parks like a stuck one.
+			return "", fmt.Errorf("resolve test command: %w", r.park(fmt.Sprintf("test-command discovery round killed on a no-delivery watchdog: %v", err)))
 		}
 		if isAPIExhaustion(err) {
 			// Test-command discovery runs a jailed agent round, so it

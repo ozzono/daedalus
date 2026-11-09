@@ -806,7 +806,7 @@ func TestFlowsPreflightGateParksOnRedBaseline(t *testing.T) {
 			env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 				Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 			var agentCalls, reviewCalls int
-			env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+			env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 				Run(func(args mock.Arguments) { agentCalls++ }).
 				Return(activities.AgentRunResult{}, nil).Maybe()
 			env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
@@ -1053,7 +1053,7 @@ func TestFlowsAgentErrorFails(t *testing.T) {
 			env := newTestEnv(t)
 			env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 				Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
-			env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+			env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 				Return(activities.AgentRunResult{}, errors.New("agent exploded"))
 			// The gated flows run the preflight suite before the first
 			// agent round; investigate never touches these activities.

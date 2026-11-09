@@ -1095,7 +1095,7 @@ type Config struct {
 	// the round answers to no ceiling, resolving to UnlimitedTimeout.
 	TestsTimeout *time.Duration `yaml:"tests_timeout"`
 	// AgentRunTimeout bounds one jailed agent round — the implementation,
-	// fix, and rebuild rounds (RunJailedClaudeActivity). A
+	// fix, and rebuild rounds (RunJailedAgentActivity). A
 	// time.ParseDuration string in YAML ("45m"); DefaultAgentRunTimeout
 	// when unset (nil); an explicit 0s is unlimited, resolving to
 	// UnlimitedTimeout.

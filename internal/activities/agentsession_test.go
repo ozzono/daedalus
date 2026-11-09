@@ -294,7 +294,9 @@ func TestWatchTranscriptsStopsWhenClosed(t *testing.T) {
 // preflight refused (its prompt size is session-independent, so no fresh
 // start shrinks it), a stuck round (the ruled no-retry face: a fresh
 // session would re-enter the very silence the round was killed for), a
-// cancelled or expired context — keeps the round as it is.
+// no-delivery round (same ruled face: a fresh session would regenerate the
+// same prose into the same deliver-contract kill), a cancelled or expired
+// context — keeps the round as it is.
 func TestBrokenResume(t *testing.T) {
 	cases := []struct {
 		name string
@@ -309,6 +311,7 @@ func TestBrokenResume(t *testing.T) {
 		{"agent never launched", fmt.Errorf("%w: exec: not found", errAgentStart), false},
 		{"window preflight refusal", fmt.Errorf("run jailed: %w: pi round refused before launch", ErrPromptOverWindow), false},
 		{"stuck round", fmt.Errorf("wrap: %w", ErrAgentStuck), false},
+		{"no-delivery round", fmt.Errorf("wrap: %w", ErrAgentNoDelivery), false},
 		{"cancelled", fmt.Errorf("wrap: %w", context.Canceled), false},
 		{"deadline exceeded", context.DeadlineExceeded, false},
 	}
@@ -345,12 +348,12 @@ func shortTranscriptScan(t *testing.T) {
 	t.Cleanup(func() { transcriptScanInterval = old })
 }
 
-// TestRunJailedClaudeActivityRecordsKilledRoundSession pins the incident
+// TestRunJailedAgentActivityRecordsKilledRoundSession pins the incident
 // this feature exists for: a round killed at its ceiling never returns a
 // result carrying a session id, but its conversation is still on record by
 // the time the round dies — sourced from claude's own transcript file, not
 // from anything the round printed.
-func TestRunJailedClaudeActivityRecordsKilledRoundSession(t *testing.T) {
+func TestRunJailedAgentActivityRecordsKilledRoundSession(t *testing.T) {
 	fakeHome(t)
 	wt := t.TempDir()
 	slug := pathSlug(wt)
@@ -363,7 +366,7 @@ printf '%s\n' '{"type":"system","subtype":"init"}' > "$HOME/.claude/projects/`+s
 sleep 0.3
 kill -9 $$`)
 
-	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "implement",
 		Role:         RoleDev,
@@ -377,11 +380,11 @@ kill -9 $$`)
 	}
 }
 
-// TestRunJailedClaudeActivityResumesRecordedSession pins the retry path: a
+// TestRunJailedAgentActivityResumesRecordedSession pins the retry path: a
 // round whose workflow-provided SessionID is empty — the retry after a
 // round killed at its ceiling — resumes the recorded conversation instead
 // of restarting from zero.
-func TestRunJailedClaudeActivityResumesRecordedSession(t *testing.T) {
+func TestRunJailedAgentActivityResumesRecordedSession(t *testing.T) {
 	fakeHome(t)
 	wt := t.TempDir()
 	slug := pathSlug(wt)
@@ -391,7 +394,7 @@ func TestRunJailedClaudeActivityResumesRecordedSession(t *testing.T) {
 	stubBin(t, "ai-jail", `mkdir -p "$HOME/.claude/projects/`+slug+`"
 printf '%s\n' '{"type":"system","subtype":"init"}' > "$HOME/.claude/projects/`+slug+`/sess-att-1.jsonl"
 kill -9 $$`)
-	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "implement",
 		Role:         RoleDev,
@@ -401,7 +404,7 @@ kill -9 $$`)
 
 	// Round two: the retry, with no workflow-provided id.
 	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"continued","session_id":"sess-att-2"}'; exit 0`)
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "continue the work",
 		Role:         RoleDev,
@@ -425,10 +428,10 @@ kill -9 $$`)
 	}
 }
 
-// TestRunJailedClaudeActivityFallbackGuards pins the two guards on the
+// TestRunJailedAgentActivityFallbackGuards pins the two guards on the
 // recorded-session fallback: an empty role (one-shot rounds) never resumes,
 // and an agent without --resume support never resumes.
-func TestRunJailedClaudeActivityFallbackGuards(t *testing.T) {
+func TestRunJailedAgentActivityFallbackGuards(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		role  SessionRole
@@ -449,12 +452,12 @@ func TestRunJailedClaudeActivityFallbackGuards(t *testing.T) {
 			recordSession(context.Background(), wt, RoleDev, "sess-1")
 			plantTranscript(t, wt, "sess-1")
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "discover the test command",
 				Role:         tc.role,
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			calls := readCalls(t, log)
@@ -468,10 +471,10 @@ func TestRunJailedClaudeActivityFallbackGuards(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityStaleRecordStartsFresh pins the stale guard: a
+// TestRunJailedAgentActivityStaleRecordStartsFresh pins the stale guard: a
 // record whose transcript claude pruned is not resumed — and does not fail
 // the round; it starts fresh instead.
-func TestRunJailedClaudeActivityStaleRecordStartsFresh(t *testing.T) {
+func TestRunJailedAgentActivityStaleRecordStartsFresh(t *testing.T) {
 	fakeHome(t)
 	wt := t.TempDir()
 	log := newStubLog(t)
@@ -479,7 +482,7 @@ func TestRunJailedClaudeActivityStaleRecordStartsFresh(t *testing.T) {
 	// On record, but its transcript is gone (claude pruned it).
 	recordSession(context.Background(), wt, RoleDev, "sess-gone")
 
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "retry",
 		Role:         RoleDev,
@@ -499,12 +502,12 @@ func TestRunJailedClaudeActivityStaleRecordStartsFresh(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityBrokenResumeRetriesFresh pins the fresh-start
+// TestRunJailedAgentActivityBrokenResumeRetriesFresh pins the fresh-start
 // fallback: when the resumed conversation itself is dead anyway (a miss the
 // pre-flight check could not catch), the round retries once without
 // --resume instead of failing — and the record is left for the fresh
 // round's own transcript to overwrite.
-func TestRunJailedClaudeActivityBrokenResumeRetriesFresh(t *testing.T) {
+func TestRunJailedAgentActivityBrokenResumeRetriesFresh(t *testing.T) {
 	fakeHome(t)
 	wt := t.TempDir()
 	log := newStubLog(t)
@@ -519,7 +522,7 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"fresh ok","session
 	recordSession(context.Background(), wt, RoleDev, "sess-dead")
 	plantTranscript(t, wt, "sess-dead")
 
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "retry",
 		Role:         RoleDev,
@@ -548,11 +551,11 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"fresh ok","session
 	}
 }
 
-// TestRunJailedClaudeActivityKilledResumeNotRetriedFresh pins the exclusion:
+// TestRunJailedAgentActivityKilledResumeNotRetriedFresh pins the exclusion:
 // a resumed round killed by a signal is not given a fresh start — the kill
 // (including the activity-ceiling kill) says nothing about the conversation,
 // and the workflow's timeout accounting depends on the kill staying a kill.
-func TestRunJailedClaudeActivityKilledResumeNotRetriedFresh(t *testing.T) {
+func TestRunJailedAgentActivityKilledResumeNotRetriedFresh(t *testing.T) {
 	fakeHome(t)
 	wt := t.TempDir()
 	log := newStubLog(t)
@@ -563,7 +566,7 @@ echo SHOULD-NOT-RUN; exit 0`)
 	recordSession(context.Background(), wt, RoleDev, "sess-live")
 	plantTranscript(t, wt, "sess-live")
 
-	_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "retry",
 		Role:         RoleDev,
@@ -970,12 +973,12 @@ func TestRecordNewPiTranscript(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityPiRecordsKilledRoundSessionAndResumes pins the
+// TestRunJailedAgentActivityPiRecordsKilledRoundSessionAndResumes pins the
 // pi path end to end: a killed pi round's conversation is on record from
 // pi's own session dir by the time the round dies, and the retry — with no
 // workflow-provided id — resumes it via pi's --session flag, not claude's
 // --resume.
-func TestRunJailedClaudeActivityPiRecordsKilledRoundSessionAndResumes(t *testing.T) {
+func TestRunJailedAgentActivityPiRecordsKilledRoundSessionAndResumes(t *testing.T) {
 	scrubBugFilingEnv(t)
 	fakeHome(t)
 	wt := t.TempDir()
@@ -990,7 +993,7 @@ func TestRunJailedClaudeActivityPiRecordsKilledRoundSessionAndResumes(t *testing
 	stubBin(t, "ai-jail", `mkdir -p '`+sessionsDir+`'
 printf '%s\n' '{"type":"session","id":"sess-pi-1"}' > '`+sessionsDir+`/20260920_000000_sess-pi-1.jsonl'
 kill -9 $$`)
-	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "implement",
 		Role:         RoleDev,
@@ -1007,7 +1010,7 @@ kill -9 $$`)
 		`'{"type":"message_end","message":{"content":[{"type":"text","text":"continued"}]}}'
 printf '%s\n' '{"type":"session"}' > '`+sessionsDir+`/20260920_000001_sess-pi-2.jsonl'
 exit 0`)
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "continue the work",
 		Role:         RoleDev,
@@ -1809,7 +1812,7 @@ printf '%s\n' '{"type":"session"}' > '` + dir + `/20260920_000001_` + id + `.jso
 exit 0`
 }
 
-// TestRunJailedClaudeActivityFreshRetryPiStartsNewSession pins the
+// TestRunJailedAgentActivityFreshRetryPiStartsNewSession pins the
 // api-error fresh start: a pi round retried after a provider api error
 // (FreshRetry) starts a NEW session — a workflow-provided session id for
 // the dead conversation is dropped, and the recorded-session fallback is
@@ -1817,7 +1820,7 @@ exit 0`
 // and the prompt carries the fresh-session hand-off that replaces the lost
 // context. A round that is not an api-error retry keeps today's resume
 // behavior untouched and carries no hand-off.
-func TestRunJailedClaudeActivityFreshRetryPiStartsNewSession(t *testing.T) {
+func TestRunJailedAgentActivityFreshRetryPiStartsNewSession(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		sessionID  string
@@ -1840,7 +1843,7 @@ func TestRunJailedClaudeActivityFreshRetryPiStartsNewSession(t *testing.T) {
 				plantPiSession(t, wt, "sess-pi-old")
 			}
 
-			res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "continue the work",
 				Role:         RoleDev,
@@ -1849,7 +1852,7 @@ func TestRunJailedClaudeActivityFreshRetryPiStartsNewSession(t *testing.T) {
 				FreshRetry:   c.freshRetry,
 			})
 			if err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 			if res.Text != "fresh" {
 				t.Errorf("res.Text = %q, want %q", res.Text, "fresh")
@@ -1881,16 +1884,16 @@ func TestRunJailedClaudeActivityFreshRetryPiStartsNewSession(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityFreshRetryIgnoredWithoutPi pins the other
+// TestRunJailedAgentActivityFreshRetryIgnoredWithoutPi pins the other
 // half of the flag's contract: an api-error retry of a non-pi round ignores
 // FreshRetry entirely and keeps today's resume behavior — the session id
 // rides, and no hand-off is appended.
-func TestRunJailedClaudeActivityFreshRetryIgnoredWithoutPi(t *testing.T) {
+func TestRunJailedAgentActivityFreshRetryIgnoredWithoutPi(t *testing.T) {
 	fakeHome(t)
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"resumed","session_id":"sess-next"}'; exit 0`)
 
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: t.TempDir(),
 		Prompt:       "retry the work",
 		Role:         RoleDev,
@@ -1899,7 +1902,7 @@ func TestRunJailedClaudeActivityFreshRetryIgnoredWithoutPi(t *testing.T) {
 		FreshRetry:   true,
 	})
 	if err != nil {
-		t.Fatalf("RunJailedClaudeActivity: %v", err)
+		t.Fatalf("RunJailedAgentActivity: %v", err)
 	}
 	if res.Text != "resumed" {
 		t.Errorf("res.Text = %q, want %q", res.Text, "resumed")
