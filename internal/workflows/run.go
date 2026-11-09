@@ -130,6 +130,19 @@ type pipelineRun struct {
 	// command and must stay off pre-marker replays (see vis).
 	swiftProbe bool
 
+	// jailedActivity is the agent-round activity type name runAgent
+	// schedules (jailedAgentActivity), evaluated once in startRun beside
+	// the early gates. The evaluation must precede every await: at the
+	// schedule site, deep in the flow, a continuation task runs the call
+	// past its replayed-history boundary and the SDK's replay branch
+	// answers DefaultVersion for a version the same history holds,
+	// scheduling the legacy name over the new one. Pre-await, the call
+	// replays inside the first workflow task like the gates above: a
+	// marker the history holds in that task yields the new name; a marker
+	// it holds later, or lacks, yields the legacy name the recorded
+	// schedules carry.
+	jailedActivity string
+
 	// slimScopeGate records whether this execution recorded the slim
 	// sub-task write-scope version marker; the parse round's target-files
 	// contract and the acceptance gate's scope activity both issue new
@@ -374,6 +387,9 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func(), 
 	r.starvedStatus = starvedStatusEnabled(ctx)
 	r.suiteGate = suiteFreshnessEnabled(ctx)
 	r.swiftProbe = swiftReviewProbeEnabled(ctx)
+	// Evaluated pre-await like the four gates above — see
+	// pipelineRun.jailedActivity for the replay contract.
+	r.jailedActivity = jailedAgentActivity(ctx)
 	if input.DependsOn != "" {
 		if err := r.awaitDependency(); err != nil {
 			return nil, nil, err
@@ -590,8 +606,11 @@ func (r *pipelineRun) heartbeat(err error, stage string) error {
 const jailedAgentActivityChangeID = "jailed-agent-activity-rename"
 
 // jailedAgentActivity returns the activity type name to schedule for an
-// agent round. GetVersion is memoized per execution, so the per-round
-// calls record the marker once.
+// agent round. Called exactly once per execution, from startRun beside
+// the early gates (pipelineRun.jailedActivity): GetVersion is memoized
+// per execution, and evaluating at the schedule site — deep in the flow,
+// past a continuation task's replayed-history boundary — reads the SDK's
+// replay branch and schedules the legacy name over the new one.
 func jailedAgentActivity(ctx workflow.Context) string {
 	if workflow.GetVersion(ctx, jailedAgentActivityChangeID, workflow.DefaultVersion, 1) == 1 {
 		return "RunJailedAgentActivity"
@@ -621,7 +640,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 	freshRetry := false
 	for {
 		var result activities.AgentRunResult
-		err := workflow.ExecuteActivity(r.agentCtx, jailedAgentActivity(r.ctx), activities.AgentRunInput{
+		err := workflow.ExecuteActivity(r.agentCtx, r.jailedActivity, activities.AgentRunInput{
 			WorktreePath: r.worktree.WorktreePath,
 			Prompt:       prompt,
 			Agent:        r.input.Agent,
