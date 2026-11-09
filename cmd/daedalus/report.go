@@ -280,8 +280,12 @@ func collectWorkerRows() []workerRow {
 }
 
 // agentActivityTypes are the jailed-round activities whose results carry
-// Usage into history.
+// Usage into history. RunJailedAgentActivity's legacy spelling stays
+// matched forever: histories recorded before the rename keep the old
+// activity name, and the usage/round surfaces read those histories as
+// readily as new ones.
 var agentActivityTypes = map[string]bool{
+	"RunJailedAgentActivity":    true,
 	"RunJailedClaudeActivity":   true,
 	"RunJailedReviewerActivity": true,
 }
@@ -383,7 +387,7 @@ func aggregateRunUsage(c client.Client, workflowID, runID string, dc converter.D
 			continue
 		}
 		var u activities.Usage
-		if typ == "RunJailedClaudeActivity" {
+		if typ == "RunJailedAgentActivity" || typ == "RunJailedClaudeActivity" {
 			var r activities.AgentRunResult
 			if dc.FromPayload(ps[0], &r) != nil {
 				continue

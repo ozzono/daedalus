@@ -1170,3 +1170,21 @@ func isAgentKilled(err error) bool {
 func isAgentStuck(err error) bool {
 	return err != nil && strings.Contains(err.Error(), activities.ErrAgentStuck.Error())
 }
+
+// isAgentNoDelivery reports whether err is the activities'
+// ErrAgentNoDelivery — a jailed hands round the harness killed on its
+// deliver contract (its structured stream's terminal failed event, class
+// "no-delivery"). Same boundary note as isAgentStuck: the genuine
+// classification is structured (the activities' handsNoDelivery reads the
+// stream's class field under the hands-only gate), but this match runs on
+// the composed error string and the sibling wraps embed round output —
+// though only the no-delivery wrap embeds the labeled salvage envelope,
+// and a planted envelope merely shapes what a salvage-armed caller feeds
+// its parser, never the classification itself. ponytail: the sentinel
+// phrase stays forgeable like isAgentStuck's — symmetric, bounded (park
+// or salvage, never silent wrong work), and a signal kill outranks the
+// match. The workflow routes this face to a park — never a retry, never
+// a failover — except the salvage-armed slim planner seat.
+func isAgentNoDelivery(err error) bool {
+	return err != nil && strings.Contains(err.Error(), activities.ErrAgentNoDelivery.Error())
+}

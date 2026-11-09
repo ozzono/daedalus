@@ -50,7 +50,7 @@ const probeTimeout = 30 * time.Second
 // TestHermeticWorkerEnvStagingProbe is the representative staging
 // assertion — the aider openai endpoint wiring, asserted through the
 // same fixture and assertion helpers as
-// TestRunJailedClaudeActivityAiderOpenAIModel so the two cannot drift.
+// TestRunJailedAgentActivityAiderOpenAIModel so the two cannot drift.
 // It passes standalone in a clean env and is the child the hermeticity
 // driver seeds and executes.
 func TestHermeticWorkerEnvStagingProbe(t *testing.T) {

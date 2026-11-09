@@ -57,8 +57,8 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string, e
 	case "amp":
 		return "", nil, nil, fmt.Errorf("agent %q was removed from daedalus (deprecated): restart the run with -cli <agent> naming a shipped CLI — a silent fallback would run the round on a different agent and drop its recorded session", agent)
 	case "opencode":
-		// opencode reads the prompt from piped stdin just like claude -p;
-		// --auto approves everything not explicitly denied. Plain text
+		// opencode reads the prompt from piped stdin; --auto approves
+		// everything not explicitly denied. Plain text
 		// mode, so Thinking stays empty; capturing it means parsing
 		// opencode's --format json event stream. --standalone keeps the
 		// round off opencode's shared background server (its 2.x default):
@@ -93,7 +93,7 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string, e
 		return "pi", []string{"-p"}, []string{"--mode", "json"}, nil
 	case "codex":
 		// codex exec is the headless entry: it reads the prompt from piped
-		// stdin like claude -p (probe-verified banner, codex-cli 0.160.0:
+		// stdin (probe-verified banner, codex-cli 0.160.0:
 		// "Reading additional input from stdin..."), and
 		// --dangerously-bypass-approvals-and-sandbox is codex's own lever
 		// for "environments that are externally sandboxed" — which is
@@ -109,7 +109,7 @@ func jailedAgentCLI(agent string) (selected string, headless, output []string, e
 		return "codex", []string{"exec", "--dangerously-bypass-approvals-and-sandbox"}, nil, nil
 	case "hands":
 		// `hands round` is the headless entry: it reads the prompt from
-		// piped stdin like claude -p (probe-verified 2026-10-25 on the
+		// piped stdin (probe-verified 2026-10-25 on the
 		// installed binary), and --format json emits hands's own typed
 		// event protocol (parseHandsStream) — terminal delivered/partial/
 		// failed events replacing exit-code inference. hands has no
@@ -505,7 +505,7 @@ type FolderMount struct {
 // it before spawn instead of half-mounting; identical duplicates collapse,
 // and two grants sharing a basename are rejected — the second would silently
 // shadow the first inside the sandbox. This is the one helper both the argv
-// builder (runJailedRound) and the prompt relay (RunJailedClaudeActivity)
+// builder (runJailedRound) and the prompt relay (RunJailedAgentActivity)
 // render from, so the paths the agent is told can never drift from the
 // mounted ones.
 func FolderMounts(worktreePath string, folders []string) ([]FolderMount, error) {
@@ -1648,8 +1648,10 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// another agent's stdout can never mint this face by printing the event
 	// shape.
 	stuck := ""
+	noDelivery := ""
 	if selected == "hands" {
 		stuck = handsStuck(res.Stdout)
+		noDelivery = handsNoDelivery(res.Stdout)
 	}
 	if err != nil && !isWaitDelay(err) {
 		// The loop watcher's own kill lands here as a signal death (it
@@ -1687,6 +1689,36 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 			// never text the round printed.
 			return res, fmt.Errorf("%w: %s round died on a stuck kill: %s",
 				ErrAgentStuck, selected, stuck)
+		}
+		if noDelivery != "" {
+			// Checked symmetric with the stuck kill, and for the same
+			// reasons: the wait-status-derived death outranks the stream
+			// report, and the classes cannot coexist (one terminal failed
+			// event per stream, one class per event). The wrap names the
+			// class and the harness's reason (handsNoDelivery's composite
+			// is never empty on a match) and — like the stuck wrap —
+			// carries no raw round output: classification rides the
+			// structured event. It wraps no ErrAPIExhausted: the provider
+			// was healthy by definition here (every turn completed with
+			// tokens flowing — hands killed the round on its deliver
+			// contract, not the wire), so the exhaustion rescue would only
+			// re-run the kill whose byte-identical regeneration is the
+			// proven failure mode. The stranded prose does ride, as the
+			// salvage envelope (NoDeliveryCapturedText), so the slim
+			// planner seat can hand the killed round's plan text to the
+			// parse round instead of losing it; the envelope is omitted
+			// when the capture is empty or already carries a marker — a
+			// capture that could collide with the envelope degrades to
+			// unsalvageable, never to a mis-sliced plan.
+			noDelErr := fmt.Errorf("%w: %s round died on a no-delivery kill: %s",
+				ErrAgentNoDelivery, selected, noDelivery)
+			if captured := handsTextEvents(res.Stdout); captured != "" &&
+				!strings.Contains(captured, noDeliveryCaptureBegin) &&
+				!strings.Contains(captured, noDeliveryCaptureEnd) {
+				noDelErr = fmt.Errorf("%w\n%s\n%s\n%s", noDelErr,
+					noDeliveryCaptureBegin, captured, noDeliveryCaptureEnd)
+			}
+			return res, noDelErr
 		}
 		if apiErr != "" {
 			return res, fmt.Errorf("%w: %s round died on an api error: %s", ErrAPIExhausted, selected, apiErr)
@@ -2070,12 +2102,108 @@ var ErrAgentLoop = errors.New("jailed agent stuck in an identical-tool-call loop
 // and the park reason.
 var ErrAgentStuck = errors.New("jailed agent round stuck")
 
+// ErrAgentNoDelivery marks a jailed hands round the hands harness killed
+// on its deliver contract — its structured stream's terminal failed event
+// carrying class "no-delivery": every model turn completed cleanly (the
+// provider was healthy — the live kill of 2026-11-09 shows both strikes
+// finishing with normal token flow) but none ended in the forced delivery
+// tool call, so hands's no-tool-call strike budget killed the round with
+// its full prose stranded in the stream. Machine-parsed from the class
+// field beside the stuck class, never from output text, and its own face
+// on purpose: it wraps nothing and inherits no remediation family — not
+// ErrAPIExhausted's failover and quota heartbeat (the provider is healthy;
+// the rescue would only re-run a round whose byte-identical regeneration
+// is the live-proven failure mode), not the killed face's continuation
+// reply. The workflow routes it like ErrAgentStuck — park, work preserved
+// on the aborted/ branch, operator restarts via `daedalus continue` —
+// with one exception: the slim planner seat salvages instead of parking,
+// feeding the stranded prose (the capture envelope below) to the parse
+// round, because a plan round's deliverable IS the prose and the kill did
+// not damage it. brokenResume excludes it like stuck: a no-delivery kill
+// of a resumed round surfaces untouched instead of spending its one fresh
+// start re-entering the same contract kill. The class and reason still
+// reach the task log's round-exit dump and the park reason.
+var ErrAgentNoDelivery = errors.New("jailed agent round delivered nothing")
+
+// noDeliveryCaptureBegin and noDeliveryCaptureEnd bracket the stranded
+// round text inside an ErrAgentNoDelivery error's message — the salvage
+// envelope the workflow extracts with NoDeliveryCapturedText. The markers
+// are daedalus-internal shapes: written into the wrap by the no-delivery
+// branch above, read by NoDeliveryCapturedText, matched by nothing else.
+// A capture that already carries either marker is shipped without the
+// envelope (the branch checks), so salvage degrades to the plain park
+// rather than risk handing the parse round a mis-sliced plan.
+const (
+	noDeliveryCaptureBegin = "daedalus captured round text begins:"
+	noDeliveryCaptureEnd   = "daedalus captured round text ends"
+)
+
+// NoDeliveryCapturedText extracts the stranded round text a no-delivery
+// kill's error carries — the text between the envelope markers, outer
+// whitespace trimmed (SlimParse trims again) — "" when err is not a
+// no-delivery error or carries no capture (the envelope is omitted when
+// the capture was empty or marker-colliding).
+func NoDeliveryCapturedText(err error) string {
+	if err == nil {
+		return ""
+	}
+	_, rest, ok := strings.Cut(err.Error(), noDeliveryCaptureBegin)
+	if !ok {
+		return ""
+	}
+	text, _, _ := strings.Cut(rest, noDeliveryCaptureEnd)
+	return strings.TrimSpace(text)
+}
+
 // matchesAny reports whether s contains any marker, case-insensitively.
+// An all-digit marker matches only at digit boundaries — never inside a
+// longer digit run: "402" must hit "HTTP 402" and "error: 402" but never
+// the 402 inside a session uuid's …2a8464029e36. A bare substring match
+// let exactly that uuid classify a round as api-exhausted (the live
+// misclassification of 2026-11-09 — a hands no-delivery kill whose output
+// carried its session ids, one of which embeds "402"), which is the
+// concrete cost the exhausted-text scan's forgeability note accepted;
+// digit runs in round content (uuids, timestamps, line numbers, code) are
+// the everyday case, so the all-digit markers — the only ones a digit run
+// can swallow or fake — are held to the boundary rule. Non-digit markers
+// keep the plain substring: letters cannot hide inside a digit run, and
+// the phrase markers are litellm/provider vocabulary no honest round
+// content carries.
 func matchesAny(s string, markers []string) bool {
 	s = strings.ToLower(s)
 	return slices.ContainsFunc(markers, func(m string) bool {
-		return strings.Contains(s, m)
+		if strings.Trim(m, "0123456789") != "" {
+			return strings.Contains(s, m)
+		}
+		return containsAtDigitBoundary(s, m)
 	})
+}
+
+// containsAtDigitBoundary reports whether marker occurs in s with no
+// ASCII digit on either side of the occurrence. Each occurrence is
+// checked and the scan resumes past its first byte, so a digit-adjacent
+// hit never masks a later clean one.
+func containsAtDigitBoundary(s, marker string) bool {
+	for i := 0; i+len(marker) <= len(s); {
+		at := strings.Index(s[i:], marker)
+		if at < 0 {
+			return false
+		}
+		at += i
+		cleanBefore := at == 0 || !isASCIIDigit(s[at-1])
+		end := at + len(marker)
+		cleanAfter := end == len(s) || !isASCIIDigit(s[end])
+		if cleanBefore && cleanAfter {
+			return true
+		}
+		i = at + 1
+	}
+	return false
+}
+
+// isASCIIDigit reports whether c is an ASCII digit.
+func isASCIIDigit(c byte) bool {
+	return c >= '0' && c <= '9'
 }
 
 // activityLogger returns the activity-scoped logger, falling back to a

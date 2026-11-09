@@ -32,7 +32,7 @@ var (
 // test workflow environment (the mocks below stub their outcomes).
 func registerPipelineActivities(env *testsuite.TestWorkflowEnvironment) {
 	env.RegisterActivity(activities.CreateWorktreeActivity)
-	env.RegisterActivity(activities.RunJailedClaudeActivity)
+	env.RegisterActivity(activities.RunJailedAgentActivity)
 	env.RegisterActivity(activities.RunJailedReviewerActivity)
 	env.RegisterActivity(activities.DiffDigestActivity)
 	env.RegisterActivity(activities.ResolveTestCommandActivity)
@@ -54,6 +54,12 @@ func registerPipelineActivities(env *testsuite.TestWorkflowEnvironment) {
 		activity.RegisterOptions{Name: activities.CheckDependencyActivityName})
 	env.RegisterActivityWithOptions(stubNotifyDependents,
 		activity.RegisterOptions{Name: activities.NotifyDependentsActivityName})
+	// The rename's legacy alias mirrors the worker's own registration shape
+	// (worker_run.go): the same function under the old type name, serving
+	// histories recorded before the rename — a pre-marker replay schedules
+	// it and must find it registered.
+	env.RegisterActivityWithOptions(activities.RunJailedAgentActivity,
+		activity.RegisterOptions{Name: "RunJailedClaudeActivity"})
 }
 
 // stubCheckDependency and stubNotifyDependents are the name placeholders
@@ -200,7 +206,7 @@ type agentStep struct {
 	err    error
 }
 
-// agentRecorder captures every RunJailedClaudeActivity input.
+// agentRecorder captures every RunJailedAgentActivity input.
 type agentRecorder struct {
 	env    *testsuite.TestWorkflowEnvironment
 	inputs []activities.AgentRunInput
@@ -211,7 +217,7 @@ type agentRecorder struct {
 }
 
 func (r *agentRecorder) record() {
-	r.env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	r.env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -1026,7 +1032,7 @@ func TestFeatureDevWorkflowContinuedPreflightGate(t *testing.T) {
 		env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 			Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 		var agentCalls, reviewCalls int
-		env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+		env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 			Run(func(args mock.Arguments) { agentCalls++ }).
 			Return(activities.AgentRunResult{}, nil).Maybe()
 		env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
@@ -1379,7 +1385,7 @@ func TestFeatureDevWorkflowCreateFailure(t *testing.T) {
 
 	// The agent must never run when the worktree could not be created.
 	var agentCalls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { agentCalls++ }).
 		Return(activities.AgentRunResult{}, nil).Maybe()
 	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
@@ -1569,7 +1575,7 @@ func TestFeatureDevWorkflowSuiteRunnerMissingParks(t *testing.T) {
 	// The park precedes the first session, so agent and reviewer may never
 	// run — their mocks must not require calls.
 	var agentCalls, reviewCalls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { agentCalls++ }).
 		Return(activities.AgentRunResult{}, nil).Maybe()
 	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
@@ -1667,7 +1673,7 @@ func TestFeatureDevWorkflowCleanupOnCancellation(t *testing.T) {
 
 	// The workflow exits at the create step once cancelled, so the agent and
 	// reviewer may never run — their mocks must not require calls.
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Return(activities.AgentRunResult{}, nil).Maybe()
 	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
 		Return(activities.ReviewResult{}, nil).Maybe()
@@ -1706,7 +1712,7 @@ func TestFeatureDevWorkflowAgentTimeoutRecovers(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var inputs []activities.AgentRunInput
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -1754,7 +1760,7 @@ func TestFeatureDevWorkflowAgentTimeoutStreakFails(t *testing.T) {
 	env := newTestEnv(t)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Return(activities.AgentRunResult{}, errTimeoutStub)
 	stubTestPhase(env)
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
@@ -1784,7 +1790,7 @@ func TestFeatureDevWorkflowAgentKilledRecovers(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var inputs []activities.AgentRunInput
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -1835,7 +1841,7 @@ func TestFeatureDevWorkflowAgentKilledStreakFails(t *testing.T) {
 	env := newTestEnv(t)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Return(activities.AgentRunResult{}, errKilledStub)
 	stubTestPhase(env)
 	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
@@ -1861,7 +1867,7 @@ func TestFeatureDevWorkflowAgentKilledWrappedErrorClassifies(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var prompts []string
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -1873,7 +1879,7 @@ func TestFeatureDevWorkflowAgentKilledWrappedErrorClassifies(t *testing.T) {
 			calls++
 			if calls == 1 {
 				return activities.AgentRunResult{}, fmt.Errorf(
-					"activity RunJailedClaudeActivity (type ...) failed: %w", errKilledStub)
+					"activity RunJailedAgentActivity (type ...) failed: %w", errKilledStub)
 			}
 			return activities.AgentRunResult{Text: "done"}, nil
 		})
@@ -1904,7 +1910,7 @@ func TestFeatureDevWorkflowKillWordsWithoutSentinelFailNormally(t *testing.T) {
 	env := newTestEnv(t)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Return(activities.AgentRunResult{}, errors.New(
 			"agent failed; output tail: ... terminating on signal: killed ... exit status 1"))
 	stubTestPhase(env)
@@ -1931,7 +1937,7 @@ func TestFeatureDevWorkflowKillOutranksExhaustion(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var prompts []string
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -1976,7 +1982,7 @@ func TestFeatureDevWorkflowAgentStuckParks(t *testing.T) {
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { calls++ }).
 		Return(activities.AgentRunResult{}, errStuckStub)
 	stubTestPhase(env)
@@ -2012,7 +2018,7 @@ func TestFeatureDevWorkflowStuckOutranksExhaustion(t *testing.T) {
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { calls++ }).
 		Return(activities.AgentRunResult{}, fmt.Errorf("%w: %w", activities.ErrAgentStuck, activities.ErrAPIExhausted))
 	stubTestPhase(env)
@@ -2041,7 +2047,7 @@ func TestFeatureDevWorkflowKillOutranksStuck(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var prompts []string
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -2262,7 +2268,7 @@ func TestFeatureDevWorkflowTestsTimeoutRecovers(t *testing.T) {
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var inputs []activities.AgentRunInput
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -2430,7 +2436,7 @@ func TestFeatureDevWorkflowQuotaHeartbeatRecovers(t *testing.T) {
 	// round reset the budget — then through.
 	var calls int
 	var inputs []activities.AgentRunInput
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -2498,7 +2504,7 @@ func TestFeatureDevWorkflowQuotaHeartbeatParks(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { calls++ }).
 		Return(activities.AgentRunResult{}, errQuotaStub)
 
@@ -2540,7 +2546,7 @@ func TestFeatureDevWorkflowQuotaHeartbeatCancelled(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { calls++ }).
 		Return(activities.AgentRunResult{}, errQuotaStub)
 
@@ -2585,7 +2591,7 @@ func TestFeatureDevWorkflowWakeupInterruptsQuotaHeartbeat(t *testing.T) {
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 
 	var calls int
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
 			calls++
 			if calls == 1 {
@@ -2840,7 +2846,7 @@ func TestFeatureDevWorkflowSlotWaitRetries(t *testing.T) {
 
 	var calls int
 	var inputs []activities.AgentRunInput
-	env.OnActivity(activities.RunJailedClaudeActivity, mock.Anything, mock.Anything).
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			for _, a := range args {
 				if in, ok := a.(activities.AgentRunInput); ok {
@@ -4506,4 +4512,213 @@ func TestIsPromptOverflow(t *testing.T) {
 			t.Errorf("isPromptOverflow(%s) = %v, want %v", c.name, got, c.want)
 		}
 	}
+}
+
+// slimSalvagePlanText is the stranded plan prose a no-delivery kill carries
+// in its salvage envelope — the plan round's deliverable the harness killed
+// the round to protect.
+const slimSalvagePlanText = "Sub-task 1 (implement, adder.go): add the adder — Add(2,2) returns 4."
+
+// errNoDeliveryStub is a hands round the harness itself killed on its
+// deliver contract, as the workflow sees it: the ErrAgentNoDelivery sentinel
+// in runJailedRound's own wrap shape, with the salvage envelope riding the
+// message — the stranded prose between the capture markers (the literals
+// mirror the activities package's unexported constants; its suite pins the
+// wrap's exact shape). Matched by substring across the worker→workflow
+// boundary, like errStuckStub.
+var errNoDeliveryStub = fmt.Errorf("%w: hands round died on a no-delivery kill: class no-delivery: 2 strikes with no delivery tool call\ndaedalus captured round text begins:\n%s\ndaedalus captured round text ends",
+	activities.ErrAgentNoDelivery, slimSalvagePlanText)
+
+// errNoDeliveryBareStub is the same kill without a salvage envelope — the
+// shape a round killed before any turn (or with a marker-colliding capture)
+// crosses the boundary with.
+var errNoDeliveryBareStub = fmt.Errorf("%w: hands round died on a no-delivery kill: class no-delivery: 2 strikes with no delivery tool call",
+	activities.ErrAgentNoDelivery)
+
+// TestIsAgentNoDelivery pins the classification: the sentinel matches bare,
+// wrapped, and carrying its salvage envelope, while the near-miss shapes —
+// round output merely mentioning a delivery kill, the sibling stuck and
+// killed and exhaustion sentinels, an ordinary failure, no error — do not.
+func TestIsAgentNoDelivery(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"bare sentinel", errNoDeliveryBareStub, true},
+		{"sentinel with the salvage envelope", errNoDeliveryStub, true},
+		{"wrapped deeper", fmt.Errorf("review %q: %w", "the implementation", errNoDeliveryBareStub), true},
+		{"stuck sentinel", errStuckStub, false},
+		{"killed round", errKilledStub, false},
+		{"quota exhaustion", errQuotaStub, false},
+		{"near-miss words without the sentinel", errors.New("round delivered nothing usable, killing"), false},
+		{"ordinary failure", errAgentStub, false},
+		{"no error", nil, false},
+	} {
+		if got := isAgentNoDelivery(c.err); got != c.want {
+			t.Errorf("isAgentNoDelivery(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestFeatureDevWorkflowNoDeliveryParks pins the routing: a jailed round
+// killed on the deliver contract parks the run — never re-run, never failed
+// over, never parked in the quota heartbeat (every turn completed cleanly,
+// so the rescue would only re-run the kill) — and the salvage envelope a
+// non-slim stage carries is inert: feature-dev arms no salvage seat, so the
+// captured prose changes nothing about the park.
+func TestFeatureDevWorkflowNoDeliveryParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var calls int
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { calls++ }).
+		Return(activities.AgentRunResult{}, errNoDeliveryStub)
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked after a no-delivery kill")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"agent round killed on a no-delivery watchdog",
+		`stage "implement"`,
+		errNoDeliveryStub.Error(),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("agent calls = %d, want 1 — a no-delivery kill is never re-run", calls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowReviewerNoDeliveryParks pins the routing on the
+// review loop: a reviewer round killed on the deliver contract parks the
+// run with the focus in the park reason — no salvage seat exists on this
+// path, so the envelope is inert here too.
+func TestFeatureDevWorkflowReviewerNoDeliveryParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	rec := &agentRecorder{env: env}
+	rec.record()
+	var reviewCalls int
+	env.OnActivity(activities.RunJailedReviewerActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, in activities.ReviewInput) (activities.ReviewResult, error) {
+			reviewCalls++
+			return activities.ReviewResult{}, errNoDeliveryStub
+		})
+	stubTestPhase(env)
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked after a no-delivery reviewer round")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"reviewer round killed on a no-delivery watchdog",
+		`focus "the implementation. The task:`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if reviewCalls != 1 {
+		t.Errorf("review calls = %d, want 1 — a no-delivery reviewer round is never re-run", reviewCalls)
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowDiscoveryNoDeliveryParks pins the routing on
+// test-command discovery: the jailed discovery round dying on the deliver
+// contract parks the run under the same step-named wrap the other discovery
+// failures carry, and the kill is never re-queued.
+func TestFeatureDevWorkflowDiscoveryNoDeliveryParks(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+
+	rec := &agentRecorder{env: env}
+	rec.record()
+
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+
+	disc, suiteRec := stubTestPhase(env)
+	disc.script = []discoveryStep{
+		{command: "go test ./..."},
+		{err: errNoDeliveryBareStub},
+	}
+
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+
+	err := env.GetWorkflowError()
+	if err == nil {
+		t.Fatal("want the workflow parked when discovery dies on the deliver contract")
+	}
+	for _, want := range []string{
+		ErrAwaitingMaintainer.Error(),
+		"resolve test command",
+		"test-command discovery round killed on a no-delivery watchdog",
+		errNoDeliveryBareStub.Error(),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("park error %q should contain %q", err, want)
+		}
+	}
+	if len(disc.agents) != 2 {
+		t.Errorf("discovery ran %d times, want 2 — the killed round is never re-queued", len(disc.agents))
+	}
+	if len(suiteRec.runs) != 1 {
+		t.Errorf("suite ran %d times, want 1 (only the preflight baseline — the killed discovery ran no suite)", len(suiteRec.runs))
+	}
+	if len(rec.inputs) != 2 {
+		t.Errorf("agent ran %d times, want 2 (no fix round for a discovery park)", len(rec.inputs))
+	}
+	env.AssertExpectations(t)
+}
+
+// TestFeatureDevWorkflowPreRenameReplaySchedulesLegacyActivity pins the
+// rename's replay gate: a history recorded before the agent-activity rename
+// (GetVersion pinned to the default, the slim replay tests' shape) schedules
+// the legacy activity name, whose alias registration serves the round — a
+// run sleeping across the worker upgrade replays without a nondeterminism
+// wedge. The marker side is on trial everywhere else: every other
+// newTestEnv test schedules the new name through the version gate's fresh
+// execution.
+func TestFeatureDevWorkflowPreRenameReplaySchedulesLegacyActivity(t *testing.T) {
+	env := newTestEnv(t)
+	env.OnGetVersion(jailedAgentActivityChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
+		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
+	var legacyCalls, modernCalls int
+	env.OnActivity("RunJailedClaudeActivity", mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { legacyCalls++ }).
+		Return(activities.AgentRunResult{Text: "done"}, nil)
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { modernCalls++ }).
+		Return(activities.AgentRunResult{Text: "done"}, nil)
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+	env.OnActivity(activities.CleanupWorktreeActivity, mock.Anything, mock.Anything).Return(nil).Once()
+	env.ExecuteWorkflow(FeatureDevWorkflow, baseInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v — the pre-marker replay must not wedge on the rename", err)
+	}
+	if legacyCalls != 2 || modernCalls != 0 {
+		t.Errorf("legacy calls = %d, modern calls = %d, want every round (implement + tests) on the legacy alias alone", legacyCalls, modernCalls)
+	}
+	env.AssertExpectations(t)
 }

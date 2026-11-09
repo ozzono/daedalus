@@ -1041,7 +1041,9 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 			span := ev.GetEventTime().AsTime().Sub(at[a.GetScheduledEventId()])
 			ps := a.GetResult().GetPayloads()
 			switch sc.name {
-			case "RunJailedClaudeActivity":
+			case "RunJailedAgentActivity", "RunJailedClaudeActivity":
+				// The legacy spelling rides the case for histories recorded
+				// before the activity's rename (agentActivityTypes note).
 				u := uiUsage{NA: true}
 				if len(ps) > 0 {
 					var r activities.AgentRunResult
@@ -1093,7 +1095,7 @@ func (s *uiServer) detail(workflowID string) (uiRunDetail, error) {
 			sc := scheduled[a.GetScheduledEventId()]
 			span := ev.GetEventTime().AsTime().Sub(at[a.GetScheduledEventId()])
 			switch sc.name {
-			case "RunJailedClaudeActivity":
+			case "RunJailedAgentActivity", "RunJailedClaudeActivity":
 				addRound(roundRole(sc.role), sc.agent, "failed", "b-fail", span, uiUsage{NA: true})
 			case "RunJailedReviewerActivity":
 				addRound("review", sc.agent, "failed", "b-fail", span, uiUsage{NA: true})

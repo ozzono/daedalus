@@ -1118,11 +1118,11 @@ func TestPiRoundStagesProvider(t *testing.T) {
 		stubBin(t, "ai-jail", fmt.Sprintf(`if [ -f "$HOME/.pi/agent/models.json" ]; then cp "$HOME/.pi/agent/models.json" %q; fi
 exit 0`, capture))
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -1184,11 +1184,11 @@ exit 0`, capture))
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -1210,12 +1210,12 @@ exit 0`, capture))
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-shape failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the unbridgeable-shape failure")
 		}
 		// Name the guard in the failure: a regression that launches anyway
 		// must be distinguishable from one that fails for another reason.
@@ -1248,12 +1248,12 @@ exit 0`, capture))
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the timeout-merge failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the timeout-merge failure")
 		}
 		if !strings.Contains(err.Error(), "stage pi provider timeout") {
 			t.Errorf("error = %q, want the pi timeout staging failure", err)
@@ -1290,11 +1290,11 @@ exit 0`, seed))
 
 		// A failed cleanup is logged, never surfaced as a round failure —
 		// the round already ran, and the leftover is inert.
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity = %v, want the cleanup failure logged and swallowed", err)
+			t.Fatalf("RunJailedAgentActivity = %v, want the cleanup failure logged and swallowed", err)
 		}
 
 		// And it must never rewrite what it cannot round-trip: the

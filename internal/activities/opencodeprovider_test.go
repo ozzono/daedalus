@@ -460,11 +460,11 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -522,11 +522,11 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: gitRepo(t),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -607,12 +607,12 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-shape failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the unbridgeable-shape failure")
 		}
 		if !strings.Contains(err.Error(), "without a base URL") {
 			t.Errorf("error = %q, want the opencode no-base-URL guard message", err)
@@ -631,12 +631,12 @@ func TestOpencodeRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-shape failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the unbridgeable-shape failure")
 		}
 		if !strings.Contains(err.Error(), "without openai.model") {
 			t.Errorf("error = %q, want the opencode no-model guard message", err)

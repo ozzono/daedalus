@@ -245,11 +245,11 @@ func TestRunJailedMetricsStaging(t *testing.T) {
 	log := newStubLog(t)
 	stubBin(t, "ai-jail", "exit 0")
 
-	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: t.TempDir(),
 		Prompt:       "fix the bug",
 	}); err != nil {
-		t.Fatalf("RunJailedClaudeActivity: %v", err)
+		t.Fatalf("RunJailedAgentActivity: %v", err)
 	}
 
 	calls := readCalls(t, log)

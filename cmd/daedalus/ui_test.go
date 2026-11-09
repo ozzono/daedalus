@@ -2192,3 +2192,42 @@ func TestRunsFeedCarriesTheLastCoTCell(t *testing.T) {
 		t.Errorf("the Last CoT cell does not render the newest exited round's age:\n%s", runs)
 	}
 }
+
+// TestUIRunDetailReadsRenamedAgentRounds pins the rename's forward face on
+// the detail walk: a round recorded after the agent activity's rename
+// carries "RunJailedAgentActivity" as its history type, and the rail and
+// usage table read it exactly like the legacy spelling its older histories
+// hold (TestUIRunDetailPage records the legacy name — that face is already
+// on trial).
+func TestUIRunDetailReadsRenamedAgentRounds(t *testing.T) {
+	h := newUIHarness(t)
+	id := "renamed-iss3"
+	statusPayload, err := converter.GetDefaultDataConverter().ToPayload(workflows.StatusRunning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.fake.describes[id] = &workflowservice.DescribeWorkflowExecutionResponse{
+		WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+			Execution: &commonpb.WorkflowExecution{WorkflowId: id, RunId: "run-3"},
+			TaskQueue: "renamed",
+			Status:    enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			StartTime: timestamppb.New(time.Now().Add(-time.Hour)),
+			SearchAttributes: &commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
+				workflows.DaedalusStatusAttr: statusPayload,
+			}},
+		},
+	}
+	at := time.Now().Add(-30 * time.Minute)
+	h.fake.wfHistory[id] = []*historypb.HistoryEvent{
+		uiStartedEvent(t, workflows.PipelineInput{IssueID: "3", RepoPath: "", Flow: "feature-dev"}),
+		uiScheduled(t, 4, at, "RunJailedAgentActivity", activities.AgentRunInput{Agent: "hands", Role: activities.RoleDev}),
+		completedEvent(t, 4, at.Add(time.Minute), activities.AgentRunResult{Usage: activities.Usage{InputTokens: 30, OutputTokens: 7, CostUSD: 0.3}}),
+	}
+
+	out := h.get(t, "/runs/"+id)
+	for _, want := range []string{"implement", "hands", ">30</td>", ">7</td>"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("detail page lacks %q", want)
+		}
+	}
+}

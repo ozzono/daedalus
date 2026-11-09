@@ -371,9 +371,9 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // per request under a persistent 500 and under a mid-stream connection
 // drop alike, emits no failed event at all; a refused connection or an
 // exhausted-retry 500 surfaces as class retriable; the other observed
-// classes are round-level — "no-delivery", the loop guard, and
-// "terminal", a response hands could not use — and stay on the generic
-// failure path).
+// classes are round-level — "no-delivery" (handsNoDelivery), the loop
+// guard (handsStuck), and "terminal", a response hands could not use —
+// and stay off the api-error report).
 func agentAPIError(agent, stdout string) string {
 	switch agent {
 	case "hands":
@@ -454,7 +454,7 @@ func agentAPIError(agent, stdout string) string {
 // totality reason: a failed event is stream-terminal (the process exits
 // right after it), so no later clean event can exist to clear it. Every
 // other class stays untracked here: retriable belongs to agentAPIError,
-// the rest to the generic failure path.
+// no-delivery to handsNoDelivery, the rest to the generic failure path.
 func handsStuck(stdout string) string {
 	reason := ""
 	for line := range strings.SplitSeq(stdout, "\n") {
@@ -467,6 +467,70 @@ func handsStuck(stdout string) string {
 		}
 	}
 	return reason
+}
+
+// handsNoDelivery is handsStuck for the deliver contract's other watchdog
+// class: the failed event carrying class "no-delivery" — hands's verdict
+// that every model turn completed but none ended in the forced delivery
+// tool call, so its no-tool-call strike budget killed the round with the
+// turns' prose stranded in the stream (the strike count rides the
+// reason). Same composite, same parse-from-the-class-field shape, same
+// last-wins totality argument as handsStuck — a failed event is
+// stream-terminal, so nothing can clear it. The classes are mutually
+// exclusive (one class per terminal event), so a stream can never hit
+// both parsers. Every other class stays untracked here: stuck belongs to
+// handsStuck, retriable to agentAPIError, the rest to the generic failure
+// path.
+func handsNoDelivery(stdout string) string {
+	reason := ""
+	for line := range strings.SplitSeq(stdout, "\n") {
+		var e handsEvent
+		if json.Unmarshal([]byte(line), &e) != nil {
+			continue
+		}
+		if e.Kind == "failed" && e.Payload.Class == "no-delivery" {
+			reason = "class no-delivery: " + e.Payload.Reason
+		}
+	}
+	return reason
+}
+
+// handsTextEvents returns the text of a hands round's last text event —
+// the prose turns the deliver contract refused, which survive only in the
+// stream when the watchdog kills the round before any delivery (the
+// stranded plan a salvage feeds onward; parseHandsStream never surfaces
+// it, its text return being the delivered summary alone). The last
+// non-empty event wins, never a concatenation: the strikes regenerate the
+// same prose (live-proven byte-identical across a watchdog's two strikes,
+// 2026-11-09), so joining them would hand the consumer a duplicated plan,
+// and the final turn is the round's last word under the recovery nudge.
+// ponytail: the payload shape is probe-owed like partial's — it decodes
+// as {"text": ...} first, then as a bare JSON string, and a shape drift
+// degrades to "" (the caller routes the kill to the plain park, never to
+// a wrong plan). Turn-level events are the observed grain (the live kill
+// rode its full plan as whole per-turn events); a per-delta emitter would
+// degrade to a fragment, which spends the parse round's re-ask rather
+// than fabricating a plan.
+func handsTextEvents(stdout string) string {
+	text := ""
+	for line := range strings.SplitSeq(stdout, "\n") {
+		var e handsEvent
+		if json.Unmarshal([]byte(line), &e) != nil || e.Kind != "text" {
+			continue
+		}
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(e.Payload.Payload, &body); err == nil && body.Text != "" {
+			text = body.Text
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(e.Payload.Payload, &s); err == nil && s != "" {
+			text = s
+		}
+	}
+	return text
 }
 
 // toolLoopThreshold is the consecutive-identical-call count at which a pi

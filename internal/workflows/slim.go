@@ -86,14 +86,38 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	// Phase 1 — planner. The round opens the run's dev conversation, so
 	// the plan itself is the first block of the worker's progressive
 	// context. Pure generation: the plan is prose, and the wire format is
-	// nobody's job in this round.
+	// nobody's job in this round — the delivery IS the final prose
+	// message (template.SlimPlan asks for no tool call), so a hands round
+	// that never calls the forced delivery tool holds the whole plan as
+	// stranded prose when the deliver-contract watchdog kills it. That is
+	// the salvage seat, armed around this one round: the kill's captured
+	// prose feeds the parse round instead of parking, because the prose
+	// is exactly the deliverable the kill preserved — a plan round has
+	// nothing else to lose. Every other stage runs unarmed and parks.
 	planPrompt, err := template.SlimPlan(input.Prompt)
 	if err != nil {
 		return "", fmt.Errorf("build slim plan prompt: %w", err)
 	}
+	var salvaged string
+	run.noDeliverySalvage = &salvaged
 	planReply, err := run.runAgent(planPrompt, "slim-plan", activities.RoleDev, &run.devSession)
+	run.noDeliverySalvage = nil
+	planText := ""
 	if err != nil {
-		return "", fmt.Errorf("planner round: %w", err)
+		if salvaged == "" {
+			return "", fmt.Errorf("planner round: %w", err)
+		}
+		// The kill is deliberately not failed onward: the sentinel error's
+		// routing already ran (the salvage seat's whole point), the park
+		// it would have produced is moot, and the salvage itself is the
+		// run-visible record — the memo below stamps it where a
+		// maintainer answers "why did the parse round read salvaged
+		// prose?".
+		planText = salvaged
+		run.logger.Warn("Planner round killed on the deliver contract; salvaging the captured plan prose for the parse round", "Chars", len(planText))
+		workflow.UpsertMemo(run.ctx, map[string]interface{}{"PlanProseSalvaged": true})
+	} else {
+		planText = planReply.Text
 	}
 
 	// Phase 1b — parse. The parse round is pure transcription — the plan
@@ -102,9 +126,11 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	// exploration may inflate the parse prompt against the worker's
 	// window, where one unbounded tool result alone can squeeze the
 	// output clamp down to a one-token reply. The re-ask below still
-	// resumes the parse round's own, now-small conversation.
+	// resumes the parse round's own, now-small conversation. Salvage
+	// changes nothing here: the captured prose rides in the prompt
+	// verbatim, exactly like a delivered round's text.
 	var parseSession string
-	parsePrompt, err := template.SlimParse(planReply.Text)
+	parsePrompt, err := template.SlimParse(planText)
 	if err != nil {
 		return "", fmt.Errorf("build slim parse prompt: %w", err)
 	}

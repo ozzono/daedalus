@@ -546,7 +546,16 @@ func runWorker(cfg config.Config, workerType string) error {
 				workflow.RegisterOptions{Name: workflows.WorkflowTypeName(spec.Fn)})
 		}
 		w.RegisterActivity(activities.CreateWorktreeActivity)
-		w.RegisterActivity(activities.RunJailedClaudeActivity)
+		w.RegisterActivity(activities.RunJailedAgentActivity)
+		// Legacy alias for the rename: replay matches a scheduled activity
+		// task to its recorded history event by type name, and histories
+		// recorded before the rename permanently hold the old spelling —
+		// a run that sleeps across the worker upgrade would otherwise
+		// wedge on its next round with a nondeterminism failure. The same
+		// function serves both names; only the schedule side picks
+		// (jailedAgentActivity's version gate in the workflows package).
+		w.RegisterActivityWithOptions(activities.RunJailedAgentActivity,
+			activity.RegisterOptions{Name: "RunJailedClaudeActivity"})
 		w.RegisterActivity(activities.RunJailedReviewerActivity)
 		w.RegisterActivity(activities.DiffDigestActivity)
 		w.RegisterActivity(activities.RunNativeTestsActivity)

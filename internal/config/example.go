@@ -107,7 +107,7 @@ worker_id: ""
 # under operator supervision only.
 tests_timeout: 30m
 # Ceiling for one jailed agent round — the implementation, fix, and
-# rebuild rounds (RunJailedClaudeActivity), a Go duration string. Agent
+# rebuild rounds (RunJailedAgentActivity), a Go duration string. Agent
 # rounds legitimately run long, so this is wider than the fixed 15-minute
 # StartToClose the other activities use. An explicit 0s sets no ceiling —
 # the round runs unbounded, under operator supervision only.

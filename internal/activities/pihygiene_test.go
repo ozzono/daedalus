@@ -226,11 +226,11 @@ func TestScanPiSession(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityPiDropsPoisonedResume pins the resume gate: a
+// TestRunJailedAgentActivityPiDropsPoisonedResume pins the resume gate: a
 // pi session whose transcript embeds tool-call JSON as assistant text is
 // not resumed — the round starts fresh (no --session flag), carrying the
 // prompt and the edit guardrail but no steering.
-func TestRunJailedClaudeActivityPiDropsPoisonedResume(t *testing.T) {
+func TestRunJailedAgentActivityPiDropsPoisonedResume(t *testing.T) {
 	scrubBugFilingEnv(t)
 	fakeHome(t)
 	wt := t.TempDir()
@@ -239,7 +239,7 @@ func TestRunJailedClaudeActivityPiDropsPoisonedResume(t *testing.T) {
 	writePiTranscript(t, wt, "sess-poison",
 		`{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"{\"oldText\":\"X\"}"}]}}`)
 
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "fix the bug",
 		Agent:        "pi",
@@ -247,7 +247,7 @@ func TestRunJailedClaudeActivityPiDropsPoisonedResume(t *testing.T) {
 		Role:         RoleDev,
 	})
 	if err != nil {
-		t.Fatalf("RunJailedClaudeActivity: %v", err)
+		t.Fatalf("RunJailedAgentActivity: %v", err)
 	}
 	if res.SessionID != "sess-fresh" {
 		t.Errorf("res.SessionID = %q, want the fresh session", res.SessionID)
@@ -265,10 +265,10 @@ func TestRunJailedClaudeActivityPiDropsPoisonedResume(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityPiSteersEditLoopResume pins the steering: a
+// TestRunJailedAgentActivityPiSteersEditLoopResume pins the steering: a
 // pi session ending in a failed-edit loop keeps its session (still resumed
 // via --session) and gets piEditSteer prepended to the round's prompt.
-func TestRunJailedClaudeActivityPiSteersEditLoopResume(t *testing.T) {
+func TestRunJailedAgentActivityPiSteersEditLoopResume(t *testing.T) {
 	scrubBugFilingEnv(t)
 	fakeHome(t)
 	wt := t.TempDir()
@@ -281,7 +281,7 @@ func TestRunJailedClaudeActivityPiSteersEditLoopResume(t *testing.T) {
 		piToolResult("t2", "edit", true),
 	)
 
-	res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "fix the bug",
 		Agent:        "pi",
@@ -289,7 +289,7 @@ func TestRunJailedClaudeActivityPiSteersEditLoopResume(t *testing.T) {
 		Role:         RoleDev,
 	})
 	if err != nil {
-		t.Fatalf("RunJailedClaudeActivity: %v", err)
+		t.Fatalf("RunJailedAgentActivity: %v", err)
 	}
 	if res.Text != "steered" {
 		t.Errorf("res.Text = %q, want the round's output", res.Text)

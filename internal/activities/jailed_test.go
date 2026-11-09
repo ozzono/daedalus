@@ -140,7 +140,7 @@ func TestAiderJailMounts(t *testing.T) {
 }
 
 // stageAiderOpenAIRound is the fixture truth shared by
-// TestRunJailedClaudeActivityAiderOpenAIModel and the hermeticity
+// TestRunJailedAgentActivityAiderOpenAIModel and the hermeticity
 // probe: the aider openai wiring round — stubs, agent/model/endpoint
 // env, worktree, run — returning the recorded ai-jail call and the
 // worktree for the deeper assertions.
@@ -154,11 +154,11 @@ func stageAiderOpenAIRound(t *testing.T) ([]stubCall, string) {
 	t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 	wt := gitRepo(t)
 
-	if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+	if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "fix the bug",
 	}); err != nil {
-		t.Fatalf("RunJailedClaudeActivity: %v", err)
+		t.Fatalf("RunJailedAgentActivity: %v", err)
 	}
 
 	calls := readCalls(t, log)
@@ -180,7 +180,7 @@ func assertAiderOpenAIEndpoint(t *testing.T, calls []stubCall) {
 	}
 }
 
-// TestRunJailedClaudeActivityAiderOpenAIModel pins the model wiring an
+// TestRunJailedAgentActivityAiderOpenAIModel pins the model wiring an
 // openai-configured round gets on top of the base aider argv: the argv
 // flags select the prefixed model and point at the staged metadata and
 // settings files (the prefix is what routes aider's litellm layer to the
@@ -190,7 +190,7 @@ func assertAiderOpenAIEndpoint(t *testing.T, calls []stubCall) {
 // default budget), the settings file caps the wire request's max_tokens,
 // and OPENAI_API_BASE rides the round env next to OPENAI_BASE_URL — the
 // failover bridge for environments that never went through AgentEnv.
-func TestRunJailedClaudeActivityAiderOpenAIModel(t *testing.T) {
+func TestRunJailedAgentActivityAiderOpenAIModel(t *testing.T) {
 	calls, wt := stageAiderOpenAIRound(t)
 	args := calls[0].Args
 	mi := slices.Index(args, "--message-file")
@@ -236,15 +236,15 @@ func TestRunJailedClaudeActivityAiderOpenAIModel(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityAiderContextTokensOverride pins the
+// TestRunJailedAgentActivityAiderContextTokensOverride pins the
 // context-window channel for aider rounds: a config.ContextTokensEnv
 // export (anthropic.context_tokens) replaces the staged metadata's input
 // side per round, while the completion cap stays at the constant — the
 // window says nothing about output size. A non-positive value is not a
 // window and falls back to the constant. The fallback values with the env
-// unset are pinned by TestRunJailedClaudeActivityAiderOpenAIModel;
+// unset are pinned by TestRunJailedAgentActivityAiderOpenAIModel;
 // TestMain scrubs the ambient var so both pins are host-independent.
-func TestRunJailedClaudeActivityAiderContextTokensOverride(t *testing.T) {
+func TestRunJailedAgentActivityAiderContextTokensOverride(t *testing.T) {
 	for _, c := range []struct {
 		name     string
 		envValue string
@@ -263,11 +263,11 @@ func TestRunJailedClaudeActivityAiderContextTokensOverride(t *testing.T) {
 			t.Setenv(config.ContextTokensEnv, c.envValue)
 			wt := gitRepo(t)
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "fix the bug",
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			metadata, err := os.ReadFile(filepath.Join(wt, ".daedalus-aider", "model.metadata.json"))
@@ -303,15 +303,15 @@ func keysOf[V any](m map[string]V) []string {
 	return keys
 }
 
-// TestRunJailedClaudeActivityAiderOutputTokensOverride pins the
+// TestRunJailedAgentActivityAiderOutputTokensOverride pins the
 // completion-cap channel for aider rounds: a config.MaxOutputTokensEnv
 // export (anthropic.max_output_tokens) replaces both sides of the 8192
 // constant per round — the staged metadata's max_output_tokens and the
 // settings' extra_params.max_tokens — while a non-positive value is not a
 // cap and falls back to the constant. The fallback pins with the env unset
-// live in TestRunJailedClaudeActivityAiderOpenAIModel; TestMain scrubs the
+// live in TestRunJailedAgentActivityAiderOpenAIModel; TestMain scrubs the
 // ambient var so all pins are host-independent.
-func TestRunJailedClaudeActivityAiderOutputTokensOverride(t *testing.T) {
+func TestRunJailedAgentActivityAiderOutputTokensOverride(t *testing.T) {
 	for _, c := range []struct {
 		name     string
 		envValue string
@@ -330,11 +330,11 @@ func TestRunJailedClaudeActivityAiderOutputTokensOverride(t *testing.T) {
 			t.Setenv(config.MaxOutputTokensEnv, c.envValue)
 			wt := gitRepo(t)
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "fix the bug",
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			metadata, err := os.ReadFile(filepath.Join(wt, ".daedalus-aider", "model.metadata.json"))
@@ -369,7 +369,7 @@ func TestRunJailedClaudeActivityAiderOutputTokensOverride(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityAiderSamplers pins the sampler channel for
+// TestRunJailedAgentActivityAiderSamplers pins the sampler channel for
 // aider rounds: the DAEDALUS_* exports (config.yaml's openai section) are
 // staged into the settings file — top_p, presence_penalty, and
 // repetition_penalty at extra_params' top level, top_k and min_p under
@@ -377,7 +377,7 @@ func TestRunJailedClaudeActivityAiderOutputTokensOverride(t *testing.T) {
 // decimal point, so pyyaml never reads it as a string), a malformed export
 // is silently ignored rather than killing the round, and the whole file
 // must still parse as YAML with float-typed params.
-func TestRunJailedClaudeActivityAiderSamplers(t *testing.T) {
+func TestRunJailedAgentActivityAiderSamplers(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		topP       string
@@ -399,11 +399,11 @@ func TestRunJailedClaudeActivityAiderSamplers(t *testing.T) {
 			t.Setenv(config.TopKEnv, "40")
 			wt := gitRepo(t)
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "fix the bug",
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			settings, err := os.ReadFile(filepath.Join(wt, ".daedalus-aider", "model.settings.yml"))
@@ -489,11 +489,11 @@ func TestRunJailedAiderStreamFlag(t *testing.T) {
 				wt = gitRepo(t)
 			}
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "fix the bug",
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			calls := readCalls(t, log)
@@ -521,11 +521,11 @@ func TestRunJailedAiderStreamFlag(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: gitRepo(t),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -555,11 +555,11 @@ func TestRunJailedThinkingOffLevers(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: gitRepo(t),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -579,11 +579,11 @@ func TestRunJailedThinkingOffLevers(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: gitRepo(t),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		for _, call := range readCalls(t, log) {
@@ -609,11 +609,11 @@ func TestRunJailedThinkingOffLevers(t *testing.T) {
 			stubBin(t, "ai-jail", `echo "ENV:MAX_THINKING_TOKENS=$MAX_THINKING_TOKENS" >> "$STUB_LOG"
 exit 0`)
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: t.TempDir(),
 				Prompt:       "fix the bug",
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			calls := readCalls(t, log)
@@ -674,11 +674,11 @@ func TestRunJailedAiderWireThinking(t *testing.T) {
 		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 		wt := gitRepo(t)
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		body, ok := parseSettings(t, wt)["extra_body"].(map[string]any)
@@ -715,11 +715,11 @@ func TestRunJailedAiderWireThinking(t *testing.T) {
 			t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 			wt := gitRepo(t)
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "fix the bug",
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			checkNoStaging(t, parseSettings(t, wt))
@@ -737,11 +737,11 @@ func TestRunJailedAiderWireThinking(t *testing.T) {
 		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 		wt := gitRepo(t)
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		body, ok := parseSettings(t, wt)["extra_body"].(map[string]any)
@@ -795,11 +795,11 @@ exit 0`)
 				wt = gitRepo(t)
 			}
 
-			if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: wt,
 				Prompt:       "fix the bug",
 			}); err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 
 			calls := readCalls(t, log)
@@ -834,7 +834,7 @@ func TestRunJailedBugMirrorMount(t *testing.T) {
 			t.Fatal(err)
 		}
 		stubBin(t, "ai-jail", "exit 0")
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 		})
@@ -850,7 +850,7 @@ func TestRunJailedBugMirrorMount(t *testing.T) {
 
 		calls, err := runRound(t, wt)
 		if err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		if len(calls) != 1 {
 			t.Fatalf("ai-jail called %d times, want 1", len(calls))
@@ -888,7 +888,7 @@ func TestRunJailedBugMirrorMount(t *testing.T) {
 
 			calls, err := runRound(t, wt)
 			if err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 			for _, call := range calls {
 				if slices.Contains(call.Args, "--rw-map") {
@@ -909,7 +909,7 @@ func TestRunJailedBugMirrorMount(t *testing.T) {
 
 		calls, err := runRound(t, wt)
 		if err == nil || !strings.Contains(err.Error(), "--rw-map") || !strings.Contains(err.Error(), ":") {
-			t.Fatalf("RunJailedClaudeActivity error = %v, want a mount-spec colon rejection", err)
+			t.Fatalf("RunJailedAgentActivity error = %v, want a mount-spec colon rejection", err)
 		}
 		if len(calls) != 0 {
 			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
@@ -931,7 +931,7 @@ func TestRunJailedBugMirrorMount(t *testing.T) {
 
 		calls, err := runRound(t, wt)
 		if err == nil || !strings.Contains(err.Error(), "prepare bug mirror dir") {
-			t.Fatalf("RunJailedClaudeActivity error = %v, want a mirror-dir preparation failure", err)
+			t.Fatalf("RunJailedAgentActivity error = %v, want a mirror-dir preparation failure", err)
 		}
 		if len(calls) != 0 {
 			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
@@ -949,7 +949,7 @@ func TestRunJailedBugMirrorMount(t *testing.T) {
 
 		calls, err := runRound(t, wt)
 		if err == nil || !strings.Contains(err.Error(), "prepare bug dir mountpoint") {
-			t.Fatalf("RunJailedClaudeActivity error = %v, want a mountpoint preparation failure", err)
+			t.Fatalf("RunJailedAgentActivity error = %v, want a mountpoint preparation failure", err)
 		}
 		if len(calls) != 0 {
 			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
@@ -1048,7 +1048,7 @@ func TestFolderMounts(t *testing.T) {
 	})
 }
 
-// TestRunJailedClaudeActivityFolderGrants pins the folder-grant round seam
+// TestRunJailedAgentActivityFolderGrants pins the folder-grant round seam
 // in runJailedRound: with grants, the argv gains one --rw-map
 // <source>:<dest> pair per grant before the "--" terminator and each
 // mountpoint is created host-side before spawn (an empty dir is invisible
@@ -1057,7 +1057,7 @@ func TestFolderMounts(t *testing.T) {
 // lives in that conversation), a rotted grant fails the round before
 // spawn, and the broken-resume fresh retry — which drops the resume flag —
 // relays the note its resumed first launch skipped.
-func TestRunJailedClaudeActivityFolderGrants(t *testing.T) {
+func TestRunJailedAgentActivityFolderGrants(t *testing.T) {
 	grant := func(t *testing.T) string {
 		t.Helper()
 		dir := filepath.Join(t.TempDir(), "shared")
@@ -1078,12 +1078,12 @@ func TestRunJailedClaudeActivityFolderGrants(t *testing.T) {
 		}
 		wt := t.TempDir()
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 			Folders:      []string{first, second},
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -1125,11 +1125,11 @@ func TestRunJailedClaudeActivityFolderGrants(t *testing.T) {
 		stubBin(t, "ai-jail", "exit 0")
 		wt := t.TempDir()
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		for _, call := range readCalls(t, log) {
@@ -1152,13 +1152,13 @@ func TestRunJailedClaudeActivityFolderGrants(t *testing.T) {
 		src := grant(t)
 		wt := t.TempDir()
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 			SessionID:    "sess-7",
 			Folders:      []string{src},
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -1181,13 +1181,13 @@ func TestRunJailedClaudeActivityFolderGrants(t *testing.T) {
 		stubBin(t, "ai-jail", "exit 0")
 		wt := t.TempDir()
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 			Folders:      []string{filepath.Join(t.TempDir(), "gone")},
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity on a rotted grant should fail")
+			t.Fatal("RunJailedAgentActivity on a rotted grant should fail")
 		}
 		if calls := readCalls(t, log); len(calls) != 0 {
 			t.Errorf("ai-jail called %d times, want the round to fail before spawn", len(calls))
@@ -1215,7 +1215,7 @@ exit 0`)
 		recordSession(context.Background(), wt, RoleDev, "sess-dead")
 		plantTranscript(t, wt, "sess-dead")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: wt,
 			Prompt:       "fix the bug",
 			Role:         RoleDev,
@@ -1467,12 +1467,12 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "echo CODEX-OUTPUT; exit 0")
 
-		res, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		if res.Text != "CODEX-OUTPUT\n" {
 			t.Errorf("result.Text = %q, want the raw plain-mode output", res.Text)
@@ -1511,11 +1511,11 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 
 		calls := readCalls(t, log)
@@ -1550,12 +1550,12 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-shape failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the unbridgeable-shape failure")
 		}
 		if !strings.Contains(err.Error(), "without a base URL") {
 			t.Errorf("error = %q, want the codex no-base-URL guard message", err)
@@ -1574,12 +1574,12 @@ func TestCodexRoundStagesProvider(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-shape failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the unbridgeable-shape failure")
 		}
 		if !strings.Contains(err.Error(), "without openai.model") {
 			t.Errorf("error = %q, want the codex no-model guard message", err)
@@ -1830,11 +1830,11 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		calls := readCalls(t, log)
 		if len(calls) != 1 {
@@ -1862,11 +1862,11 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		calls := readCalls(t, log)
 		if len(calls) != 1 {
@@ -1897,11 +1897,11 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		calls := readCalls(t, log)
 		if len(calls) != 1 {
@@ -1933,11 +1933,11 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		calls := readCalls(t, log)
 		if len(calls) != 1 {
@@ -1967,11 +1967,11 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		calls := readCalls(t, log)
 		if len(calls) != 1 {
@@ -2002,11 +2002,11 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		calls := readCalls(t, log)
 		if len(calls) != 1 {
@@ -2028,11 +2028,11 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		if _, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		}); err != nil {
-			t.Fatalf("RunJailedClaudeActivity: %v", err)
+			t.Fatalf("RunJailedAgentActivity: %v", err)
 		}
 		calls := readCalls(t, log)
 		if len(calls) != 1 {
@@ -2063,12 +2063,12 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
 
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the unbridgeable-loopback failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the unbridgeable-loopback failure")
 		}
 		if !strings.Contains(err.Error(), "cannot bridge") {
 			t.Errorf("error = %q, want the loopback bridge failure", err)
@@ -2099,12 +2099,12 @@ func TestJailArgvEgressPosture(t *testing.T) {
 		t.Cleanup(func() { slotWaitTimeout = prevWait })
 
 		start := time.Now()
-		_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 			WorktreePath: t.TempDir(),
 			Prompt:       "fix the bug",
 		})
 		if err == nil {
-			t.Fatal("RunJailedClaudeActivity = nil error, want the hostless-URL failure")
+			t.Fatal("RunJailedAgentActivity = nil error, want the hostless-URL failure")
 		}
 		if !strings.Contains(err.Error(), "carries no host") {
 			t.Errorf("error = %q, want the egress derivation to preempt the slot wait (ErrAgentSlotsBusy after %v would mean it queued first)", err, time.Since(start))
@@ -2166,13 +2166,13 @@ func TestWindowPreflight(t *testing.T) {
 	}
 }
 
-// TestRunJailedClaudeActivityWindowPreflightRefusesBeforeLaunch pins the
+// TestRunJailedAgentActivityWindowPreflightRefusesBeforeLaunch pins the
 // gate at the activity boundary: a round whose prompt cannot fit the
 // staged window is refused with ErrPromptOverWindow before ai-jail ever
 // spawns (no launch, no slot wait — the stub log stays empty), while the
 // same round with the gate off (no window staged) or with room in the
 // budget launches normally.
-func TestRunJailedClaudeActivityWindowPreflightRefusesBeforeLaunch(t *testing.T) {
+func TestRunJailedAgentActivityWindowPreflightRefusesBeforeLaunch(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		window  string
@@ -2192,7 +2192,7 @@ exit 0`)
 				t.Setenv(config.ContextTokensEnv, c.window)
 			}
 
-			_, err := RunJailedClaudeActivity(context.Background(), AgentRunInput{
+			_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 				WorktreePath: t.TempDir(),
 				Prompt:       "fix the bug",
 				Role:         RoleDev,
@@ -2208,7 +2208,7 @@ exit 0`)
 				return
 			}
 			if err != nil {
-				t.Fatalf("RunJailedClaudeActivity: %v", err)
+				t.Fatalf("RunJailedAgentActivity: %v", err)
 			}
 			calls := readCalls(t, log)
 			if len(calls) != 1 {
@@ -2329,5 +2329,87 @@ sleep 0.3
 exit 0`)
 	if _, err := runJailedRound(context.Background(), jailedPiRoundEnv(), "", "claude", t.TempDir(), "round prompt"); err != nil {
 		t.Fatalf("runJailedRound: %v", err)
+	}
+}
+
+// TestNoDeliveryCapturedText pins the salvage extractor: the text between
+// the envelope markers, outer whitespace trimmed; "" for a nil error, a
+// plain error, a no-delivery wrap without an envelope, and anything past
+// the end marker — the cut is a slice, never a trim of the whole error.
+func TestNoDeliveryCapturedText(t *testing.T) {
+	plan := "Sub-task 1 (implement, adder.go): add the adder."
+	enveloped := func(text string) error {
+		return fmt.Errorf("%w: hands round died on a no-delivery kill: class no-delivery: strikes\n%s\n%s\n%s",
+			ErrAgentNoDelivery, noDeliveryCaptureBegin, text, noDeliveryCaptureEnd)
+	}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"plain error", errors.New("no envelope here"), ""},
+		{"sentinel without an envelope", fmt.Errorf("%w: hands round died on a no-delivery kill", ErrAgentNoDelivery), ""},
+		{"unrelated error carrying stray text", errors.New("loose prose, no markers"), ""},
+		{"envelope extracts the plan", enveloped(plan), plan},
+		{"outer whitespace is trimmed", enveloped("\n  " + plan + "  \n"), plan},
+		{"multi-line plan survives intact", enveloped("line one\nline two\nline three"), "line one\nline two\nline three"},
+		{"content past the end marker is cut off", errors.New(enveloped(plan).Error() + "\ntrailer"), plan},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := NoDeliveryCapturedText(c.err); got != c.want {
+				t.Errorf("NoDeliveryCapturedText(%v) = %q, want %q", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// TestMatchesAnyDigitBoundary pins the all-digit markers' boundary rule on
+// the exhausted-text scan: "402" hits "HTTP 402" and "error: 402" and a
+// string-edge hit, but never the 402 inside a digit run — the live
+// misclassification where a hands round's session uuid (…2a8464029e36)
+// classified the round as api-exhausted. A digit-adjacent hit never masks a
+// later clean one (the scan resumes past its first byte), non-digit markers
+// keep the plain substring with no boundary rule, and the match stays
+// case-insensitive.
+func TestMatchesAnyDigitBoundary(t *testing.T) {
+	cases := []struct {
+		name    string
+		s       string
+		markers []string
+		want    bool
+	}{
+		{"bare status hit", "error: 402", []string{"402"}, true},
+		{"status in prose hits", "server said HTTP 402 today", []string{"402"}, true},
+		{"string-start hit", "402 payment required", []string{"402"}, true},
+		{"string-end hit", "payment required: 402", []string{"402"}, true},
+		{"uuid digit run never hits", "session conv-2a8464029e36 closed", []string{"402"}, false},
+		{"digit-adjacent on both sides never hits", "14022", []string{"402"}, false},
+		{"swallowed occurrence never hits", "4024", []string{"402"}, false},
+		{"blocked hit never masks a later clean one", "uuid 2a8464029e36 then HTTP 402", []string{"402"}, true},
+		{"two adjacent runs never compose a hit", "402402", []string{"402"}, false},
+		{"other four-digit statuses behave alike", "exit code 1429 recorded", []string{"429"}, false},
+		{"marker after a space still hits", "exit code: 429", []string{"429"}, true},
+		// The live shape, against the production marker list: a no-delivery
+		// kill whose stream carries only session uuids must stay generic.
+		{"production list stays deaf to uuid digit runs",
+			"session conv-2a8464029e36, class no-delivery: 2 strikes",
+			apiExhaustionMarkers, false},
+		{"production list still hears a real exhaustion",
+			"provider said HTTP 429: overloaded",
+			apiExhaustionMarkers, true},
+		// Non-digit markers keep the plain substring: letters cannot hide
+		// inside a digit run, so there is nothing to bound.
+		{"non-digit marker keeps the plain substring", "xrate limitx", []string{"rate limit"}, true},
+		{"non-digit marker matches in prose", "RATE LIMIT reached for key", apiExhaustionMarkers, true},
+		{"non-digit marker unbounded still matches mid-word", "quota8x", []string{"quota"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := matchesAny(c.s, c.markers); got != c.want {
+				t.Errorf("matchesAny(%q) = %v, want %v", c.s, got, c.want)
+			}
+		})
 	}
 }
