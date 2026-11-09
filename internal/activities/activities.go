@@ -262,6 +262,21 @@ type ReviewResult struct {
 	Usage Usage
 }
 
+// RunJailedClaudeActivity is the jailed agent round under its pre-rename
+// type name — a distinct wrapper function, never an alias registration of
+// the renamed one. The SDK rewrites dispatch names through a map keyed on
+// the registered function's own name, and by-name schedules ride the same
+// rewrite: aliasing RunJailedAgentActivity would put the legacy spelling
+// on the wire whatever the rename gate schedules. Keying the rewrite on
+// this wrapper's own name leaves the gate's decision verbatim, and the
+// histories that permanently hold the legacy spelling — pre-rename, and
+// the rename-era marker histories recorded while the dispatch rewrite was
+// live — replay through this wrapper: the same implementation, the legacy
+// wire spelling their recorded schedules carry.
+func RunJailedClaudeActivity(ctx context.Context, input AgentRunInput) (AgentRunResult, error) {
+	return RunJailedAgentActivity(ctx, input)
+}
+
 // RunJailedAgentActivity runs the jailed agent (claude, opencode, pi,
 // codex, hands, or aider, per config) inside an ai-jail sandbox rooted at
 // the worktree. claude runs with json output so its visible text comes

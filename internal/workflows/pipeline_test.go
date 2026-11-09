@@ -54,12 +54,13 @@ func registerPipelineActivities(env *testsuite.TestWorkflowEnvironment) {
 		activity.RegisterOptions{Name: activities.CheckDependencyActivityName})
 	env.RegisterActivityWithOptions(stubNotifyDependents,
 		activity.RegisterOptions{Name: activities.NotifyDependentsActivityName})
-	// The rename's legacy alias mirrors the worker's own registration shape
-	// (worker_run.go): the same function under the old type name, serving
-	// histories recorded before the rename — a pre-marker replay schedules
-	// it and must find it registered.
-	env.RegisterActivityWithOptions(activities.RunJailedAgentActivity,
-		activity.RegisterOptions{Name: "RunJailedClaudeActivity"})
+	// The rename's legacy wrapper mirrors the worker's registration shape
+	// (worker_run.go): a plain registration of the same implementation
+	// under its old type name — never an alias registration of the
+	// renamed function, which would rewrite every dispatch on the wire —
+	// serving histories recorded before the rename: a pre-marker replay
+	// schedules the legacy name and must find it registered.
+	env.RegisterActivity(activities.RunJailedClaudeActivity)
 }
 
 // stubCheckDependency and stubNotifyDependents are the name placeholders
@@ -4690,23 +4691,26 @@ func TestFeatureDevWorkflowDiscoveryNoDeliveryParks(t *testing.T) {
 // TestFeatureDevWorkflowPreRenameReplaySchedulesLegacyActivity pins the
 // rename's replay gate: a history recorded before the agent-activity rename
 // (GetVersion pinned to the default, the slim replay tests' shape) schedules
-// the legacy activity name, whose alias registration serves the round — a
-// run sleeping across the worker upgrade replays without a nondeterminism
-// wedge. The marker side is on trial everywhere else: every other
-// newTestEnv test schedules the new name through the version gate's fresh
-// execution.
+// the legacy activity name, which the plain legacy-wrapper registration
+// serves — a run sleeping across the worker upgrade replays without a
+// nondeterminism wedge. The marker side is on trial everywhere else: every
+// other newTestEnv test schedules the new name through the version gate's
+// fresh execution.
 func TestFeatureDevWorkflowPreRenameReplaySchedulesLegacyActivity(t *testing.T) {
 	env := newTestEnv(t)
-	env.OnGetVersion(jailedAgentActivityChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+	env.OnGetVersion(jailedAgentActivityChangeID, workflow.DefaultVersion, 2).Return(workflow.DefaultVersion)
 	env.OnActivity(activities.CreateWorktreeActivity, mock.Anything, mock.Anything).
 		Return(activities.WorktreeOutput{WorktreePath: "/wt/issue-42"}, nil)
 	var legacyCalls, modernCalls int
 	env.OnActivity("RunJailedClaudeActivity", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { legacyCalls++ }).
 		Return(activities.AgentRunResult{Text: "done"}, nil)
+	// The modern stub is Maybe: a pre-rename replay must never dispatch the
+	// new name — the counter below proves the absence.
 	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) { modernCalls++ }).
-		Return(activities.AgentRunResult{Text: "done"}, nil)
+		Return(activities.AgentRunResult{Text: "done"}, nil).
+		Maybe()
 	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
 	rev.record()
 	stubTestPhase(env)
@@ -4718,7 +4722,7 @@ func TestFeatureDevWorkflowPreRenameReplaySchedulesLegacyActivity(t *testing.T) 
 		t.Fatalf("workflow error: %v — the pre-marker replay must not wedge on the rename", err)
 	}
 	if legacyCalls != 2 || modernCalls != 0 {
-		t.Errorf("legacy calls = %d, modern calls = %d, want every round (implement + tests) on the legacy alias alone", legacyCalls, modernCalls)
+		t.Errorf("legacy calls = %d, modern calls = %d, want every round (implement + tests) on the legacy name alone", legacyCalls, modernCalls)
 	}
 	env.AssertExpectations(t)
 }

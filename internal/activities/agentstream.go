@@ -258,6 +258,10 @@ type handsEvent struct {
 		Session string `json:"session"`
 		Class   string `json:"class"`
 		Reason  string `json:"reason"`
+		// Text is kind "text"'s prose, riding flat on the payload — the
+		// level failed carries class and reason at — probe-pinned live
+		// against the strand a deliver-contract kill leaves behind.
+		Text string `json:"text"`
 		// Payload is the kind-shaped body: the session id under
 		// started, class/reason under failed, the delivery arguments
 		// under delivered/partial at this one nested level — decoded
@@ -501,16 +505,18 @@ func handsNoDelivery(stdout string) string {
 // stranded plan a salvage feeds onward; parseHandsStream never surfaces
 // it, its text return being the delivered summary alone). The last
 // non-empty event wins, never a concatenation: the strikes regenerate the
-// same prose (live-proven byte-identical across a watchdog's two strikes,
-// 2026-11-09), so joining them would hand the consumer a duplicated plan,
+// same prose (live-proven byte-identical across a watchdog's two
+// strikes), so joining them would hand the consumer a duplicated plan,
 // and the final turn is the round's last word under the recovery nudge.
-// ponytail: the payload shape is probe-owed like partial's — it decodes
-// as {"text": ...} first, then as a bare JSON string, and a shape drift
-// degrades to "" (the caller routes the kill to the plain park, never to
-// a wrong plan). Turn-level events are the observed grain (the live kill
-// rode its full plan as whole per-turn events); a per-delta emitter would
-// degrade to a fragment, which spends the parse round's re-ask rather
-// than fabricating a plan.
+// The payload shape is probe-settled live: the prose rides flat on the
+// payload (payload.text, the level failed carries class and reason at),
+// decoded first; the deeper shapes — the body under a nested payload
+// key, then a bare JSON string payload — stay as drift fallbacks, and a
+// total drift degrades to "" (the caller routes the kill to the plain
+// park, never to a wrong plan). Turn-level events are the observed grain
+// (the live kill rode its full plan as whole per-turn events); a
+// per-delta emitter would degrade to a fragment, which spends the parse
+// round's re-ask rather than fabricating a plan.
 func handsTextEvents(stdout string) string {
 	text := ""
 	for line := range strings.SplitSeq(stdout, "\n") {
@@ -518,6 +524,13 @@ func handsTextEvents(stdout string) string {
 		if json.Unmarshal([]byte(line), &e) != nil || e.Kind != "text" {
 			continue
 		}
+		// The probe-proven shape: the prose flat on the payload.
+		if e.Payload.Text != "" {
+			text = e.Payload.Text
+			continue
+		}
+		// The drift fallbacks: the body one nesting level deeper, then a
+		// bare JSON string payload.
 		var body struct {
 			Text string `json:"text"`
 		}
