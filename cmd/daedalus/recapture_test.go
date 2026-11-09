@@ -171,7 +171,7 @@ func TestDetectStuckAttempts(t *testing.T) {
 		},
 	}
 
-	stuck, err := detectStuckAttempts(context.Background(), fake, "daedalus")
+	stuck, err := detectStuckAttempts(context.Background(), fake, "daedalus", nil, nil)
 	if err != nil {
 		t.Fatalf("detectStuckAttempts: %v", err)
 	}
@@ -233,8 +233,56 @@ func TestDetectStuckAttempts(t *testing.T) {
 func TestDetectStuckAttemptsUndecidableQueue(t *testing.T) {
 	fake := &fakeRecaptureClient{}
 	fake.service.describeErrs = map[string]error{"daedalus": errors.New("temporal exploded")}
-	if _, err := detectStuckAttempts(context.Background(), fake, "daedalus"); err == nil {
+	if _, err := detectStuckAttempts(context.Background(), fake, "daedalus", nil, nil); err == nil {
 		t.Error("detectStuckTasks with an undescribable queue = nil error, want the describe failure")
+	}
+}
+
+// TestDetectStuckAttemptsLiveHolderExemption pins the boot-window guard:
+// a holder whose pid sits in the live recorded-worker set is being served
+// even while absent from the poller list — poller visibility lags a boot,
+// and a recapture inside that window killed a live worker's in-flight test
+// suite on 2026-11-08 (worker booted, attempt in flight, poller list still
+// showing only the dead predecessor). The same exemption covers a
+// never-dispatched attempt on a queue whose own recorded worker is live.
+// With no live pids recorded, the identical shape is still a pair of
+// ghosts — the pre-fix behavior, kept as the contrast half of the pin.
+func TestDetectStuckAttemptsLiveHolderExemption(t *testing.T) {
+	newFake := func() *fakeRecaptureClient {
+		fake := &fakeRecaptureClient{pages: [][]string{{"w-main"}}}
+		fake.service = fakeRecaptureService{
+			// Boot window: the queues report no pollers at all — the
+			// new worker's pollers have not surfaced and the dead
+			// predecessor's entries have aged out.
+			pollers: map[string][]string{
+				"daedalus": {},
+				"test":     {},
+			},
+			describes: map[string][]*workflowpb.PendingActivityInfo{
+				"w-main": {
+					pendingActivity("a-live-holder", "424242@host@9", "test", false),
+					pendingActivity("a-never", "", "test", false),
+				},
+			},
+		}
+		return fake
+	}
+
+	live := map[string]bool{"424242": true}
+	stuck, err := detectStuckAttempts(context.Background(), newFake(), "daedalus", live, live)
+	if err != nil {
+		t.Fatalf("detectStuckAttempts: %v", err)
+	}
+	if len(stuck) != 0 {
+		t.Errorf("a live recorded pid must exempt holder and never-dispatched attempts, got %v", stuck)
+	}
+
+	stuck, err = detectStuckAttempts(context.Background(), newFake(), "daedalus", nil, nil)
+	if err != nil {
+		t.Fatalf("detectStuckAttempts: %v", err)
+	}
+	if len(stuck) != 2 {
+		t.Errorf("with no live recorded pid both attempts stay ghosts, got %v", stuck)
 	}
 }
 
