@@ -12,7 +12,7 @@
 // and the ledger reads the usage block at EOF — structurally uniform
 // across both wires, whatever CLI produced the round. A keyed round's
 // inspected call additionally tees its request body and the response's
-// assistant text into the in-memory per-round capture (capture.go) — the
+// assistant text into the per-round capture (capture.go) — the
 // primary source `daedalus log <wf> -cot` renders. Every other request
 // proxies verbatim. The relay reads no request or response content beyond
 // that capture, the usage blocks, and the attribution encoding the worker
@@ -24,7 +24,10 @@
 // table of the shared metrics database (store.go — sqlite mode, the
 // daemon's default); memory mode (the zero-value Ledger, no store wired)
 // keeps the rows in-process only — explicitly the no-disk posture, so its
-// slice is unbounded by design. Cost stays render-time: the
+// slice is unbounded by design. The capture persists beside it in the
+// same database's relay_captures table, riding the ledger's store; a
+// memory-mode relay keeps the captures in-process too. Cost stays
+// render-time: the
 // operator's price
 // table (the dashboard's models tab) prices entries when the dashboard
 // reads them, and CostUSD is never written.
@@ -403,6 +406,11 @@ func Start(port int, ledger *Ledger, registry *Registry) (*Relay, error) {
 	r := &Relay{
 		ledger:   ledger,
 		registry: registry,
+		// The capture rides the ledger's store: sqlite mode persists the
+		// per-round records across restarts (the relay_captures table),
+		// memory mode keeps the in-process map only — the ledger's own
+		// zero-value split, no separate wiring to forget.
+		captures: Captures{store: ledger.store},
 		started:  time.Now(),
 		listener: ln,
 	}

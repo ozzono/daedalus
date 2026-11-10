@@ -2,12 +2,17 @@
 // ledger. Every keyed, inspected round's request body (the prompt side —
 // for a chained CLI the accumulated conversation its last provider call
 // carried) and the assistant text extracted from its response stream are
-// kept here, last write wins per round, under the ledger's own discipline:
-// in-memory only, dropped on daemon restart, plain eviction. The capture is
-// keyed-only by construction — an unkeyed round has no per-round
-// attribution to file it under. `daedalus log <wf> -cot` reads it as its
-// primary source (see cmd/daedalus/tasklog.go) over the /capture endpoint;
-// durable roll-ups stay the golens-metrics embed's concern.
+// kept here, last write wins per round under one guard: an empty response
+// (a pure tool-call turn's stream) never replaces a stored text-bearing
+// one — the round's single text turn is the prose -cot renders. The
+// discipline is the ledger's own: sqlite mode (a store wired) persists
+// the records in the shared database's relay_captures table, memory mode
+// (the zero value) keeps them in-process, dropped on restart, plain
+// eviction. The capture is keyed-only by construction — an unkeyed round
+// has no per-round attribution to file it under. `daedalus log <wf> -cot`
+// reads it as its primary source (see cmd/daedalus/tasklog.go) over the
+// /capture endpoint; durable roll-ups stay the golens-metrics embed's
+// concern.
 package metricsrelay
 
 import (
@@ -36,7 +41,8 @@ const captureCap = 2048
 type captureKey struct{ task, role, round string }
 
 // CapturedRound is one keyed round's wire record. Prompt is the request
-// body of the round's last captured provider call; Response is the
+// body of the round's latest filed provider call (the empty-response guard
+// may leave an earlier, text-bearing one standing); Response is the
 // assistant text extracted from that call's stream — the material `-cot`
 // renders. A capture that hit its byte cap says so inline (the truncation
 // marker), never silently.
@@ -46,17 +52,27 @@ type CapturedRound struct {
 	Response string    `json:"response,omitempty"`
 }
 
-// Captures is the in-memory capture store: last write wins per round, so a
-// round's record always holds its most complete provider call (a chained
-// CLI's last request carries everything before it). Zero value ready.
+// Captures is the per-round capture store: last write wins per round (the
+// empty-response guard aside), so a round's record always holds its most
+// complete provider call (a chained CLI's last request carries everything
+// before it). Memory mode as the zero value — in-process only, dropped on
+// exit; sqlite mode when a store is wired, the records persisting in the
+// shared database across restarts. Zero value ready.
 type Captures struct {
 	mu    sync.Mutex
 	m     map[captureKey]CapturedRound
 	order []captureKey
+	store *Store // nil keeps the in-memory-only path
 }
 
 // Put records one round's capture. An existing record for the round is
-// replaced, not appended; rounds past captureCap evict oldest-first.
+// replaced, not appended; rounds past captureCap evict oldest-first. One
+// guard bends last-write-wins: an empty Response never replaces a stored
+// text-bearing one, and a wired store takes the write-through — memory
+// and the relay_captures table move together under the same lock, with
+// the guard reading the table for a pre-restart record the restarted
+// memory map has not seen. A failed consult files nothing: the guard
+// cannot see the table, so it must not act on it.
 func (c *Captures) Put(task, role, round string, cr CapturedRound) {
 	if task == "" || round == "" {
 		return // no per-round attribution, nothing to file the capture under
@@ -64,6 +80,24 @@ func (c *Captures) Put(task, role, round string, cr CapturedRound) {
 	k := captureKey{task, role, round}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	prev, seen := c.m[k]
+	if !seen && cr.Response == "" && c.store != nil {
+		// Memory starts empty after a restart; the stored text capture —
+		// what the guard exists to protect — reads back from the table.
+		var err error
+		prev, seen, err = c.store.getCapture(task, role, round)
+		if err != nil {
+			// The guard is blind: it cannot tell whether a text row
+			// survives, so file nothing — the memory map included, or it
+			// would shadow the surviving row from every later Get —
+			// rather than risk the destructive upsert. The suppressed
+			// record is an empty one, nothing -cot would have rendered.
+			return
+		}
+	}
+	if seen && prev.Response != "" && cr.Response == "" {
+		return
+	}
 	if _, seen := c.m[k]; !seen {
 		if c.m == nil {
 			c.m = map[captureKey]CapturedRound{}
@@ -74,18 +108,29 @@ func (c *Captures) Put(task, role, round string, cr CapturedRound) {
 			delete(c.m, c.order[0])
 			c.order = c.order[1:]
 		}
-		return
+	} else {
+		c.m[k] = cr
 	}
-	c.m[k] = cr
+	if c.store != nil {
+		c.store.putCapture(task, role, round, cr)
+	}
 }
 
 // Get returns one round's record; ok is false when the capture holds none
-// (never captured, aged out, or the daemon restarted).
+// (never captured, aged out, or — memory mode — the daemon restarted).
+// With a store wired, a restart-surviving record reads back from the
+// relay_captures table when the in-memory map misses; a failed read
+// degrades to capture-absent (logged at the source), as it reads without
+// a store.
 func (c *Captures) Get(task, role, round string) (CapturedRound, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cr, ok := c.m[captureKey{task, role, round}]
-	return cr, ok
+	if ok || c.store == nil {
+		return cr, ok
+	}
+	cr, found, _ := c.store.getCapture(task, role, round)
+	return cr, found
 }
 
 // serveCapture answers one round's record for the -cot reader. 404 — not

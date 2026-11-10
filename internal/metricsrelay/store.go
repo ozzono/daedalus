@@ -9,6 +9,7 @@ package metricsrelay
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"sync/atomic"
@@ -19,10 +20,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// relaySchema is the ledger's namespaced slice of the shared database.
-// Costs stay out of the rows: CostUSD is the reserved zero it has always
-// been (the package comment) — the column only keeps a row's round-trip
-// faithful to its Entry.
+// relaySchema is this package's namespaced slice of the shared database:
+// the ledger's relay_entries and the per-round capture's relay_captures
+// (one row per keyed round, the capture's last-write-wins as a primary
+// key). Costs stay out of the rows: CostUSD is the reserved zero it has
+// always been (the package comment) — the column only keeps a row's
+// round-trip faithful to its Entry.
 const relaySchema = `
 CREATE TABLE IF NOT EXISTS relay_entries (
     at INTEGER NOT NULL,
@@ -45,6 +48,16 @@ CREATE TABLE IF NOT EXISTS relay_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_relay_entries_at ON relay_entries(at);
 CREATE INDEX IF NOT EXISTS idx_relay_entries_worker ON relay_entries(worker, at);
+CREATE TABLE IF NOT EXISTS relay_captures (
+    task TEXT NOT NULL,
+    role TEXT NOT NULL,
+    round TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    prompt TEXT NOT NULL,
+    response TEXT NOT NULL,
+    PRIMARY KEY (task, role, round)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_captures_at ON relay_captures(at);
 `
 
 // relayCols is the SELECT/INSERT column list, in scan and bind order.
@@ -133,10 +146,51 @@ func (s *Store) maybePrune(now time.Time) {
 }
 
 func (s *Store) prune(now time.Time) {
-	_, err := s.db.Exec(`DELETE FROM relay_entries WHERE at < ?`, now.Add(-s.maxAge).UnixNano())
-	if err != nil {
+	cutoff := now.Add(-s.maxAge).UnixNano()
+	if _, err := s.db.Exec(`DELETE FROM relay_entries WHERE at < ?`, cutoff); err != nil {
 		log.Printf("metricsrelay: ledger prune: %v", err)
 	}
+	if _, err := s.db.Exec(`DELETE FROM relay_captures WHERE at < ?`, cutoff); err != nil {
+		log.Printf("metricsrelay: capture prune: %v", err)
+	}
+}
+
+// putCapture writes one round's capture through to the relay_captures
+// table — the upsert is the capture's last-write-wins, one row per keyed
+// round. Same best-effort posture as Append: a failed write is logged,
+// never fatal (the capture is observability).
+func (s *Store) putCapture(task, role, round string, cr CapturedRound) {
+	_, err := s.db.Exec(`INSERT INTO relay_captures (task, role, round, at, prompt, response)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(task, role, round) DO UPDATE SET
+			at = excluded.at, prompt = excluded.prompt, response = excluded.response`,
+		task, role, round, cr.At.UnixNano(), cr.Prompt, cr.Response)
+	if err != nil {
+		log.Printf("metricsrelay: capture insert: %v", err)
+	}
+}
+
+// getCapture reads one keyed round's row back. found is false only when
+// the table holds none (never captured or pruned); a failed read comes
+// back as err with found false, so a caller can tell an empty table from
+// one it could not see — Put's empty-response guard must not fire blind
+// on the latter. The error is logged at the source, once for both faces.
+// At carries no zone of its own in sqlite — time.Unix reconstitutes local
+// time, as the entries' scan does.
+func (s *Store) getCapture(task, role, round string) (cr CapturedRound, found bool, err error) {
+	var at int64
+	err = s.db.QueryRow(`SELECT at, prompt, response FROM relay_captures
+		WHERE task = ? AND role = ? AND round = ?`,
+		task, role, round).Scan(&at, &cr.Prompt, &cr.Response)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CapturedRound{}, false, nil
+	}
+	if err != nil {
+		log.Printf("metricsrelay: capture read: %v", err)
+		return CapturedRound{}, false, err
+	}
+	cr.At = time.Unix(0, at)
+	return cr, true, nil
 }
 
 // Len reports the ledger's row count. A failed count reads as zero and is

@@ -3,7 +3,10 @@ package metricsrelay
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -62,6 +65,178 @@ func TestCapturesRing(t *testing.T) {
 			t.Errorf("Put with task=%q round=%q filed a record; an unattributable round has nothing to file under", key[0], key[2])
 		}
 	}
+}
+
+// TestCapturesEmptyResponseGuard pins the one guard on last-write-wins: a
+// pure tool-call turn's stream extracts to no assistant text, and that
+// empty response must never replace a stored text-bearing one — the
+// round's single prose turn is the material -cot renders. The guard is not
+// a blanket in the other direction: prose files over an earlier empty
+// turn (the tool loop's first turn must not squat the round), and empty
+// over empty is the plain last write (the newer call's prompt side is the
+// fresher record).
+func TestCapturesEmptyResponseGuard(t *testing.T) {
+	t.Run("an empty response never replaces a stored text-bearing one", func(t *testing.T) {
+		var c Captures
+		c.Put("wf", "dev", "1", CapturedRound{At: time.Unix(1, 0), Prompt: "prose prompt", Response: "the answer"})
+		c.Put("wf", "dev", "1", CapturedRound{At: time.Unix(2, 0), Prompt: "tool-call prompt"})
+		got, ok := c.Get("wf", "dev", "1")
+		if !ok || got.Response != "the answer" || got.Prompt != "prose prompt" || !got.At.Equal(time.Unix(1, 0)) {
+			t.Errorf("capture = (%+v, %v), want the text-bearing record kept whole", got, ok)
+		}
+	})
+
+	t.Run("prose files over an earlier empty turn", func(t *testing.T) {
+		var c Captures
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "tool-call prompt"})
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "prose prompt", Response: "the answer"})
+		got, ok := c.Get("wf", "dev", "1")
+		if !ok || got.Response != "the answer" || got.Prompt != "prose prompt" {
+			t.Errorf("capture = (%+v, %v), want the prose turn filed over the tool-call turn", got, ok)
+		}
+	})
+
+	t.Run("empty over empty is the plain last write", func(t *testing.T) {
+		var c Captures
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "first"})
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "second"})
+		got, ok := c.Get("wf", "dev", "1")
+		if !ok || got.Prompt != "second" {
+			t.Errorf("capture = (%+v, %v), want the newer call's record", got, ok)
+		}
+	})
+}
+
+// openCaptures opens a store-backed capture over a fresh sqlite file in
+// the test's temp dir — the daemon's sqlite-mode shape (Start wires the
+// capture to the ledger's store). The store closes at cleanup.
+func openCaptures(t *testing.T, maxAge time.Duration) (*Captures, *Store) {
+	t.Helper()
+	s := openTempStore(t, maxAge)
+	return &Captures{store: s}, s
+}
+
+// TestCapturesStoreMode pins the sqlite-mode capture: a Put writes through
+// to the relay_captures table, a fresh Captures over the same store — the
+// restarted daemon's shape — reads the record back whole (nanosecond At
+// included), the keyed upsert is one row per round with the last write
+// standing, role splits the key as it does in memory, and a round the
+// table holds none of reads back absent.
+func TestCapturesStoreMode(t *testing.T) {
+	c, s := openCaptures(t, 0)
+	at := time.Unix(1700000000, 123456789)
+	c.Put("wf-1", "dev", "3", CapturedRound{At: at, Prompt: "the prompt", Response: "the answer"})
+
+	// The restarted daemon's memory map starts empty; the record survives
+	// in the table and Get reads it back through the store.
+	fresh := &Captures{store: s}
+	got, ok := fresh.Get("wf-1", "dev", "3")
+	if !ok {
+		t.Fatal("the store-backed capture did not survive the restart")
+	}
+	if got.Prompt != "the prompt" || got.Response != "the answer" || !got.At.Equal(time.Unix(0, at.UnixNano())) {
+		t.Errorf("restarted Get = %+v, want the record whole with its nanosecond At", got)
+	}
+
+	// Last write wins in the table too: the keyed upsert is one row per
+	// round, never a second appended row.
+	c.Put("wf-1", "dev", "3", CapturedRound{At: at.Add(time.Minute), Prompt: "newer prompt", Response: "newer answer"})
+	var rows int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM relay_captures
+		WHERE task = ? AND role = ? AND round = ?`, "wf-1", "dev", "3").Scan(&rows); err != nil {
+		t.Fatalf("count relay_captures: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("relay_captures holds %d rows for one keyed round, want the upsert's single row", rows)
+	}
+	if got, ok := fresh.Get("wf-1", "dev", "3"); !ok || got.Response != "newer answer" {
+		t.Errorf("restarted Get = (%+v, %v), want the last write standing", got, ok)
+	}
+
+	// Role splits the key: the reviewer round's record never answers for
+	// the dev round's.
+	c.Put("wf-1", "test", "3", CapturedRound{Response: "reviewer words"})
+	if got, ok := fresh.Get("wf-1", "test", "3"); !ok || got.Response != "reviewer words" {
+		t.Errorf("Get(role test) = (%+v, %v), want the roles kept apart", got, ok)
+	}
+	if got, ok := fresh.Get("wf-1", "dev", "3"); !ok || got.Response != "newer answer" {
+		t.Errorf("Get(role dev) after the test-role write = (%+v, %v), want the dev record untouched", got, ok)
+	}
+
+	if _, ok := fresh.Get("wf-1", "dev", "99"); ok {
+		t.Error("a round the table holds none of answered Get")
+	}
+}
+
+// TestCapturesStoreModeEmptyGuard pins the guard's store-mode faces — the
+// restart wipe the relay's tool loop kept tripping: after a restart the
+// memory map starts empty, so the guard reads the table for the stored
+// prose before it lets an empty response through, and the refused write
+// leaves the memory map empty too (a shadow there would hide the
+// surviving row from every later Get). A round the table holds none of
+// still files its empty record — the consult, not emptiness, is the gate
+// — and a consult that fails leaves the guard blind: it files nothing,
+// rather than upsert blind over a row it could not see.
+func TestCapturesStoreModeEmptyGuard(t *testing.T) {
+	t.Run("a post-restart tool-call turn cannot clobber the stored prose", func(t *testing.T) {
+		c, s := openCaptures(t, 0)
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "prose prompt", Response: "the answer"})
+
+		restarted := &Captures{store: s}
+		restarted.Put("wf", "dev", "1", CapturedRound{Prompt: "tool-call prompt"})
+		got, ok := restarted.Get("wf", "dev", "1")
+		if !ok || got.Response != "the answer" || got.Prompt != "prose prompt" {
+			t.Errorf("capture = (%+v, %v), want the stored prose still standing and served", got, ok)
+		}
+	})
+
+	t.Run("the same-process guard spares the table row too", func(t *testing.T) {
+		c, s := openCaptures(t, 0)
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "prose prompt", Response: "the answer"})
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "tool-call prompt"})
+		// The guard fired off the memory record; the write-through must
+		// have been refused with it, or the restart would read the
+		// clobbered row.
+		got, ok := (&Captures{store: s}).Get("wf", "dev", "1")
+		if !ok || got.Response != "the answer" {
+			t.Errorf("restarted Get = (%+v, %v), want the table's prose un-upserted", got, ok)
+		}
+	})
+
+	t.Run("an empty first turn files when the table holds none", func(t *testing.T) {
+		c, s := openCaptures(t, 0)
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "tool-call prompt"})
+		got, ok := (&Captures{store: s}).Get("wf", "dev", "1")
+		if !ok || got.Prompt != "tool-call prompt" {
+			t.Errorf("capture = (%+v, %v), want the empty record filed (nothing to guard)", got, ok)
+		}
+	})
+
+	t.Run("a failed consult files nothing, blind", func(t *testing.T) {
+		s := openTempStore(t, 0)
+		c := &Captures{store: s}
+		s.Close() // every consult now fails: the guard cannot see the table
+
+		c.Put("wf", "dev", "1", CapturedRound{Prompt: "tool-call prompt"})
+		// Get is blind on the same dead store, so the memory map is the
+		// one observable: the suppressed record is an empty one, nothing
+		// -cot would have rendered, and filing it would shadow the row
+		// the guard could not see from every later Get.
+		if len(c.m) != 0 {
+			t.Errorf("the blind guard filed %d memory records, want none", len(c.m))
+		}
+		if _, ok := c.Get("wf", "dev", "1"); ok {
+			t.Error("Get answered through a dead store")
+		}
+		// A text-bearing write needs no consult: it files in memory even
+		// though the table write fails with it — the capture is
+		// best-effort, and the memory record is the freshest thing Get can
+		// serve.
+		c.Put("wf", "dev", "2", CapturedRound{Prompt: "p", Response: "text"})
+		if got, ok := c.Get("wf", "dev", "2"); !ok || got.Response != "text" {
+			t.Errorf("capture = (%+v, %v), want the memory record served past the failed table write", got, ok)
+		}
+	})
 }
 
 // TestServeCaptureEndpoint pins the -cot reader's endpoint: a stored round
@@ -398,4 +573,79 @@ func TestProxyCaptureTeesKeyedRounds(t *testing.T) {
 			t.Errorf("capture = (%+v, %v), want the last call's record whole", cr, ok)
 		}
 	})
+}
+
+// TestProxyCapturePersistsAcrossRestart pins the daemon's sqlite-mode
+// capture end to end — the sequence that used to empty `-cot`: a keyed
+// round's prose turn files through the relay into the shared database,
+// the daemon restarts (a fresh store, ledger, and relay on the same file,
+// the wiring under test), the round's next provider call is a pure
+// tool-call turn whose stream carries no assistant text — and the prose
+// survives it, served by the restarted relay's /capture for the -cot
+// reader.
+func TestProxyCapturePersistsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metrics.db")
+	prosePrompt := []byte(`{"model":"glm-4","messages":[{"role":"user","content":"fix the bug"}]}`)
+	toolPrompt := []byte(`{"model":"glm-4","messages":[{"role":"user","content":"run the tests"}]}`)
+	toolCallStream := "data: " + `{"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"ls"}}]}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	// The upstream answers per turn: the prose prompt gets the prose
+	// stream, the tool-call prompt gets a stream with no assistant text
+	// in it — the pure tool-call turn whose empty extraction used to
+	// overwrite the round's record.
+	rec := &recorder{}
+	proseStream := "data: " + `{"choices":[{"delta":{"content":"the answer"}}]}` + "\n\ndata: [DONE]\n\n"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		rec.add(r, b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if bytes.Contains(b, []byte("run the tests")) {
+			w.Write([]byte(toolCallStream))
+			return
+		}
+		w.Write([]byte(proseStream))
+	}))
+	defer up.Close()
+
+	s := openStoreAt(t, path, 0)
+	r1, root1 := startRelay(t, NewLedger(s), NewRegistry(time.Minute))
+	registerRelay(t, root1, "w", map[string]string{"openai": up.URL + "/v1"}, nil, nil)
+	h := http.Header{}
+	h.Set("Authorization", "Bearer task-wf1-role-dev-round-3-rk-"+testToken)
+	if status, _ := postRelay(t, staged(root1, "w", WireOpenAI, up.URL+"/v1")+"/chat/completions", h, prosePrompt); status != http.StatusOK {
+		t.Fatalf("prose turn status = %d, want the forward through", status)
+	}
+	if cr, ok := r1.captures.Get("wf1", "dev", "3"); !ok || cr.Response != "the answer" {
+		t.Fatalf("first boot capture = (%+v, %v), want the prose filed", cr, ok)
+	}
+
+	// Second boot: a fresh store on the same file — the restarted daemon.
+	// The round's next provider call is a pure tool-call turn.
+	s.Close()
+	s2 := openStoreAt(t, path, 0)
+	_, root2 := startRelay(t, NewLedger(s2), NewRegistry(time.Minute))
+	registerRelay(t, root2, "w", map[string]string{"openai": up.URL + "/v1"}, nil, nil)
+	stagedURL := staged(root2, "w", WireOpenAI, up.URL+"/v1")
+	if status, body := postRelay(t, stagedURL+"/chat/completions", h, toolPrompt); status != http.StatusOK || !bytes.Equal(body, []byte(toolCallStream)) {
+		t.Fatalf("tool-call turn = (%d) %s, want the stream bytes verbatim", status, body)
+	}
+
+	// The prose stands: the restarted /capture serves the first boot's
+	// record whole, the tool-call turn having filed nothing over it.
+	resp, err := http.Get(root2 + "/capture?task=wf1&role=dev&round=3")
+	if err != nil {
+		t.Fatalf("GET restarted /capture: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET restarted /capture = %d, want 200 — the prose survives the restart and the tool-call turn", resp.StatusCode)
+	}
+	var cr CapturedRound
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		t.Fatalf("decode capture: %v", err)
+	}
+	if cr.Response != "the answer" || cr.Prompt != string(prosePrompt) {
+		t.Errorf("restarted capture = %+v, want the first boot's prose record whole", cr)
+	}
 }

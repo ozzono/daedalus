@@ -193,6 +193,47 @@ func TestStorePrune(t *testing.T) {
 			t.Errorf("after the hourly prune = %+v, want only the fresh row", got)
 		}
 	})
+
+	t.Run("the boot prune takes the aged captures with the entries", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "metrics.db")
+		seed := openStoreAt(t, path, 0) // no retention: both captures persist
+		now := time.Now()
+		c := &Captures{store: seed}
+		c.Put("wf", "dev", "1", CapturedRound{At: now.Add(-3 * time.Hour), Prompt: "aged"})
+		c.Put("wf", "dev", "2", CapturedRound{At: now, Prompt: "fresh"})
+		seed.Close()
+
+		// Reads go through fresh captures over the reopened store — the
+		// restarted daemon's shape, the table the only survivor.
+		s := openStoreAt(t, path, time.Hour)
+		if got, ok := (&Captures{store: s}).Get("wf", "dev", "2"); !ok || got.Prompt != "fresh" {
+			t.Errorf("fresh capture = (%+v, %v), want it through the boot prune", got, ok)
+		}
+		if _, ok := (&Captures{store: s}).Get("wf", "dev", "1"); ok {
+			t.Error("the aged capture survived the boot prune")
+		}
+	})
+
+	t.Run("the hourly ride-along prunes the captures too", func(t *testing.T) {
+		s := openTempStore(t, time.Hour) // the boot prune stores this hour's bucket
+		c := &Captures{store: s}
+		c.Put("wf", "dev", "1", CapturedRound{At: time.Now().Add(-3 * time.Hour), Prompt: "aged"})
+		// Table reads, not c's own (the memory map always answers for what
+		// it just filed): a fresh capture consults the store on its miss.
+		read := func() bool {
+			_, ok := (&Captures{store: s}).Get("wf", "dev", "1")
+			return ok
+		}
+		s.Append(Entry{At: time.Now(), Worker: "w"}) // mid-hour: the throttle holds the prune
+		if !read() {
+			t.Fatal("the aged capture went early; want it to survive the throttled hour")
+		}
+		s.lastPrune.Store(0) // force the next hour's first append
+		s.Append(Entry{At: time.Now(), Worker: "w"})
+		if read() {
+			t.Error("the aged capture survived the hourly prune")
+		}
+	})
 }
 
 // TestLedgerSQLiteModeRoutesThroughTheStore pins the sqlite-mode ledger
