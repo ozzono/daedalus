@@ -1188,3 +1188,10 @@ func isAgentStuck(err error) bool {
 func isAgentNoDelivery(err error) bool {
 	return err != nil && strings.Contains(err.Error(), activities.ErrAgentNoDelivery.Error())
 }
+
+// noDeliveryParkReason renders the park reason a no-delivery kill parks
+// on — runAgent's unarmed path and the slim parse salvage's not-recovered
+// path produce the identical record, so the wording lives in one place.
+func noDeliveryParkReason(stage string, err error) string {
+	return fmt.Sprintf("agent round killed on a no-delivery watchdog (stage %q): %v", stage, err)
+}

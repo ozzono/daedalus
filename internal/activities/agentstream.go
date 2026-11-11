@@ -282,17 +282,26 @@ type handsEvent struct {
 // this hands build (summary required, files_changed optional — probed
 // live; the fit review's caller-supplied-schema shape did not land), so a
 // round always ends in a structured deliverable instead of free prose.
+// Content is the optional deliverable passthrough: the full deliverable
+// text beside the minimal summary, present when the hands build carries it
+// and the model supplied it. A summary-only payload is live-proven
+// unsatisfiable for a transcription consumer — the parse stage reads the
+// delivery and gets the narration ABOUT the deliverable, never the
+// deliverable, so its strict contract can never parse — which is why the
+// field exists and why summary stays only the fallback.
 type handsDelivery struct {
 	Summary      string   `json:"summary"`
 	FilesChanged []string `json:"files_changed"`
+	Content      string   `json:"content"`
 }
 
 // parseHandsStream is parseAgentStream for hands's --format json event
 // stream: the started event carries the conversation session, and the
-// terminal delivered/partial event's delivery summary is the round's
-// visible text — the forced deliverable, not whatever narration preceded
-// it. hands emits no thinking events (the wire thinking knob stages
-// through its config), so thinking stays empty.
+// terminal delivered/partial event's delivery is the round's visible text
+// — the deliverable content when the payload carries it, the delivery
+// summary as the fallback — the forced deliverable, not whatever narration
+// preceded it. hands emits no thinking events (the wire thinking knob
+// stages through its config), so thinking stays empty.
 func parseHandsStream(stdout string) (thinking, text, session string) {
 	for line := range strings.SplitSeq(stdout, "\n") {
 		var e handsEvent
@@ -304,8 +313,13 @@ func parseHandsStream(stdout string) (thinking, text, session string) {
 			session = e.Payload.Session
 		case "delivered", "partial":
 			var d handsDelivery
-			if json.Unmarshal(e.Payload.Payload, &d) == nil && d.Summary != "" {
-				text = d.Summary
+			if json.Unmarshal(e.Payload.Payload, &d) == nil {
+				switch {
+				case d.Content != "":
+					text = d.Content
+				case d.Summary != "":
+					text = d.Summary
+				}
 			}
 		}
 	}

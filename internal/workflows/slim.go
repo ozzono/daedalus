@@ -43,7 +43,12 @@ const maxSlimStepRounds = 8
 //     anything costs budget, and one strict re-ask of the parse round
 //     absorbs any other malformed reply (resumed in the parse round's own
 //     conversation, so the model sees and corrects its previous reply);
-//     an unparseable second reply parks the run.
+//     an unparseable second reply parks the run. A parse round killed on
+//     the deliver contract gets one automatic transcription pass by the
+//     parsing AI (slim.parser_model — the tool-parse salvage) before that
+//     park: a recovered queue continues the pipeline, stamped
+//     ParseSalvaged in the run memo; a not-recovered kill parks exactly
+//     as the unarmed path would have.
 //
 //  2. Atomic loops: each sub-task in order runs implement ↔ review on
 //     the shared pipelineRun machinery, with the native suite executed
@@ -128,37 +133,76 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 	// output clamp down to a one-token reply. The re-ask below still
 	// resumes the parse round's own, now-small conversation. Salvage
 	// changes nothing here: the captured prose rides in the prompt
-	// verbatim, exactly like a delivered round's text.
+	// verbatim, exactly like a delivered round's text. The salvage seat
+	// is armed around this round too, gated for replay like the gates
+	// below: a hands round killed on the deliver contract hands its
+	// stranded prose back as the capture, and the tool-parse salvage gets
+	// ONE automatic transcription pass at it before the kill parks — the
+	// deliver-contract kills were live-proven deterministic (whole plans
+	// stranded as prose the contract discards), so the prose is the
+	// deliverable and the parse seat has nothing else to lose.
 	var parseSession string
 	parsePrompt, err := template.SlimParse(planText)
 	if err != nil {
 		return "", fmt.Errorf("build slim parse prompt: %w", err)
 	}
-	parseReply, err := run.runAgent(parsePrompt, "slim-parse", activities.RoleDev, &parseSession)
-	if err != nil {
-		return "", fmt.Errorf("parse round: %w", err)
+	var salvagedParse string
+	if slimParseSalvageEnabled(ctx) {
+		run.noDeliverySalvage = &salvagedParse
 	}
-	repairOK := slimParseRepairEnabled(ctx)
-	run.slimScopeGate = slimScopeGateEnabled(ctx)
-	subtasks, repaired, perr := parseSlimPlan(parseReply.Text, repairOK, run.slimScopeGate)
-	if perr != nil {
-		// One strict re-ask, resumed in the parse round's own
-		// conversation: the model sees its previous reply and corrects it
-		// (never a re-run of the planner — the plan is not the thing that
-		// failed). The re-ask text is an overridable template; the parse
-		// prompt rides above it so the contract stays adjacent to the
-		// correction.
-		run.logger.Warn("Parse round reply was not a parseable subtask queue; re-asking", "Error", perr)
-		reask, err := template.SlimParseReask(perr.Error())
-		if err != nil {
-			return "", fmt.Errorf("build slim parse re-ask prompt: %w", err)
+	parseReply, err := run.runAgent(parsePrompt, "slim-parse", activities.RoleDev, &parseSession)
+	run.noDeliverySalvage = nil
+	var subtasks []template.SlimSubtask
+	var repaired bool
+	if err != nil {
+		if salvagedParse == "" {
+			return "", fmt.Errorf("parse round: %w", err)
 		}
-		parseReply, err = run.runAgent(parsePrompt+"\n\n"+reask, "slim-parse", activities.RoleDev, &parseSession)
-		if err != nil {
-			return "", fmt.Errorf("parse retry round: %w", err)
+		// The tool-parse check, wired at this stage only by ruling: the
+		// round died on the deliver contract with substantive captured
+		// text, so one automatic parsing-AI call decides between
+		// recovery and the park. The parse AI may only recover — its
+		// garbage, like an unconfigured or unreachable seat, returns
+		// not-recovered and parks exactly as the unarmed path would have.
+		// The version gates here read the memoized values (each gate is
+		// evaluated once per execution).
+		var ok bool
+		scopeGate := slimScopeGateEnabled(ctx)
+		if subtasks, repaired, ok = run.salvageSlimParse(salvagedParse,
+			slimParseRepairEnabled(ctx), scopeGate); !ok {
+			return "", run.park(noDeliveryParkReason("slim-parse", err))
 		}
-		if subtasks, repaired, perr = parseSlimPlan(parseReply.Text, repairOK, run.slimScopeGate); perr != nil {
-			return "", run.park(fmt.Sprintf("parse round could not produce a parseable subtask queue: %v", perr))
+		// The salvage's firing is durable and run-visible, like the
+		// repair's stamp below: a green run must answer "where did this
+		// queue come from?" where a maintainer actually looks.
+		run.slimScopeGate = scopeGate
+		run.logger.Warn("Parse round killed on the deliver contract; the parsing AI transcribed the captured plan prose",
+			"Chars", len(salvagedParse), "Subtasks", len(subtasks))
+		workflow.UpsertMemo(run.ctx, map[string]interface{}{"ParseSalvaged": true})
+	} else {
+		repairOK := slimParseRepairEnabled(ctx)
+		run.slimScopeGate = slimScopeGateEnabled(ctx)
+		var perr error
+		subtasks, repaired, perr = parseSlimPlan(parseReply.Text, repairOK, run.slimScopeGate)
+		if perr != nil {
+			// One strict re-ask, resumed in the parse round's own
+			// conversation: the model sees its previous reply and corrects it
+			// (never a re-run of the planner — the plan is not the thing that
+			// failed). The re-ask text is an overridable template; the parse
+			// prompt rides above it so the contract stays adjacent to the
+			// correction.
+			run.logger.Warn("Parse round reply was not a parseable subtask queue; re-asking", "Error", perr)
+			reask, err := template.SlimParseReask(perr.Error())
+			if err != nil {
+				return "", fmt.Errorf("build slim parse re-ask prompt: %w", err)
+			}
+			parseReply, err = run.runAgent(parsePrompt+"\n\n"+reask, "slim-parse", activities.RoleDev, &parseSession)
+			if err != nil {
+				return "", fmt.Errorf("parse retry round: %w", err)
+			}
+			if subtasks, repaired, perr = parseSlimPlan(parseReply.Text, repairOK, run.slimScopeGate); perr != nil {
+				return "", run.park(fmt.Sprintf("parse round could not produce a parseable subtask queue: %v", perr))
+			}
 		}
 	}
 	if repaired {
@@ -205,6 +249,43 @@ func SlimWorkflow(ctx workflow.Context, input PipelineInput) (string, error) {
 		}
 	}
 	return run.finalize()
+}
+
+// salvageSlimParse is the slim parse stage's tool-parse salvage — the one
+// wiring site of the automatic parsing call, by ruling: the captured
+// stranded prose rides template.SlimParse's transcription contract (the
+// same prompt the parse round carried, expected payload shape included) to
+// the parsing AI as ONE activity call, and the reply is validated by
+// exactly parseSlimPlan. ok=false on anything that machinery rejects, and
+// on an unconfigured, unreachable, or timed-out parsing seat (the
+// activity is fail-open by contract) — the parse AI may only recover a
+// doomed round, never wedge the run; the caller parks exactly as the
+// unarmed path would have. Never retried: the schedule carries the
+// workflow's single-attempt retry policy and this helper invokes it once —
+// one automatic call per run, no retry loop, no second seat. Dev, review,
+// and every other stage's no-delivery handling is untouched (no
+// generalized auto-parse).
+func (r *pipelineRun) salvageSlimParse(captured string, repair, targets bool) ([]template.SlimSubtask, bool, bool) {
+	prompt, err := template.SlimParse(captured)
+	if err != nil {
+		r.logger.Warn("Slim parse salvage could not build the transcription prompt", "Error", err)
+		return nil, false, false
+	}
+	var out activities.SlimParseSalvageOutput
+	if err := workflow.ExecuteActivity(r.ctx, activities.SlimParseSalvageActivity,
+		activities.SlimParseSalvageInput{Prompt: prompt}).Get(r.ctx, &out); err != nil {
+		r.logger.Warn("Slim parse salvage: parsing-AI call failed", "Error", err)
+		return nil, false, false
+	}
+	if !out.OK {
+		return nil, false, false
+	}
+	subtasks, repaired, perr := parseSlimPlan(out.Text, repair, targets)
+	if perr != nil {
+		r.logger.Warn("Slim parse salvage: parsing-AI reply is not a parseable subtask queue", "Error", perr)
+		return nil, false, false
+	}
+	return subtasks, repaired, true
 }
 
 // slimStep runs one sub-task's atomic loop: an implement round in the
@@ -350,6 +431,23 @@ const slimScopeChangeID = "slim-subtask-scope-gate"
 
 func slimScopeGateEnabled(ctx workflow.Context) bool {
 	return workflow.GetVersion(ctx, slimScopeChangeID, workflow.DefaultVersion, 1) == 1
+}
+
+// slimParseSalvageChangeID gates the parse stage's tool-parse salvage
+// behind its own version marker, for the same replay reason as
+// slimParseRepairChangeID and slimScopeChangeID: arming the salvage seat
+// changes which commands the workflow issues — the kill surfaces as the
+// salvage sentinel with a parsing-AI activity scheduled behind it, where
+// pre-marker history recorded the park alone — so a run whose history was
+// recorded before the marker and replayed by an upgraded worker would
+// issue commands that history does not hold and wedge at the next worker
+// upgrade. Pre-marker replays take the unarmed path exactly as their
+// history recorded. The memo stamp (ParseSalvaged) needs no gate of its
+// own — it can only fire when the gated salvage did.
+const slimParseSalvageChangeID = "slim-parse-salvage"
+
+func slimParseSalvageEnabled(ctx workflow.Context) bool {
+	return workflow.GetVersion(ctx, slimParseSalvageChangeID, workflow.DefaultVersion, 1) == 1
 }
 
 // parseSlimPlan extracts the parse round's subtask queue from its reply.

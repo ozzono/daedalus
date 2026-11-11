@@ -610,9 +610,10 @@ func TestHandsSessionID(t *testing.T) {
 
 // TestParseHandsStream pins the stream parser: the started event carries
 // the conversation session, the terminal delivered/partial event's
-// delivery summary is the round's visible text (the forced deliverable,
-// not the narration before it), the last non-empty summary wins, and
-// thinking stays empty — hands emits no thinking events.
+// delivery is the round's visible text (the forced deliverable, not the
+// narration before it) — the deliverable content when the payload carries
+// it, the delivery summary as the fallback — and thinking stays empty:
+// hands emits no thinking events.
 func TestParseHandsStream(t *testing.T) {
 	t.Run("a delivered round", func(t *testing.T) {
 		out := `{"round_id":"r","seq":0,"kind":"started","payload":{"session":"s-1"}}` + "\n" +
@@ -638,6 +639,33 @@ func TestParseHandsStream(t *testing.T) {
 			`{"kind":"delivered","payload":{"payload":{"summary":"second"}}}`
 		if _, text, _ := parseHandsStream(out); text != "second" {
 			t.Errorf("parseHandsStream text = %q, want the terminal delivery", text)
+		}
+	})
+
+	t.Run("the content passthrough wins over the summary", func(t *testing.T) {
+		// A summary-only payload is unsatisfiable for a transcription
+		// consumer: the summary narrates ABOUT the deliverable, the
+		// content IS it — so a payload carrying both must surface the
+		// content, never the narration.
+		out := `{"kind":"delivered","payload":{"payload":{"summary":"delivered the plan","content":"Sub-task 1 (implement): add the adder."}}}`
+		if _, text, _ := parseHandsStream(out); text != "Sub-task 1 (implement): add the adder." {
+			t.Errorf("parseHandsStream text = %q, want the deliverable content, not the narration summary", text)
+		}
+	})
+
+	t.Run("a content-only delivery is the text", func(t *testing.T) {
+		out := `{"kind":"delivered","payload":{"payload":{"content":"the whole deliverable"}}}`
+		if _, text, _ := parseHandsStream(out); text != "the whole deliverable" {
+			t.Errorf("parseHandsStream text = %q, want the content field", text)
+		}
+	})
+
+	t.Run("an empty content falls back to the summary", func(t *testing.T) {
+		// The summary-only shape every live hands build shipped before the
+		// content field existed: the fallback is the old behavior.
+		out := `{"kind":"delivered","payload":{"payload":{"summary":"the fallback","content":""}}}`
+		if _, text, _ := parseHandsStream(out); text != "the fallback" {
+			t.Errorf("parseHandsStream text = %q, want the summary fallback", text)
 		}
 	})
 
@@ -913,13 +941,16 @@ func TestHandsRoundRecordsKilledSessionAndResumes(t *testing.T) {
 		}
 	}
 
-	// Round two: the retry, with no workflow-provided id.
+	// Round two: the retry, with no workflow-provided id and the retry
+	// license set — the workflow latches it once the killed attempt
+	// actually launched.
 	stubBin(t, "ai-jail",
 		`printf '%s\n' '{"round_id":"r-2","seq":0,"kind":"started","payload":{"session":"sess-hands-2"}}' '{"round_id":"r-2","seq":1,"kind":"delivered","payload":{"payload":{"summary":"resumed and delivered","files_changed":["a.go"]}}}' '{"round_id":"r-2","seq":2,"kind":"usage","payload":{"input_tokens":100,"output_tokens":20,"cost_dollars":0.42}}'; exit 0`)
 	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "continue the work",
 		Role:         RoleDev,
+		RetryAttempt: true,
 	})
 	if err != nil {
 		t.Fatalf("retry round: %v", err)

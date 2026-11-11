@@ -305,6 +305,18 @@ const (
 	// metrics is enabled and the worker registered; absent — metrics
 	// off — means no round stages any capture path.
 	MetricsOtelEndpointEnv = "DAEDALUS_METRICS_OTEL_ENDPOINT"
+	// SlimParserModelEnv carries the slim flow's parser model (config
+	// slim.parser_model) to the worker process env for the parse-salvage
+	// activity: when a slim parse round dies on the deliver contract with
+	// its transcription stranded as captured text, the activity dials this
+	// model at the openai channel's upstream (OPENAI_API_BASE /
+	// OPENAI_BASE_URL, already exported by AgentEnv) for one automatic
+	// transcription pass before the kill parks. Exported only when set —
+	// absent means the salvage layer is off and a no-delivery parse kill
+	// parks exactly as before — and scrubbed from the daemon spawn
+	// (WorkerEnvVars) so a stale export cannot arm a config that says
+	// nothing.
+	SlimParserModelEnv = "DAEDALUS_SLIM_PARSER_MODEL"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -860,10 +872,14 @@ type SlimConfig struct {
 	// ParserModel names the model the worker's tool-call relay
 	// (internal/toolrelay) uses to normalize lifted arguments, resolved
 	// against the openai section's upstream via ollama structured output.
-	// Empty — the default — means the relay never starts and slim rounds
-	// behave exactly as before the relay existed: text-encoded tool calls
-	// from text-emitting models stay inert (pi executes only native
-	// tool_calls).
+	// The same model is the slim flow's parsing seat for the parse-salvage
+	// activity (SlimParseSalvageActivity): a slim parse round killed on the
+	// deliver contract with captured prose gets one automatic transcription
+	// pass at it (exported as SlimParserModelEnv) before the kill parks.
+	// Empty — the default — means the relay never starts and the salvage
+	// layer never fires, and slim rounds behave exactly as before the relay
+	// existed: text-encoded tool calls from text-emitting models stay inert
+	// (pi executes only native tool_calls).
 	ParserModel string `yaml:"parser_model"`
 	// MaxInputTokens is the slim input gate's ceiling: a `daedalus run` that
 	// resolves to the slim flow refuses to start when its task input — the
@@ -1920,6 +1936,7 @@ func WorkerEnvVars() []string {
 		"DAEDALUS_MAX_CONCURRENT_AGENT_RUNS",
 		"DAEDALUS_MAX_CONCURRENT_TESTS",
 		"DAEDALUS_SLIM",
+		SlimParserModelEnv,
 		"DAEDALUS_THINKING",
 		"DAEDALUS_STREAM",
 		"DAEDALUS_AGENT",

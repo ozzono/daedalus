@@ -148,7 +148,10 @@ func restoreProcessEnv(t *testing.T, names ...string) {
 // branches clear what a process that kept the inherit semantics (worker
 // foreground) carried in. The slim tool relay's
 // DAEDALUS_TOOL_RELAY_URL obeys the same tri-state rule and additionally
-// needs slim.parser_model plus the openai section. runWorker is driven to
+// needs slim.parser_model plus the openai section, and the slim parse
+// seat's DAEDALUS_SLIM_PARSER_MODEL follows the set-or-unset rule alone:
+// a configured slim.parser_model exports it (the parse-salvage activity's
+// dial), an unconfigured one clears it. runWorker is driven to
 // its first failure (an empty task queue fails worktree preflight before
 // any Temporal dial) purely to observe the exports.
 func TestRunWorkerSlimEnvExports(t *testing.T) {
@@ -159,13 +162,14 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	// below sets openai.url, which AgentEnv exports.
 	restoreProcessEnv(t, "DAEDALUS_SLIM", "DAEDALUS_THINKING", "DAEDALUS_STREAM", "DAEDALUS_AGENT",
 		"DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", "DAEDALUS_MAX_CONCURRENT_TESTS", "DAEDALUS_WORKER_NAME",
-		"API_TIMEOUT_MS", config.ToolRelayURLEnv, "OPENAI_BASE_URL", "OPENAI_API_BASE")
+		"API_TIMEOUT_MS", config.ToolRelayURLEnv, config.SlimParserModelEnv, "OPENAI_BASE_URL", "OPENAI_API_BASE")
 
 	// Stale exports must not outlive a config that says off.
 	t.Setenv("DAEDALUS_SLIM", "1")
 	t.Setenv("DAEDALUS_THINKING", "off")
 	t.Setenv("DAEDALUS_STREAM", "on")
 	t.Setenv(config.ToolRelayURLEnv, "http://127.0.0.1:1/stale-relay")
+	t.Setenv(config.SlimParserModelEnv, "stale-parser-model")
 	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
 		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
 	}
@@ -180,6 +184,9 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	}
 	if got := os.Getenv(config.ToolRelayURLEnv); got != "" {
 		t.Errorf("%s = %q after a relay-off config, want the stale export cleared", config.ToolRelayURLEnv, got)
+	}
+	if got := os.Getenv(config.SlimParserModelEnv); got != "" {
+		t.Errorf("%s = %q after a config without parser_model, want the stale export cleared — a stale shell export must not arm the parse salvage a config says nothing about", config.SlimParserModelEnv, got)
 	}
 
 	// The on-config exports all three — but slim alone never starts the
@@ -220,6 +227,9 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	}
 	if staged.Path != "/v1" {
 		t.Errorf("staged relay URL %q, want the upstream's /v1 path prefix preserved", staged)
+	}
+	if got := os.Getenv(config.SlimParserModelEnv); got != "qwen2.5-coder:3b-parser" {
+		t.Errorf("%s = %q after a slim.parser_model config, want the parse seat's model exported", config.SlimParserModelEnv, got)
 	}
 
 	// The stream toggle exports both spellings, and an explicit false is
@@ -732,6 +742,7 @@ func TestRunWorkerExportsAreScrubbed(t *testing.T) {
 		"MetricsRelayTokenEnv":     config.MetricsRelayTokenEnv,
 		"MetricsOtelEndpointEnv":   config.MetricsOtelEndpointEnv,
 		"ToolRelayURLEnv":          config.ToolRelayURLEnv,
+		"SlimParserModelEnv":       config.SlimParserModelEnv,
 		"BugDirEnv":                config.BugDirEnv,
 		"BugMirrorEnv":             config.BugMirrorEnv,
 		"TestOutputMirrorEnv":      config.TestOutputMirrorEnv,

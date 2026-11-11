@@ -1832,6 +1832,19 @@ func TestFeatureDevWorkflowAgentKilledRecovers(t *testing.T) {
 			t.Errorf("inputs[%d].FreshRetry = true, want false — kills never latch the fresh start", i)
 		}
 	}
+	// The retry license rides the opposite rule: the killed attempt
+	// launched, so its continuation may resume the recorded conversation —
+	// and the phase after it is a fresh round whose first attempt never
+	// does (the same-run same-role leak).
+	if inputs[0].RetryAttempt {
+		t.Errorf("inputs[0].RetryAttempt = true, want false — a first attempt is never licensed")
+	}
+	if !inputs[1].RetryAttempt {
+		t.Errorf("inputs[1].RetryAttempt = false, want true — the continuation of a launched attempt resumes the recorded session")
+	}
+	if inputs[2].RetryAttempt {
+		t.Errorf("inputs[2].RetryAttempt = true, want false — a fresh round's first attempt never resumes")
+	}
 	env.AssertExpectations(t)
 }
 
@@ -2883,6 +2896,15 @@ func TestFeatureDevWorkflowSlotWaitRetries(t *testing.T) {
 	}
 	if strings.Contains(inputs[1].Prompt, "timeout ceiling") {
 		t.Errorf("slot re-queue was answered as a timeout continuation: %q", inputs[1].Prompt)
+	}
+	// The slot-busy requeue is the one retry path that never launched an
+	// attempt, so it alone leaves the RetryAttempt latch untouched: a round
+	// that lands straight into a busy slot must not inherit another phase's
+	// recorded conversation on its re-queue.
+	for i, in := range inputs {
+		if in.RetryAttempt {
+			t.Errorf("inputs[%d].RetryAttempt = true, want false — a slot-busy round never launched, so its re-queue is not a retry", i)
+		}
 	}
 	env.AssertExpectations(t)
 }
