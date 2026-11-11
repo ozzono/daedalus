@@ -166,6 +166,22 @@ func runWorker(cfg config.Config, workerType string) error {
 	} else if err := os.Unsetenv("DAEDALUS_SLIM"); err != nil {
 		return fmt.Errorf("unset DAEDALUS_SLIM: %w", err)
 	}
+	// The slim parser seat rides the same channel: the parse-salvage
+	// activity reads DAEDALUS_SLIM_PARSER_MODEL when it transcribes a
+	// no-delivery parse round's captured prose (slim.parser_model; the dial
+	// goes to the openai channel's upstream, already exported by AgentEnv
+	// above). Set only when configured — absent means the salvage layer
+	// never fires and a no-delivery parse kill parks as before — and unset
+	// symmetrically (both in the daemon spawn scrub,
+	// config.WorkerEnvVars), so a stale shell export cannot arm a config
+	// that says nothing, on the foreground path too.
+	if cfg.Slim.ParserModel != "" {
+		if err := os.Setenv(config.SlimParserModelEnv, cfg.Slim.ParserModel); err != nil {
+			return fmt.Errorf("set %s: %w", config.SlimParserModelEnv, err)
+		}
+	} else if err := os.Unsetenv(config.SlimParserModelEnv); err != nil {
+		return fmt.Errorf("unset %s: %w", config.SlimParserModelEnv, err)
+	}
 	// The metrics relay (config metrics.enabled): the worker's rounds stage
 	// their provider calls onto the host metrics daemon's relay
 	// (internal/metricsrelay), which keeps the usage ledger the `daedalus
@@ -574,6 +590,7 @@ func runWorker(cfg config.Config, workerType string) error {
 		w.RegisterActivity(activities.CleanupWorktreeActivity)
 		w.RegisterActivity(activities.VerifyWriteScopeActivity)
 		w.RegisterActivity(activities.ReproFirstGateActivity)
+		w.RegisterActivity(activities.SlimParseSalvageActivity)
 		// The dependency probe is a closure over this daemon's client (c is
 		// dialed above, before registration) — no second dial, no env
 		// channel. Its name is pinned as a string on both ends. The

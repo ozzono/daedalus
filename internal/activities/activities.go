@@ -46,8 +46,9 @@ type AgentRunInput struct {
 	SessionID string
 	// Role scopes the recorded-session fallback to one of the run's four
 	// chained conversations (RoleDev, RoleTest, RoleDevReview,
-	// RoleTestReview): when SessionID is empty — a first round, or a retry
-	// of one killed at its ceiling — the round resumes the conversation the
+	// RoleTestReview): when SessionID is empty on a genuine retry
+	// (RetryAttempt) — the continuation of a round whose earlier attempt
+	// was killed at its ceiling — the round resumes the conversation the
 	// session watcher recorded for this role, if any. Empty role (one-shot
 	// callers) skips the fallback.
 	Role SessionRole
@@ -73,6 +74,22 @@ type AgentRunInput struct {
 	// and a round that did not die exhausted never sets it, so healthy
 	// phase continues keep resuming as before.
 	FreshRetry bool
+	// RetryAttempt marks this execution as the workflow's retry of an
+	// earlier attempt of the same round — the continuation after a ceiling
+	// kill, the fresh-session fallback, an exhaustion heartbeat retry —
+	// set only once an attempt actually launched (a slot-busy requeue
+	// never launched anything and keeps it false). It licenses the
+	// recorded-session fallback: the retry whose SessionID is empty resumes
+	// the conversation the killed attempt recorded, continuing its progress
+	// instead of restarting from zero. A first attempt never sets it, so a
+	// fresh round can never inherit another phase's conversation — the
+	// same-run same-role leak where the slim parse round (RoleDev like the
+	// planner) opened on the planner's whole exploration. recordedSession's
+	// doc has always scoped the fallback to retries; this flag is the
+	// workflow-side license that makes the code match (the activity-level
+	// Attempt counter cannot: every agent-round schedule carries a
+	// single-attempt retry policy, so the counter never leaves 1).
+	RetryAttempt bool
 }
 
 // AgentRunResult carries the agent's visible text and chain of thought into
@@ -308,11 +325,17 @@ func RunJailedAgentActivity(ctx context.Context, input AgentRunInput) (AgentRunR
 	// (--session), opencode (-s), and codex (exec resume) support resume;
 	// aider has no id-addressable session and ignores the field.
 	//
-	// With no workflow-provided id — a first round, or the retry after a
-	// round cut off at its ceiling, which never produced a result carrying
-	// one — the round resumes the conversation recorded from the killed
-	// attempt's transcript, so the retry continues its progress instead of
-	// restarting from zero.
+	// With no workflow-provided id on a genuine retry — the continuation
+	// after a round cut off at its ceiling, which never produced a result
+	// carrying one (RetryAttempt) — the round resumes the conversation
+	// recorded from the killed attempt's transcript, so the retry continues
+	// its progress instead of restarting from zero. A first attempt never
+	// resumes: the record it would resolve is another phase's conversation
+	// whenever the run already ran this role — the live leak where the slim
+	// parse round (RoleDev like the planner, in the same worktree) opened
+	// on the planner's whole exploration, growing the parse prompt attempt
+	// over attempt. recordedSession's doc has always scoped the fallback to
+	// retries; the flag is what makes the code match.
 	_, canResume := agentResumeFlag(agent)
 	resume := input.SessionID
 	fresh := false
@@ -329,7 +352,7 @@ func RunJailedAgentActivity(ctx context.Context, input AgentRunInput) (AgentRunR
 		fresh = true
 		activityLogger(ctx).Info("api-error retry: starting a fresh pi session instead of resuming",
 			"Role", string(input.Role))
-	} else if resume == "" && canResume {
+	} else if resume == "" && canResume && input.RetryAttempt {
 		logger := activityLogger(ctx)
 		id, stale := recordedAgentSession(ctx, agent, input.WorktreePath, input.Role)
 		if stale {

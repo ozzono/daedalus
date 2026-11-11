@@ -231,11 +231,13 @@ type pipelineRun struct {
 	// no-delivery kill into salvage: instead of the park, runAgent stores
 	// the killed round's stranded prose (activities.NoDeliveryCapturedText)
 	// through the pointer and returns the sentinel error for the caller to
-	// route. Set around exactly one round — the slim planner seat, whose
-	// deliverable IS the prose a no-delivery kill strands (see
-	// SlimWorkflow); every other stage leaves it nil and takes the park.
-	// A kill with no capture in its error parks even under the seat:
-	// salvaging "" would only move the park one call frame.
+	// route. Set around exactly two rounds — the slim planner seat, whose
+	// deliverable IS the prose a no-delivery kill strands, and the slim
+	// parse seat, whose captured prose the tool-parse salvage transcribes
+	// with one parsing-AI call (both see SlimWorkflow); every other stage
+	// leaves it nil and takes the park. A kill with no capture in its
+	// error parks even under the seat: salvaging "" would only move the
+	// park one call frame.
 	noDeliverySalvage *string
 
 	// skillDevReviewSessions and skillTestReviewSessions chain each entry
@@ -648,6 +650,14 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 	// no session id back, so *session still names the dead conversation,
 	// and un-latching would send the next retry straight back into it.
 	freshRetry := false
+	// Latched once an attempt of this round actually launched: from then on
+	// the activity may license the recorded-session fallback
+	// (AgentRunInput.RetryAttempt) — a killed attempt recorded a session
+	// the retry should continue. The slot-busy requeue below is the one
+	// retry path that never launches anything, so it alone leaves the
+	// latch untouched; a first attempt that lands straight into a busy
+	// slot must not inherit another phase's recorded conversation.
+	retryAttempt := false
 	for {
 		var result activities.AgentRunResult
 		err := workflow.ExecuteActivity(r.agentCtx, r.jailedActivity, activities.AgentRunInput{
@@ -658,6 +668,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			Role:         role,
 			Folders:      r.input.Folders,
 			FreshRetry:   freshRetry,
+			RetryAttempt: retryAttempt,
 		}).Get(r.ctx, &result)
 		if err == nil {
 			r.consecutiveTimeouts = 0
@@ -711,7 +722,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 					return activities.AgentRunResult{}, err
 				}
 			}
-			return activities.AgentRunResult{}, r.park(fmt.Sprintf("agent round killed on a no-delivery watchdog (stage %q): %v", stage, err))
+			return activities.AgentRunResult{}, r.park(noDeliveryParkReason(stage, err))
 		}
 		if !killed && isAPIExhaustion(err) {
 			if herr := r.heartbeat(err, stage); herr != nil {
@@ -723,6 +734,7 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			// re-read to 30k on a 32k window, clamping pi to one-token
 			// replies). The retry starts fresh instead of resuming it.
 			freshRetry = true
+			retryAttempt = true
 			continue
 		}
 		if !killed && isSlotWait(err) {
@@ -738,6 +750,12 @@ func (r *pipelineRun) runAgent(prompt string, stage string, role activities.Sess
 			r.setStatus(StatusRunning)
 			continue
 		}
+		// Everything below either loops on an attempt that ran (the
+		// timeout continuation, the fresh-session fallback) or is
+		// terminal — the latch only matters on the looping paths, and a
+		// round whose attempt actually launched has a recorded session a
+		// continuation may resume.
+		retryAttempt = true
 		// A round the window preflight refused never launched, and the
 		// refusal is static — the estimate is session-independent
 		// (windowPreflight's own note), so the fresh-session fallback

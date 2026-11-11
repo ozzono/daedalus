@@ -1220,6 +1220,7 @@ exit 0`)
 			Prompt:       "fix the bug",
 			Role:         RoleDev,
 			Folders:      []string{src},
+			RetryAttempt: true,
 		}); err != nil {
 			t.Fatalf("broken resume must get one fresh start, got %v", err)
 		}

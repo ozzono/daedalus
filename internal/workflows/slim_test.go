@@ -1,6 +1,8 @@
 package workflows
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -1158,5 +1160,203 @@ func TestSlimWorkflowNoDeliverySalvage(t *testing.T) {
 		// No AssertExpectations: the reviewer recorder's minimum-call
 		// expectation can never be met on a park path that runs no review
 		// (the slim parse-retry park tests omit it for the same reason).
+	})
+}
+
+// salvageRecorder captures every SlimParseSalvageActivity dispatch — the
+// parse stage's one automatic transcription call — and plays its scripted
+// outputs in order before falling back to the last.
+type salvageRecorder struct {
+	env    *testsuite.TestWorkflowEnvironment
+	inputs []activities.SlimParseSalvageInput
+	script []activities.SlimParseSalvageOutput
+}
+
+func (r *salvageRecorder) record() {
+	r.env.OnActivity(activities.SlimParseSalvageActivity, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, a := range args {
+				if in, ok := a.(activities.SlimParseSalvageInput); ok {
+					r.inputs = append(r.inputs, in)
+				}
+			}
+		}).
+		Return(func(ctx context.Context, in activities.SlimParseSalvageInput) (activities.SlimParseSalvageOutput, error) {
+			if len(r.script) == 0 {
+				return activities.SlimParseSalvageOutput{}, errors.New("no stubbed salvage replies")
+			}
+			out := r.script[0]
+			if len(r.script) > 1 {
+				r.script = r.script[1:]
+			}
+			return out, nil
+		})
+}
+
+// TestSlimWorkflowParseSalvage pins the parse stage's tool-parse salvage:
+// a parse round killed on the deliver contract hands its stranded
+// transcription prose back as the capture, and the parsing AI gets ONE
+// automatic transcription pass at it (the same SlimParse contract the
+// round carried, the reply judged by exactly parseSlimPlan) before the
+// kill parks. A recovered queue continues the pipeline, stamped ParseSalvaged
+// on the run memo beside the repair's stamp; a not-recovered kill — the
+// seat's garbage, an unconfigured seat — parks exactly as the unarmed path
+// would have, with the identical no-delivery park record. A capture-less
+// kill never spends the call (salvaging "" would only move the park one
+// call frame). A pre-marker replay takes the unarmed path exactly as its
+// history recorded it: no salvage dispatch, the park alone.
+func TestSlimWorkflowParseSalvage(t *testing.T) {
+	t.Run("a captured parse kill recovers through the parsing AI", func(t *testing.T) {
+		env, agents, reviews, suites, scope := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"ParseSalvaged": true}).Return(nil).Once()
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan, SessionID: "dev-1"}},
+			{err: errNoDeliveryStub},
+			{result: activities.AgentRunResult{Text: "step one done", SessionID: "dev-3"}},
+		}
+		salvage := &salvageRecorder{env: env, script: []activities.SlimParseSalvageOutput{
+			{OK: true, Text: slimSalvageQueue},
+		}}
+		salvage.record()
+		reviews.stub = []activities.ReviewResult{{Approved: true}}
+		env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+			Return("daedalus/issue-42-1", nil).Once()
+
+		branch, err := runSlim(t, env)
+		if err != nil {
+			t.Fatalf("workflow error: %v", err)
+		}
+		if branch != "daedalus/issue-42-1" {
+			t.Errorf("branch = %q, want the finalize deliverable", branch)
+		}
+		if len(agents.inputs) != 3 {
+			t.Fatalf("agent ran %d times, want 3 (plan, killed parse, step — the kill is never re-run)", len(agents.inputs))
+		}
+		if len(salvage.inputs) != 1 {
+			t.Fatalf("parsing AI called %d times, want exactly one automatic pass", len(salvage.inputs))
+		}
+		prompt := salvage.inputs[0].Prompt
+		if !strings.Contains(prompt, slimSalvagePlanText) || !strings.Contains(prompt, "raw JSON array") {
+			t.Errorf("salvage prompt should transcribe the captured stranded prose under the parse contract, got:\n%s", prompt)
+		}
+		if strings.Contains(prompt, twoSubtaskProsePlan) {
+			t.Errorf("salvage prompt rides the capture, never the plan round's own reply, got:\n%s", prompt)
+		}
+		if got := agents.inputs[2].SessionID; got != "dev-1" {
+			t.Errorf("step SessionID = %q, want %q — the implementation rounds chain the plan's dev conversation, never the killed parse round's", got, "dev-1")
+		}
+		if len(suites.runs) != 2 {
+			t.Errorf("suite ran %d times, want 2 (preflight + the accepted round)", len(suites.runs))
+		}
+		if len(scope.inputs) != 1 {
+			t.Errorf("write-scope gate ran %d times, want 1 (the salvaged queue runs the loop like any other)", len(scope.inputs))
+		}
+		// The memo assertion rides AssertExpectations: exactly one stamp,
+		// exactly the ParseSalvaged map.
+		env.AssertExpectations(t)
+	})
+
+	t.Run("a capture-less parse kill parks without spending the call", func(t *testing.T) {
+		env, agents, reviews, suites, _ := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"ParseSalvaged": true}).Never()
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+			{err: errNoDeliveryBareStub},
+		}
+		salvage := &salvageRecorder{env: env}
+		salvage.record()
+
+		err := runSlimErr(t, env)
+		for _, want := range []string{
+			ErrAwaitingMaintainer.Error(),
+			"parse round:",
+			"agent round killed on a no-delivery watchdog",
+			errNoDeliveryBareStub.Error(),
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if len(salvage.inputs) != 0 {
+			t.Errorf("parsing AI called %d times, want 0 — there is nothing to transcribe", len(salvage.inputs))
+		}
+		if len(agents.inputs) != 2 {
+			t.Errorf("agent ran %d times, want 2 (plan, killed parse — the kill parks)", len(agents.inputs))
+		}
+		if len(reviews.inputs) != 0 {
+			t.Errorf("reviewer ran %d times, want 0 (nothing to review without a queue)", len(reviews.inputs))
+		}
+		if len(suites.runs) != 1 {
+			t.Errorf("suite ran %d times, want 1 (preflight only)", len(suites.runs))
+		}
+	})
+
+	t.Run("a not-recovered salvage parks as the unarmed path would", func(t *testing.T) {
+		env, agents, reviews, suites, _ := stubSlimRun(t)
+		env.OnUpsertMemo(map[string]interface{}{"ParseSalvaged": true}).Never()
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+			{err: errNoDeliveryStub},
+		}
+		salvage := &salvageRecorder{env: env, script: []activities.SlimParseSalvageOutput{
+			{OK: false},
+		}}
+		salvage.record()
+
+		err := runSlimErr(t, env)
+		for _, want := range []string{
+			ErrAwaitingMaintainer.Error(),
+			`agent round killed on a no-delivery watchdog (stage "slim-parse")`,
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if len(salvage.inputs) != 1 {
+			t.Errorf("parsing AI called %d times, want exactly one automatic pass", len(salvage.inputs))
+		}
+		if len(agents.inputs) != 2 {
+			t.Errorf("agent ran %d times, want 2 (plan, killed parse — the kill is never re-run)", len(agents.inputs))
+		}
+		if len(reviews.inputs) != 0 {
+			t.Errorf("reviewer ran %d times, want 0 (nothing to review without a queue)", len(reviews.inputs))
+		}
+		if len(suites.runs) != 1 {
+			t.Errorf("suite ran %d times, want 1 (preflight only)", len(suites.runs))
+		}
+	})
+
+	t.Run("a pre-marker replay never arms the seat", func(t *testing.T) {
+		env, agents, reviews, suites, _ := stubSlimRun(t)
+		env.OnGetVersion(slimParseSalvageChangeID, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+		env.OnUpsertMemo(map[string]interface{}{"ParseSalvaged": true}).Never()
+		agents.script = []agentStep{
+			{result: activities.AgentRunResult{Text: twoSubtaskProsePlan}},
+			{err: errNoDeliveryStub},
+		}
+		salvage := &salvageRecorder{env: env}
+		salvage.record()
+
+		err := runSlimErr(t, env)
+		for _, want := range []string{
+			ErrAwaitingMaintainer.Error(),
+			`agent round killed on a no-delivery watchdog (stage "slim-parse")`,
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("park error %q should contain %q", err, want)
+			}
+		}
+		if len(salvage.inputs) != 0 {
+			t.Errorf("parsing AI called %d times, want 0 — a pre-marker replay never dispatches the salvage", len(salvage.inputs))
+		}
+		if len(agents.inputs) != 2 {
+			t.Errorf("agent ran %d times, want 2 (plan, killed parse — the park alone, as the history recorded)", len(agents.inputs))
+		}
+		if len(reviews.inputs) != 0 {
+			t.Errorf("reviewer ran %d times, want 0 (nothing to review without a queue)", len(reviews.inputs))
+		}
+		if len(suites.runs) != 1 {
+			t.Errorf("suite ran %d times, want 1 (preflight only)", len(suites.runs))
+		}
 	})
 }

@@ -382,8 +382,8 @@ kill -9 $$`)
 
 // TestRunJailedAgentActivityResumesRecordedSession pins the retry path: a
 // round whose workflow-provided SessionID is empty — the retry after a
-// round killed at its ceiling — resumes the recorded conversation instead
-// of restarting from zero.
+// round killed at its ceiling, licensed by RetryAttempt — resumes the
+// recorded conversation instead of restarting from zero.
 func TestRunJailedAgentActivityResumesRecordedSession(t *testing.T) {
 	fakeHome(t)
 	wt := t.TempDir()
@@ -402,12 +402,15 @@ kill -9 $$`)
 		t.Fatalf("first round error = %v, want ErrAgentKilled", err)
 	}
 
-	// Round two: the retry, with no workflow-provided id.
+	// Round two: the retry, with no workflow-provided id and the retry
+	// license set — the workflow latches it once the killed attempt
+	// actually launched.
 	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"continued","session_id":"sess-att-2"}'; exit 0`)
 	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
 		WorktreePath: wt,
 		Prompt:       "continue the work",
 		Role:         RoleDev,
+		RetryAttempt: true,
 	})
 	if err != nil {
 		t.Fatalf("retry round: %v", err)
@@ -425,6 +428,45 @@ kill -9 $$`)
 	}
 	if !contains(calls[1].Args, "--resume") || !contains(calls[1].Args, "sess-att-1") {
 		t.Errorf("retry args %v should resume the recorded session sess-att-1", calls[1].Args)
+	}
+}
+
+// TestRunJailedAgentActivityFirstAttemptNeverResumes pins the leak guard on
+// the recorded-session fallback: a live record and transcript for this
+// worktree's role are not enough — a first attempt (RetryAttempt unset)
+// starts fresh even when the fallback's every other gate would pass. The
+// record it would resolve is another phase's conversation whenever the run
+// already ran this role: the live leak where the slim parse round (RoleDev
+// like the planner, same worktree) opened on the planner's whole
+// exploration. Only a genuine retry — the workflow's RetryAttempt latch —
+// may resume.
+func TestRunJailedAgentActivityFirstAttemptNeverResumes(t *testing.T) {
+	fakeHome(t)
+	wt := t.TempDir()
+	log := newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' '{"type":"result","subtype":"success","result":"fresh","session_id":"sess-first"}'; exit 0`)
+	// A live record for this role with its transcript on disk: every
+	// pre-flight gate the fallback checks would pass.
+	recordSession(context.Background(), wt, RoleDev, "sess-other-phase")
+	plantTranscript(t, wt, "sess-other-phase")
+
+	res, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+		WorktreePath: wt,
+		Prompt:       "first attempt",
+		Role:         RoleDev,
+	})
+	if err != nil {
+		t.Fatalf("RunJailedAgentActivity: %v", err)
+	}
+	if res.SessionID != "sess-first" {
+		t.Errorf("res.SessionID = %q, want the fresh session", res.SessionID)
+	}
+	calls := readCalls(t, log)
+	if len(calls) != 1 {
+		t.Fatalf("ai-jail called %d times, want 1", len(calls))
+	}
+	if contains(calls[0].Args, "--resume") || contains(calls[0].Args, "sess-other-phase") {
+		t.Errorf("first attempt resumed the recorded session: %v", calls[0].Args)
 	}
 }
 
@@ -526,6 +568,7 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"fresh ok","session
 		WorktreePath: wt,
 		Prompt:       "retry",
 		Role:         RoleDev,
+		RetryAttempt: true,
 	})
 	if err != nil {
 		t.Fatalf("broken resume must get one fresh start, got %v", err)
@@ -570,6 +613,7 @@ echo SHOULD-NOT-RUN; exit 0`)
 		WorktreePath: wt,
 		Prompt:       "retry",
 		Role:         RoleDev,
+		RetryAttempt: true,
 	})
 	if !errors.Is(err, ErrAgentKilled) {
 		t.Fatalf("error = %v, want ErrAgentKilled", err)
@@ -976,8 +1020,8 @@ func TestRecordNewPiTranscript(t *testing.T) {
 // TestRunJailedAgentActivityPiRecordsKilledRoundSessionAndResumes pins the
 // pi path end to end: a killed pi round's conversation is on record from
 // pi's own session dir by the time the round dies, and the retry — with no
-// workflow-provided id — resumes it via pi's --session flag, not claude's
-// --resume.
+// workflow-provided id and the RetryAttempt license — resumes it via pi's
+// --session flag, not claude's --resume.
 func TestRunJailedAgentActivityPiRecordsKilledRoundSessionAndResumes(t *testing.T) {
 	scrubBugFilingEnv(t)
 	fakeHome(t)
@@ -1014,6 +1058,7 @@ exit 0`)
 		WorktreePath: wt,
 		Prompt:       "continue the work",
 		Role:         RoleDev,
+		RetryAttempt: true,
 	})
 	if err != nil {
 		t.Fatalf("retry round: %v", err)

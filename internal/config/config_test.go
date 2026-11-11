@@ -1918,7 +1918,7 @@ func TestProviderEnvVarsIncludesKnobExports(t *testing.T) {
 // detached daemon's inherited env at spawn forever (AllWorkerEnvVars →
 // envWithoutWorkerVars) although runWorker never re-exports it, silently
 // changing daemon behavior with every suite green. The list must equal
-// exactly these nine names (set equality + length); OPENCODE_CONFIG is
+// exactly these ten names (set equality + length); OPENCODE_CONFIG is
 // the one deliberate non-re-exported member (the opencode bridge stages
 // it round-scoped), DAEDALUS_WORKER_DAEMON the daemon marker carried on
 // the spawned daemon's env (worker.go's daemonEnv). An intentional
@@ -1931,6 +1931,7 @@ func TestWorkerEnvVarsExactMembership(t *testing.T) {
 		"DAEDALUS_MAX_CONCURRENT_AGENT_RUNS",
 		"DAEDALUS_MAX_CONCURRENT_TESTS",
 		"DAEDALUS_SLIM",
+		"DAEDALUS_SLIM_PARSER_MODEL",
 		"DAEDALUS_THINKING",
 		"DAEDALUS_STREAM",
 		"DAEDALUS_AGENT",
