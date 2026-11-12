@@ -248,9 +248,10 @@ func seedCotRun(t *testing.T) *fakeCotServer {
 // its run id (the task-log blocks' 8-char-prefix convention); reviewer
 // rounds prefer their native Thinking over the inline <think> fence, a
 // Thinking-less round falls back to the fence, a round with neither says so
-// rather than rendering an empty section; and the dump carries no tail
-// block — the newest section is its last word (the plain `log` mode keeps
-// the footer).
+// rather than rendering an empty section; and the dump's tail is the bare
+// freshness line — divider then the last log arrival stamp, no "=== log
+// tail:" header and no temporal-state clause (the plain `log` mode keeps
+// the full footer).
 func TestTaskLogCotRendersRounds(t *testing.T) {
 	fake := seedCotRun(t)
 
@@ -270,14 +271,25 @@ func TestTaskLogCotRendersRounds(t *testing.T) {
 			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
 		}
 	}
-	// No tail block: -cot is the CoT-only view — no "=== log tail:" footer
-	// and no temporal-state clause, on a live run as much as a finished one.
-	// A freshness stamp and a final/not-final verdict are the plain mode's
-	// job.
+	// The tail is the bare freshness line: divider then the last log
+	// arrival stamp — no "=== log tail:" header and no temporal-state
+	// clause, on a live run as much as a finished one. A final/not-final
+	// verdict is the plain mode's job. The stamp degrades to its named
+	// unknown here: the test host holds no task log for the id.
 	for _, absent := range []string{"=== log tail:", "temporal state"} {
 		if strings.Contains(out, absent) {
-			t.Errorf("-cot output carries the tail block (%q present):\n%s", absent, out)
+			t.Errorf("-cot output carries the plain mode's tail block (%q present):\n%s", absent, out)
 		}
+	}
+	trimmed := strings.TrimRight(out, "\n")
+	last := trimmed[strings.LastIndex(trimmed, "\n")+1:]
+	if last != "unknown (task log not readable on this host)" {
+		if _, perr := time.Parse(time.RFC3339, last); perr != nil {
+			t.Errorf("-cot tail line = %q, want the arrival stamp or its named unknown: %v", last, perr)
+		}
+	}
+	if !strings.HasSuffix(out, "=====================================\n"+last+"\n") {
+		t.Errorf("-cot tail is not divider-then-stamp; output ends:\n%s", trimmed[strings.LastIndex(trimmed, "====="):])
 	}
 	// Native thinking wins over the fenced part of the same round.
 	if strings.Contains(out, "fenced review thought") {
