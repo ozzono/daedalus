@@ -1096,6 +1096,27 @@ func ledgerTaskID(workflowID string) string {
 	return strings.NewReplacer("-role-", "_role_", "-round-", "_round_").Replace(workflowID)
 }
 
+// newestLedgerAt returns the newest provider-call stamp the ledger holds
+// for a run — every relayed provider completion lands as one entry
+// carrying the run's attribution (Task, the scrubbed workflow id) and a
+// timestamp, regardless of which agent ran the round, so it answers "is
+// anything moving right now" where LastActivityAt answers only "when did
+// the workflow last change state". Zero when entries holds nothing for
+// the run. The caller stamps the cell with the newer of this and the
+// attribute — the boundary upsert is fresher than the previous round's
+// last call until the new round's first completion lands — so neither
+// source alone can regress the cell.
+func newestLedgerAt(entries []metricsrelay.Entry, workflowID string) time.Time {
+	task := ledgerTaskID(workflowID)
+	var newest time.Time
+	for _, e := range entries {
+		if e.Task == task && e.At.After(newest) {
+			newest = e.At
+		}
+	}
+	return newest
+}
+
 // roundLedgerCosts folds one run's ledger entries into priced per-round
 // figures, keyed by the relay's Round — the scheduled activity id the
 // worker sends as its attribution (internal/activities/metricsrelay.go).

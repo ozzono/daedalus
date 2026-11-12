@@ -248,8 +248,9 @@ func seedCotRun(t *testing.T) *fakeCotServer {
 // its run id (the task-log blocks' 8-char-prefix convention); reviewer
 // rounds prefer their native Thinking over the inline <think> fence, a
 // Thinking-less round falls back to the fence, a round with neither says so
-// rather than rendering an empty section; and the dump ends with the
-// log-tail block naming the live temporal state.
+// rather than rendering an empty section; and the dump carries no tail
+// block — the newest section is its last word (the plain `log` mode keeps
+// the footer).
 func TestTaskLogCotRendersRounds(t *testing.T) {
 	fake := seedCotRun(t)
 
@@ -264,11 +265,18 @@ func TestTaskLogCotRendersRounds(t *testing.T) {
 		"fenced fallback",
 		"=== round 4: dev-review (run run-new-) @",
 		"no CoT captured for this round",
-		"=== log tail:",
-		"temporal state Running: run still going — this dump is not final",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("-cot output should contain %q; got:\n%s", want, out)
+		}
+	}
+	// No tail block: -cot is the CoT-only view — no "=== log tail:" footer
+	// and no temporal-state clause, on a live run as much as a finished one.
+	// A freshness stamp and a final/not-final verdict are the plain mode's
+	// job.
+	for _, absent := range []string{"=== log tail:", "temporal state"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("-cot output carries the tail block (%q present):\n%s", absent, out)
 		}
 	}
 	// Native thinking wins over the fenced part of the same round.

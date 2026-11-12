@@ -533,6 +533,10 @@ func (s *uiServer) snapshot() uiSnapshot {
 	if c, err := s.temporal(); err != nil {
 		snap.WalkErr = err.Error()
 	} else {
+		// One ledger fold per feed render backs the running rows' Activity
+		// cell (the newestLedgerAt degrade below): an unwired relay costs
+		// a nil return here, a wired one one ascending read per render.
+		ledger := s.ledgerEntries()
 		dc := converter.GetDefaultDataConverter()
 		for _, q := range queues {
 			resp, err := c.ListWorkflow(context.Background(), &workflowservice.ListWorkflowExecutionsRequest{
@@ -557,10 +561,24 @@ func (s *uiServer) snapshot() uiSnapshot {
 					Started:    clockOrDate(info.GetStartTime().AsTime()),
 				}
 				row.startedAt = info.GetStartTime().AsTime()
+				// A closed row's Activity is its close time. A running row's
+				// is the freshest stamp known: the relay ledger's newest
+				// provider call answers "is anything moving right now"
+				// mid-round (touch() upserts LastActivityAt at state
+				// boundaries only), but at each boundary the attribute is
+				// the fresh stamp while the ledger's newest entry is the
+				// previous round's last call — so the newer of the two
+				// wins, and the cell never regresses across a poll. With
+				// neither (no relay, no upsert yet) the zero time renders
+				// the dash — never a fabricated stamp.
 				if closed := info.GetCloseTime(); closed.IsValid() {
 					row.LastAt = relTime(closed.AsTime(), snap.Generated)
 				} else {
-					row.LastAt = relTime(vis.LastAt, snap.Generated)
+					at := newestLedgerAt(ledger, row.WorkflowID)
+					if vis.LastAt.After(at) {
+						at = vis.LastAt
+					}
+					row.LastAt = relTime(at, snap.Generated)
 				}
 				row.Badge = badgeClass(row.Status)
 				row.LastCoT = lastCoTAge(row.WorkflowID, snap.Generated)
@@ -1225,21 +1243,23 @@ type uiCot struct {
 	Poll bool
 }
 
-// fragCot serves the detail page's collapsed CoT box, live-first: a round
-// in flight is newer than every finished section — the ordering the CLI's
-// `log -cot` already prints, the live section always following the
-// finished ones — so it wins the box while it runs, and the last finished
-// round's section (completed or dead) returns when it ends. The live
-// section's inputs are file-derived (one task-log read plus one
-// transcript read), so a live serve skips the history walk entirely; only
-// the idle face pays for the walk, which is why the box keeps its own
-// poll out of the polled body — rendering there would double every
-// poll's work for a box that is closed almost all the time. The poll is
-// armed by the responses that need it (the live one, so the `last write`
-// stamp advances while the round streams, and an idle one whose walk
-// still lags the task log's round count, so a section finished between
-// the live probe and the walk re-renders without a reopen), and the
-// client fetches only while the box is open.
+// fragCot serves the detail page's collapsed CoT box with the same view
+// the CLI's `log -cot` prints at default settings: every finished section
+// of every execution of the id, oldest first, the live face following — a
+// contentful live section (an agent whose transcript the view reads) or
+// the one-line in-flight status when the round's CoT is not followable
+// yet — and no footer. A contentless live status never empties the box:
+// the finished sections ride above it, and a first-round-in-flight render
+// carries the status line alone as the body. The walk pays for the live
+// face too now (parity means the box never tails), which is why the box
+// keeps its own poll out of the polled body — rendering there would
+// double every poll's work for a box that is closed almost all the time.
+// The poll is armed by the responses that need it (a live face, so the
+// `last write` stamp advances while the round streams and the box picks
+// the round's finished section up when it ends, and an idle face whose
+// walk still lags the task log's round count, so a section finished
+// between the live probe and the walk re-renders without a reopen), and
+// the client fetches only while the box is open.
 func (s *uiServer) fragCot(w http.ResponseWriter, req *http.Request) {
 	id := req.PathValue("id")
 	// listWorkflowRuns exits on an id its visibility query cannot carry;
@@ -1253,14 +1273,8 @@ func (s *uiServer) fragCot(w http.ResponseWriter, req *http.Request) {
 		s.render(w, http.StatusOK, "frag_cot", uiCot{Err: err.Error()})
 		return
 	}
-	if live := liveCotSectionWith(id, c); live != "" {
-		out := uiCot{ID: id, Poll: true}
-		out.Head, out.Body, _ = strings.Cut(strings.TrimRight(live, "\n"), "\n")
-		s.render(w, http.StatusOK, "frag_cot", out)
-		return
-	}
-	// No round in flight: the tail-1 view. The walk covers every execution
-	// of the id, a restarted session's earlier runs included.
+	// The walk covers every execution of the id, a restarted session's
+	// earlier runs included — the same walk the CLI's dump makes.
 	var out uiCot
 	runs := listWorkflowRuns(c, id)
 	// A visibility miss walks the latest execution alone while the task
@@ -1279,9 +1293,26 @@ func (s *uiServer) fragCot(w http.ResponseWriter, req *http.Request) {
 		s.render(w, http.StatusOK, "frag_cot", uiCot{Err: err.Error()})
 		return
 	}
-	if len(sections) > 0 {
-		out.Head, out.Body, _ = strings.Cut(sections[len(sections)-1], "\n")
+	// The section stream, CLI order: finished sections then the live face.
+	// Each section's own header line rides inside it; the stream's first
+	// line fills the box's head slot and the rest its body, so a
+	// single-line stream (the one-line in-flight status alone) renders as
+	// the body and never trips the empty-body placeholder.
+	live := liveCotSectionWith(id, c)
+	var b strings.Builder
+	for _, sec := range sections {
+		b.WriteString(sec)
+		b.WriteString("\n")
 	}
+	if live != "" {
+		b.WriteString(live)
+	}
+	if head, body, ok := strings.Cut(strings.TrimRight(b.String(), "\n"), "\n"); ok {
+		out.Head, out.Body = head, body
+	} else {
+		out.Body = strings.TrimRight(b.String(), "\n")
+	}
+	out.Poll = live != ""
 	// A round that finished (or started) between the live probe and this
 	// walk — its task-log line landed, its history event may not have —
 	// leaves the walk exactly one round behind: the log has started one
@@ -1296,9 +1327,11 @@ func (s *uiServer) fragCot(w http.ResponseWriter, req *http.Request) {
 	// transient shape too and would keep an open box re-walking; the
 	// writer always emits decode-able payloads, so that corner is the
 	// accepted ceiling (closing the box stops the fetches).
-	if path, perr := activities.TaskLogPath(id); perr == nil && full {
-		if data, rerr := os.ReadFile(path); rerr == nil && roundStarts(string(data)) == len(sections)+1 {
-			out.Poll = true
+	if !out.Poll && full {
+		if path, perr := activities.TaskLogPath(id); perr == nil {
+			if data, rerr := os.ReadFile(path); rerr == nil && roundStarts(string(data)) == len(sections)+1 {
+				out.Poll = true
+			}
 		}
 	}
 	out.ID = id

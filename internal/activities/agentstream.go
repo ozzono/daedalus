@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -382,8 +383,8 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // wherever the CLI chose to put the report.
 // Agents without a structured stream (opencode, codex, aider) report ""
 // here; their plain-text face is matched separately (apiErrorTextMarkers).
-// hands reports through its terminal failed event, and only the class
-// "retriable" is the API-level report (probe-pinned 2026-10-25: a failed
+// hands reports through its terminal failed event, and the class
+// "retriable" is its API-level report (probe-pinned 2026-10-25: a failed
 // event is always the stream's last line — the process exits 1 right
 // after it — because an internally retried provider failure, two attempts
 // per request under a persistent 500 and under a mid-stream connection
@@ -391,7 +392,12 @@ func parseRoundOutput(agent, stdout string) (thinking, text, session string, usa
 // exhausted-retry 500 surfaces as class retriable; the other observed
 // classes are round-level — "no-delivery" (handsNoDelivery), the loop
 // guard (handsStuck), and "terminal", a response hands could not use —
-// and stay off the api-error report).
+// and stay off the api-error report). One rider reclassifies at this
+// boundary: a non-retriable failed event whose reason carries a transient
+// provider serving signature (transientProviderReason) reports anyway —
+// the harness cannot know a serving stack's transient vocabulary, and the
+// 409 unload-pending wedge reached this parser as class terminal while
+// the server answered normally minutes later.
 func agentAPIError(agent, stdout string) string {
 	switch agent {
 	case "hands":
@@ -401,15 +407,31 @@ func agentAPIError(agent, stdout string) string {
 			if json.Unmarshal([]byte(line), &e) != nil {
 				continue
 			}
-			// Last retriable wins — a totality guard, not a pi-mirror
+			if e.Kind != "failed" {
+				continue
+			}
+			// Last failed event wins — a totality guard, not a pi-mirror
 			// standing rule: a failed event is stream-terminal (probe-
 			// pinned 2026-10-25 — hands's internal retries are silent, so
 			// nothing ever follows a failed event, least of all a
 			// delivery), so no later clean event can exist here to clear
-			// it. The other classes are untracked — they stay on the
-			// generic failure path by design.
-			if e.Kind == "failed" && e.Payload.Class == "retriable" {
+			// it. A declared-retriable event is the API-level report. Any
+			// other class stays the round-level verdict it was — unless
+			// its reason carries a transient provider serving signature
+			// (transientProviderReason), which daedalus reclassifies
+			// retryable at this boundary regardless of the declared class:
+			// the harness cannot know a serving stack's vocabulary, and
+			// the recorded event is never touched — only this read
+			// reclassifies.
+			switch {
+			case e.Payload.Class == "retriable":
 				apiErr = "class retriable: " + e.Payload.Reason
+			case transientProviderReason(e.Payload.Reason):
+				declared := e.Payload.Class
+				if declared == "" {
+					declared = "none"
+				}
+				apiErr = "provider transient (declared " + declared + "): " + e.Payload.Reason
 			}
 		}
 		return apiErr
@@ -456,6 +478,40 @@ func agentAPIError(agent, stdout string) string {
 		}
 	}
 	return ""
+}
+
+// transientProviderStatus matches the HTTP status a provider error line
+// carries as a word in a hands failed event's reason. The set is the
+// serving stack's "come back later" vocabulary — 429 (rate limit) and
+// 502/503/504 (gateway, overloaded, upstream) are transient always; 409
+// is transient only with the unload/busy serving phrase, never blanket.
+var transientProviderStatus = regexp.MustCompile(`\b(?:429|502|503|504|409)\b`)
+
+// transientProviderReason reports whether a hands failed event's reason
+// names a transient provider serving state — the failure belonged to the
+// serving stack, not the round, and the round is retryable here at the
+// runner boundary regardless of the class the harness declared (it
+// cannot know a serving stack's vocabulary; the observed wedge was a
+// 409 "Model … is busy; cannot start work while unload is pending …"
+// declared terminal that cleared minutes later). The status rides the
+// reason text as a word — provider error lines lead with it. A 409
+// counts only when the message carries the unload phrase ("unload is
+// pending …", matched on the stem, so rewordings of the same serving
+// state still hit); any other 409 is a genuine request conflict and
+// keeps its declared class.
+// ponytail: the word match can in principle fire on a reason that merely
+// quotes one of the codes in prose; the cost is bounded (failover,
+// heartbeat, park — never silent wrong work) and the reasons carrying
+// codes are provider error lines, so the looseness is accepted.
+func transientProviderReason(reason string) bool {
+	code := transientProviderStatus.FindString(reason)
+	if code == "" {
+		return false
+	}
+	if code == "409" {
+		return strings.Contains(strings.ToLower(reason), "unload")
+	}
+	return true
 }
 
 // handsStuck reports a hands round's structured stream declaring its own

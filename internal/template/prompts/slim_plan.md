@@ -13,4 +13,6 @@ Rules:
 - Acceptance criteria concrete and terminal — a command run or code read decides them, never "the code looks correct". Cover normal behavior and important edge cases.
 - Last sub-task completes the whole task. No sub-tasks for work the repository already has.
 
+Harness tool contract: the jailed toolset writes a file only where its parent directory already exists, and no tool creates directories. Every target_files path must therefore be a path whose parent directories already exist in the repository — plan no directory creation, and never target a file under a directory that does not exist yet.
+
 Output contract: your final prose message IS the delivery — the plan itself, in markdown, and nothing after it. Do not call any tool to hand off or deliver the plan: there is no deliver step, and the text you write is read as the plan exactly as you write it. Structure the plan for the transcription seat that reads it: one section per sub-task, in execution order, numbered from 1, each section carrying these four fields — kind (implement, test, docs, or fix); target files (the 1–2 files it creates or edits); what to do (precisely); acceptance criteria (concrete and terminal). Do not emit JSON, arrays, or code fences anywhere in the plan.

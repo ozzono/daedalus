@@ -984,7 +984,8 @@ func TestRunJailedGenuineFailureNotRescued(t *testing.T) {
 // TestAgentAPIErrorClassify pins agentAPIError's classification table:
 // only a structured report decides — pi's last message_end (an error still
 // standing at stream end, its errorMessage or a shape fallback), the
-// claude result event, hands's last retriable failed event — and chat
+// claude result event, hands's last failed event (retriable, or any class
+// whose reason carries a transient provider serving signature) — and chat
 // text or unstructured agents never do.
 func TestAgentAPIErrorClassify(t *testing.T) {
 	cases := []struct {
@@ -1030,6 +1031,31 @@ func TestAgentAPIErrorClassify(t *testing.T) {
 				`{"kind":"started","payload":{"session":"s-9"}}` + "\n" +
 				`{"kind":"delivered","payload":{"payload":{"summary":"done"}}}`,
 			"class retriable: first try"},
+		// The transient-serving reclassification: a non-retriable failed
+		// event whose reason names a transient provider state reports
+		// anyway — the harness cannot know a serving stack's vocabulary,
+		// and the 409 unload-pending wedge reached this parser as class
+		// terminal while the server answered minutes later.
+		{"hands 409 unload-pending reclassifies a terminal round", "hands",
+			`{"kind":"failed","payload":{"class":"terminal","reason":"409 Model glm-selfhost is busy; cannot start work while unload is pending (try again shortly)"}}`,
+			"provider transient (declared terminal): 409 Model glm-selfhost is busy; cannot start work while unload is pending (try again shortly)"},
+		{"hands a classless failed event reclassifies as none", "hands",
+			`{"kind":"failed","payload":{"reason":"502 bad gateway"}}`,
+			"provider transient (declared none): 502 bad gateway"},
+		{"hands 429 reclassifies a round-level class", "hands",
+			`{"kind":"failed","payload":{"class":"no-delivery","reason":"429 rate limited"}}`,
+			"provider transient (declared no-delivery): 429 rate limited"},
+		{"hands 409 without the unload phrase keeps its class", "hands",
+			`{"kind":"failed","payload":{"class":"terminal","reason":"409 conflicting session write"}}`, ""},
+		{"hands a code inside a larger number is not a status", "hands",
+			`{"kind":"failed","payload":{"class":"terminal","reason":"error 4290 sub-codes"}}`, ""},
+		{"hands retriable keeps its face even on a transient reason", "hands",
+			`{"kind":"failed","payload":{"class":"retriable","reason":"503 upstream unavailable"}}`,
+			"class retriable: 503 upstream unavailable"},
+		{"hands last failed event wins across classes", "hands",
+			`{"kind":"failed","payload":{"class":"retriable","reason":"first try"}}` + "\n" +
+				`{"kind":"failed","payload":{"class":"terminal","reason":"409 unload is pending; model busy"}}`,
+			"provider transient (declared terminal): 409 unload is pending; model busy"},
 		{"hands no-delivery stays generic", "hands",
 			`{"kind":"failed","payload":{"class":"no-delivery","reason":"loop guard"}}`, ""},
 		{"hands terminal class stays generic", "hands",
@@ -1045,6 +1071,40 @@ func TestAgentAPIErrorClassify(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := agentAPIError(c.agent, c.stdout); got != c.want {
 				t.Errorf("agentAPIError(%q, %q) = %q, want %q", c.agent, c.stdout, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTransientProviderReason pins the serving-stack vocabulary the hands
+// reclassification reads: 429 and the 5xx gateway codes are transient as
+// bare words, 409 only with the unload phrase (matched on the stem, any
+// casing — rewordings of the same serving state still hit, a genuine
+// conflict never does), a code inside a larger number is not a word, and
+// the absence of any code is not transient — an untracked class must stay
+// the round-level verdict it was.
+func TestTransientProviderReason(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+		want   bool
+	}{
+		{"429 rate limit is transient", "429 too many requests", true},
+		{"502 gateway is transient", "502 bad gateway", true},
+		{"503 overloaded is transient", "server said 503 overloaded", true},
+		{"504 upstream timeout is transient", "504 gateway timeout", true},
+		{"409 with the unload phrase is transient", "409 Model m is busy; cannot start work while unload is pending", true},
+		{"409 reworded still carries the stem", "409 cannot start work while UNLOAD is pending for m", true},
+		{"409 without the phrase is a real conflict", "409 conflicting session write", false},
+		{"500 is not in the vocabulary", "500 internal server error", false},
+		{"a code inside a larger number is not a word", "error 4290 sub-codes", false},
+		{"no code at all is not transient", "unusable response shape", false},
+		{"empty reason is not transient", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := transientProviderReason(c.reason); got != c.want {
+				t.Errorf("transientProviderReason(%q) = %v, want %v", c.reason, got, c.want)
 			}
 		})
 	}
