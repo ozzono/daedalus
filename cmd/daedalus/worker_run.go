@@ -182,6 +182,23 @@ func runWorker(cfg config.Config, workerType string) error {
 	} else if err := os.Unsetenv(config.SlimParserModelEnv); err != nil {
 		return fmt.Errorf("unset %s: %w", config.SlimParserModelEnv, err)
 	}
+	// The slim sampler knobs ride the same channel: the jailed-round builder
+	// reads DAEDALUS_SLIM_SAMPLER_ARGS when staging a hands round's
+	// `--sampler k=v` flags (slim's sampler fields, pre-rendered by
+	// SamplerArgs; ruling D1 — the knobs reach hands as round CLI args, this
+	// var is the worker-internal leg only and never enters the sandbox).
+	// Set only when slim is enabled and at least one knob is set — absent
+	// means no flags stage and requests keep the serving stack's own
+	// defaults — and unset symmetrically (in the daemon spawn scrub,
+	// config.WorkerEnvVars), so a stale shell export cannot stage knobs a
+	// config that says nothing, on the foreground path too.
+	if samplerArgs := cfg.Slim.SamplerArgs(); cfg.Slim.Enabled && len(samplerArgs) > 0 {
+		if err := os.Setenv(config.SlimSamplerEnv, strings.Join(samplerArgs, " ")); err != nil {
+			return fmt.Errorf("set %s: %w", config.SlimSamplerEnv, err)
+		}
+	} else if err := os.Unsetenv(config.SlimSamplerEnv); err != nil {
+		return fmt.Errorf("unset %s: %w", config.SlimSamplerEnv, err)
+	}
 	// The metrics relay (config metrics.enabled): the worker's rounds stage
 	// their provider calls onto the host metrics daemon's relay
 	// (internal/metricsrelay), which keeps the usage ledger the `daedalus

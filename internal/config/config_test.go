@@ -356,6 +356,168 @@ func TestLoadSlimMaxInputTokens(t *testing.T) {
 	}
 }
 
+// TestLoadSlimSamplerKnobs pins the slim sampler knob surface end to end.
+// SlimSamplerNames is the hands `--sampler` schema verbatim — the single
+// list the strict unmarshal, SamplerArgs, and the jailed-round builder's
+// stage-time check all answer to — so the pin names its entries exactly.
+// The strict decode admits every listed key and rejects a typo'd or
+// mistyped one; SamplerArgs renders the set knobs as `k=v` tokens in the
+// list's order regardless of the file's key order, an unset knob
+// contributes nothing (absence is the don't-send default — pointer
+// semantics, so an explicit 0 is a real value, never the sentinel),
+// floats render as plain decimal scalars ('f'-formatted, never the
+// exponent literal a `--sampler` token cannot carry), value ranges stay
+// the serving stack's business (a negative loads), and a non-finite
+// float fails the load: NaN/Inf cannot travel as a plain scalar token
+// and the stage would hand hands a flag it refuses at launch, failing
+// every round instead of the config. The render contract matches: a set
+// knob renders, an unset one renders absent (never null), and the render
+// round-trips byte for byte with its SamplerArgs intact.
+func TestLoadSlimSamplerKnobs(t *testing.T) {
+	wantNames := []string{
+		"temperature", "top_p", "top_k", "min_p", "seed",
+		"frequency_penalty", "presence_penalty", "repetition_penalty",
+		"repetition_context_size", "no_repeat_ngram_size", "ngram_window",
+		"xtc_probability", "xtc_threshold",
+	}
+	if !slices.Equal(SlimSamplerNames(), wantNames) {
+		t.Errorf("SlimSamplerNames() = %v, want the hands --sampler schema verbatim %v", SlimSamplerNames(), wantNames)
+	}
+
+	// The full surface loads through strict decode and renders in the
+	// name list's order — deliberately scrambled in the file, with every
+	// value distinct so a field/token cross-wiring shows up in the tokens.
+	cfg, err := Load(writeConfig(t, "slim:\n"+
+		"  xtc_threshold: 0.9\n  temperature: 0.7\n  no_repeat_ngram_size: 20\n"+
+		"  top_p: 0.95\n  seed: 12345\n  repetition_context_size: 512\n"+
+		"  top_k: 40\n  ngram_window: 8\n  min_p: 0.05\n"+
+		"  frequency_penalty: -0.5\n  xtc_probability: 0.1\n"+
+		"  presence_penalty: 0.25\n  repetition_penalty: 1.05\n"))
+	if err != nil {
+		t.Fatalf("Load(all sampler knobs): %v", err)
+	}
+	if *cfg.Slim.Temperature != 0.7 || *cfg.Slim.TopK != 40 || *cfg.Slim.XTCThreshold != 0.9 || *cfg.Slim.Seed != 12345 {
+		t.Errorf("slim knob decode crossed wires: temperature %v top_k %v xtc_threshold %v seed %v",
+			cfg.Slim.Temperature, cfg.Slim.TopK, cfg.Slim.XTCThreshold, cfg.Slim.Seed)
+	}
+	wantArgs := []string{
+		"temperature=0.7", "top_p=0.95", "top_k=40", "min_p=0.05", "seed=12345",
+		"frequency_penalty=-0.5", "presence_penalty=0.25", "repetition_penalty=1.05",
+		"repetition_context_size=512", "no_repeat_ngram_size=20", "ngram_window=8",
+		"xtc_probability=0.1", "xtc_threshold=0.9",
+	}
+	if got := cfg.Slim.SamplerArgs(); !slices.Equal(got, wantArgs) {
+		t.Errorf("SamplerArgs(all knobs) = %v, want the name-list order %v", got, wantArgs)
+	}
+
+	// A subset renders only its set knobs, still in list order — the
+	// worker exports whatever this renders, so the order is the argv
+	// order the round receives.
+	cfg, err = Load(writeConfig(t, "slim:\n  repetition_penalty: 1.05\n  temperature: 0.7\n"))
+	if err != nil {
+		t.Fatalf("Load(sampler subset): %v", err)
+	}
+	if got := cfg.Slim.SamplerArgs(); !slices.Equal(got, []string{"temperature=0.7", "repetition_penalty=1.05"}) {
+		t.Errorf("SamplerArgs(subset) = %v, want list order with the unset knobs absent", got)
+	}
+
+	// Nothing set renders nothing — the absent-means-defaults contract the
+	// exporter and the staging both ride. (Slim enabled needs its
+	// verdict_repair decision model, like every slim-enabled load here.)
+	cfg, err = Load(writeConfig(t, "slim:\n  enabled: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n"))
+	if err != nil {
+		t.Fatalf("Load(slim without knobs): %v", err)
+	}
+	if got := cfg.Slim.SamplerArgs(); len(got) != 0 {
+		t.Errorf("SamplerArgs(no knobs) = %v, want empty", got)
+	}
+
+	// Pointer semantics: an explicit 0 is a meaningful value (several
+	// dials turn off at 0), never the don't-send sentinel; a negative is
+	// legal — ranges are the serving stack's business, so no range rule
+	// here — and an integral float renders without a trailing .0.
+	cfg, err = Load(writeConfig(t, "slim:\n  temperature: 0\n  seed: -1\n  frequency_penalty: -0.5\n"))
+	if err != nil {
+		t.Fatalf("Load(zero/negative knobs): %v", err)
+	}
+	if got := cfg.Slim.SamplerArgs(); !slices.Equal(got, []string{"temperature=0", "seed=-1", "frequency_penalty=-0.5"}) {
+		t.Errorf("SamplerArgs(zero/negative) = %v, want the explicit values verbatim", got)
+	}
+
+	// Floats render 'f'-formatted: a token is always a plain decimal
+	// scalar, never an exponent literal.
+	cfg, err = Load(writeConfig(t, "slim:\n  min_p: 0.0000001\n"))
+	if err != nil {
+		t.Fatalf("Load(small float knob): %v", err)
+	}
+	if got := cfg.Slim.SamplerArgs(); !slices.Equal(got, []string{"min_p=0.0000001"}) {
+		t.Errorf("SamplerArgs(small float) = %v, want the plain decimal token", got)
+	}
+
+	// A non-finite float fails the load, naming the knob.
+	for _, name := range []string{
+		"temperature", "top_p", "min_p", "frequency_penalty",
+		"presence_penalty", "repetition_penalty", "xtc_probability", "xtc_threshold",
+	} {
+		for _, lit := range []string{".nan", ".inf", "-.inf"} {
+			_, err := Load(writeConfig(t, "slim:\n  "+name+": "+lit+"\n"))
+			if err == nil || !strings.Contains(err.Error(), "slim."+name) || !strings.Contains(err.Error(), "finite") {
+				t.Errorf("Load(slim.%s: %s) err = %v, want the slim.%s finite rejection", name, lit, err, name)
+			}
+		}
+	}
+
+	// The strict decode still governs the new keys: a typo'd knob is the
+	// field-not-found rejection, a mistyped value the decode error.
+	_, err = Load(writeConfig(t, "slim:\n  xtc_probablity: 0.5\n"))
+	if err == nil || !strings.Contains(err.Error(), "field xtc_probablity not found") {
+		t.Errorf("Load(typo'd sampler knob) err = %v, want the field-not-found rejection", err)
+	}
+	if _, err := Load(writeConfig(t, "slim:\n  top_k: not-an-int\n")); err == nil || !strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Errorf("Load(mistyped top_k) err = %v, want a decode error failing the load", err)
+	}
+
+	// The render prints a set knob and leaves an unset one absent —
+	// `key: null` is a shape no config line means — and the render
+	// round-trips byte for byte with its SamplerArgs intact.
+	raw, err := LoadRaw(writeConfig(t, "slim:\n  temperature: 0.7\n  min_p: 0.05\n"))
+	if err != nil {
+		t.Fatalf("LoadRaw: %v", err)
+	}
+	out, err := raw.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML: %v", err)
+	}
+	for _, want := range []string{"temperature: 0.7", "min_p: 0.05"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderYAML output is missing %q:\n%s", want, out)
+		}
+	}
+	for _, leaked := range []string{"xtc_probability", "seed", ": null"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("RenderYAML printed the unset sampler knob marker %q — an absent knob renders absent:\n%s", leaked, out)
+		}
+	}
+	back, err := LoadRaw(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("parse RenderYAML output: %v\n%s", err, out)
+	}
+	roundTrip, err := back.RenderYAML()
+	if err != nil {
+		t.Fatalf("RenderYAML round-trip: %v", err)
+	}
+	if roundTrip != out {
+		t.Errorf("RenderYAML round-trip =\n%s\nwant\n%s", roundTrip, out)
+	}
+	reloaded, err := Load(writeConfig(t, out))
+	if err != nil {
+		t.Fatalf("Load(render output): %v\n%s", err, out)
+	}
+	if got := reloaded.Slim.SamplerArgs(); !slices.Equal(got, []string{"temperature=0.7", "min_p=0.05"}) {
+		t.Errorf("SamplerArgs(render output) = %v, want the set knobs through the round-trip", got)
+	}
+}
+
 // TestLoadThinkingDisabled pins the thinking toggle's pointer semantics: an
 // absent key and an explicit true both mean pi follows its host default;
 // only an explicit false disables thinking on jailed pi rounds.
@@ -1918,7 +2080,7 @@ func TestProviderEnvVarsIncludesKnobExports(t *testing.T) {
 // detached daemon's inherited env at spawn forever (AllWorkerEnvVars →
 // envWithoutWorkerVars) although runWorker never re-exports it, silently
 // changing daemon behavior with every suite green. The list must equal
-// exactly these ten names (set equality + length); OPENCODE_CONFIG is
+// exactly these eleven names (set equality + length); OPENCODE_CONFIG is
 // the one deliberate non-re-exported member (the opencode bridge stages
 // it round-scoped), DAEDALUS_WORKER_DAEMON the daemon marker carried on
 // the spawned daemon's env (worker.go's daemonEnv). An intentional
@@ -1932,6 +2094,7 @@ func TestWorkerEnvVarsExactMembership(t *testing.T) {
 		"DAEDALUS_MAX_CONCURRENT_TESTS",
 		"DAEDALUS_SLIM",
 		"DAEDALUS_SLIM_PARSER_MODEL",
+		SlimSamplerEnv,
 		"DAEDALUS_THINKING",
 		"DAEDALUS_STREAM",
 		"DAEDALUS_AGENT",

@@ -1426,6 +1426,24 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 		}
 	}
 	args = append(args, headless...)
+	// The slim sampler knobs stage as repeatable `--sampler k=v` flags on
+	// the fresh `hands round` shape — the subcommand the flags belong to
+	// (ruling D1's transport), validated and rendered by handsSamplerFlags
+	// from the worker's slim sampler export; unset knobs stage nothing and
+	// the serving stack's own defaults stand. A resumed round is the
+	// precomposed `hands resume` argv (agentResumeArgs), whose flag surface
+	// is not the receiver this contract was verified against — the flags
+	// skip it, so a resumed round keeps the serving defaults where the
+	// fresh shape overrides them. ponytail: `hands resume`'s --sampler
+	// tolerance is unpinned; extend the staging to resumed rounds once that
+	// surface is verified, not before.
+	if selected == "hands" && len(agentArgs) == 0 {
+		samplerFlags, err := handsSamplerFlags(env)
+		if err != nil {
+			return jailResult{}, err
+		}
+		args = append(args, samplerFlags...)
+	}
 	// codex reads no provider env var natively, so an openai-served codex
 	// round is bridged per invocation: stageCodexProvider returns the -c
 	// overrides selecting the staged provider and -m the model, layered

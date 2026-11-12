@@ -489,6 +489,80 @@ func TestStageHandsProviderStagesKnobs(t *testing.T) {
 	})
 }
 
+// TestHandsSamplerFlags pins the fresh hands round's sampler staging
+// (handsSamplerFlags): the worker's DAEDALUS_SLIM_SAMPLER_ARGS export —
+// daedalus-written, space-joined `k=v` tokens from config slim's sampler
+// fields — splits into one `--sampler <token>` flag per token, verbatim,
+// in order; an absent export stages nothing (the requests keep the
+// serving stack's own defaults); every name on SlimSamplerNames is a
+// legal token; and anything else — no `=`, an empty value, a name off
+// the knob list — rejects loudly, naming the export and the offending
+// token: the export is daedalus-written, so unparseable content is
+// corruption (ruling D2 — reject at launch, never ignore, or a stale
+// export would stage a flag hands refuses at its own launch).
+func TestHandsSamplerFlags(t *testing.T) {
+	t.Run("absent export stages nothing", func(t *testing.T) {
+		flags, err := handsSamplerFlags(handsEnv("OPENAI_MODEL=glm", "DAEDALUS_SLIM=1"))
+		if err != nil {
+			t.Fatalf("handsSamplerFlags: %v", err)
+		}
+		if flags != nil {
+			t.Errorf("handsSamplerFlags = %v, want nil without the export", flags)
+		}
+	})
+
+	t.Run("tokens render one flag each, verbatim and in order", func(t *testing.T) {
+		flags, err := handsSamplerFlags(handsEnv(config.SlimSamplerEnv + "=temperature=0.7 min_p=0.05 no_repeat_ngram_size=20"))
+		if err != nil {
+			t.Fatalf("handsSamplerFlags: %v", err)
+		}
+		want := []string{"--sampler", "temperature=0.7", "--sampler", "min_p=0.05", "--sampler", "no_repeat_ngram_size=20"}
+		if !slices.Equal(flags, want) {
+			t.Errorf("handsSamplerFlags = %v, want %v", flags, want)
+		}
+	})
+
+	t.Run("every knob name is a legal token", func(t *testing.T) {
+		var tokens []string
+		for _, name := range config.SlimSamplerNames() {
+			tokens = append(tokens, name+"=1")
+		}
+		flags, err := handsSamplerFlags(handsEnv(config.SlimSamplerEnv + "=" + strings.Join(tokens, " ")))
+		if err != nil {
+			t.Fatalf("handsSamplerFlags: %v", err)
+		}
+		if len(flags) != 2*len(config.SlimSamplerNames()) {
+			t.Fatalf("handsSamplerFlags staged %d args, want one --sampler pair per knob name (%d)", len(flags), 2*len(config.SlimSamplerNames()))
+		}
+		for i, tok := range tokens {
+			if flags[2*i] != "--sampler" || flags[2*i+1] != tok {
+				t.Errorf("flag pair %d = [%s %s], want [--sampler %s]", i, flags[2*i], flags[2*i+1], tok)
+			}
+		}
+	})
+
+	for _, c := range []struct {
+		name string
+		raw  string
+		tok  string
+	}{
+		{"token without an = fails", "temperature 0.7", "temperature"},
+		{"empty value fails", "temperature=", "temperature="},
+		{"unknown knob fails", "max_tokens=100", "max_tokens=100"},
+		{"typo'd knob fails", "xtc_probablity=0.5", "xtc_probablity=0.5"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			flags, err := handsSamplerFlags(handsEnv(config.SlimSamplerEnv + "=" + c.raw))
+			if err == nil || !strings.Contains(err.Error(), config.SlimSamplerEnv) || !strings.Contains(err.Error(), c.tok) {
+				t.Errorf("handsSamplerFlags(%q) = %v, %v; want a rejection naming %s and %q", c.raw, flags, err, config.SlimSamplerEnv, c.tok)
+			}
+			if flags != nil {
+				t.Errorf("handsSamplerFlags(%q) staged %v alongside the error, want nil", c.raw, flags)
+			}
+		})
+	}
+}
+
 // TestHandsJailMounts pins the state-dir resolution behind the hands jail
 // mount: the worktree scratch's .config/hands maps read-write onto the
 // real ~/.config/hands (so the child reads the staged provider and its
@@ -890,6 +964,157 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 			calls := readCalls(t, log)
 			t.Errorf("ai-jail called %d times, want the round failed before launch (%v)", len(calls), calls)
 		}
+	})
+}
+
+// TestHandsRoundStagesSamplerFlags pins the slim sampler knobs' argv seam
+// on the jailed hands round: a set DAEDALUS_SLIM_SAMPLER_ARGS export rides
+// the fresh `hands round` command line as repeatable `--sampler k=v` flags
+// appended after the fixed headless set, and the export itself never
+// reaches the round env — worker-internal plumbing only (the sandbox gate
+// strips it; the knobs travel as argv, ruling D1's transport). An unset
+// export stages no flag, so the requests keep the serving stack's own
+// defaults; a corrupt export fails the round before launch instead of
+// staging a flag hands would refuse (ruling D2); and a resumed round —
+// the precomposed `hands resume` argv, whose flag surface the staging
+// contract was not verified against — skips the flags even with the
+// export set.
+func TestHandsRoundStagesSamplerFlags(t *testing.T) {
+	t.Run("fresh round stages the flags after the headless set", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		home := fakeHome(t)
+		t.Setenv("DAEDALUS_AGENT", "hands")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
+		t.Setenv(config.SlimSamplerEnv, "temperature=0.7 min_p=0.05")
+		wt := gitRepo(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedAgentActivity: %v", err)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		src := filepath.Join(wt, handsScratchDir, ".config", "hands")
+		dst := filepath.Join(home, ".config", "hands")
+		assertArgs(t, calls[0].Args, slices.Concat(
+			[]string{"--worktree",
+				"--no-save-config",
+				"--allow-host",
+				"selfhost.example"},
+			roundEnvRiders(calls[0].Env),
+			[]string{"--mask",
+				".claude/settings.json",
+				"--mask",
+				".claude/settings.local.json",
+				"--mask",
+				homeClaudeMask(t),
+				"--rw-map",
+				src + ":" + dst,
+				"--",
+				"hands",
+				"round",
+				"--format",
+				"json",
+				"--sampler",
+				"temperature=0.7",
+				"--sampler",
+				"min_p=0.05",
+			},
+		), "ai-jail")
+		if got := calls[0].Env[config.SlimSamplerEnv]; got != "" {
+			t.Errorf("round env carries %s=%q — the sampler export is worker-internal plumbing and must stop at the sandbox gate", config.SlimSamplerEnv, got)
+		}
+	})
+
+	t.Run("unset export stages no flag", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("DAEDALUS_AGENT", "hands")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
+		wt := gitRepo(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		}); err != nil {
+			t.Fatalf("RunJailedAgentActivity: %v", err)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if contains(calls[0].Args, "--sampler") {
+			t.Errorf("fresh hands round staged a --sampler flag without the export: %v", calls[0].Args)
+		}
+	})
+
+	t.Run("corrupt export fails the round before launch", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("DAEDALUS_AGENT", "hands")
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_API_KEY", "sk-local")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
+		t.Setenv(config.SlimSamplerEnv, "temperature=0.7 junk")
+		wt := gitRepo(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+			WorktreePath: wt,
+			Prompt:       "fix the bug",
+		})
+		if err == nil || !strings.Contains(err.Error(), config.SlimSamplerEnv) || !strings.Contains(err.Error(), "junk") {
+			t.Errorf("RunJailedAgentActivity err = %v, want the %s rejection naming the offending token", err, config.SlimSamplerEnv)
+		}
+		if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+			calls := readCalls(t, log)
+			t.Errorf("ai-jail called %d times, want the round failed before launch (%v)", len(calls), calls)
+		}
+	})
+
+	t.Run("resumed round skips the flags", func(t *testing.T) {
+		scrubBugFilingEnv(t)
+		fakeHome(t)
+		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
+		t.Setenv("OPENAI_MODEL", "glm-selfhost")
+		t.Setenv(config.SlimSamplerEnv, "temperature=0.7")
+		wt := gitRepo(t)
+		log := newStubLog(t)
+		stubBin(t, "ai-jail", "exit 0")
+
+		if _, err := runJailedRound(context.Background(), os.Environ(), "", "hands", wt, "fix the bug",
+			agentResumeArgs("hands", "sess-hands-1", nil)...); err != nil {
+			t.Fatalf("runJailedRound: %v", err)
+		}
+
+		calls := readCalls(t, log)
+		if len(calls) != 1 {
+			t.Fatalf("ai-jail called %d times, want 1", len(calls))
+		}
+		if contains(calls[0].Args, "--sampler") {
+			t.Errorf("resumed hands round staged a --sampler flag — the precomposed argv is not the verified receiver: %v", calls[0].Args)
+		}
+		assertArgs(t, calls[0].Args[len(calls[0].Args)-6:], []string{
+			"--", "hands", "resume", "sess-hands-1", "--format", "json",
+		}, "resumed argv tail")
 	})
 }
 

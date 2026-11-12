@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -73,8 +74,11 @@ const (
 // stageOpencodeProvider); no openai export falls to the anthropic family,
 // where model is required and url is optional (absent means hands's own
 // public default, matching claude's key-alone posture). The sampler knobs
-// have no hands config field, so they never stage and the backend's own
-// defaults stand, per the agnostic rule.
+// stay out of this file on purpose: hands's strict config schema has no
+// sampler fields, so they stage as `--sampler k=v` flags on the round
+// command line instead (handsSamplerFlags, called by the jailed-round
+// builder), and an unset knob leaves the serving stack's own defaults
+// standing.
 func stageHandsProvider(env []string, worktreePath string) error {
 	url := envLookup(env, "OPENAI_BASE_URL")
 	if url == "" {
@@ -161,6 +165,34 @@ func stageHandsProvider(env []string, worktreePath string) error {
 		return err
 	}
 	return os.WriteFile(path, []byte(b.String()), 0o600)
+}
+
+// handsSamplerFlags renders the `--sampler k=v` argv flags a fresh hands
+// round stages: the worker's slim sampler export (config.SlimSamplerEnv —
+// the set slim sampler knobs, pre-rendered as space-joined `k=v` tokens by
+// config's SamplerArgs) splits into tokens, one flag per token. Every name
+// is checked against the knob list before staging — ruling D2: an unknown
+// knob rejects at launch, never ignores, so a stale or hand-set export
+// fails the round here instead of staging a flag hands would refuse at its
+// own launch (the same loud posture for a malformed token: the export is
+// daedalus-written, so anything unparseable in it is corruption, not
+// config). An absent export stages nothing — the requests keep the serving
+// stack's own defaults.
+func handsSamplerFlags(env []string) ([]string, error) {
+	raw := envLookup(env, config.SlimSamplerEnv)
+	if raw == "" {
+		return nil, nil
+	}
+	names := config.SlimSamplerNames()
+	var flags []string
+	for _, tok := range strings.Fields(raw) {
+		name, value, ok := strings.Cut(tok, "=")
+		if !ok || value == "" || !slices.Contains(names, name) {
+			return nil, fmt.Errorf("hands round: %s carries %q, which is not a slim sampler knob token — the export is daedalus-written from config slim's sampler fields; fix the config or unset the stale export", config.SlimSamplerEnv, tok)
+		}
+		flags = append(flags, "--sampler", tok)
+	}
+	return flags, nil
 }
 
 // handsJailMounts resolves the host paths a jailed hands round needs

@@ -317,6 +317,19 @@ const (
 	// (WorkerEnvVars) so a stale export cannot arm a config that says
 	// nothing.
 	SlimParserModelEnv = "DAEDALUS_SLIM_PARSER_MODEL"
+	// SlimSamplerEnv carries the set slim sampler knobs to the jailed-round
+	// builder as the pre-rendered `k=v` tokens (SamplerArgs, space-joined)
+	// it validates and stages as repeatable `--sampler` flags on the `hands
+	// round` command line — ruling D1: the knobs reach hands as round CLI
+	// args, never an env the harness reads, so this var is worker-internal
+	// plumbing only, consumed pre-spawn and absent from RoundEnvVars (the
+	// sandbox gate strips it; no allowlist change). Exported only when slim
+	// is enabled and at least one knob is set — absent means no flags stage
+	// and hands's requests keep the serving stack's own defaults — and unset
+	// symmetrically, scrubbed from the daemon spawn (WorkerEnvVars) like
+	// every other config-derived value, so a stale shell export cannot
+	// stage knobs a config that says nothing.
+	SlimSamplerEnv = "DAEDALUS_SLIM_SAMPLER_ARGS"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -891,6 +904,39 @@ type SlimConfig struct {
 	// It is a ceiling on input, not a model window — hence not
 	// context_tokens — and matches the max_output_tokens precedent.
 	MaxInputTokens int `yaml:"max_input_tokens"`
+	// The sampler knobs are the slim serving stack's per-request dials,
+	// staged as repeatable `--sampler k=v` flags on every fresh `hands
+	// round` command line (SamplerArgs → SlimSamplerEnv → handsSamplerFlags):
+	// the hands harness folds each pair into its openai requests, a set knob
+	// overriding the request while an unset one stays out of the body so the
+	// serving stack's own defaults stand. Pointer types carry the
+	// don't-send semantics: nil (the key absent) sends nothing — 0 is a
+	// meaningful value for several of them, so there is no sentinel zero.
+	// The anti-loop motivation is repetition degeneration on small
+	// self-hosted models (temperature/min_p/repetition_penalty/
+	// no_repeat_ngram_size are the dials the incident class names); the
+	// full set is the serving stack's request schema, and the names here are
+	// the hands `--sampler` keys verbatim. Thinking knobs
+	// (enable_thinking, thinking_budget) are deliberately absent —
+	// wireThinkingEnv owns that channel, and a second writer for one knob
+	// would make the two surfaces race — as are stop, max_tokens, and the
+	// response-format knobs, owned by their existing sections. A non-finite
+	// float fails the load (Config.validate): it cannot travel as a plain
+	// scalar token. omitempty is the render contract (RenderYAML): an unset
+	// knob renders absent, never null.
+	Temperature           *float64 `yaml:"temperature,omitempty"`
+	TopP                  *float64 `yaml:"top_p,omitempty"`
+	TopK                  *int     `yaml:"top_k,omitempty"`
+	MinP                  *float64 `yaml:"min_p,omitempty"`
+	Seed                  *int     `yaml:"seed,omitempty"`
+	FrequencyPenalty      *float64 `yaml:"frequency_penalty,omitempty"`
+	PresencePenalty       *float64 `yaml:"presence_penalty,omitempty"`
+	RepetitionPenalty     *float64 `yaml:"repetition_penalty,omitempty"`
+	RepetitionContextSize *int     `yaml:"repetition_context_size,omitempty"`
+	NoRepeatNgramSize     *int     `yaml:"no_repeat_ngram_size,omitempty"`
+	NgramWindow           *int     `yaml:"ngram_window,omitempty"`
+	XTCProbability        *float64 `yaml:"xtc_probability,omitempty"`
+	XTCThreshold          *float64 `yaml:"xtc_threshold,omitempty"`
 }
 
 // DefaultSlimMaxInputTokens is the slim input gate's ceiling when
@@ -908,6 +954,71 @@ func (s SlimConfig) MaxInputTokensOrDefault() int {
 		return s.MaxInputTokens
 	}
 	return DefaultSlimMaxInputTokens
+}
+
+// slimSamplerKnobNames is the slim sampler surface in staging order — the
+// hands `--sampler` keys verbatim, which are the serving stack's
+// ChatCompletionRequest fields. It is the single name list the strict
+// unmarshal, SamplerArgs, and the jailed-round builder's stage-time check
+// (ruling D2: an unknown knob rejects at launch, never ignores) all answer
+// to; the unmarshal cases and the SamplerArgs walk must stay within it, and
+// a drift between this list and the hands receiver fails the round loudly
+// here rather than staging a flag hands refuses.
+var slimSamplerKnobNames = []string{
+	"temperature",
+	"top_p",
+	"top_k",
+	"min_p",
+	"seed",
+	"frequency_penalty",
+	"presence_penalty",
+	"repetition_penalty",
+	"repetition_context_size",
+	"no_repeat_ngram_size",
+	"ngram_window",
+	"xtc_probability",
+	"xtc_threshold",
+}
+
+// SlimSamplerNames lists the slim sampler knob names (read-only — callers
+// must not mutate the backing array): the set SlimConfig fields may render,
+// and the builder validates every staged token against it.
+func SlimSamplerNames() []string {
+	return slimSamplerKnobNames
+}
+
+// SamplerArgs renders the set slim sampler knobs as `k=v` tokens, in
+// slimSamplerKnobNames order — the payload SlimSamplerEnv carries to the
+// jailed-round builder (space-joined by the exporter), which stages one
+// `--sampler <token>` flag per token. Floats render 'f'-formatted so a
+// token is always a plain decimal scalar (never an exponent literal), ints
+// verbatim; unset knobs contribute nothing.
+func (s SlimConfig) SamplerArgs() []string {
+	var args []string
+	addFloat := func(name string, v *float64) {
+		if v != nil {
+			args = append(args, name+"="+strconv.FormatFloat(*v, 'f', -1, 64))
+		}
+	}
+	addInt := func(name string, v *int) {
+		if v != nil {
+			args = append(args, name+"="+strconv.Itoa(*v))
+		}
+	}
+	addFloat("temperature", s.Temperature)
+	addFloat("top_p", s.TopP)
+	addInt("top_k", s.TopK)
+	addFloat("min_p", s.MinP)
+	addInt("seed", s.Seed)
+	addFloat("frequency_penalty", s.FrequencyPenalty)
+	addFloat("presence_penalty", s.PresencePenalty)
+	addFloat("repetition_penalty", s.RepetitionPenalty)
+	addInt("repetition_context_size", s.RepetitionContextSize)
+	addInt("no_repeat_ngram_size", s.NoRepeatNgramSize)
+	addInt("ngram_window", s.NgramWindow)
+	addFloat("xtc_probability", s.XTCProbability)
+	addFloat("xtc_threshold", s.XTCThreshold)
+	return args
 }
 
 // UnmarshalYAML migrates the historical top-level `slim: true/false`
@@ -942,6 +1053,58 @@ func (s *SlimConfig) UnmarshalYAML(value *yaml.Node) error {
 			}
 		case "max_input_tokens":
 			if err := val.Decode(&s.MaxInputTokens); err != nil {
+				return err
+			}
+		case "temperature":
+			if err := val.Decode(&s.Temperature); err != nil {
+				return err
+			}
+		case "top_p":
+			if err := val.Decode(&s.TopP); err != nil {
+				return err
+			}
+		case "top_k":
+			if err := val.Decode(&s.TopK); err != nil {
+				return err
+			}
+		case "min_p":
+			if err := val.Decode(&s.MinP); err != nil {
+				return err
+			}
+		case "seed":
+			if err := val.Decode(&s.Seed); err != nil {
+				return err
+			}
+		case "frequency_penalty":
+			if err := val.Decode(&s.FrequencyPenalty); err != nil {
+				return err
+			}
+		case "presence_penalty":
+			if err := val.Decode(&s.PresencePenalty); err != nil {
+				return err
+			}
+		case "repetition_penalty":
+			if err := val.Decode(&s.RepetitionPenalty); err != nil {
+				return err
+			}
+		case "repetition_context_size":
+			if err := val.Decode(&s.RepetitionContextSize); err != nil {
+				return err
+			}
+		case "no_repeat_ngram_size":
+			if err := val.Decode(&s.NoRepeatNgramSize); err != nil {
+				return err
+			}
+		case "ngram_window":
+			if err := val.Decode(&s.NgramWindow); err != nil {
+				return err
+			}
+		case "xtc_probability":
+			if err := val.Decode(&s.XTCProbability); err != nil {
+				return err
+			}
+		case "xtc_threshold":
+			if err := val.Decode(&s.XTCThreshold); err != nil {
 				return err
 			}
 		default:
@@ -1937,6 +2100,7 @@ func WorkerEnvVars() []string {
 		"DAEDALUS_MAX_CONCURRENT_TESTS",
 		"DAEDALUS_SLIM",
 		SlimParserModelEnv,
+		SlimSamplerEnv,
 		"DAEDALUS_THINKING",
 		"DAEDALUS_STREAM",
 		"DAEDALUS_AGENT",
@@ -2236,6 +2400,30 @@ func (c Config) validate(path string) error {
 	}
 	if c.Slim.MaxInputTokens < 0 {
 		return fmt.Errorf("config %s: slim.max_input_tokens: must not be negative", path)
+	}
+	// The slim sampler floats join the openai section's finite check (same
+	// rationale: NaN/Inf pass every comparison against zero and cannot travel
+	// as a plain scalar --sampler token — the stage would emit "NaN", which
+	// hands refuses at launch, failing every hands round on the worker
+	// instead of the config). Value ranges stay the serving stack's business:
+	// daedalus passes the configured scalars through untouched, so no
+	// negative or range rule here.
+	for _, s := range []struct {
+		name string
+		v    *float64
+	}{
+		{"temperature", c.Slim.Temperature},
+		{"top_p", c.Slim.TopP},
+		{"min_p", c.Slim.MinP},
+		{"frequency_penalty", c.Slim.FrequencyPenalty},
+		{"presence_penalty", c.Slim.PresencePenalty},
+		{"repetition_penalty", c.Slim.RepetitionPenalty},
+		{"xtc_probability", c.Slim.XTCProbability},
+		{"xtc_threshold", c.Slim.XTCThreshold},
+	} {
+		if s.v != nil && (math.IsNaN(*s.v) || math.IsInf(*s.v, 0)) {
+			return fmt.Errorf("config %s: slim.%s: must be a finite number", path, s.name)
+		}
 	}
 	if c.Metrics.Port < 0 || c.Metrics.RelayPort < 0 {
 		return fmt.Errorf("config %s: metrics: port and relay_port must not be negative", path)
