@@ -344,8 +344,8 @@ header are prefixed with one space, so output is preserved except for that
 byte.) Each block header stamps the temporal run id
 (first 8 characters), so a continued session's runs are distinguishable in
 one file. Files untouched for 7 days are pruned along with the worker logs.
-The dump ends with a tail block (plain and -cot; --status needs none, it is
-itself the brief):
+The dump ends with a tail block (plain mode only — -cot carries none;
+--status needs none, it is itself the brief):
 
   === log tail: last log 2026-10-07T18:04:05Z — workflow daedalus-42 — <state> ===
 
@@ -400,32 +400,25 @@ view can open above round 1. 0 prints no completed sections; a negative
 value is a usage error. A live in-flight section, when one exists, always
 follows regardless of the tail — it is newer than every completed round.
 
-The -cot dump ends with the same tail block, but the state clause names
-the workflow's real Temporal execution status, since -cot is already
-connected: "temporal state Completed: run not running — this dump is
-final" (likewise Failed, Canceled, Terminated, TimedOut), or "temporal
-state Running: run still going — this dump is not final" while the
-workflow lives (ContinuedAsNew counts as still going). A run between
-rounds therefore reads as still going, and a finished run never reads as
-live. A paused execution — only a manual temporal-CLI pause can produce
-one; daedalus never pauses its own workflows — reads "temporal state
-Paused: run paused — this dump is not final; the run can resume", since
-unpausing brings more rounds. -cot works on hosts the worker never
-touched: there the arrival stamp reads "unknown (task log not readable
-on this host)" rather than failing a dump that already rendered, and a
-failed status lookup degrades to "temporal state unknown" the same way.
+The -cot dump carries no tail block: it ends at the newest material
+there is — the live section while a round is in flight, else the newest
+finished section — so the view is CoT only, first section to last. The
+plain "daedalus log" mode keeps its "=== log tail:" footer naming the
+last log arrival and the run's state; run that mode when a freshness
+stamp and a final/not-final verdict are what is needed.
 
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's
 host-side transcript as the agent writes it — claude's and pi's, newest
-file wins. Agents whose host transcripts the
-live view does not follow (aider, opencode, codex) get one line
-saying their CoT appears when the round completes — codex does keep a
-rollout transcript, the live view just does not read it yet. Between
+file wins. A round whose CoT the live view cannot follow yet — an agent
+whose host transcript the view does not read (aider, opencode, codex),
+or a claude/pi round with no transcript yet or none with assistant
+output in it — renders the same one agent-agnostic in-flight line
+instead: the round's stage and start, then that its CoT appears when the
+round completes; the line claims nothing about transcripts. Between
 rounds there is no live section — the newest
 transcript then belongs to the just-finished round, already rendered
-above — and a round whose transcript holds no assistant output yet says
-so in one line. The live section never truncates, and it does not repeat
+above. The live section never truncates, and it does not repeat
 a completed section — outside the brief window right after a round
 spawns, before the in-flight round's own transcript file appears, when
 the just-finished round's transcript is still the newest and can read as

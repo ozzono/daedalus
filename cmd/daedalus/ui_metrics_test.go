@@ -1427,6 +1427,40 @@ func TestUIUsageTableRendersTheOtelEra(t *testing.T) {
 	}
 }
 
+// TestNewestLedgerAtPinsTheRunningRowStamp pins the Activity cell's
+// newest-stamp fold: the newest At among a run's entries wins regardless of
+// role, round, or which agent made the call — entries file under the run's
+// scrubbed task id (ledgerTaskID), another run's entries and unattributed
+// ones contribute nothing, and a run the ledger never heard of reads zero
+// (the caller's degrade to LastActivityAt, never a fabricated stamp).
+func TestNewestLedgerAtPinsTheRunningRowStamp(t *testing.T) {
+	at := func(mins int) time.Time {
+		return time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC).Add(time.Duration(mins) * time.Minute)
+	}
+	entries := []metricsrelay.Entry{
+		{At: at(0), Task: "listq-iss9_role_dev_round_1", Role: "dev", Round: "1", InputTokens: 10},
+		{At: at(4), Task: "listq-iss9_role_test_round_2", Role: "test", Round: "2", InputTokens: 10},
+		// Same run, earlier stamp: never wins over the newest.
+		{At: at(2), Task: "listq-iss9_role_dev_round_3", Role: "dev", Round: "3", InputTokens: 10},
+		// Another run's newer call: not this run's activity.
+		{At: at(9), Task: "listq-other_role_dev_round_1", Role: "dev", Round: "1", InputTokens: 10},
+		// An unattributed row: nothing to file under any run.
+		{At: at(9), InputTokens: 10},
+	}
+	if got, want := newestLedgerAt(entries, "listq-iss9-role-test-round-2"), at(4); !got.Equal(want) {
+		t.Errorf("newestLedgerAt = %v, want the run's newest entry %v (scrubbed-task match across roles)", got, want)
+	}
+	if got, want := newestLedgerAt(entries, "listq-iss9-role-dev-round-3"), at(2); !got.Equal(want) {
+		t.Errorf("newestLedgerAt = %v, want that run's own newest %v", got, want)
+	}
+	if got := newestLedgerAt(entries, "listq-ghost-role-dev-round-1"); !got.IsZero() {
+		t.Errorf("newestLedgerAt(unknown run) = %v, want zero", got)
+	}
+	if got := newestLedgerAt(nil, "listq-iss9-role-dev-round-1"); !got.IsZero() {
+		t.Errorf("newestLedgerAt(no entries) = %v, want zero", got)
+	}
+}
+
 // TestRoundLedgerCostsPinsThePerRoundFold pins the detail walk's per-round
 // pricing fold: entries fold per Round (the scheduled activity id the
 // worker sends as its attribution) and per run's Task only — another run's

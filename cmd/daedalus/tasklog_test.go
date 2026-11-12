@@ -665,9 +665,9 @@ func TestTaskLogTailWindow(t *testing.T) {
 }
 
 // fakeTailClient answers only DescribeWorkflowExecution — the one client
-// call cotTailState makes. The embedded nil interface keeps the rest of
-// client.Client unreachable: a panic there is the test failing loudly, not
-// a silent wrong clause.
+// call the contentful live face makes (its activity half). The embedded nil
+// interface keeps the rest of client.Client unreachable: a panic there is
+// the test failing loudly, not a silent wrong clause.
 type fakeTailClient struct {
 	client.Client
 	resp       *workflowservice.DescribeWorkflowExecutionResponse
@@ -679,76 +679,6 @@ type fakeTailClient struct {
 func (f *fakeTailClient) DescribeWorkflowExecution(_ context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
 	f.workflowID, f.runID = workflowID, runID
 	return f.resp, f.describeEr
-}
-
-// TestCotTailState pins -cot's state clause, rendered from the workflow's
-// real Temporal status: the Describe rides the empty run id (the latest
-// execution is what "is it still going" asks about a continued session),
-// Running and ContinuedAsNew read still going, Paused reads resumable —
-// never final, an unpause brings more rounds — every terminal status reads
-// final, and a describe failure degrades the clause to unknown rather than
-// failing a dump that already rendered.
-func TestCotTailState(t *testing.T) {
-	t.Run("describe rides the empty run id", func(t *testing.T) {
-		c := &fakeTailClient{resp: preflightDescribe(enums.WORKFLOW_EXECUTION_STATUS_RUNNING, "")}
-		cotTailState(c, "wf-tail")
-		if c.workflowID != "wf-tail" || c.runID != "" {
-			t.Errorf("DescribeWorkflowExecution = (%q, %q), want (workflow, empty run id)", c.workflowID, c.runID)
-		}
-	})
-
-	for _, c := range []struct {
-		name, want string
-		status     enums.WorkflowExecutionStatus
-	}{
-		{
-			name:   "running reads still going",
-			status: enums.WORKFLOW_EXECUTION_STATUS_RUNNING,
-			want:   "temporal state Running: run still going — this dump is not final",
-		},
-		{
-			name:   "ContinuedAsNew counts as still going",
-			status: enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW,
-			want:   "temporal state ContinuedAsNew: run still going — this dump is not final",
-		},
-		{
-			name:   "paused reads resumable, never final",
-			status: enums.WORKFLOW_EXECUTION_STATUS_PAUSED,
-			want:   "temporal state Paused: run paused — this dump is not final; the run can resume",
-		},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			got := cotTailState(&fakeTailClient{resp: preflightDescribe(c.status, "")}, "wf-tail")
-			if got != c.want {
-				t.Errorf("cotTailState(%s) = %q, want %q", c.status, got, c.want)
-			}
-		})
-	}
-
-	// Every terminal status must read final — enumerated, because a
-	// misrouted status is exactly how Paused once claimed finality.
-	t.Run("terminal statuses read final", func(t *testing.T) {
-		for _, s := range []enums.WorkflowExecutionStatus{
-			enums.WORKFLOW_EXECUTION_STATUS_COMPLETED,
-			enums.WORKFLOW_EXECUTION_STATUS_FAILED,
-			enums.WORKFLOW_EXECUTION_STATUS_CANCELED,
-			enums.WORKFLOW_EXECUTION_STATUS_TERMINATED,
-			enums.WORKFLOW_EXECUTION_STATUS_TIMED_OUT,
-		} {
-			want := "temporal state " + s.String() + ": run not running — this dump is final"
-			if got := cotTailState(&fakeTailClient{resp: preflightDescribe(s, "")}, "wf-tail"); got != want {
-				t.Errorf("cotTailState(%s) = %q, want %q", s, got, want)
-			}
-		}
-	})
-
-	t.Run("a describe failure degrades to unknown", func(t *testing.T) {
-		got := cotTailState(&fakeTailClient{describeEr: errors.New("dial failed")}, "wf-tail")
-		want := "temporal state unknown (describe failed: dial failed)"
-		if got != want {
-			t.Errorf("cotTailState(describe error) = %q, want %q", got, want)
-		}
-	})
 }
 
 // TestLogTail pins the tail block's identity fields: the arrival stamp is
@@ -1516,9 +1446,12 @@ func TestTranscriptCoT(t *testing.T) {
 // to unknown — and the client-backed subtests pin what a live describe
 // adds.
 func TestLiveCotSection(t *testing.T) {
-	// The live section consults all four sources through newestTranscript;
-	// codex and opencode stay inert here — this test pins the file-based
-	// faces only.
+	// The live face has two shapes: the contentless one-line in-flight
+	// status — agent-agnostic, every round whose CoT is not followable yet
+	// renders it — and the contentful section for a claude/pi round whose
+	// transcript holds assistant output. newestTranscript consults all four
+	// sources; codex and opencode stay inert here — this test pins the
+	// file-based faces only.
 	fakeSessionSources(t, noCodexRollout, noOpencodeUpdate)
 	fakeDirs := func(t *testing.T, claudeDir, piDir string, claudeErr, piErr error) {
 		t.Helper()
@@ -1571,41 +1504,59 @@ func TestLiveCotSection(t *testing.T) {
 		}
 	})
 
-	t.Run("non-transcript agent gets the one-line note", func(t *testing.T) {
+	// The contentless face is ONE line, agent-agnostic — no placeholder
+	// block, no header: plumbing reading as garbage under a CoT-only
+	// contract. It keeps the one signal the old block carried (a round is
+	// mid-flight, so the finished capture above is stale), anchored on the
+	// round's start stamp the task-log scan already parses.
+	t.Run("non-transcript agent gets the one-line status", func(t *testing.T) {
 		useTaskLogDir(t)
 		writeTaskLogFile(t, "wf-live-aider", startedLine("aider", "dev"))
 		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
 
-		want := "=== in-flight round (stage=dev, live) ===\n" +
-			"aider keeps no host transcript; CoT appears here when the round completes\n\n"
+		want := "round in flight (stage=dev) since 2026-09-25T10:00:00Z — CoT appears here when the round completes\n"
 		if got := liveCotSectionWith("wf-live-aider", nil); got != want {
 			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
-	t.Run("codex round notes the unread rollout transcript", func(t *testing.T) {
+	t.Run("codex round gets the same one-line status", func(t *testing.T) {
 		useTaskLogDir(t)
 		writeTaskLogFile(t, "wf-live-codex", startedLine("codex", "dev"))
 		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
 
-		// codex does keep a host transcript (its rollout tree), so the
-		// no-transcript note would be false for it — its own note says the
-		// live view does not read it.
-		want := "=== in-flight round (stage=dev, live) ===\n" +
-			"codex keeps a host transcript the live view does not read; CoT appears here when the round completes\n\n"
+		// codex does keep a host transcript (its rollout tree, unread), but
+		// the status claims nothing about transcripts — the same line every
+		// not-yet-followable round renders.
+		want := "round in flight (stage=dev) since 2026-09-25T10:00:00Z — CoT appears here when the round completes\n"
 		if got := liveCotSectionWith("wf-live-codex", nil); got != want {
 			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
-	t.Run("an empty stage reads as unknown in the header", func(t *testing.T) {
+	t.Run("an empty stage reads as unknown in the status line", func(t *testing.T) {
 		useTaskLogDir(t)
 		writeTaskLogFile(t, "wf-live-unknown", startedLine("aider", ""))
 		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
 
-		out := liveCotSectionWith("wf-live-unknown", nil)
-		if !strings.HasPrefix(out, "=== in-flight round (stage=unknown, live) ===\n") {
-			t.Errorf("liveCotSectionWith = %q, want the unknown-stage header", out)
+		want := "round in flight (stage=unknown) since 2026-09-25T10:00:00Z — CoT appears here when the round completes\n"
+		if got := liveCotSectionWith("wf-live-unknown", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a start stamp the parser cannot read degrades to unknown start", func(t *testing.T) {
+		useTaskLogDir(t)
+		// lastRoundState counts the round running off the header grammar
+		// alone — the stamp's parseability is lastRoundStart's business, and
+		// its failure degrades the anchor rather than fabricating an age.
+		writeTaskLogFile(t, "wf-live-nostamp",
+			"=== not-a-stamp jailed claude round started: stage=dev worktree=/wt pgid=1 (run abcd1234) ===")
+		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
+
+		want := "round in flight (stage=dev) since unknown start — CoT appears here when the round completes\n"
+		if got := liveCotSectionWith("wf-live-nostamp", nil); got != want {
+			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
@@ -1647,18 +1598,18 @@ func TestLiveCotSection(t *testing.T) {
 		}
 	})
 
-	t.Run("running with no transcript yet degrades to one line", func(t *testing.T) {
+	t.Run("running with no transcript yet degrades to the status line", func(t *testing.T) {
 		useTaskLogDir(t)
 		writeTaskLogFile(t, "wf-live-notyet", startedLine("claude", "dev"))
 		fakeDirs(t, t.TempDir(), t.TempDir(), nil, nil)
 
-		want := "=== in-flight round (stage=dev, live) ===\nno transcript yet — no assistant output has landed\n\n"
+		want := "round in flight (stage=dev) since 2026-09-25T10:00:00Z — CoT appears here when the round completes\n"
 		if got := liveCotSectionWith("wf-live-notyet", nil); got != want {
 			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
-	t.Run("a transcript without assistant output says so", func(t *testing.T) {
+	t.Run("a transcript without assistant output is the status line too", func(t *testing.T) {
 		useTaskLogDir(t)
 		writeTaskLogFile(t, "wf-live-empty", startedLine("claude", "dev"))
 		claudeDir := t.TempDir()
@@ -1666,24 +1617,23 @@ func TestLiveCotSection(t *testing.T) {
 		if err := os.WriteFile(path, []byte(`{"type":"user","message":{"content":"the prompt"}}`+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// A transcript on disk with no assistant output yet is still in
-		// hand — the stamped header renders with its mtime, only the
-		// body degrades.
+		// A transcript on disk with no assistant output in it yet is not a
+		// contentful face: no stamped header, no mtime — the one-line
+		// status is all a dump mid-first-round shows.
 		mtime := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
 		if err := os.Chtimes(path, mtime, mtime); err != nil {
 			t.Fatal(err)
 		}
 		fakeDirs(t, claudeDir, t.TempDir(), nil, nil)
 
-		want := "=== in-flight round (stage=dev, live, last write 2026-10-08T09:00:00Z|activity unknown) ===\n" +
-			"no assistant output in the transcript yet\n\n"
+		want := "round in flight (stage=dev) since 2026-09-25T10:00:00Z — CoT appears here when the round completes\n"
 		if got := liveCotSectionWith("wf-live-empty", nil); got != want {
 			t.Errorf("liveCotSectionWith = %q, want %q", got, want)
 		}
 	})
 
 	// The activity half comes off the live describe — the same
-	// empty-run-id call cotTailState makes — so these run through
+	// empty-run-id call the contentful face makes — so these run through
 	// liveCotSectionWith with the fake client. A failed describe or a
 	// run that never backfilled LastActivityAt degrades that half alone:
 	// the section still renders, on the last-write half's own stamp.

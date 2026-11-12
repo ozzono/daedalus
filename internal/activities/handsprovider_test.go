@@ -1096,3 +1096,34 @@ exit 1`)
 		}
 	})
 }
+
+// TestHandsRoundTransient409ReclassifiesToRescue pins the serving-stack
+// wedge at the round boundary: a hands round the harness declared terminal
+// — a 409 "busy; unload is pending" serving state, observed live to clear
+// minutes later — reclassifies retryable at this boundary and routes into
+// ErrAPIExhausted (the failover-and-heartbeat rescue), not the generic
+// failure path and not the no-delivery face.
+func TestHandsRoundTransient409ReclassifiesToRescue(t *testing.T) {
+	resetProviderState(t)
+	handsNoDeliveryRoundEnv(t)
+	wt := gitRepo(t)
+	newStubLog(t)
+	stubBin(t, "ai-jail", `printf '%s\n' \
+  '{"round_id":"r-1","seq":0,"kind":"started","payload":{"session":"conv-unload"}}' \
+  '{"round_id":"r-1","seq":1,"kind":"failed","payload":{"class":"terminal","reason":"409 Model glm-selfhost is busy; cannot start work while unload is pending (try again shortly)"}}'
+exit 1`)
+
+	_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
+		WorktreePath: wt,
+		Prompt:       "do things",
+	})
+	if !errors.Is(err, ErrAPIExhausted) {
+		t.Fatalf("error = %v, want ErrAPIExhausted — the transient serving state must reach the rescue, not park as a genuine failure", err)
+	}
+	if errors.Is(err, ErrAgentNoDelivery) || errors.Is(err, ErrAgentStuck) {
+		t.Errorf("error %v rides a round-level face, want the exhaustion route alone", err)
+	}
+	if !strings.Contains(err.Error(), "unload is pending") {
+		t.Errorf("error %q must keep the serving stack's reason for the heartbeat's diagnostics", err)
+	}
+}

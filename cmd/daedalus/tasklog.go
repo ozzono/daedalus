@@ -102,11 +102,12 @@ func plainTailState(log string) string {
 // the resolved config when one is found — an unloadable one fails like
 // every other client command — else the default, so the command works
 // wherever the Temporal service is reachable. When a round is in flight
-// right now, a live section rendered from the agent's host-side transcript
-// follows the finished ones (see liveCotSectionWith). The dump ends with a
-// log-tail block naming when the last log arrived and the workflow's real
-// Temporal state, so a finished run's output never reads as live (see
-// logTail).
+// right now, the live face follows the finished ones — a contentful live
+// section rendered from the agent's host-side transcript, or the one-line
+// in-flight status when the round's CoT is not followable yet (see
+// liveCotSectionWith). Nothing follows that: the dump carries no log-tail
+// footer — the newest material there is is the dump's last word, and the
+// plain `log` mode keeps the footer (see logTail).
 func runTaskLogCot(workflowID string, cotN int) {
 	host := config.DefaultTemporalHost
 	if path, err := resolveConfigPath(defaultConfigPath); err == nil {
@@ -164,10 +165,6 @@ func runTaskLogCot(workflowID string, cotN int) {
 	if len(sections) == 0 && live == "" {
 		exitf("no jailed agent rounds in %s's Temporal history — the run has not started any rounds yet, or predates structured round capture", workflowID)
 	}
-	// The tail rides only on the dump path: the zero-round error above
-	// already names that state ("not started"), and an error line plus a
-	// tail would say it twice.
-	fmt.Print(logTail(workflowID, cotTailState(c, workflowID)))
 }
 
 // cotSectionsWith walks each run's history like the usage report does: pair
@@ -593,41 +590,16 @@ func claudeTranscriptCoT(worktree, sessionID string) string {
 	return cot
 }
 
-// cotTailState renders -cot's run-state clause from the workflow's live
-// Temporal status — the same empty-run-id Describe the dependency gate and
-// wakeup use, which for a continued session means the latest execution,
-// exactly what "is it still going" asks. Terminal statuses end the clause
-// with "this dump is final", so a finished run's -cot output never reads
-// as live; a describe failure degrades the clause rather than failing a
-// dump that already succeeded.
-func cotTailState(c client.Client, workflowID string) string {
-	resp, err := c.DescribeWorkflowExecution(context.Background(), workflowID, "")
-	if err != nil {
-		return fmt.Sprintf("temporal state unknown (describe failed: %v)", err)
-	}
-	s := resp.GetWorkflowExecutionInfo().GetStatus()
-	switch s {
-	case enums.WORKFLOW_EXECUTION_STATUS_RUNNING, enums.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
-		return fmt.Sprintf("temporal state %s: run still going — this dump is not final", s)
-	case enums.WORKFLOW_EXECUTION_STATUS_PAUSED:
-		// Paused is not terminal — an unpause resumes the run and more
-		// rounds arrive — so it must never read final. daedalus itself
-		// never pauses a workflow; only a manual temporal-CLI pause lands
-		// here (see backlog/bugs/log-tail-paused-state-final-clause.md).
-		return fmt.Sprintf("temporal state %s: run paused — this dump is not final; the run can resume", s)
-	default:
-		return fmt.Sprintf("temporal state %s: run not running — this dump is final", s)
-	}
-}
-
-// logTail renders the tail block appended to every log dump (plain and
-// -cot): one more === === line in the task log's own header style, naming
+// logTail renders the tail block appended to the plain log dump — the
+// `-cot` view ends at its newest section and carries no footer: one more
+// === === line in the task log's own header style, naming
 // when the last log material arrived and the run's state. The arrival
 // stamp is the task log file's mtime — the writer appends each block in a
 // single O_APPEND write, so mtime is the last arrival — and degrades to
-// "unknown" when the file is absent or unreadable: -cot works on hosts the
-// worker never touched, and a missing file must not fail a dump that
-// already rendered. A read/stat race with a concurrent block write shifts
+// "unknown" when the file is absent or unreadable: the plain dump runs on
+// hosts the worker never touched (the dash's plain task-log face appends
+// the same line), and a missing file must not fail a dump that already
+// rendered. A read/stat race with a concurrent block write shifts
 // the stamp by at most one block — this is an observability aid, not a
 // transaction. The line never enters the log file itself, so the file
 // parsers (lastRoundState and friends) never see it; even if one did, a
@@ -707,19 +679,27 @@ func inlineCoT(text string) string {
 // just-finished round's, and rendering it live would duplicate that
 // round's completed section and mislabel it.
 //
-// The header carries the section's own freshness stamp, so a mid-round
-// dump no longer reads as stale: `last write` is the transcript's mtime
-// — the liveness signal, what the agent last produced — and `activity`
-// the run's LastActivityAt search attribute off the live describe, the
-// same decode the runs table uses. touch() fires at round boundaries
-// only, so mid-round the activity value reads as round-start: it answers
-// "when did the workflow last change state", not "is anything moving
-// right now" — the two labels keep the halves apart. A describe failure,
-// an old run that never backfilled the attribute, or a nil client
-// degrades the activity half to "unknown", never a fabricated stamp and
-// never a failed dump. The early returns before a transcript is in hand
-// (codex's note, the no-host-transcript note, no transcript yet) have no
-// mtime to show and keep the bare header.
+// A round whose CoT the live view cannot follow yet — codex's unread
+// rollout, a harness keeping no transcript the view reads (aider,
+// opencode, hands), or a claude/pi transcript with no assistant output in
+// it yet — renders as ONE status line, never a placeholder block: the
+// block's only content was the no-transcript note, plumbing reading as
+// garbage under a CoT-only contract. The line keeps the one signal the
+// block carried — the finished capture above is stale because a round is
+// mid-flight — anchored on the round's start stamp, which the task-log
+// scan already in hand parses (lastRoundStart); no new temporal calls.
+//
+// The contentful section's header carries its own freshness stamp, so a
+// mid-round dump no longer reads as stale: `last write` is the
+// transcript's mtime — the liveness signal, what the agent last produced
+// — and `activity` the run's LastActivityAt search attribute off the live
+// describe, the same decode the runs table uses. touch() fires at round
+// boundaries only, so mid-round the activity value reads as round-start:
+// it answers "when did the workflow last change state", not "is anything
+// moving right now" — the two labels keep the halves apart. A describe
+// failure, an old run that never backfilled the attribute, or a nil
+// client degrades the activity half to "unknown", never a fabricated
+// stamp and never a failed dump.
 func liveCotSectionWith(workflowID string, c client.Client) string {
 	path, err := activities.TaskLogPath(workflowID)
 	if err != nil {
@@ -729,42 +709,38 @@ func liveCotSectionWith(workflowID string, c client.Client) string {
 	if err != nil {
 		return "" // no log, no round in flight
 	}
-	name, stage, worktree, running := lastRoundState(string(data))
+	log := string(data)
+	name, stage, worktree, running := lastRoundState(log)
 	if !running {
 		return ""
 	}
 	if stage == "" {
 		stage = "unknown"
 	}
-	var b strings.Builder
-	bare := fmt.Sprintf("=== in-flight round (stage=%s, live) ===\n", stage)
-	if name == "codex" {
-		// codex keeps a rollout transcript the live view does not follow
-		// yet — say so rather than reuse the "keeps no host transcript"
-		// note below, which is false for codex.
-		b.WriteString(bare)
-		fmt.Fprintf(&b, "%s keeps a host transcript the live view does not read; CoT appears here when the round completes\n", name)
-		return b.String() + "\n"
+	// The one-line in-flight status: the contentless face every
+	// no-CoT-yet round renders, agent-agnostic — it claims nothing about
+	// transcripts, which is what lets codex (rollout unread) and the
+	// no-host-transcript harnesses share it.
+	status := func() string {
+		since := "unknown start"
+		if start := lastRoundStart(log); !start.IsZero() {
+			since = start.UTC().Format(time.RFC3339)
+		}
+		return fmt.Sprintf("round in flight (stage=%s) since %s — CoT appears here when the round completes\n", stage, since)
 	}
 	if name != "claude" && name != "pi" {
-		// aider and opencode keep no host transcript the live view
-		// follows — opencode's session database exists, the live view just
-		// does not read it; never silence, never a guess.
-		b.WriteString(bare)
-		fmt.Fprintf(&b, "%s keeps no host transcript; CoT appears here when the round completes\n", name)
-		return b.String() + "\n"
+		return status()
 	}
 	tpath, _, tmod, ok, err := newestTranscript(worktree)
 	if err != nil || !ok {
-		b.WriteString(bare)
-		b.WriteString("no transcript yet — no assistant output has landed\n")
-		return b.String() + "\n"
+		return status()
 	}
+	var b strings.Builder
 	activity := "unknown"
 	if c != nil {
 		if resp, derr := c.DescribeWorkflowExecution(context.Background(), workflowID, ""); derr == nil {
-			// Same decode the runs table uses; the describe is the
-			// empty-run-id latest-execution one cotTailState already makes.
+			// Same decode the runs table uses, off the same empty-run-id
+			// latest-execution describe.
 			if vis := decodeRunVisibility(resp.GetWorkflowExecutionInfo().GetSearchAttributes(), converter.GetDefaultDataConverter()); !vis.LastAt.IsZero() {
 				activity = vis.LastAt.UTC().Format(time.RFC3339)
 			}
@@ -780,8 +756,7 @@ func liveCotSectionWith(workflowID string, c client.Client) string {
 	// is a maintainer decision, out of scope here.
 	cot, found := transcriptCoT(tpath, name)
 	if !found {
-		b.WriteString("no assistant output in the transcript yet\n")
-		return b.String() + "\n"
+		return status()
 	}
 	b.WriteString(cot)
 	return b.String() + "\n"

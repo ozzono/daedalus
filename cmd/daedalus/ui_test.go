@@ -751,6 +751,75 @@ func TestUIRunsViewFilters(t *testing.T) {
 	}
 }
 
+// TestUIRunsFeedActivityCellSources pins the feed's Activity cell per row
+// state: a running row reads the run's newest provider-call stamp off the
+// relay ledger (touch() upserts LastActivityAt at state boundaries only, so
+// mid-round the attribute answers "when did the workflow last change
+// state", not "is anything moving right now"); the boundary window runs
+// the other way — at a state boundary the attribute is the fresh stamp
+// while the ledger's newest entry is the previous round's last call, so a
+// fresher attribute beats a present ledger and the cell never regresses
+// across a poll; a running row the ledger holds nothing for degrades to
+// the attribute; and a closed row always reads its close time — the
+// ledger's fresher stamps are finished work, not live activity.
+func TestUIRunsFeedActivityCellSources(t *testing.T) {
+	h := newUIHarness(t)
+	dc := converter.GetDefaultDataConverter()
+	attrs := func(at time.Time) *commonpb.SearchAttributes {
+		t.Helper()
+		payload, err := dc.ToPayload(at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
+			"LastActivityAt": payload,
+		}}
+	}
+	started := time.Now().Add(-4 * time.Hour)
+	closed := time.Now().Add(-30 * time.Minute)
+	liveRow := uiRow(t, "listq-led", "run-led", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started, nil)
+	liveRow.SearchAttributes = attrs(time.Now().Add(-3 * time.Hour))
+	attrRow := uiRow(t, "listq-attr", "run-attr", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started.Add(time.Minute), nil)
+	attrRow.SearchAttributes = attrs(time.Now().Add(-3 * time.Hour))
+	staleRow := uiRow(t, "listq-stale", "run-stale", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, started.Add(3*time.Minute), nil)
+	staleRow.SearchAttributes = attrs(time.Now().Add(-8 * time.Minute))
+	doneRow := uiRow(t, "listq-done", "run-done", enums.WORKFLOW_EXECUTION_STATUS_COMPLETED, workflows.StatusApproved, started.Add(2*time.Minute), &closed)
+	doneRow.SearchAttributes = attrs(time.Now().Add(-3 * time.Hour))
+	h.fake.rows = []*workflowpb.WorkflowExecutionInfo{liveRow, attrRow, staleRow, doneRow}
+
+	seedLedger(h, []metricsrelay.Entry{
+		// The running row's freshest provider call: 2m ago beats the
+		// attribute's 3h-old stamp.
+		{At: time.Now().Add(-2 * time.Minute), Task: "listq-led", Worker: "w", Model: "mA", InputTokens: 10, Status: 200},
+		// The boundary window: this run's ledger entry is present but stale
+		// (47m ago, the previous round's last call) against a fresh
+		// attribute (8m ago, the boundary's upsert) — the attribute wins.
+		{At: time.Now().Add(-47 * time.Minute), Task: "listq-stale", Worker: "w", Model: "mA", InputTokens: 10, Status: 200},
+		// A finished run's fresher stamp must not read as activity.
+		{At: time.Now().Add(-time.Minute), Task: "listq-done", Worker: "w", Model: "mA", InputTokens: 10, Status: 200},
+	})
+
+	out := h.get(t, "/runs/rows")
+	cell := func(face string) string {
+		return `data-th="Last interaction">` + face + `</td>`
+	}
+	for _, want := range []string{
+		cell("2m ago"),  // running, ledger entry newest
+		cell("8m ago"),  // running, attribute fresher than the present ledger
+		cell("3h ago"),  // running, no ledger entry: the attribute's degrade
+		cell("30m ago"), // closed: the close time, ledger ignored
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the Activity cell lacks %q:\n%s", want, out)
+		}
+	}
+	// The regression this row exists for: dropping the newer-of-two fold
+	// would let the stale ledger entry drag the cell back to 47m ago.
+	if strings.Contains(out, cell("47m ago")) {
+		t.Errorf("a fresher attribute must beat the run's own stale ledger entry:\n%s", out)
+	}
+}
+
 // TestUIDashMobileRowCards pins the dash tables' mobile re-flow markup:
 // converted tables carry the mtable hook and render their rows as mcards
 // whose cells self-label through data-th with the desktop column's name —
@@ -1314,11 +1383,15 @@ func TestUIRunDetailCauseCard(t *testing.T) {
 // newest finished section — the killed round's degraded one, not the
 // completed predecessor before it — is what opens, and the in-flight face
 // stays out (a dead round is not in flight).
-func TestUIRunCotBoxTailsTheKilledRound(t *testing.T) {
+// TestUIRunCotBoxMatchesTheCLIWalk pins the box's idle face on CLI parity:
+// every finished section of every execution renders, oldest first — the
+// killed round included, its predecessors above it, never a tail that
+// hides them — with the live face following when a round is in flight.
+func TestUIRunCotBoxMatchesTheCLIWalk(t *testing.T) {
 	h := newUIHarness(t)
-	// The box probes the live section first — the probe reads the task log —
-	// so the log dir moves aside: no wf-kill log exists there, the probe
-	// answers no round in flight, and the pinned tail-1 walk is what serves.
+	// The live face reads the task log, so the log dir moves aside: no
+	// wf-kill log exists there, the probe answers no round in flight, and
+	// the walk's sections are all there is.
 	useTaskLogDir(t)
 	dc := converter.GetDefaultDataConverter()
 	started := time.Now().Add(-time.Hour)
@@ -1337,6 +1410,8 @@ func TestUIRunCotBoxTailsTheKilledRound(t *testing.T) {
 
 	out := h.get(t, "/runs/wf-kill/cot")
 	for _, want := range []string{
+		"=== round 1: dev (run run-kill) @",
+		"predecessor reasoning",
 		"=== round 2: dev (run run-kill) @",
 		"round cancelled",
 		"no CoT captured for this round",
@@ -1345,21 +1420,27 @@ func TestUIRunCotBoxTailsTheKilledRound(t *testing.T) {
 			t.Errorf("the CoT box lacks %q:\n%s", want, out)
 		}
 	}
-	for _, absent := range []string{"=== round 1:", "predecessor reasoning", "in-flight round"} {
+	// CLI order: the killed round's section follows its predecessor's.
+	if i, j := strings.Index(out, "round 1:"), strings.Index(out, "round 2:"); i > j {
+		t.Errorf("the CoT box ordered the newer section first:\n%s", out)
+	}
+	for _, absent := range []string{"in-flight round", "round in flight"} {
 		if strings.Contains(out, absent) {
-			t.Errorf("the CoT box must tail one section — the killed round's — not %q:\n%s", absent, out)
+			t.Errorf("an idle run's box must carry no live face (%q present):\n%s", absent, out)
 		}
 	}
 }
 
 // TestUIRunCotBoxPollArm pins the box's own poll as the responses arm and
-// disarm it. A round in flight wins the box over every finished section and
-// arms the poll (live-first); a caught-up idle face stays fetch-once; the
-// exactly-one-round-behind walk — a round whose task-log line landed while
-// its history event had not — arms the poll on the body face, and the same
-// lag shape on an empty history arms it on the placeholder; a wider mismatch
-// and a visibility miss are permanent degradations whose faces stay
-// fetch-once, arming there would re-walk forever.
+// disarm it. A round in flight follows the finished sections and arms the
+// poll (the live face is the stream's tail); a contentless live status
+// never empties the box and arms it too; a caught-up idle face stays
+// fetch-once; the exactly-one-round-behind walk — a round whose task-log
+// line landed while its history event had not — arms the poll on the body
+// face, and the same lag shape on an empty history arms it on the
+// placeholder; a wider mismatch and a visibility miss are permanent
+// degradations whose faces stay fetch-once, arming there would re-walk
+// forever.
 func TestUIRunCotBoxPollArm(t *testing.T) {
 	startedLine := func(ts, worktree string) string {
 		return "=== " + ts + " jailed claude round started: stage=dev worktree=" + worktree +
@@ -1372,13 +1453,13 @@ func TestUIRunCotBoxPollArm(t *testing.T) {
 		return `hx-get="/runs/` + id + `/cot" hx-trigger="every 5s [!document.hidden]" hx-swap="outerHTML"`
 	}
 
-	t.Run("a round in flight wins the box and arms the poll", func(t *testing.T) {
+	t.Run("a round in flight follows the finished sections and arms the poll", func(t *testing.T) {
 		h := newUIHarness(t)
 		useTaskLogDir(t)
 		dc := converter.GetDefaultDataConverter()
 		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
-		// A finished round in history — the walk's tail would render it, so
-		// its absence from the box is what shows live-first winning.
+		// A finished round in history — the walk renders it above the live
+		// face, the same CLI order a `log -cot` dump prints.
 		h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
 			uiRow(t, "wf-live", "run-live", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, at, nil),
 		}
@@ -1411,6 +1492,8 @@ func TestUIRunCotBoxPollArm(t *testing.T) {
 			// The wrapper div carries the poll; outerHTML keeps the arm
 			// self-replacing until a response retires it.
 			`<div ` + pollAttrs("wf-live") + `>`,
+			"=== round 1: dev (run run-live) @",
+			"finished reasoning",
 			"=== in-flight round (stage=dev, live, last write " + at.UTC().Format(time.RFC3339),
 			"live reasoning",
 		} {
@@ -1418,10 +1501,50 @@ func TestUIRunCotBoxPollArm(t *testing.T) {
 				t.Errorf("the live box lacks %q:\n%s", want, out)
 			}
 		}
-		for _, absent := range []string{"=== round 1:", "finished reasoning"} {
-			if strings.Contains(out, absent) {
-				t.Errorf("a round in flight must win the box over the finished tail (%q present):\n%s", absent, out)
+		// CLI order: the finished section rides above the live face.
+		if i, j := strings.Index(out, "round 1:"), strings.Index(out, "in-flight round"); i > j {
+			t.Errorf("the live face must follow the finished sections:\n%s", out)
+		}
+	})
+
+	t.Run("a contentless live status never empties the box", func(t *testing.T) {
+		h := newUIHarness(t)
+		useTaskLogDir(t)
+		at := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+		h.fake.rows = []*workflowpb.WorkflowExecutionInfo{
+			uiRow(t, "wf-first", "run-first", enums.WORKFLOW_EXECUTION_STATUS_RUNNING, workflows.StatusRunning, at, nil),
+		}
+		// A first round in flight: no finished section in history, an
+		// unpaired started block in the log, and no transcript the view
+		// reads yet — the one-line status is the whole stream.
+		h.fake.wfHistory["run-first"] = []*historypb.HistoryEvent{
+			uiStartedEvent(t, workflows.PipelineInput{IssueID: "42", RepoPath: "/repo/alpha"}),
+		}
+		wt := t.TempDir()
+		writeTaskLogFile(t, "wf-first", startedLine(at.Format(time.RFC3339), wt))
+		claudeDir := t.TempDir()
+		resetC := claudeProjectsDir
+		t.Cleanup(func() { claudeProjectsDir = resetC })
+		claudeProjectsDir = func(string) (string, error) { return claudeDir, nil }
+		resetP := piSessionsDir
+		t.Cleanup(func() { piSessionsDir = resetP })
+		piSessionsDir = func(string) (string, error) { return t.TempDir(), nil }
+		fakeSessionSources(t, noCodexRollout, noOpencodeUpdate)
+
+		out := h.get(t, "/runs/wf-first/cot")
+		for _, want := range []string{
+			`<div ` + pollAttrs("wf-first") + `>`,
+			"round in flight (stage=dev) since " + at.UTC().Format(time.RFC3339),
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the first-round box lacks %q:\n%s", want, out)
 			}
+		}
+		// The single-line stream renders as the body — the placeholder must
+		// never trip under a live status, or a first round would read as no
+		// rounds at all.
+		if strings.Contains(out, "No jailed agent rounds in this run's history yet.") {
+			t.Errorf("the live status emptied the box onto the placeholder:\n%s", out)
 		}
 	})
 
