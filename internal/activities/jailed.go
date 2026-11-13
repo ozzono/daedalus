@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/log"
 
 	"github.com/ozzono/daedalus/internal/config"
@@ -476,6 +477,70 @@ func heartbeatLoop(ctx context.Context, done <-chan struct{}) {
 				defer func() { recover() }()
 				activity.RecordHeartbeat(ctx)
 			}()
+		}
+	}
+}
+
+// cotProgressInterval is how often a jailed claude/pi/codex round polls its
+// transcript mtimes for CoT output, mirroring heartbeatInterval's cadence.
+// A var (not a const) so tests can shorten it.
+var cotProgressInterval = 30 * time.Second
+
+// CotProgressSignal is the signal a jailed claude/pi/codex round sends the
+// run workflow on each transcript advance: the workflow's receive loop
+// upserts LastActivityAt with the RFC3339 mtime the payload carries, so the
+// column tracks the round's CoT output mid-round, not only at round
+// boundaries (workflow-side touch()).
+const CotProgressSignal = "cot-progress"
+
+// cotProgressClient is the worker's Temporal client, installed once before
+// activity registration (SetCotProgressClient) — the same single-dial shape
+// the dependency probe closes over. Nil (unit tests invoke the round runner
+// directly) degrades the loop to a no-op.
+var cotProgressClient client.Client
+
+// SetCotProgressClient installs the worker's Temporal client for the
+// cot-progress signal, ahead of activity registration.
+func SetCotProgressClient(c client.Client) { cotProgressClient = c }
+
+// cotProgressLoop advances the run workflow's LastActivityAt as this round's
+// transcript advances: every cotProgressInterval it stats the worktree's
+// newest claude/pi/codex transcript mtime and, when it moved past the
+// baseline, signals the workflow with the RFC3339 mtime as payload — one
+// signal per advance, so bursts between two ticks land as a single stamp.
+// Baseline-first: the first read never signals, so a previous round's stale
+// transcript cannot pull the attribute backward below the round-start stamp.
+// A failed send is logged and the loop carries on — a lost progress stamp
+// degrades column freshness, never the round — and outside a real activity
+// context the workflow identity lookup recovers the SDK panic into a no-op
+// send. Like heartbeatLoop, the loop exits when done closes or ctx ends.
+func cotProgressLoop(ctx context.Context, worktree string, done <-chan struct{}) {
+	logger := activityLogger(ctx)
+	ticker := time.NewTicker(cotProgressInterval)
+	defer ticker.Stop()
+	baseline, _ := NewestTranscriptMtime(worktree)
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			mt, ok := NewestTranscriptMtime(worktree)
+			if !ok || !mt.After(baseline) {
+				continue
+			}
+			baseline = mt
+			if cotProgressClient == nil {
+				continue
+			}
+			workflowID, runID := taskLogIdentity(ctx)
+			if workflowID == "" {
+				continue
+			}
+			if err := cotProgressClient.SignalWorkflow(ctx, workflowID, runID, CotProgressSignal, mt.Format(time.RFC3339)); err != nil {
+				logger.Warn("cot-progress signal failed; LastActivityAt freshness degrades", "Error", err)
+			}
 		}
 	}
 }
@@ -1061,6 +1126,13 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	hbDone := make(chan struct{})
 	defer close(hbDone)
 	go heartbeatLoop(ctx, hbDone)
+	// claude, pi, and codex write host-side transcripts the run's
+	// LastActivityAt column follows mid-round (see cotProgressLoop); aider,
+	// opencode, and hands keep nothing stat-able and leave the boundary
+	// stamps. Shares hbDone so the loop dies with the round.
+	if selected == "claude" || selected == "pi" || selected == "codex" {
+		go cotProgressLoop(ctx, worktreePath, hbDone)
+	}
 	wait := time.NewTimer(slotWaitTimeout)
 	defer wait.Stop()
 	agentWaiters.Add(1)

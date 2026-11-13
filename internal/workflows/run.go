@@ -393,6 +393,32 @@ func startRun(ctx workflow.Context, input PipelineInput) (*pipelineRun, func(), 
 	// Evaluated pre-await like the four gates above — see
 	// pipelineRun.jailedActivity for the replay contract.
 	r.jailedActivity = jailedAgentActivity(ctx)
+	// Mid-round liveness: a jailed claude/pi/codex round signals
+	// cot-progress as its transcript advances, and this receive loop — a
+	// workflow goroutine the SDK dispatches while the main goroutine is
+	// parked in the round activity — upserts LastActivityAt with the
+	// signaled stamp, so the column moves with the round's CoT output and
+	// not only at the round boundaries touch() stamps. Replay-safe: the
+	// signal rides history, so the upsert re-executes with the same value;
+	// an unparseable payload degrades to workflow.Now. Without the
+	// visibility marker the loop never arms — unreceived signals merely
+	// buffer.
+	if r.vis {
+		cotCh := workflow.GetSignalChannel(ctx, activities.CotProgressSignal)
+		workflow.Go(ctx, func(ctx workflow.Context) {
+			for {
+				var stamp string
+				if !cotCh.Receive(ctx, &stamp) {
+					return
+				}
+				at, err := time.Parse(time.RFC3339, stamp)
+				if err != nil {
+					at = workflow.Now(ctx)
+				}
+				workflow.UpsertSearchAttributes(ctx, map[string]interface{}{LastActivityAttr: at})
+			}
+		})
+	}
 	if input.DependsOn != "" {
 		if err := r.awaitDependency(); err != nil {
 			return nil, nil, err
@@ -522,7 +548,10 @@ func (r *pipelineRun) setStatus(s RunStatus) {
 }
 
 // touch stamps the LastActivityAt visibility attribute at each completed
-// round; a no-op without the version marker (see r.vis).
+// round; a no-op without the version marker (see r.vis). Mid-round the
+// column also advances on its own — startRun's cot-progress receive loop
+// upserts the in-flight round's transcript stamps — so touch() owns the
+// boundaries, not the whole column.
 func (r *pipelineRun) touch() {
 	if !r.vis {
 		return

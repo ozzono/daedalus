@@ -706,13 +706,14 @@ func inlineCoT(text string) string {
 // mid-round dump no longer reads as stale: `last write` is the
 // transcript's mtime — the liveness signal, what the agent last produced
 // — and `activity` the run's LastActivityAt search attribute off the live
-// describe, the same decode the runs table uses. touch() fires at round
-// boundaries only, so mid-round the activity value reads as round-start:
-// it answers "when did the workflow last change state", not "is anything
-// moving right now" — the two labels keep the halves apart. A describe
-// failure, an old run that never backfilled the attribute, or a nil
-// client degrades the activity half to "unknown", never a fabricated
-// stamp and never a failed dump.
+// describe, the same decode the runs table uses. A claude/pi round now
+// advances the attribute mid-round itself (cot-progress stamps on
+// transcript writes, at most one poll interval behind last write), so
+// both labels move with the round; they keep their halves apart as
+// transcript-write vs workflow-attribute. A describe failure, an old run
+// that never backfilled the attribute, or a nil client degrades the
+// activity half to "unknown", never a fabricated stamp and never a
+// failed dump.
 func liveCotSectionWith(workflowID string, c client.Client) string {
 	path, err := activities.TaskLogPath(workflowID)
 	if err != nil {

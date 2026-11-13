@@ -330,8 +330,10 @@ func IsParkedResult(result string) bool { return strings.HasPrefix(result, Parke
 // The run-visibility search attributes the pipeline upserts (registered on
 // the namespace by `make custom-columns`): DaedalusStatus distinguishes a
 // parked run from an approved one — both are Completed in ExecutionStatus —
-// and waiting from running, while LastActivityAt carries the last completed
-// round's time, the liveness signal a quota-heartbeat sleep lacks.
+// and waiting from running, while LastActivityAt carries the run's last
+// output time — the completed round's boundary stamp, advanced mid-round by
+// the in-flight jailed round's transcript writes (claude/pi/codex
+// cot-progress signals) — the liveness signal a quota-heartbeat sleep lacks.
 // DaedalusDependsOn names a dependent run's dependency workflow id, upserted
 // once when the dependency gate engages. DaedalusStartedAt is the run's
 // first moment of real work — the gate's release on an approved dependency —

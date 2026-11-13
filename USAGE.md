@@ -14,9 +14,9 @@ the help text are kept in agreement.
 | `continue` | `<workflow-id> "<prompt>"` | `-d` | Resume a closed, failed, or parked session |
 | `guide` | `<workflow-id> "<message>"` | — | Send operator instructions to a running pipeline |
 | `attach` | `<workflow-id>` | — | Reconnect to an in-flight or completed pipeline |
-| `list` | `[max]` | — | Display past and current sessions on the task queue |
-| `log` | `<workflow-id>` | `--status -cot -cot-n` | Show a session's captured task log (raw, status brief, or chain-of-thought) |
-| `wipe` | `<workflow-id>` | `--yes` | Erase a session's disk work entirely (worktree, branches, logs) |
+| `list` | `[max]` | — | Display past and current sessions on the task queue (newest first; `max` defaults to 10) |
+| `log` | `<workflow-id>` | `--status -cot -cot-n` | Show a session's captured task log (raw, status brief, or chain-of-thought — raw and `--status` read the task log file by name alone, no config and no Temporal; `-cot` dials Temporal at the resolved config's host) |
+| `wipe` | `<workflow-id>` | `--yes` | Stop the run if it is still executing, then erase everything daedalus put on disk for it (worktree, branches, session record, task log) |
 | `worker start` | — | `-c -t` | Run the worker daemon detached (the default worker action) |
 | `worker stop` | — | `-c` | Drain the daemon gracefully (SIGTERM) |
 | `worker status` | — | — | List every worker on record (plus live strays) with live probes; the stuck-work recapture point |
@@ -31,10 +31,10 @@ the help text are kept in agreement.
 | `metrics restart` | — | `-c` | Stop + start the daemon with the config re-read from disk |
 | `metrics list` | — | `--worker --page --json` | Query the live usage ledger, newest first |
 | `metrics foreground` | — | `-c` | Run the metrics daemon attached to this terminal |
-| `init` | `[prompt] [slim]` | — | Generate a fully commented `config-example.yaml` |
-| `config` | — | — | Print the active configuration (resolved path + every field) |
+| `init` | `[prompt] [slim]` | — | Generate a fully commented `config-example.yaml` — see command notes below for the profile arguments |
+| `config` | — | — | Print the active configuration (resolved path + every field, the file's pre-defaults view: set values verbatim, absent ones empty) |
 | `version` | — | — | Print the version and exit |
-| `completion` | `bash\|zsh` | — | Print the tab-completion script (eval into your shell rc) |
+| `completion` | `bash\|zsh` | — | Print the tab-completion script (eval into your shell rc) — it calls the hidden `__complete` probe, so it self-updates with the binary, and daedalus writes no files of its own |
 
 Global flags: `-c/--config <path>`, `-v/--version`, `-h/--help`. `-c` is
 accepted by every command except `log`, the record-driven worker commands
@@ -63,6 +63,30 @@ Flag reference:
 | `--yes` | `wipe` | Skip the interactive confirmation (scripted use) |
 | `--json` / `--table` | `worker report`, `metrics list` | JSON vs table output (table is the default; `--table` is accepted for explicitness) |
 | `--worker <name>` / `--page <n>` | `metrics list` | Filter the ledger page to one worker / pick the page (50 entries per page, newest first) |
+
+Command notes the table compresses:
+
+- **`dash` is the metrics commands' current spelling.** Every `metrics`
+  row above is also spelled `dash start|stop|restart|status|list|foreground`
+  — `metrics …` is the kept pre-`dash` alias for the same actions. The
+  record-driven ones (`dash status`, `dash stop`, `dash list`) read the
+  daemon's recorded files alone, no config, like their `metrics`
+  spellings.
+- **`init` profiles.** Bare `init` writes the full example and refuses to
+  overwrite an existing file. With profile arguments — `init slim`,
+  `init prompt`, or both — it *regenerates* `./config-example.yaml` as the
+  base configuration plus the requested feature's blocks (the one form
+  that overwrites: a profiled file is a sample of the example, not an
+  addition to whatever an earlier init left, and there is no merging
+  across invocations; unknown or repeated profiles are a usage error).
+  `init prompt <dir>` is the three-word form: instead of a profile, it
+  scaffolds a prompt-override directory at `<dir>` (sample prompts plus a
+  README) for the `prompt` config field to point at.
+- **`run -a` needs a live worker.** Append mode runs the same worker
+  preflight a fresh run does — the guidance signal is consumed by a
+  round's poller — so a `run -a` with no serving worker fails before the
+  signal is sent. The repo path check does not apply: an append targets
+  an already-running pipeline and never touches the repo.
 
 1. **Install** the CLI:
 

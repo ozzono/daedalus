@@ -546,6 +546,12 @@ func runWorker(cfg config.Config, workerType string) error {
 	}
 	defer c.Close()
 
+	// The jailed rounds' cot-progress signals dial this same client — the
+	// single-dial shape the dependency probe shares. Installed once before
+	// any activity can register, so a mid-round transcript advance reaches
+	// the run workflow without a second dial.
+	activities.SetCotProgressClient(c)
+
 	// The worker registers its own search attributes before any poller
 	// comes up: the runs it is about to serve upsert them, and an
 	// unregistered attribute fails every workflow task with

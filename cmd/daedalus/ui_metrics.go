@@ -1100,12 +1100,12 @@ func ledgerTaskID(workflowID string) string {
 // for a run — every relayed provider completion lands as one entry
 // carrying the run's attribution (Task, the scrubbed workflow id) and a
 // timestamp, regardless of which agent ran the round, so it answers "is
-// anything moving right now" where LastActivityAt answers only "when did
-// the workflow last change state". Zero when entries holds nothing for
-// the run. The caller stamps the cell with the newer of this and the
-// attribute — the boundary upsert is fresher than the previous round's
-// last call until the new round's first completion lands — so neither
-// source alone can regress the cell.
+// anything moving right now" for the agents the LastActivityAt column
+// cannot follow mid-round (aider, opencode, and hands keep no transcript
+// for the cot-progress stamps; claude, pi, and codex advance the attribute
+// themselves). Zero when entries holds nothing for the run. The caller
+// still stamps the cell with the newer of this and the attribute, so
+// neither source alone can regress the cell.
 func newestLedgerAt(entries []metricsrelay.Entry, workflowID string) time.Time {
 	task := ledgerTaskID(workflowID)
 	var newest time.Time

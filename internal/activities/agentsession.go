@@ -815,6 +815,56 @@ func CodexNewestRollout(worktree string) (string, time.Time, bool) {
 	return best, bestT, true
 }
 
+// NewestTranscriptMtime returns the newest mtime the worktree's host-side
+// transcripts hold, across claude's project dir, pi's session dir, and
+// codex's rollout tree — the newest-wins scan, because no source is ever
+// cleaned and a previous round's stale file on one side must not shadow the
+// live writer's newer write. Aider and opencode keep no stat-able host
+// transcript, so they contribute nothing here. ok is false when no source
+// holds a transcript; unreadable sources just do not count.
+func NewestTranscriptMtime(worktree string) (time.Time, bool) {
+	var newest time.Time
+	found := false
+	consider := func(t time.Time, ok bool) {
+		if ok && (!found || t.After(newest)) {
+			newest, found = t, true
+		}
+	}
+	if dir, err := claudeProjectDir(worktree); err == nil {
+		consider(newestJSONLMtime(dir))
+	}
+	if dir, err := piSessionsDir(worktree); err == nil {
+		consider(newestJSONLMtime(dir))
+	}
+	_, t, ok := CodexNewestRollout(worktree)
+	consider(t, ok)
+	return newest, found
+}
+
+// newestJSONLMtime stats dir's *.jsonl transcripts and returns the newest
+// mtime; ok is false when the dir holds no transcripts or cannot be read.
+func newestJSONLMtime(dir string) (time.Time, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}, false
+	}
+	var newest time.Time
+	found := false
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if m := info.ModTime(); !found || m.After(newest) {
+			newest, found = m, true
+		}
+	}
+	return newest, found
+}
+
 // brokenResume reports whether err is consistent with the resumed
 // conversation itself being dead — the agent launched and exited with an
 // error of its own (a missing, pruned, or corrupt session chief among
