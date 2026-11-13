@@ -421,9 +421,10 @@ func TestLoadSlimSamplerKnobs(t *testing.T) {
 		t.Errorf("SamplerArgs(subset) = %v, want list order with the unset knobs absent", got)
 	}
 
-	// Nothing set renders nothing — the absent-means-defaults contract the
-	// exporter and the staging both ride. (Slim enabled needs its
-	// verdict_repair decision model, like every slim-enabled load here.)
+	// Nothing set renders nothing — SamplerArgs renders only what the
+	// section itself sets; the slim defaults arm in ResolvedSampler, not
+	// here. (Slim enabled needs its verdict_repair decision model, like
+	// every slim-enabled load here.)
 	cfg, err = Load(writeConfig(t, "slim:\n  enabled: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n"))
 	if err != nil {
 		t.Fatalf("Load(slim without knobs): %v", err)
@@ -515,6 +516,87 @@ func TestLoadSlimSamplerKnobs(t *testing.T) {
 	}
 	if got := reloaded.Slim.SamplerArgs(); !slices.Equal(got, []string{"temperature=0.7", "min_p=0.05"}) {
 		t.Errorf("SamplerArgs(render output) = %v, want the set knobs through the round-trip", got)
+	}
+}
+
+// TestSlimResolvedSampler pins the slim sampler resolution — the set the
+// worker installs at startup and the jailed-round builder stages as
+// `--sampler` flags: slim.enabled alone arms the four slim-default
+// anti-loop knobs, so a config naming no sampler field at all still
+// stages temperature=0.7, min_p=0.05, repetition_penalty=1.1, and
+// no_repeat_ngram_size=20 (in staging order); a set knob overrides its
+// default per knob with no opt-out; a knob with neither a default nor a
+// config value stays unset and stages no flag; and a disabled section
+// resolves to the zero value whatever its sampler fields say — a non-slim
+// worker stages nothing. Tokens are pinned through SamplerArgs verbatim:
+// that string list is exactly what the jailed-round builder renders one
+// `--sampler` flag apiece, so a drifted constant fails here before any
+// serving stack sees it.
+func TestSlimResolvedSampler(t *testing.T) {
+	// Acceptance case 1, loaded through the strict decode: a slim-enabled
+	// config with no sampler fields arms exactly the four defaults. (A
+	// slim-enabled load needs the verdict_repair decision model, like
+	// every slim-enabled load here.)
+	cfg, err := Load(writeConfig(t, "slim:\n  enabled: true\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n"))
+	if err != nil {
+		t.Fatalf("Load(slim without sampler fields): %v", err)
+	}
+	want := []string{
+		"temperature=0.7",
+		"min_p=0.05",
+		"repetition_penalty=1.1",
+		"no_repeat_ngram_size=20",
+	}
+	if got := cfg.Slim.ResolvedSampler().SamplerArgs(); !slices.Equal(got, want) {
+		t.Errorf("ResolvedSampler(no sampler fields).SamplerArgs() = %v, want the slim-default prevention set %v", got, want)
+	}
+
+	// Acceptance case 2: a set knob overrides its default per knob and a
+	// defaultless knob stages only when set — temperature drops to 0.6,
+	// the other three defaults stand, and xtc_probability joins.
+	cfg, err = Load(writeConfig(t, "slim:\n  enabled: true\n  temperature: 0.6\n  xtc_probability: 0.1\nverdict_repair:\n  url: http://127.0.0.1:11434/v1\n  model: qwen2.5-coder:3b\n"))
+	if err != nil {
+		t.Fatalf("Load(slim with override): %v", err)
+	}
+	want = []string{
+		"temperature=0.6",
+		"min_p=0.05",
+		"repetition_penalty=1.1",
+		"no_repeat_ngram_size=20",
+		"xtc_probability=0.1",
+	}
+	if got := cfg.Slim.ResolvedSampler().SamplerArgs(); !slices.Equal(got, want) {
+		t.Errorf("ResolvedSampler(override).SamplerArgs() = %v, want the override under the standing defaults %v", got, want)
+	}
+
+	// The defaultless knobs stay unsent: resolution fills only the four
+	// dials that have a default — top_p, seed, and xtc_threshold remain
+	// nil on the resolved set, out of the argv and out of the request body.
+	resolved := SlimConfig{Enabled: true}.ResolvedSampler()
+	if resolved.TopP != nil || resolved.Seed != nil || resolved.XTCThreshold != nil {
+		t.Errorf("resolved set filled a defaultless knob: top_p %v seed %v xtc_threshold %v, want them nil", resolved.TopP, resolved.Seed, resolved.XTCThreshold)
+	}
+
+	// Pointer semantics meet the defaults: an explicit 0 is an override
+	// (several dials turn off at 0), never the don't-send sentinel —
+	// resolution keeps it instead of filling the default over it.
+	zero := 0.0
+	got := SlimConfig{Enabled: true, Temperature: &zero}.ResolvedSampler().SamplerArgs()
+	if !slices.Equal(got, []string{
+		"temperature=0",
+		"min_p=0.05",
+		"repetition_penalty=1.1",
+		"no_repeat_ngram_size=20",
+	}) {
+		t.Errorf("ResolvedSampler(explicit 0) = %v, want the explicit 0 kept under the standing defaults", got)
+	}
+
+	// A disabled section resolves to the zero value whatever its sampler
+	// fields say — slim.enabled alone is the switch, so a non-slim worker
+	// installs nothing and stages no flags even with knobs configured.
+	temp := 0.9
+	if got := (SlimConfig{Temperature: &temp}).ResolvedSampler(); got != (SlimConfig{}) {
+		t.Errorf("ResolvedSampler(slim-disabled) = %+v, want the zero value — staging nothing", got)
 	}
 }
 
@@ -2080,7 +2162,7 @@ func TestProviderEnvVarsIncludesKnobExports(t *testing.T) {
 // detached daemon's inherited env at spawn forever (AllWorkerEnvVars →
 // envWithoutWorkerVars) although runWorker never re-exports it, silently
 // changing daemon behavior with every suite green. The list must equal
-// exactly these eleven names (set equality + length); OPENCODE_CONFIG is
+// exactly these ten names (set equality + length); OPENCODE_CONFIG is
 // the one deliberate non-re-exported member (the opencode bridge stages
 // it round-scoped), DAEDALUS_WORKER_DAEMON the daemon marker carried on
 // the spawned daemon's env (worker.go's daemonEnv). An intentional
@@ -2094,7 +2176,6 @@ func TestWorkerEnvVarsExactMembership(t *testing.T) {
 		"DAEDALUS_MAX_CONCURRENT_TESTS",
 		"DAEDALUS_SLIM",
 		"DAEDALUS_SLIM_PARSER_MODEL",
-		SlimSamplerEnv,
 		"DAEDALUS_THINKING",
 		"DAEDALUS_STREAM",
 		"DAEDALUS_AGENT",

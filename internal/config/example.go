@@ -154,8 +154,9 @@ max_concurrent_agent_runs: 2
 max_requests_per_minute: 0
 `
 
-// exampleSlimBlock is the slim: section (the mode toggle and the tool-call
-// relay's parser model) — the "slim" profile's flow-side slice.
+// exampleSlimBlock is the slim: section (the mode toggle, the tool-call
+// relay's parser model, and the slim sampler knobs) — the "slim" profile's
+// flow-side slice.
 const exampleSlimBlock = `# Slim mode for limited self-hosted models (small context window, low max
 # output tokens) on the aider and pi agents. When enabled: this worker runs a
 # single jailed-agent round at a time — max_concurrent_agent_runs above is
@@ -227,17 +228,19 @@ slim:
   # repeatable "--sampler k=v" flags on every "hands round" command line:
   # a set knob overrides that field on every openai request the harness
   # builds, an unset knob sends nothing so the serving stack's own baked
-  # defaults stand — absence is the default, and these lines ship commented
-  # for exactly that reason. They exist to keep small self-hosted models out
-  # of verbatim-repetition loops (temperature, min_p, repetition_penalty,
-  # and no_repeat_ngram_size are the dials that class names); the full
-  # surface is the serving stack's request schema: temperature, top_p,
-  # top_k, min_p, seed, frequency_penalty, presence_penalty,
-  # repetition_penalty, repetition_context_size, no_repeat_ngram_size,
-  # ngram_window, xtc_probability, xtc_threshold. Thinking knobs are owned
+  # defaults stand. Four of the dials are slim defaults armed by
+  # slim.enabled alone — a config that sets no sampler line at all still
+  # stages temperature=0.7, min_p=0.05, repetition_penalty=1.1, and
+  # no_repeat_ngram_size=20 on every slim round, keeping small self-hosted
+  # models out of verbatim-repetition loops (these are the dials that class
+  # names) — and a line set here overrides its default per knob; there is
+  # no opt-out. The rest of the surface is the serving stack's request
+  # schema: top_p, top_k, seed, frequency_penalty, presence_penalty,
+  # repetition_context_size, ngram_window, xtc_probability, xtc_threshold —
+  # staged only when set. Thinking knobs are owned
   # by the disable_thinking/wire-thinking channel, max_tokens and stop by
   # their existing sections — do not duplicate them here. A non-finite float
-  # fails the config load. Example posture (uncomment to use):
+  # fails the config load. Example posture (uncomment to override):
   # temperature: 0.7
   # min_p: 0.05
   # repetition_penalty: 1.05

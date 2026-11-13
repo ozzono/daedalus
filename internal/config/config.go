@@ -317,19 +317,6 @@ const (
 	// (WorkerEnvVars) so a stale export cannot arm a config that says
 	// nothing.
 	SlimParserModelEnv = "DAEDALUS_SLIM_PARSER_MODEL"
-	// SlimSamplerEnv carries the set slim sampler knobs to the jailed-round
-	// builder as the pre-rendered `k=v` tokens (SamplerArgs, space-joined)
-	// it validates and stages as repeatable `--sampler` flags on the `hands
-	// round` command line — ruling D1: the knobs reach hands as round CLI
-	// args, never an env the harness reads, so this var is worker-internal
-	// plumbing only, consumed pre-spawn and absent from RoundEnvVars (the
-	// sandbox gate strips it; no allowlist change). Exported only when slim
-	// is enabled and at least one knob is set — absent means no flags stage
-	// and hands's requests keep the serving stack's own defaults — and unset
-	// symmetrically, scrubbed from the daemon spawn (WorkerEnvVars) like
-	// every other config-derived value, so a stale shell export cannot
-	// stage knobs a config that says nothing.
-	SlimSamplerEnv = "DAEDALUS_SLIM_SAMPLER_ARGS"
 )
 
 // TemporalConfig describes the Temporal deployment daedalus talks to.
@@ -906,14 +893,20 @@ type SlimConfig struct {
 	MaxInputTokens int `yaml:"max_input_tokens"`
 	// The sampler knobs are the slim serving stack's per-request dials,
 	// staged as repeatable `--sampler k=v` flags on every fresh `hands
-	// round` command line (SamplerArgs → SlimSamplerEnv → handsSamplerFlags):
-	// the hands harness folds each pair into its openai requests, a set knob
-	// overriding the request while an unset one stays out of the body so the
-	// serving stack's own defaults stand. Pointer types carry the
-	// don't-send semantics: nil (the key absent) sends nothing — 0 is a
-	// meaningful value for several of them, so there is no sentinel zero.
-	// The anti-loop motivation is repetition degeneration on small
-	// self-hosted models (temperature/min_p/repetition_penalty/
+	// round` command line (SamplerArgs → the jailed-round builder's
+	// slimSamplerFlags, rendering the resolved set the worker installs at
+	// startup as typed state — no env channel): the hands harness folds each
+	// pair into its openai requests, a set knob overriding the request while
+	// an unset one stays out of the body so the serving stack's own defaults
+	// stand. Pointer types carry the don't-send semantics: nil (the key
+	// absent) sends nothing — 0 is a meaningful value for several of them,
+	// so there is no sentinel zero. Four of the dials are also slim defaults
+	// (the SlimDefault* constants): ResolvedSampler fills each unset one
+	// from its default, so a config that names no sampler field at all
+	// still arms the anti-loop set on every slim round — slim.enabled alone
+	// is the switch, a set knob overrides its default per knob, and there
+	// is no opt-out. The anti-loop motivation is repetition degeneration on
+	// small self-hosted models (temperature/min_p/repetition_penalty/
 	// no_repeat_ngram_size are the dials the incident class names); the
 	// full set is the serving stack's request schema, and the names here are
 	// the hands `--sampler` keys verbatim. Thinking knobs
@@ -956,14 +949,57 @@ func (s SlimConfig) MaxInputTokensOrDefault() int {
 	return DefaultSlimMaxInputTokens
 }
 
+// The slim-default sampler knobs: the four dials the verbatim-repetition
+// degeneration class names, pinned as the prevention set every slim round
+// arms when the config leaves them unset. Tests and the worker's staging
+// resolve against these constants, never inlined literals.
+const (
+	SlimDefaultTemperature       = 0.7
+	SlimDefaultMinP              = 0.05
+	SlimDefaultRepetitionPenalty = 1.1
+	SlimDefaultNoRepeatNgramSize = 20
+)
+
+// ResolvedSampler arms the slim sampler: a copy of the section with every
+// unset knob that has a slim default filled from it — slim.enabled alone is
+// the switch, so loop prevention needs no sampler config, and a disabled
+// section resolves to the zero value (stages nothing). A set knob keeps its
+// own value: the per-knob override, with no opt-out of a default. A knob
+// with neither a default nor a config value stays unset and stages no flag.
+// The returned set is what the worker installs and the jailed-round builder
+// renders into `--sampler` flags.
+func (s SlimConfig) ResolvedSampler() SlimConfig {
+	if !s.Enabled {
+		return SlimConfig{}
+	}
+	if s.Temperature == nil {
+		v := SlimDefaultTemperature
+		s.Temperature = &v
+	}
+	if s.MinP == nil {
+		v := SlimDefaultMinP
+		s.MinP = &v
+	}
+	if s.RepetitionPenalty == nil {
+		v := SlimDefaultRepetitionPenalty
+		s.RepetitionPenalty = &v
+	}
+	if s.NoRepeatNgramSize == nil {
+		v := SlimDefaultNoRepeatNgramSize
+		s.NoRepeatNgramSize = &v
+	}
+	return s
+}
+
 // slimSamplerKnobNames is the slim sampler surface in staging order — the
 // hands `--sampler` keys verbatim, which are the serving stack's
 // ChatCompletionRequest fields. It is the single name list the strict
-// unmarshal, SamplerArgs, and the jailed-round builder's stage-time check
-// (ruling D2: an unknown knob rejects at launch, never ignores) all answer
-// to; the unmarshal cases and the SamplerArgs walk must stay within it, and
-// a drift between this list and the hands receiver fails the round loudly
-// here rather than staging a flag hands refuses.
+// unmarshal and SamplerArgs both answer to; the unmarshal cases and the
+// SamplerArgs walk must stay within it. An unknown knob cannot reach the
+// builder (ruling D2: the strict slim unmarshal rejects the field at load,
+// never ignores it), so staging renders straight from the resolved fields
+// and a drift between this list and the hands receiver surfaces as hands
+// refusing the flag at its own launch.
 var slimSamplerKnobNames = []string{
 	"temperature",
 	"top_p",
@@ -982,17 +1018,16 @@ var slimSamplerKnobNames = []string{
 
 // SlimSamplerNames lists the slim sampler knob names (read-only — callers
 // must not mutate the backing array): the set SlimConfig fields may render,
-// and the builder validates every staged token against it.
+// in staging order.
 func SlimSamplerNames() []string {
 	return slimSamplerKnobNames
 }
 
 // SamplerArgs renders the set slim sampler knobs as `k=v` tokens, in
-// slimSamplerKnobNames order — the payload SlimSamplerEnv carries to the
-// jailed-round builder (space-joined by the exporter), which stages one
-// `--sampler <token>` flag per token. Floats render 'f'-formatted so a
-// token is always a plain decimal scalar (never an exponent literal), ints
-// verbatim; unset knobs contribute nothing.
+// slimSamplerKnobNames order — the tokens the jailed-round builder stages
+// one `--sampler <token>` flag apiece on a fresh hands round. Floats render
+// 'f'-formatted so a token is always a plain decimal scalar (never an
+// exponent literal), ints verbatim; unset knobs contribute nothing.
 func (s SlimConfig) SamplerArgs() []string {
 	var args []string
 	addFloat := func(name string, v *float64) {
@@ -2100,7 +2135,6 @@ func WorkerEnvVars() []string {
 		"DAEDALUS_MAX_CONCURRENT_TESTS",
 		"DAEDALUS_SLIM",
 		SlimParserModelEnv,
-		SlimSamplerEnv,
 		"DAEDALUS_THINKING",
 		"DAEDALUS_STREAM",
 		"DAEDALUS_AGENT",

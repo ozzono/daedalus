@@ -1500,9 +1500,11 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	args = append(args, headless...)
 	// The slim sampler knobs stage as repeatable `--sampler k=v` flags on
 	// the fresh `hands round` shape — the subcommand the flags belong to
-	// (ruling D1's transport), validated and rendered by handsSamplerFlags
-	// from the worker's slim sampler export; unset knobs stage nothing and
-	// the serving stack's own defaults stand. A resumed round is the
+	// (ruling D1's transport) — rendered by slimSamplerFlags from the
+	// resolved set the worker installed: the slim defaults under the
+	// config's own per-knob overrides, armed by slim.enabled alone. A
+	// non-slim worker installs nothing and the argv stays byte-identical,
+	// as it does for every non-hands agent. A resumed round is the
 	// precomposed `hands resume` argv (agentResumeArgs), whose flag surface
 	// is not the receiver this contract was verified against — the flags
 	// skip it, so a resumed round keeps the serving defaults where the
@@ -1510,11 +1512,7 @@ func runJailedRoundFolders(ctx context.Context, env []string, role SessionRole, 
 	// tolerance is unpinned; extend the staging to resumed rounds once that
 	// surface is verified, not before.
 	if selected == "hands" && len(agentArgs) == 0 {
-		samplerFlags, err := handsSamplerFlags(env)
-		if err != nil {
-			return jailResult{}, err
-		}
-		args = append(args, samplerFlags...)
+		args = append(args, slimSamplerFlags()...)
 	}
 	// codex reads no provider env var natively, so an openai-served codex
 	// round is bridged per invocation: stageCodexProvider returns the -c

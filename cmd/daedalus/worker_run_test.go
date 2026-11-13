@@ -250,71 +250,6 @@ func TestRunWorkerSlimEnvExports(t *testing.T) {
 	}
 }
 
-// TestRunWorkerSlimSamplerEnvExport pins the slim sampler knobs' env
-// channel at worker startup: a slim-enabled config with at least one knob
-// set exports DAEDALUS_SLIM_SAMPLER_ARGS as the space-joined SamplerArgs
-// tokens (the payload handsSamplerFlags splits into `--sampler k=v` flags),
-// and the export is set-or-unset symmetric like every config-derived var —
-// a stale shell export must not stage knobs a config that says nothing
-// (or says slim-disabled, or configures no knob) would never stage. The
-// knobs ride their own channel: slim enabled with no knobs exports
-// nothing, and the export does not wait for a parser_model the way the
-// tool relay's URL does. runWorker is driven to its first failure (an
-// empty task queue fails worktree preflight before any Temporal dial)
-// purely to observe the exports.
-func TestRunWorkerSlimSamplerEnvExport(t *testing.T) {
-	restoreProcessEnv(t, "DAEDALUS_SLIM", config.SlimSamplerEnv,
-		"DAEDALUS_AGENT", "DAEDALUS_MAX_CONCURRENT_AGENT_RUNS", "DAEDALUS_MAX_CONCURRENT_TESTS", "DAEDALUS_WORKER_NAME",
-		"API_TIMEOUT_MS", "OPENAI_BASE_URL", "OPENAI_API_BASE")
-
-	// A stale export must not outlive a config that says nothing.
-	t.Setenv(config.SlimSamplerEnv, "temperature=0.7 stale_knob=1")
-	if err := runWorker(config.Config{Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
-		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
-	}
-	if got := os.Getenv(config.SlimSamplerEnv); got != "" {
-		t.Errorf("%s = %q after an unconfigured config, want the stale export cleared", config.SlimSamplerEnv, got)
-	}
-
-	// Slim enabled with no knobs: nothing exports — absence is the
-	// serving-stack-defaults contract, and a stale export still dies.
-	t.Setenv(config.SlimSamplerEnv, "stale=1")
-	if err := runWorker(config.Config{Slim: config.SlimConfig{Enabled: true}, Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
-		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
-	}
-	if got := os.Getenv(config.SlimSamplerEnv); got != "" {
-		t.Errorf("%s = %q after a slim config with no knobs, want the stale export cleared", config.SlimSamplerEnv, got)
-	}
-
-	// Knobs configured while slim is disabled: nothing exports — the
-	// sampler flags are a slim-serving-stack channel, not a general one.
-	temp := 0.7
-	if err := runWorker(config.Config{Slim: config.SlimConfig{Temperature: &temp}, Metrics: config.MetricsConfig{Enabled: boolPtr(false)}}, ""); err == nil {
-		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
-	}
-	if got := os.Getenv(config.SlimSamplerEnv); got != "" {
-		t.Errorf("%s = %q after a slim-disabled config with knobs, want it unset", config.SlimSamplerEnv, got)
-	}
-
-	// The set branch: slim enabled plus knobs exports the joined tokens —
-	// no parser_model needed, the knobs ride their own channel.
-	minp, ngram := 0.05, 20
-	if err := runWorker(config.Config{
-		Slim: config.SlimConfig{
-			Enabled:           true,
-			Temperature:       &temp,
-			MinP:              &minp,
-			NoRepeatNgramSize: &ngram,
-		},
-		Metrics: config.MetricsConfig{Enabled: boolPtr(false)},
-	}, ""); err == nil {
-		t.Fatal("runWorker with an empty task queue should fail worktree preflight, got nil")
-	}
-	if got, want := os.Getenv(config.SlimSamplerEnv), "temperature=0.7 min_p=0.05 no_repeat_ngram_size=20"; got != want {
-		t.Errorf("%s = %q, want the SamplerArgs tokens space-joined %q", config.SlimSamplerEnv, got, want)
-	}
-}
-
 // TestRunWorkerReviewerSplitEnvExports pins the reviewer-split env channel
 // at worker startup: a reviewer.model export travels as
 // DAEDALUS_REVIEWER_MODEL (exported only when set — scrubbed from the
@@ -808,7 +743,6 @@ func TestRunWorkerExportsAreScrubbed(t *testing.T) {
 		"MetricsOtelEndpointEnv":   config.MetricsOtelEndpointEnv,
 		"ToolRelayURLEnv":          config.ToolRelayURLEnv,
 		"SlimParserModelEnv":       config.SlimParserModelEnv,
-		"SlimSamplerEnv":           config.SlimSamplerEnv,
 		"BugDirEnv":                config.BugDirEnv,
 		"BugMirrorEnv":             config.BugMirrorEnv,
 		"TestOutputMirrorEnv":      config.TestOutputMirrorEnv,
