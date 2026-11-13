@@ -489,78 +489,77 @@ func TestStageHandsProviderStagesKnobs(t *testing.T) {
 	})
 }
 
-// TestHandsSamplerFlags pins the fresh hands round's sampler staging
-// (handsSamplerFlags): the worker's DAEDALUS_SLIM_SAMPLER_ARGS export —
-// daedalus-written, space-joined `k=v` tokens from config slim's sampler
-// fields — splits into one `--sampler <token>` flag per token, verbatim,
-// in order; an absent export stages nothing (the requests keep the
-// serving stack's own defaults); every name on SlimSamplerNames is a
-// legal token; and anything else — no `=`, an empty value, a name off
-// the knob list — rejects loudly, naming the export and the offending
-// token: the export is daedalus-written, so unparseable content is
-// corruption (ruling D2 — reject at launch, never ignore, or a stale
-// export would stage a flag hands refuses at its own launch).
-func TestHandsSamplerFlags(t *testing.T) {
-	t.Run("absent export stages nothing", func(t *testing.T) {
-		flags, err := handsSamplerFlags(handsEnv("OPENAI_MODEL=glm", "DAEDALUS_SLIM=1"))
-		if err != nil {
-			t.Fatalf("handsSamplerFlags: %v", err)
-		}
-		if flags != nil {
-			t.Errorf("handsSamplerFlags = %v, want nil without the export", flags)
+// installSlimSampler installs a resolved slim sampler set as the worker's
+// package-global state and restores the previous value at cleanup: the
+// state is worker-global (the SetCotProgressClient shape — one startup
+// installer, no per-round channel), so a leaked install would stage
+// sampler flags into every later argv pin in this package.
+func installSlimSampler(t *testing.T, s config.SlimConfig) {
+	t.Helper()
+	prev := slimSampler
+	t.Cleanup(func() { SetSlimSampler(prev) })
+	SetSlimSampler(s)
+}
+
+// TestSlimSamplerFlags pins the fresh hands round's sampler flag rendering
+// (slimSamplerFlags): the worker's installed slim sampler state — the
+// resolved set (config slim.ResolvedSampler) SetSlimSampler installs at
+// startup — renders as repeatable `--sampler <token>` flags, one per
+// SamplerArgs token, verbatim and in that order. The zero value — a
+// non-slim worker, nothing installed — stages nil, so the requests keep
+// the serving stack's own defaults. There is no stage-time validation:
+// the set is typed config state and config's strict slim unmarshal
+// rejects an unknown knob at load (ruling D2's rejection lives there, not
+// at staging), so a flag hands would refuse cannot arise here.
+func TestSlimSamplerFlags(t *testing.T) {
+	t.Run("no installed state stages nothing", func(t *testing.T) {
+		installSlimSampler(t, config.SlimConfig{})
+		if flags := slimSamplerFlags(); flags != nil {
+			t.Errorf("slimSamplerFlags() = %v, want nil without installed state", flags)
 		}
 	})
 
-	t.Run("tokens render one flag each, verbatim and in order", func(t *testing.T) {
-		flags, err := handsSamplerFlags(handsEnv(config.SlimSamplerEnv + "=temperature=0.7 min_p=0.05 no_repeat_ngram_size=20"))
-		if err != nil {
-			t.Fatalf("handsSamplerFlags: %v", err)
+	t.Run("the resolved slim defaults render the four prevention flags", func(t *testing.T) {
+		installSlimSampler(t, config.SlimConfig{Enabled: true}.ResolvedSampler())
+		want := []string{
+			"--sampler", "temperature=0.7",
+			"--sampler", "min_p=0.05",
+			"--sampler", "repetition_penalty=1.1",
+			"--sampler", "no_repeat_ngram_size=20",
 		}
-		want := []string{"--sampler", "temperature=0.7", "--sampler", "min_p=0.05", "--sampler", "no_repeat_ngram_size=20"}
-		if !slices.Equal(flags, want) {
-			t.Errorf("handsSamplerFlags = %v, want %v", flags, want)
-		}
-	})
-
-	t.Run("every knob name is a legal token", func(t *testing.T) {
-		var tokens []string
-		for _, name := range config.SlimSamplerNames() {
-			tokens = append(tokens, name+"=1")
-		}
-		flags, err := handsSamplerFlags(handsEnv(config.SlimSamplerEnv + "=" + strings.Join(tokens, " ")))
-		if err != nil {
-			t.Fatalf("handsSamplerFlags: %v", err)
-		}
-		if len(flags) != 2*len(config.SlimSamplerNames()) {
-			t.Fatalf("handsSamplerFlags staged %d args, want one --sampler pair per knob name (%d)", len(flags), 2*len(config.SlimSamplerNames()))
-		}
-		for i, tok := range tokens {
-			if flags[2*i] != "--sampler" || flags[2*i+1] != tok {
-				t.Errorf("flag pair %d = [%s %s], want [--sampler %s]", i, flags[2*i], flags[2*i+1], tok)
-			}
+		if got := slimSamplerFlags(); !slices.Equal(got, want) {
+			t.Errorf("slimSamplerFlags() = %v, want the slim-default prevention set %v", got, want)
 		}
 	})
 
-	for _, c := range []struct {
-		name string
-		raw  string
-		tok  string
-	}{
-		{"token without an = fails", "temperature 0.7", "temperature"},
-		{"empty value fails", "temperature=", "temperature="},
-		{"unknown knob fails", "max_tokens=100", "max_tokens=100"},
-		{"typo'd knob fails", "xtc_probablity=0.5", "xtc_probablity=0.5"},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			flags, err := handsSamplerFlags(handsEnv(config.SlimSamplerEnv + "=" + c.raw))
-			if err == nil || !strings.Contains(err.Error(), config.SlimSamplerEnv) || !strings.Contains(err.Error(), c.tok) {
-				t.Errorf("handsSamplerFlags(%q) = %v, %v; want a rejection naming %s and %q", c.raw, flags, err, config.SlimSamplerEnv, c.tok)
-			}
-			if flags != nil {
-				t.Errorf("handsSamplerFlags(%q) staged %v alongside the error, want nil", c.raw, flags)
-			}
+	t.Run("every knob renders one flag pair, verbatim and in order", func(t *testing.T) {
+		one, oneInt := 1.0, 1
+		installSlimSampler(t, config.SlimConfig{
+			Enabled:               true,
+			Temperature:           &one,
+			TopP:                  &one,
+			TopK:                  &oneInt,
+			MinP:                  &one,
+			Seed:                  &oneInt,
+			FrequencyPenalty:      &one,
+			PresencePenalty:       &one,
+			RepetitionPenalty:     &one,
+			RepetitionContextSize: &oneInt,
+			NoRepeatNgramSize:     &oneInt,
+			NgramWindow:           &oneInt,
+			XTCProbability:        &one,
+			XTCThreshold:          &one,
 		})
-	}
+		flags := slimSamplerFlags()
+		if len(flags) != 2*len(config.SlimSamplerNames()) {
+			t.Fatalf("slimSamplerFlags staged %d args, want one --sampler pair per knob name (%d)", len(flags), 2*len(config.SlimSamplerNames()))
+		}
+		for i, name := range config.SlimSamplerNames() {
+			if flags[2*i] != "--sampler" || flags[2*i+1] != name+"=1" {
+				t.Errorf("flag pair %d = [%s %s], want [--sampler %s=1]", i, flags[2*i], flags[2*i+1], name)
+			}
+		}
+	})
 }
 
 // TestHandsJailMounts pins the state-dir resolution behind the hands jail
@@ -968,19 +967,21 @@ func TestHandsRoundStagesProvider(t *testing.T) {
 }
 
 // TestHandsRoundStagesSamplerFlags pins the slim sampler knobs' argv seam
-// on the jailed hands round: a set DAEDALUS_SLIM_SAMPLER_ARGS export rides
-// the fresh `hands round` command line as repeatable `--sampler k=v` flags
-// appended after the fixed headless set, and the export itself never
-// reaches the round env — worker-internal plumbing only (the sandbox gate
-// strips it; the knobs travel as argv, ruling D1's transport). An unset
-// export stages no flag, so the requests keep the serving stack's own
-// defaults; a corrupt export fails the round before launch instead of
-// staging a flag hands would refuse (ruling D2); and a resumed round —
-// the precomposed `hands resume` argv, whose flag surface the staging
-// contract was not verified against — skips the flags even with the
-// export set.
+// on the jailed hands round: the worker's installed slim sampler state —
+// the resolved set (config slim.ResolvedSampler) SetSlimSampler installs
+// at startup — rides the fresh `hands round` command line as repeatable
+// `--sampler k=v` flags appended after the fixed headless set (ruling
+// D1's transport: the knobs travel as argv, never an env the harness
+// reads). Nothing installed — a non-slim worker — stages no flag, so the
+// requests keep the serving stack's own defaults and the argv stays
+// byte-identical. There is no corrupt-payload path to pin: the state is
+// typed config state and config's strict slim unmarshal rejects an
+// unknown knob at load, so staging cannot render a flag hands would
+// refuse. A resumed round — the precomposed `hands resume` argv, whose
+// flag surface the staging contract was not verified against — skips the
+// flags even with the full set installed.
 func TestHandsRoundStagesSamplerFlags(t *testing.T) {
-	t.Run("fresh round stages the flags after the headless set", func(t *testing.T) {
+	t.Run("fresh round stages the resolved defaults after the headless set", func(t *testing.T) {
 		scrubBugFilingEnv(t)
 		home := fakeHome(t)
 		t.Setenv("DAEDALUS_AGENT", "hands")
@@ -988,7 +989,7 @@ func TestHandsRoundStagesSamplerFlags(t *testing.T) {
 		t.Setenv("OPENAI_API_KEY", "sk-local")
 		t.Setenv("OPENAI_MODEL", "glm-selfhost")
 		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
-		t.Setenv(config.SlimSamplerEnv, "temperature=0.7 min_p=0.05")
+		installSlimSampler(t, config.SlimConfig{Enabled: true}.ResolvedSampler())
 		wt := gitRepo(t)
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
@@ -1029,14 +1030,15 @@ func TestHandsRoundStagesSamplerFlags(t *testing.T) {
 				"temperature=0.7",
 				"--sampler",
 				"min_p=0.05",
+				"--sampler",
+				"repetition_penalty=1.1",
+				"--sampler",
+				"no_repeat_ngram_size=20",
 			},
 		), "ai-jail")
-		if got := calls[0].Env[config.SlimSamplerEnv]; got != "" {
-			t.Errorf("round env carries %s=%q — the sampler export is worker-internal plumbing and must stop at the sandbox gate", config.SlimSamplerEnv, got)
-		}
 	})
 
-	t.Run("unset export stages no flag", func(t *testing.T) {
+	t.Run("nothing installed stages no flag", func(t *testing.T) {
 		scrubBugFilingEnv(t)
 		fakeHome(t)
 		t.Setenv("DAEDALUS_AGENT", "hands")
@@ -1044,6 +1046,7 @@ func TestHandsRoundStagesSamplerFlags(t *testing.T) {
 		t.Setenv("OPENAI_API_KEY", "sk-local")
 		t.Setenv("OPENAI_MODEL", "glm-selfhost")
 		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
+		installSlimSampler(t, config.SlimConfig{})
 		wt := gitRepo(t)
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")
@@ -1060,33 +1063,7 @@ func TestHandsRoundStagesSamplerFlags(t *testing.T) {
 			t.Fatalf("ai-jail called %d times, want 1", len(calls))
 		}
 		if contains(calls[0].Args, "--sampler") {
-			t.Errorf("fresh hands round staged a --sampler flag without the export: %v", calls[0].Args)
-		}
-	})
-
-	t.Run("corrupt export fails the round before launch", func(t *testing.T) {
-		scrubBugFilingEnv(t)
-		fakeHome(t)
-		t.Setenv("DAEDALUS_AGENT", "hands")
-		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
-		t.Setenv("OPENAI_API_KEY", "sk-local")
-		t.Setenv("OPENAI_MODEL", "glm-selfhost")
-		t.Setenv("OPENAI_API_BASE", "https://selfhost.example/v1")
-		t.Setenv(config.SlimSamplerEnv, "temperature=0.7 junk")
-		wt := gitRepo(t)
-		log := newStubLog(t)
-		stubBin(t, "ai-jail", "exit 0")
-
-		_, err := RunJailedAgentActivity(context.Background(), AgentRunInput{
-			WorktreePath: wt,
-			Prompt:       "fix the bug",
-		})
-		if err == nil || !strings.Contains(err.Error(), config.SlimSamplerEnv) || !strings.Contains(err.Error(), "junk") {
-			t.Errorf("RunJailedAgentActivity err = %v, want the %s rejection naming the offending token", err, config.SlimSamplerEnv)
-		}
-		if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
-			calls := readCalls(t, log)
-			t.Errorf("ai-jail called %d times, want the round failed before launch (%v)", len(calls), calls)
+			t.Errorf("fresh hands round staged a --sampler flag without an installed set: %v", calls[0].Args)
 		}
 	})
 
@@ -1095,7 +1072,7 @@ func TestHandsRoundStagesSamplerFlags(t *testing.T) {
 		fakeHome(t)
 		t.Setenv("OPENAI_BASE_URL", "https://selfhost.example/v1")
 		t.Setenv("OPENAI_MODEL", "glm-selfhost")
-		t.Setenv(config.SlimSamplerEnv, "temperature=0.7")
+		installSlimSampler(t, config.SlimConfig{Enabled: true}.ResolvedSampler())
 		wt := gitRepo(t)
 		log := newStubLog(t)
 		stubBin(t, "ai-jail", "exit 0")

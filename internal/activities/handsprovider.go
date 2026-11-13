@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -76,7 +75,7 @@ const (
 // public default, matching claude's key-alone posture). The sampler knobs
 // stay out of this file on purpose: hands's strict config schema has no
 // sampler fields, so they stage as `--sampler k=v` flags on the round
-// command line instead (handsSamplerFlags, called by the jailed-round
+// command line instead (slimSamplerFlags, called by the jailed-round
 // builder), and an unset knob leaves the serving stack's own defaults
 // standing.
 func stageHandsProvider(env []string, worktreePath string) error {
@@ -167,32 +166,32 @@ func stageHandsProvider(env []string, worktreePath string) error {
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
-// handsSamplerFlags renders the `--sampler k=v` argv flags a fresh hands
-// round stages: the worker's slim sampler export (config.SlimSamplerEnv —
-// the set slim sampler knobs, pre-rendered as space-joined `k=v` tokens by
-// config's SamplerArgs) splits into tokens, one flag per token. Every name
-// is checked against the knob list before staging — ruling D2: an unknown
-// knob rejects at launch, never ignores, so a stale or hand-set export
-// fails the round here instead of staging a flag hands would refuse at its
-// own launch (the same loud posture for a malformed token: the export is
-// daedalus-written, so anything unparseable in it is corruption, not
-// config). An absent export stages nothing — the requests keep the serving
-// stack's own defaults.
-func handsSamplerFlags(env []string) ([]string, error) {
-	raw := envLookup(env, config.SlimSamplerEnv)
-	if raw == "" {
-		return nil, nil
-	}
-	names := config.SlimSamplerNames()
+// slimSampler is the worker's resolved slim sampler knob set (config
+// slim.ResolvedSampler — the slim-default knobs filled under the config's
+// own per-knob overrides), installed at worker startup. The zero value — a
+// non-slim worker — stages nothing, and the round's requests keep the
+// serving stack's own defaults.
+var slimSampler config.SlimConfig
+
+// SetSlimSampler installs the worker's resolved slim sampler knobs ahead of
+// activity registration (the SetCotProgressClient shape: worker-global
+// typed state with one startup installer and no per-round channel — in
+// particular no env leg a stale shell export could speak for). Written
+// once before the worker polls, read-only after.
+func SetSlimSampler(s config.SlimConfig) { slimSampler = s }
+
+// slimSamplerFlags renders the installed slim sampler knobs as repeatable
+// `--sampler k=v` argv flags, one per resolved knob in SamplerArgs order.
+// No stage-time validation: the set is typed config state, and config's
+// strict slim unmarshal rejects an unknown knob at load (ruling D2 — the
+// rejection lives at config load, never as a launch-time guess), so a flag
+// hands would refuse cannot be staged.
+func slimSamplerFlags() []string {
 	var flags []string
-	for _, tok := range strings.Fields(raw) {
-		name, value, ok := strings.Cut(tok, "=")
-		if !ok || value == "" || !slices.Contains(names, name) {
-			return nil, fmt.Errorf("hands round: %s carries %q, which is not a slim sampler knob token — the export is daedalus-written from config slim's sampler fields; fix the config or unset the stale export", config.SlimSamplerEnv, tok)
-		}
+	for _, tok := range slimSampler.SamplerArgs() {
 		flags = append(flags, "--sampler", tok)
 	}
-	return flags, nil
+	return flags
 }
 
 // handsJailMounts resolves the host paths a jailed hands round needs
