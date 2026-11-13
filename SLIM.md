@@ -8,7 +8,7 @@ Slim mode serves a deployment from small self-hosted models — small context wi
 slim:
   enabled: true
   parser_model: qwen2.5-coder:3b   # optional; enables the tool-call relay
-  max_input_tokens: 4098           # optional; 0/unset = DefaultSlimMaxInputTokens, negative fails the load
+  max_input_tokens: 4098           # optional; 0/unset = the 4098 default (DefaultSlimMaxInputTokens), negative fails the load
 ```
 
 - **Flow gating:** `slim.enabled: true` reroutes a defaulted `-w` to the slim flow; `max_concurrent_agent_runs` is clamped to 1 under slim (a cold repo cannot be explored concurrently by a small window).
@@ -18,7 +18,23 @@ slim:
 
 ## The slim flow (`internal/workflows/slim.go`)
 
-A planner round writes the plan **in prose** (no JSON, no code fences — pure generation), and a separate parse round transcribes it into the ordered queue of `SlimSubtask` entries — 1–2-file sub-tasks. A malformed parse gets one deterministic trailing-comma repair first (`stripTrailingCommas` — string-aware, escape-correct, only commas directly before `}`/`]` outside string literals; a still-broken reply keeps its original error) and then exactly one strict re-ask (`slim_parse_reask`, quoted wording pinned by tests); a second failure parks the run naming the failing stage. Each sub-task then runs its own implement ↔ review loop: the worker conversation chains across the run (progressive context) while every review round is a completely fresh reviewer session (no WORKER context leaks into REVIEW), the native suite runs every round as terminal ground truth (a red suite blocks approval), and a sub-task parks after `maxSlimStepRounds` (8) non-converging rounds. A run's flow is fixed at start; `continue` resumes it under the same flow, keeping slim's per-round command and no-suite park on resume.
+Slim requires a discoverable native test suite before anything runs: every sub-task round is gated on the suite's output, so a repository whose preflight finds no suite command parks at the gate — before any agent budget is spent — instead of failing opaquely on the first empty suite command mid-run.
+
+### Planner: prose plan, parse, repairs, salvage
+
+A planner round writes the plan **in prose** (no JSON, no code fences — pure generation; the plan is the first block of the worker's progressive context), and a separate parse round in a fresh session of its own transcribes it into the ordered queue of `SlimSubtask` entries (`id`, `type`, `target_files`, `description`, `acceptance_criteria`) — 1–2-file sub-tasks, each verifiable against its own acceptance criteria. The parse round's validation rejects a subtask without target files.
+
+A malformed parse gets two deterministic repairs first — a trailing-comma strip (`stripTrailingCommas` — string-aware, escape-correct, only commas directly before `}`/`]` outside string literals) and a bracket closure of a reply carrying at least one complete element whose final closers were dropped; the run memo is stamped `ParseQueueRepaired` when either fires — and then exactly one strict re-ask (`slim_parse_reask`, quoted wording pinned by tests, resumed in the parse round's own conversation so the model sees and corrects its previous reply); a still-unparseable second reply parks the run naming the failing stage.
+
+Before that park, a parse round killed on the deliver contract gets one automatic transcription pass by the parsing AI — the tool-parse salvage (`slim.parser_model`, one `SlimParseSalvageActivity` call, never retried): the kill's captured stranded prose rides the same transcription prompt, the reply is validated by exactly the parse machinery, a recovered queue continues the pipeline with the run memo stamped `ParseSalvaged`, and a not-recovered kill parks exactly as the unarmed path would have. The salvage is fail-open by contract — an unconfigured, unreachable, or timed-out parsing seat parks the run — and it is the parse stage's seat alone: no other stage's no-delivery handling is armed (no generalized auto-parse).
+
+### Atomic loops: implement ↔ suite ↔ review, write-fenced
+
+Each sub-task then runs its own implement ↔ review loop: the worker conversation chains across the run (progressive context) while every review round is a completely fresh reviewer session (no WORKER context leaks into REVIEW), the native suite runs every round as terminal ground truth (a red suite blocks approval — never self-confirmation), and a sub-task parks after `maxSlimStepRounds` (8) non-converging rounds, the counter resetting per sub-task. A red round's suite logs travel to the fix prompt; green logs stay out of the review prompt — the reviewer can run the suite itself, and a context-limited model should not carry a full green log it does not need.
+
+The structural half of the fencing sits at the acceptance point: a sub-task is accepted only when the suite is green **and** the fresh reviewer approves, and at exactly that point a write-scope gate diffs the worktree against the sub-task's declared target files plus every earlier accepted sub-task's (plus the run's own allowed paths) — a diff that leaves the scope parks the run for the maintainer rather than stripping files silently. A red suite blocks first, whatever the diff touches; the gate is version-marker-gated like the other pipeline gates, so replays of older runs keep their recorded behavior.
+
+A run's flow is fixed at start; `continue` resumes it under the same flow, keeping slim's per-round command and no-suite park on resume.
 
 ## Per-role provider overrides
 
@@ -76,3 +92,5 @@ Slim owns five embedded templates — `slim_plan` (prose plan), `slim_step` (imp
 | 2026-10-15 | Relay rate cap + pi timeouts (#32) | `max_requests_per_minute` sliding-window pacing in the relay; pi retry/idle timeout staging |
 | 2026-10-15 | Slim prompt trim | Shrink diet applied to each round's final stdin prompt, not only the submit-time input (branch pending merge) |
 | 2026-10-16 | Per-role provider overrides | `dev` / `reviewer` / `final_reviewer` groups — per-round model/url/key/window/thinking staging with the final-reviewer → reviewer → serving fallback chain (branch pending merge) |
+| 2026-11-04 | Slim scope narrowing (#51) | Sub-task target-files contract — the parse rejects target-less subtasks, and the cumulative write-scope gate at acceptance parks a diff that leaves the declared scope instead of stripping |
+| 2026-11-11 | Parse salvage (#58) | One parser-AI transcription pass on a deliver-contract-killed parse round (`ParseSalvaged` memo stamp) plus the bracket-closure repair (`ParseQueueRepaired`); parse ownership stays parse-only — no generalized auto-parse |

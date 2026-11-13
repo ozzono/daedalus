@@ -344,8 +344,8 @@ header are prefixed with one space, so output is preserved except for that
 byte.) Each block header stamps the temporal run id
 (first 8 characters), so a continued session's runs are distinguishable in
 one file. Files untouched for 7 days are pruned along with the worker logs.
-The dump ends with a tail block (plain mode only — -cot carries none;
---status needs none, it is itself the brief):
+The plain dump ends with a tail block (--status needs none, it is itself
+the brief; -cot carries a bare timestamp line instead — see below):
 
   === log tail: last log 2026-10-07T18:04:05Z — workflow daedalus-42 — <state> ===
 
@@ -400,12 +400,14 @@ view can open above round 1. 0 prints no completed sections; a negative
 value is a usage error. A live in-flight section, when one exists, always
 follows regardless of the tail — it is newer than every completed round.
 
-The -cot dump carries no tail block: it ends at the newest material
-there is — the live section while a round is in flight, else the newest
-finished section — so the view is CoT only, first section to last. The
-plain "daedalus log" mode keeps its "=== log tail:" footer naming the
-last log arrival and the run's state; run that mode when a freshness
-stamp and a final/not-final verdict are what is needed.
+The -cot dump ends at the newest material there is — the live section
+while a round is in flight, else the newest finished section — followed
+by one freshness line: a divider and the task log's last-write stamp
+(the timestamp when the last output material arrived), nothing else. No
+state clause and no final/not-final verdict ride on it; the sections'
+own headers carry their completion stamps, and the plain "daedalus log"
+mode keeps its "=== log tail:" footer naming the last log arrival and
+the run's state — run that mode when a verdict is what is needed.
 
 While a round is in flight, a live section follows the completed ones:
 the in-flight round's reasoning and assistant text, read from the agent's

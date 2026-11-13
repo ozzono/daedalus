@@ -248,3 +248,92 @@ func TestQuotaHeartbeatStampsStarved(t *testing.T) {
 	}
 	env.AssertExpectations(t)
 }
+
+// TestCotProgressSignalName pins the wire name: the worker's jailed rounds
+// and the run workflow are separate deployables, and the signal name is
+// their contract — the same way searchattrs_test pins the attribute names.
+func TestCotProgressSignalName(t *testing.T) {
+	if activities.CotProgressSignal != "cot-progress" {
+		t.Errorf("CotProgressSignal = %q, want %q", activities.CotProgressSignal, "cot-progress")
+	}
+}
+
+// TestCotProgressSignalAdvancesLastActivity pins the mid-round half of the
+// LastActivityAt story: while the run sleeps in its quota heartbeat, a
+// cot-progress signal advances the attribute to the signaled stamp — the
+// payload's time, not workflow.Now — a payload that is not an RFC3339
+// stamp still advances (the workflow.Now fallback, never a dropped
+// signal), the advance touches LastActivityAt alone (DaedalusStatus keeps
+// the sleeping run's starved stamp), and the completed run's boundary
+// touch still stamps past the last mid-round advance.
+func TestCotProgressSignalAdvancesLastActivity(t *testing.T) {
+	env := newTestEnv(t)
+	stubWorktree(t, env)
+	rev := &reviewerRecorder{env: env, stub: []activities.ReviewResult{{Approved: true}}}
+	rev.record()
+	stubTestPhase(env)
+	env.OnActivity(activities.FinalizeWorktreeActivity, mock.Anything, mock.Anything).
+		Return("daedalus/issue-42-1", nil).Once()
+
+	// The first agent round exhausts the API and the run enters its hourly
+	// sleep — the window where a real round's transcript writes would
+	// signal. The second succeeds, so the run completes through its
+	// boundary touch. (No agentRecorder here: its default stub would take
+	// the dispatch before this closure.)
+	var calls int
+	env.OnActivity(activities.RunJailedAgentActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, in activities.AgentRunInput) (activities.AgentRunResult, error) {
+			calls++
+			if calls == 1 {
+				return activities.AgentRunResult{}, errQuotaStub
+			}
+			return activities.AgentRunResult{Text: "done"}, nil
+		})
+
+	// Mid-sleep choreography: a well-formed stamp at 20 minutes, read back
+	// at 25; garbage at 30, read back at 35; the wakeup resumes the run.
+	stamp := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	var midStamp, midGarbage visSnapshot
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(activities.CotProgressSignal, stamp.Format(time.RFC3339))
+	}, 20*time.Minute)
+	env.RegisterDelayedCallback(func() {
+		val, err := env.QueryWorkflow("vis")
+		if err != nil {
+			t.Errorf("mid-sleep vis query: %v", err)
+		} else if err := val.Get(&midStamp); err != nil {
+			t.Errorf("decode mid-sleep vis snapshot: %v", err)
+		}
+	}, 25*time.Minute)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(activities.CotProgressSignal, "not-a-timestamp")
+	}, 30*time.Minute)
+	env.RegisterDelayedCallback(func() {
+		val, err := env.QueryWorkflow("vis")
+		if err != nil {
+			t.Errorf("post-garbage vis query: %v", err)
+		} else if err := val.Get(&midGarbage); err != nil {
+			t.Errorf("decode post-garbage vis snapshot: %v", err)
+		}
+	}, 35*time.Minute)
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow("wakeup", "") }, 45*time.Minute)
+
+	final := runVisProbe(t, env, FeatureDevWorkflow)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error: %v", err)
+	}
+	if midStamp.Status != string(StatusStarved) {
+		t.Errorf("mid-sleep DaedalusStatus = %q, want %q — the advance must touch LastActivityAt alone", midStamp.Status, StatusStarved)
+	}
+	if !midStamp.LastAt.Equal(stamp) {
+		t.Errorf("mid-sleep LastActivityAt = %v, want the signaled %v — the payload's time, not workflow.Now", midStamp.LastAt, stamp)
+	}
+	if !midGarbage.LastAt.After(stamp) {
+		t.Errorf("post-garbage LastActivityAt = %v, want something after %v — an unparseable payload must still advance (the workflow.Now fallback)", midGarbage.LastAt, stamp)
+	}
+	if !final.LastAt.After(midGarbage.LastAt) {
+		t.Errorf("final LastActivityAt %v not after the mid-round advance %v — the boundary touch must refresh past it", final.LastAt, midGarbage.LastAt)
+	}
+	env.AssertExpectations(t)
+}

@@ -562,12 +562,12 @@ func (s *uiServer) snapshot() uiSnapshot {
 				}
 				row.startedAt = info.GetStartTime().AsTime()
 				// A closed row's Activity is its close time. A running row's
-				// is the freshest stamp known: the relay ledger's newest
-				// provider call answers "is anything moving right now"
-				// mid-round (touch() upserts LastActivityAt at state
-				// boundaries only), but at each boundary the attribute is
-				// the fresh stamp while the ledger's newest entry is the
-				// previous round's last call — so the newer of the two
+				// is the freshest stamp known: mid-round, a jailed
+				// claude/pi/codex round's cot-progress signals advance
+				// LastActivityAt with the round's newest transcript write,
+				// while the relay ledger's newest provider call covers
+				// every agent — aider, opencode, and hands keep no
+				// transcript the attribute follows. The newer of the two
 				// wins, and the cell never regresses across a poll. With
 				// neither (no relay, no upsert yet) the zero time renders
 				// the dash — never a fabricated stamp.

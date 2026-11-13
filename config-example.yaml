@@ -209,6 +209,25 @@ slim:
   # budget it needs. 0 (or the key unset) = 4098; a negative value fails
   # the config load.
   max_input_tokens: 4098
+  # Per-request sampler knobs for the slim serving stack, staged as
+  # repeatable "--sampler k=v" flags on every "hands round" command line:
+  # a set knob overrides that field on every openai request the harness
+  # builds, an unset knob sends nothing so the serving stack's own baked
+  # defaults stand — absence is the default, and these lines ship commented
+  # for exactly that reason. They exist to keep small self-hosted models out
+  # of verbatim-repetition loops (temperature, min_p, repetition_penalty,
+  # and no_repeat_ngram_size are the dials that class names); the full
+  # surface is the serving stack's request schema: temperature, top_p,
+  # top_k, min_p, seed, frequency_penalty, presence_penalty,
+  # repetition_penalty, repetition_context_size, no_repeat_ngram_size,
+  # ngram_window, xtc_probability, xtc_threshold. Thinking knobs are owned
+  # by the disable_thinking/wire-thinking channel, max_tokens and stop by
+  # their existing sections — do not duplicate them here. A non-finite float
+  # fails the config load. Example posture (uncomment to use):
+  # temperature: 0.7
+  # min_p: 0.05
+  # repetition_penalty: 1.05
+  # no_repeat_ngram_size: 20
 # Mid-tier mode for capable remote models (large context windows) served on
 # the deployment's own provider channel — either wire: the provider: section
 # or the legacy anthropic:/openai: sections, exactly as they serve rounds

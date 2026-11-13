@@ -105,9 +105,10 @@ func plainTailState(log string) string {
 // right now, the live face follows the finished ones — a contentful live
 // section rendered from the agent's host-side transcript, or the one-line
 // in-flight status when the round's CoT is not followable yet (see
-// liveCotSectionWith). Nothing follows that: the dump carries no log-tail
-// footer — the newest material there is is the dump's last word, and the
-// plain `log` mode keeps the footer (see logTail).
+// liveCotSectionWith). One line follows the newest material: a divider
+// then the task log's last-write stamp — when the last output arrived
+// worker-side, no state clause and no verdict (see lastLogArrival); the
+// plain `log` mode keeps its full footer (see logTail).
 func runTaskLogCot(workflowID string, cotN int) {
 	host := config.DefaultTemporalHost
 	if path, err := resolveConfigPath(defaultConfigPath); err == nil {
@@ -165,6 +166,13 @@ func runTaskLogCot(workflowID string, cotN int) {
 	if len(sections) == 0 && live == "" {
 		exitf("no jailed agent rounds in %s's Temporal history — the run has not started any rounds yet, or predates structured round capture", workflowID)
 	}
+	// The tail is one freshness line, nothing more: a divider then the
+	// task log's mtime — when the last output material arrived. No state
+	// clause and no final/not-final verdict: the sections' own headers
+	// carry their completion stamps, and the plain `log` mode's footer
+	// owns the verdict.
+	fmt.Print("=====================================\n")
+	fmt.Print(lastLogArrival(workflowID) + "\n")
 }
 
 // cotSectionsWith walks each run's history like the usage report does: pair
@@ -590,28 +598,33 @@ func claudeTranscriptCoT(worktree, sessionID string) string {
 	return cot
 }
 
-// logTail renders the tail block appended to the plain log dump — the
-// `-cot` view ends at its newest section and carries no footer: one more
-// === === line in the task log's own header style, naming
-// when the last log material arrived and the run's state. The arrival
-// stamp is the task log file's mtime — the writer appends each block in a
-// single O_APPEND write, so mtime is the last arrival — and degrades to
-// "unknown" when the file is absent or unreadable: the plain dump runs on
+// lastLogArrival renders the task log file's last-write stamp — when the
+// last log material arrived (the writer appends each block in a single
+// O_APPEND write, so mtime is the last arrival) — degrading to a named
+// "unknown" when the file is absent or unreadable: both dump modes run on
 // hosts the worker never touched (the dash's plain task-log face appends
-// the same line), and a missing file must not fail a dump that already
-// rendered. A read/stat race with a concurrent block write shifts
-// the stamp by at most one block — this is an observability aid, not a
-// transaction. The line never enters the log file itself, so the file
+// the same stamp), and a missing file must not fail a dump that already
+// rendered. A read/stat race with a concurrent block write shifts the
+// stamp by at most one block — this is an observability aid, not a
+// transaction. The stamp never enters the log file itself, so the file
 // parsers (lastRoundState and friends) never see it; even if one did, a
 // "log tail" event matches no state-bearing grammar.
-func logTail(workflowID, statePhrase string) string {
-	last := "unknown (task log not readable on this host)"
+func lastLogArrival(workflowID string) string {
 	if path, err := activities.TaskLogPath(workflowID); err == nil {
 		if info, serr := os.Stat(path); serr == nil {
-			last = info.ModTime().UTC().Format(time.RFC3339)
+			return info.ModTime().UTC().Format(time.RFC3339)
 		}
 	}
-	return fmt.Sprintf("=== log tail: last log %s — workflow %s — %s ===\n", last, workflowID, statePhrase)
+	return "unknown (task log not readable on this host)"
+}
+
+// logTail renders the tail block appended to the plain log dump: one more
+// === === line in the task log's own header style, naming when the last
+// log material arrived (lastLogArrival) and the run's state. The `-cot`
+// view ends at its newest section plus the bare arrival stamp, with no
+// header and no state clause.
+func logTail(workflowID, statePhrase string) string {
+	return fmt.Sprintf("=== log tail: last log %s — workflow %s — %s ===\n", lastLogArrival(workflowID), workflowID, statePhrase)
 }
 
 // listWorkflowRuns returns the run ids of every execution recorded for
@@ -693,13 +706,14 @@ func inlineCoT(text string) string {
 // mid-round dump no longer reads as stale: `last write` is the
 // transcript's mtime — the liveness signal, what the agent last produced
 // — and `activity` the run's LastActivityAt search attribute off the live
-// describe, the same decode the runs table uses. touch() fires at round
-// boundaries only, so mid-round the activity value reads as round-start:
-// it answers "when did the workflow last change state", not "is anything
-// moving right now" — the two labels keep the halves apart. A describe
-// failure, an old run that never backfilled the attribute, or a nil
-// client degrades the activity half to "unknown", never a fabricated
-// stamp and never a failed dump.
+// describe, the same decode the runs table uses. A claude/pi round now
+// advances the attribute mid-round itself (cot-progress stamps on
+// transcript writes, at most one poll interval behind last write), so
+// both labels move with the round; they keep their halves apart as
+// transcript-write vs workflow-attribute. A describe failure, an old run
+// that never backfilled the attribute, or a nil client degrades the
+// activity half to "unknown", never a fabricated stamp and never a
+// failed dump.
 func liveCotSectionWith(workflowID string, c client.Client) string {
 	path, err := activities.TaskLogPath(workflowID)
 	if err != nil {
